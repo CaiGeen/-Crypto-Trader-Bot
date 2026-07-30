@@ -1,0 +1,12 @@
+# Core dependencies
+python-telegram-bot>=20.0,<21.0
+ccxt>=4.0.0
+python-dotenv>=1.0.0
+pytz>=2023.0
+
+# Optional: for better HTTP performance
+httpx>=0.25.0
+
+# For development and debugging (optional)
+# pytest>=7.0.0
+# black>=23.0.0
