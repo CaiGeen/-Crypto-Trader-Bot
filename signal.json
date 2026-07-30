@@ -1,0 +1,29 @@
+{
+    "symbol": "BTCUSDT",
+    "side": "BUY",
+    "leverage": 100,
+    "entries": [
+        {
+            "trigger_price": 64300,
+            "amount": 0.001,
+            "stop_loss": 64000
+        },
+        {
+            "trigger_price": 64330,
+            "amount": 0.001,
+            "stop_loss": 64001
+        },
+        {
+            "trigger_price": 66200,
+            "amount": 0.001,
+            "stop_loss": 63003
+        },
+        {
+            "trigger_price": 66300,
+            "amount": 0.001,
+            "stop_loss": 63304
+        }
+    ],
+    "take_profit": 66000,
+    "initial_stop_loss": 63000
+}
