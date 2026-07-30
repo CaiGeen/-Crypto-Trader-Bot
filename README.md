@@ -88,8 +88,8 @@ my-crypto-bot/
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/yourusername/crypto-trader-bot.git
-cd crypto-trader-bot
+git clone https://github.com/CaiGeen/-Crypto-Trader-Bot.git
+cd -Crypto-Trader-Bot
 ```
 
 ### 2. 安装依赖
