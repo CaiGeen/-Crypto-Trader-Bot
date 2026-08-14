@@ -1,0 +1,5 @@
+ccxt>=4.5.68
+python-telegram-bot>=22.8
+python-dotenv>=1.2.2
+pytz>=2024.1
+httpx>=0.28.1
