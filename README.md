@@ -66,8 +66,8 @@
 ### 2. 安装
 
 ```bash
-git clone https://github.com/<your-name>/<repo>.git
-cd <repo>
+git clone https://github.com/CaiGeen/-Crypto-Trader-Bot.git
+cd ./-Crypto-Trader-Bot
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
