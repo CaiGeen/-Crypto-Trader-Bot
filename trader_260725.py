@@ -8,7 +8,7 @@ import ccxt
 import threading
 import asyncio
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
 from parser import TradeSignal, parse_signal_from_json
@@ -68,6 +68,8 @@ class CryptoTrader:
                 'https': proxy_url,
             }
 
+        self.proxy_url = proxy_url  # 保存供 IP 检测使用
+
         self.exchange = ccxt.binanceusdm(exchange_config)
 
         self.tg_bot = tg_bot
@@ -119,7 +121,7 @@ class CryptoTrader:
 
         self.last_time_sync = time.time()
 
-        # 🔥 每日结算日报线程（daemon，每天 00:05 发送）
+        # 🔥 每日结算日报线程（daemon，每天 08:05 发送昨日结算）
         self._last_daily_report_date = None
         threading.Thread(target=self._daily_report_loop, daemon=True).start()
 
@@ -147,17 +149,28 @@ class CryptoTrader:
             print(f"⚠️ 保存 IP 失败: {e}")
 
     def _get_public_ip(self) -> str | None:
-        """主动获取当前公网 IP（静默失败）"""
+        """主动获取当前公网 IP（走代理时查币安实际看到的出口 IP，静默失败）"""
         if not self.IP_CHECK_ENABLED:
             return self.last_known_ip
 
         try:
             import urllib.request
+
+            # 如果配置了代理，走代理查询（与币安 API 同一出口 IP）
+            if getattr(self, 'proxy_url', None):
+                proxy_handler = urllib.request.ProxyHandler({
+                    'http': self.proxy_url,
+                    'https': self.proxy_url,
+                })
+                opener = urllib.request.build_opener(proxy_handler)
+            else:
+                opener = urllib.request.build_opener()
+
             req = urllib.request.Request(
                 'https://api.ipify.org',
                 headers={'User-Agent': 'Mozilla/5.0'}
             )
-            with urllib.request.urlopen(req, timeout=5) as response:
+            with opener.open(req, timeout=5) as response:
                 ip = response.read().decode('utf-8').strip()
                 if ip and '.' in ip and len(ip) < 20:
                     return ip
@@ -416,9 +429,9 @@ class CryptoTrader:
             pass
 
     def _send_daily_report(self):
-        """发送每日结算报告（当日已实现盈亏 + 余额 + 持仓快照）"""
+        """发送每日结算报告（昨日已实现盈亏 + 余额 + 持仓快照）"""
         try:
-            today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+            report_date = (datetime.now(BEIJING_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
             base_dir = os.path.dirname(os.path.abspath(__file__))
             stats_file = os.path.join(base_dir, "trade_stats.json")
             today_trades = []
@@ -428,7 +441,7 @@ class CryptoTrader:
                     with open(stats_file, "r", encoding="utf-8") as f:
                         stats = json.load(f)
                     for t in stats.get("trades", []):
-                        if str(t.get("time", "")).startswith(today):
+                        if str(t.get("time", "")).startswith(report_date):
                             today_trades.append(t)
                             total_pnl += float(t.get("net_pnl", 0.0))
                 except Exception:
@@ -446,17 +459,17 @@ class CryptoTrader:
                 balance_txt = ""
 
             msg = (
-                f"📅 **每日结算报告** `{today}`\n\n"
-                f"📊 今日平仓: `{len(today_trades)}` 笔\n"
+                f"📅 **每日结算报告** `{report_date}`\n\n"
+                f"📊 昨日平仓: `{len(today_trades)}` 笔\n"
             )
             if today_trades:
-                msg += f"💰 今日已实现盈亏: `{total_pnl:+.2f}` USDT\n"
+                msg += f"💰 昨日已实现盈亏: `{total_pnl:+.2f}` USDT\n"
                 msg += "📝 明细（最近5笔）：\n"
                 for t in today_trades[-5:]:
                     emoji = "🟢" if t['net_pnl'] >= 0 else "🔴"
                     msg += f"  {emoji} `{t['symbol']}` {t['side']} {t['mode']} | `{t['net_pnl']:+.2f}` USDT\n"
             else:
-                msg += f"💰 今日已实现盈亏: `0.00` USDT（无平仓）\n"
+                msg += f"💰 昨日已实现盈亏: `0.00` USDT（无平仓）\n"
 
             msg += f"\n{balance_txt}"
             if snapshot:
@@ -464,18 +477,18 @@ class CryptoTrader:
 
             self.send_tg_notification(msg)
             # 🔥 日报同步推送 QQ 邮箱（留档）
-            self._send_email_alert(msg, subject=f"每日结算报告 {today}")
+            self._send_email_alert(msg, subject=f"每日结算报告 {report_date}")
         except Exception as e:
             print(f"⚠️ [日报] 发送失败: {e}")
 
     def _daily_report_loop(self):
-        """每日 00:05（北京时间）自动发送结算日报（daemon 线程）"""
+        """每日 08:05（北京时间）自动发送昨日结算日报（daemon 线程）"""
         self._last_daily_report_date = None
         while True:
             try:
                 now = datetime.now(BEIJING_TZ)
                 today = now.strftime("%Y-%m-%d")
-                if (now.hour == 0 and now.minute == 5
+                if (now.hour == 8 and now.minute == 5
                         and self._last_daily_report_date != today):
                     self._send_daily_report()
                     self._last_daily_report_date = today
@@ -2097,6 +2110,15 @@ class CryptoTrader:
 
                         # 重置标记，防止重复触发
                         manual_canceled_detected = False
+
+                # 🔥 程序撤单/pending_close 且无成交：退出监控（finally 块会清理状态）
+                if batch_filled_count == 0:
+                    latest_all_pc = self.load_all_states()
+                    latest_b_data_pc = latest_all_pc.get(symbol, {}).get(batch_id, {})
+                    if latest_b_data_pc and (latest_b_data_pc.get('is_programmatic_cancel', False) or
+                                              latest_b_data_pc.get('pending_close', False)):
+                        print(f"🚨 [批次终止] 本批次未建仓，程序撤单已完成，正在退出监控...")
+                        break
 
                 if batch_filled_amount > 0:
                     batch_filled_amount = float(self.exchange.amount_to_precision(symbol, batch_filled_amount))
