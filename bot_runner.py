@@ -24,7 +24,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.request import HTTPXRequest
-from telegram.error import NetworkError, TimedOut, RetryAfter, Conflict
+from telegram.error import NetworkError, RetryAfter, Conflict, BadRequest
 
 # 导入交易核心与解析器
 from parser import parse_signal_from_json
@@ -134,34 +134,6 @@ def print_system_safety_check(trader=None):
 
 
 # ==================== Watchdog 支持 ====================
-def check_watchdog_notify():
-    """
-    检查 watchdog 是否有通知需要发送
-    支持格式:
-    - "ip_notify|消息内容" -> IP 变化通知
-    - "crash_alert|消息内容" -> 崩溃报警
-    - "summary_restart" -> 重启后汇总
-    - 其他 -> 普通通知
-    """
-    try:
-        notify_file = os.path.join(BASE_DIR, ".notify")
-        if os.path.exists(notify_file):
-            with open(notify_file, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-            os.remove(notify_file)
-
-            if '|' in content:
-                parts = content.split('|', 2)
-                if len(parts) >= 2:
-                    notify_type = parts[0]
-                    notify_msg = parts[1] if len(parts) > 1 else parts[0]
-                    return {'type': notify_type, 'msg': notify_msg}
-            return {'type': 'unknown', 'msg': content}
-    except Exception:
-        pass
-    return None
-
-
 def is_authorized(user_id: int) -> bool:
     if int(user_id) != ALLOWED_USER_ID:
         logging.warning(f"🚫 拦截到未经授权的访问请求，User ID: {user_id}")
@@ -177,6 +149,15 @@ async def safe_reply(update: Update, text: str, parse_mode=None, reply_markup=No
         elif update.callback_query and update.callback_query.message:
             return await update.callback_query.message.reply_text(text, parse_mode=parse_mode,
                                                                   reply_markup=reply_markup)
+    except BadRequest as e:
+        # 真错误（Markdown 格式错、消息超长等），必须保留可见性
+        logging.error(f"⚠️ 回复消息给 Telegram 失败（BadRequest，请检查消息格式）: {e}")
+    except RetryAfter as e:
+        # Flood control 限流，稍后自动恢复，正常现象
+        logging.debug(f"ℹ️ Telegram 回复受限（Flood control，稍后自动恢复）: {e}")
+    except NetworkError as e:
+        # 裸 NetworkError（Bad Gateway/ConnectError 等）网络抖动
+        logging.debug(f"ℹ️ Telegram 回复失败（网络抖动，可忽略）: {e}")
     except Exception as e:
         logging.error(f"⚠️ 回复消息给 Telegram 失败: {e}")
 
@@ -838,6 +819,10 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     """处理消息下方内联按钮点击交互"""
     try:
         await update.callback_query.answer()
+    except BadRequest as e:
+        logging.warning(f"⚠️ 应答 callback_query 失败（BadRequest）: {e}")
+    except NetworkError as e:
+        logging.debug(f"ℹ️ 应答 callback_query 失败（网络抖动）: {e}")
     except Exception as e:
         logging.warning(f"⚠️ 应答 callback_query 失败: {e}")
 
@@ -1881,16 +1866,30 @@ async def on_post_init(app: Application):
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
 
-    if isinstance(error, NetworkError):
-        error_str = str(error).lower()
-        # httpx 网络错误（ConnectError 等）由库的 network_retry_loop 自动重试，属正常抖动
-        if "disconnected" in error_str or "remoteprotocolerror" in error_str \
-                or "httpx" in error_str or "connecterror" in error_str:
-            logging.debug(f"ℹ️ Telegram 网络异常（库自动重试，正常）: {error}")
-            return
+    # BadRequest 是 NetworkError 子类（库的命名怪癖），但它是真错误（格式错/消息超长等），必须保留可见性
+    if isinstance(error, BadRequest):
+        logging.error("❌ Telegram BadRequest（真错误）:", exc_info=error)
+        try:
+            if update:
+                await safe_reply(update, f"⚠️ **系统异常**\n{str(error)[:300]}")
+            else:
+                await context.bot.send_message(
+                    chat_id=ALLOWED_USER_ID,
+                    text=f"⚠️ **系统异常**\n{str(error)[:300]}",
+                    parse_mode='Markdown'
+                )
+        except Exception:
+            pass
+        return
 
-    if isinstance(error, TimedOut):
-        logging.debug(f"ℹ️ Telegram 请求超时（正常）: {error}")
+    # 裸 NetworkError（Bad Gateway / ConnectError 等；TimedOut 也是其子类，一并覆盖）
+    # 由 python-telegram-bot 库的 network_retry_loop 自动无限重试，属正常网络抖动
+    if isinstance(error, NetworkError):
+        logging.debug(f"ℹ️ Telegram 网络抖动（库自动重试）: {error}")
+        return
+
+    if isinstance(error, RetryAfter):
+        logging.warning(f"⚠️ Telegram 请求受限（Flood control）: {error}")
         return
 
     if isinstance(error, Conflict):

@@ -81,7 +81,7 @@ class CryptoTrader:
         self.ip_file = os.path.join(os.path.dirname(__file__), ".last_ip.txt")
         self._load_last_ip()
         self.last_ip_check_time = 0
-        self.IP_CHECK_INTERVAL = 600  # 5 分钟
+        self.IP_CHECK_INTERVAL = 600  # 10 分钟
 
         # 🔥 是否启用 IP 检测（云服务器有固定 IP 时可以禁用）
         self.IP_CHECK_ENABLED = os.getenv("IP_CHECK_ENABLED", "true").lower() == "true"
@@ -209,10 +209,6 @@ class CryptoTrader:
         if not sent:
             self._fallback_notify_file(ip, source)
 
-    def get_last_reported_ip(self) -> str | None:
-        """获取最近一次币安报告的 IP（用于调试）"""
-        return self._last_reported_ip
-
     def _try_async_send(self, text: str) -> bool:
         """尝试通过异步方式发送，返回是否成功"""
         if not self.tg_bot or not self.chat_id or not self.loop:
@@ -290,12 +286,14 @@ class CryptoTrader:
         """
         发送 Telegram 通知（异步方式）
         用于正常运行期间的通知发送
-        level: 'info' 普通通知 | 'critical' 资金安全告警（自动加醒目前缀）
+        level: 'info' 普通通知 | 'warning' 需关注（自动加 ⚠️ 前缀） | 'critical' 资金安全告警（自动加 🚨 前缀 + 邮箱兜底）
         """
         if level == 'critical':
             text = f"🚨【资金安全】\n{text}"
             # 🔥 资金安全告警同步推送 QQ 邮箱（兜底通道，独立线程异步发送，失败不影响 TG）
             self._send_email_alert(text, subject="🚨 资金安全告警")
+        elif level == 'warning':
+            text = f"⚠️【需关注】\n{text}"
         if self.tg_bot and self.chat_id and self.loop:
             try:
                 future = asyncio.run_coroutine_threadsafe(
@@ -498,25 +496,6 @@ class CryptoTrader:
             except Exception as e:
                 print(f"⚠️ [日报] 循环异常: {e}")
                 time.sleep(300)
-
-    def _health_check(self) -> bool:
-        """交易所健康检查：时间 + 账户 + 持仓"""
-        try:
-            print("🔍 [健康检查] 检查时间同步...")
-            self._safe_api_call(self.exchange.fetch_time)
-            print("✅ [健康检查] 时间同步正常")
-            print("🔍 [健康检查] 检查账户余额...")
-            self._safe_api_call(self.exchange.fetch_balance)
-            print("✅ [健康检查] 账户余额正常")
-            print("🔍 [健康检查] 检查持仓...")
-            self._safe_api_call(self.exchange.fetch_positions)
-            print("✅ [健康检查] 持仓查询正常")
-            return True
-        except Exception as e:
-            import traceback
-            print(f"⚠️ [健康检查失败] {e}")
-            traceback.print_exc()
-            return False
 
     def _wait_for_api_cooldown(self):
         """等待全局 API 熔断结束"""
@@ -1198,7 +1177,7 @@ class CryptoTrader:
                     f"⚠️ 当前价格低于名义均价，即使不含手续费也无法保本！\n"
                     f"💡 建议等待价格回升至 `{nominal_avg:.2f}` 以上再尝试。"
                 )
-                self.send_tg_notification(error_msg)
+                self.send_tg_notification(error_msg, level='warning')
                 return False, "当前价格低于成本价，无法设置保本损"
         else:  # SELL
             if current_price <= actual_avg:
@@ -1219,7 +1198,7 @@ class CryptoTrader:
                     f"⚠️ 当前价格高于名义均价，即使不含手续费也无法保本！\n"
                     f"💡 建议等待价格回落至 `{nominal_avg:.2f}` 以下再尝试。"
                 )
-                self.send_tg_notification(error_msg)
+                self.send_tg_notification(error_msg, level='warning')
                 return False, "当前价格高于成本价，无法设置保本损"
 
         # 构建详细通知
@@ -1321,21 +1300,20 @@ class CryptoTrader:
 
     def set_breakeven_stop_loss(self, batch_id: str) -> float | None:
         success, msg = self.set_breakeven_sl(batch_id)
-        if success:
-            import re
-            match = re.search(r'`([\d.]+)`', msg)
-            if match:
-                return float(match.group(1))
-            all_states = self.load_all_states()
-            for symbol, symbol_batches in all_states.items():
-                if batch_id in symbol_batches and symbol_batches[batch_id].get('is_active'):
-                    b_data = symbol_batches[batch_id]
-                    stop_steps = b_data.get('stop_steps', [])
-                    if stop_steps:
-                        return stop_steps[-1]
+        if not success:
             return None
-        else:
-            return None
+        # 从状态中读取保本损价格（set_breakeven_sl 已更新 stop_steps）
+        all_states = self.load_all_states()
+        for symbol, symbol_batches in all_states.items():
+            if batch_id in symbol_batches and symbol_batches[batch_id].get('is_active'):
+                b_data = symbol_batches[batch_id]
+                stop_steps = b_data.get('stop_steps', [])
+                last_filled_count = b_data.get('last_filled_count', 0)
+                if stop_steps and last_filled_count > 0:
+                    return stop_steps[last_filled_count - 1]
+                elif stop_steps:
+                    return stop_steps[-1]
+        return None
 
     def _cancel_remaining_entries(self, symbol: str, entry_orders: list, filled_layers: list = None):
         print(f"🧹 正在清理本批次残余开仓挂单...")
@@ -1402,19 +1380,6 @@ class CryptoTrader:
         print(f"❌ 查询持仓失败，已重试 {retries} 次")
         return None
 
-    def _get_current_vwap_from_position(self, symbol: str) -> float | None:
-        try:
-            positions = self._safe_api_call(self.exchange.fetch_positions, [symbol])
-            for pos in positions:
-                if pos.get('symbol') == symbol or pos.get('info', {}).get('symbol') == \
-                        symbol.replace('/', '').split(':')[0]:
-                    entry_price = pos.get('entryPrice') or pos.get('info', {}).get('entryPrice')
-                    if entry_price:
-                        return float(entry_price)
-        except Exception as e:
-            print(f"⚠️ 查询持仓均价失败: {e}")
-        return None
-
     def _check_existing_conflicts(self, symbol: str, batch_id: str, all_states: dict) -> bool:
         print(f"\n🔍 正在针对批次 [{batch_id}] 进行防冲突扫描...")
 
@@ -1449,6 +1414,13 @@ class CryptoTrader:
 
         if unknown_orders:
             print(f"⚠️ 【未识别挂单提醒】检测到交易所存在 {len(unknown_orders)} 个不受代码管理的“孤儿挂单”！")
+            self.send_tg_notification(
+                f"⚠️ **孤儿挂单检测**\n"
+                f"🆔 标的：`{symbol}`\n"
+                f"🔢 发现 {len(unknown_orders)} 个不受代码管理的挂单\n"
+                f"🧹 程序将自动清理这些孤儿挂单。",
+                level='warning'
+            )
             for ord in unknown_orders:
                 print(
                     f"   └─ Order ID: {ord['id']} | 类型: {ord['type']} | 方向: {ord['side']} | 触发/委托价: {ord.get('stopPrice') or ord.get('price')}")
@@ -1626,7 +1598,6 @@ class CryptoTrader:
             order_side = 'buy' if side == 'BUY' else 'sell'
 
             layer_sl_params = []
-            layer_tp_params = []
 
             for idx, (raw_trigger_price, raw_amount) in enumerate(signal.entries):
                 formatted_amount = float(self.exchange.amount_to_precision(symbol, raw_amount))
@@ -1680,21 +1651,6 @@ class CryptoTrader:
                         'params': sl_params
                     })
 
-                    formatted_tp_price = float(self.exchange.price_to_precision(symbol, signal.take_profit))
-                    tp_params = params_base.copy()
-                    tp_params['stopPrice'] = formatted_tp_price
-                    if not is_hedge_mode:
-                        tp_params['reduceOnly'] = True
-                    tp_side = 'sell' if side == 'BUY' else 'buy'
-
-                    layer_tp_params.append({
-                        'symbol': symbol,
-                        'type': 'TAKE_PROFIT_MARKET',
-                        'side': tp_side,
-                        'amount': formatted_amount,
-                        'params': tp_params
-                    })
-
                 except ccxt.ExchangeError as e:
                     if "-2021" in str(e):
                         print(
@@ -1745,7 +1701,6 @@ class CryptoTrader:
                 'pending_sl_orders': initial_pending,
                 'prepared_tp_params': prepared_tp_params,
                 'layer_sl_params': layer_sl_params,
-                'layer_tp_params': layer_tp_params,
                 'sl_fail_count': {},
                 'sl_failed_layers': [],
             }
@@ -1768,7 +1723,7 @@ class CryptoTrader:
                     f"💡 建议：价格波动可能导致强平，请密切关注！"
                 )
                 print(f"⚠️ {warning_msg}")
-                self.send_tg_notification(warning_msg)
+                self.send_tg_notification(warning_msg, level='warning')
 
             self._safe_api_call(self.exchange.load_time_difference)
             self.last_time_sync = time.time()
@@ -1797,7 +1752,6 @@ class CryptoTrader:
                     'pending_sl_orders': initial_pending,
                     'prepared_tp_params': prepared_tp_params,
                     'layer_sl_params': layer_sl_params,
-                    'layer_tp_params': layer_tp_params,
                 },
                 daemon=True
             )
@@ -1818,8 +1772,7 @@ class CryptoTrader:
                           filled_details: list = None, total_entry_fee: float = 0.0,
                           pending_sl_orders: list = None,
                           prepared_tp_params: dict = None,
-                          layer_sl_params: list = None,
-                          layer_tp_params: list = None):
+                          layer_sl_params: list = None):
 
         # 🔥 检查并清理可能残留的监控标记
         with self._active_monitors_lock:
@@ -1841,8 +1794,6 @@ class CryptoTrader:
 
         if layer_sl_params is None:
             layer_sl_params = []
-        if layer_tp_params is None:
-            layer_tp_params = []
 
         for i in range(last_filled_count):
             if i < len(filled_layers):
@@ -1860,8 +1811,6 @@ class CryptoTrader:
                 prepared_tp_params = latest_b_data.get('prepared_tp_params', {})
             if 'layer_sl_params' in latest_b_data:
                 layer_sl_params = latest_b_data.get('layer_sl_params', [])
-            if 'layer_tp_params' in latest_b_data:
-                layer_tp_params = latest_b_data.get('layer_tp_params', [])
 
         print(f"👀 批次 [{batch_id}] 启动【批次独立隔离】实时风控监控...")
         if pending_sl_orders:
@@ -1994,7 +1943,7 @@ class CryptoTrader:
                                 if current_sl_id is None:
                                     self._place_prepared_orders_immediately(
                                         symbol, batch_id, idx, batch_filled_amount,
-                                        prepared_tp_params, layer_sl_params, layer_tp_params,
+                                        prepared_tp_params, layer_sl_params,
                                         is_hedge_mode, params_base, stop_steps
                                     )
                                 else:
@@ -2355,7 +2304,6 @@ class CryptoTrader:
                             'pending_sl_orders': pending_sl_orders,
                             'prepared_tp_params': prepared_tp_params,
                             'layer_sl_params': layer_sl_params,
-                            'layer_tp_params': layer_tp_params,
                             'sl_fail_count': sl_fail_count,
                         })
                         batch_state_data.setdefault('sl_failed_layers', [])
@@ -2765,7 +2713,8 @@ class CryptoTrader:
                                                 f"⚠️ **降级保护触发**\n"
                                                 f"🆔 批次 `{batch_id}` 新止损单挂单失败，已自动恢复为旧止损价\n"
                                                 f"🛡️ 止损价：`{old_sl_price}`\n"
-                                                f"🔢 数量：`{old_sl_amount}`"
+                                                f"🔢 数量：`{old_sl_amount}`",
+                                                level='warning'
                                             )
                                             sl_error_count = 0
                                         except Exception as recovery_e:
@@ -2889,7 +2838,6 @@ class CryptoTrader:
                         'pending_sl_orders': pending_sl_orders,
                         'prepared_tp_params': prepared_tp_params,
                         'layer_sl_params': layer_sl_params,
-                        'layer_tp_params': layer_tp_params,
                         'sl_fail_count': sl_fail_count,
                         'sl_failed_layers': sl_failed_layers,
                     })
@@ -2911,6 +2859,16 @@ class CryptoTrader:
             print(f"⚠️ 监控循环内部异常: {inner_e}")
             import traceback
             traceback.print_exc()
+            # 🔥 该异常位于 while 循环外层：监控线程将因此退出且无自动重生机制。
+            # 若批次已有持仓，将不再自动补挂止损/止盈，属资金安全事件 → critical
+            self.send_tg_notification(
+                f"🚨 **监控线程异常退出**\n"
+                f"🆔 批次：`{batch_id}`\n"
+                f"💡 原因：`{str(inner_e)[:200]}`\n"
+                f"⚠️ 该批次监控已终止，如有持仓将不再自动补挂止损/止盈\n"
+                f"💡 请检查仓位，必要时重启程序恢复监控。",
+                level='critical'
+            )
 
         # ================================================================
         # 🔥 finally 块 - 确保清理工作始终执行
@@ -2967,7 +2925,7 @@ class CryptoTrader:
             print(f"🧹 批次 [{batch_id}] 监控线程已退出")
 
     def _place_prepared_orders_immediately(self, symbol, batch_id, idx, batch_filled_amount,
-                                           prepared_tp_params, layer_sl_params, layer_tp_params,
+                                           prepared_tp_params, layer_sl_params,
                                            is_hedge_mode, params_base, stop_steps):
         """🔥 成交后立即使用预生成的参数挂止盈和止损单（1秒内完成）
         注意：此方法只在 current_sl_id 为 None 时调用，即首次成交时
