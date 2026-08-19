@@ -1622,6 +1622,16 @@ async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYP
                     verbose=False
                 )
 
+            # SG1: B 层用户体验提示（安全边界在 trader.execute_signal；临时降级实例未跑恢复同样被拦）
+            if trader is not None and not trader._ready:
+                print(f"🚫 [SG1] 信号未执行（系统未就绪）: {trader._not_ready_reason}")
+                await safe_reply(update,
+                                 f"🚫 **信号未执行**：系统未就绪\n"
+                                 f"原因: `{trader._not_ready_reason}`\n"
+                                 f"历史批次恢复完成前禁止新建仓位，请稍后重新发送信号。",
+                                 parse_mode='Markdown')
+                return
+
             signal_file = os.path.join(BASE_DIR, "signal.json")
             signal = parse_signal_from_json(signal_file)
 
@@ -1701,10 +1711,13 @@ async def run_trader_recovery_on_startup(trader: CryptoTrader):
                 loop = asyncio.get_running_loop()
                 recovery_result = await loop.run_in_executor(None, trader.recover_active_batches)
                 if recovery_result:
-                    print("✅ [启动检测] 历史任务恢复校验完成！")
+                    trader._ready = True        # SG1: 唯一置位来源 = recover 明确返回 True（含 0 批次）
+                    trader._not_ready_reason = ""
+                    print("✅ [启动检测] 历史任务恢复校验完成！系统 READY")
                     return
                 else:
                     # R3: 恢复失败不得报告成功，必须显式告警（Phase A: 让失败可见）
+                    trader._not_ready_reason = "恢复失败：交易所健康检查未通过（recover 返回 False）"
                     print("🚨 [启动检测] 历史任务恢复失败！recover_active_batches 返回 False")
                     try:
                         trader.send_tg_notification(
@@ -1721,6 +1734,7 @@ async def run_trader_recovery_on_startup(trader: CryptoTrader):
                     await asyncio.sleep(10)
                 else:
                     logging.exception(f"⚠️ 检查历史活跃任务失败 (已重试 3 次): {e}")
+                    trader._not_ready_reason = f"恢复异常：重试 3 次耗尽（{str(e)[:100]}）"
                     # R3-v2: 重试耗尽不得静默，必须显式告警（不变量⑧ Fail-Closed but not Fail-Silent）
                     try:
                         trader.send_tg_notification(

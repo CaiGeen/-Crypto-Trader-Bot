@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from parser import TradeSignal, parse_signal_from_json
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -108,6 +109,10 @@ class CryptoTrader:
         # 🔥 全局 API 熔断器（统一冷却时间）
         self.api_cooldown_until = 0
         self.api_cooldown_lock = threading.Lock()
+        self._cooldown_active = False   # R1: 当前熔断周期是否已发过进入告警
+        self._cooldown_gen = 0          # R1: 熔断周期代数，防跨周期解除通知错配
+        self._ready = False                              # SG1: READY 门控，默认 Fail-Closed
+        self._not_ready_reason = "启动恢复中（历史批次接管未完成）"  # SG1: 仅诊断展示，永不参与安全判断
 
         # 🔥 监控线程去重
         self._active_monitors = set()
@@ -312,6 +317,22 @@ class CryptoTrader:
                 future.result(timeout=5)
             except asyncio.TimeoutError:
                 print(f"⚠️ [TG通知] 发送超时 (5秒)")
+            except BadRequest as e:
+                # 🔥 Markdown/Entity 解析失败等请求级错误（如批次号奇数下划线）→ 同一消息降级纯文本重发
+                # 一次，保证告警必达（不变量⑧ Fail-not-Silent）。类型判定，不依赖错误文案。
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.tg_bot.send_message(
+                            chat_id=self.chat_id,
+                            text=text,
+                            reply_markup=reply_markup
+                        ),
+                        self.loop
+                    )
+                    future.result(timeout=5)
+                    print(f"ℹ️ [TG通知] Markdown 解析失败({str(e)[:60]})，已降级纯文本发送")
+                except Exception as e2:
+                    print(f"⚠️ [TG通知] 纯文本重发失败: {e2}")
             except Exception as e:
                 print(f"⚠️ [TG通知] 发送失败: {e}")
         else:
@@ -507,10 +528,29 @@ class CryptoTrader:
                 wait_time = self.api_cooldown_until - time.time()
 
             if wait_time <= 0:
-                return
+                break
 
             print(f"🚫 [API熔断] 等待 {wait_time:.1f} 秒...")
             time.sleep(min(wait_time, 5.0))
+
+        # R1: 熔断解除通知（状态转换式，每个周期最多 1 条；多线程下仅 1 个线程能翻转 active）
+        gen_snapshot = None
+        with self.api_cooldown_lock:
+            if self._cooldown_active and time.time() >= self.api_cooldown_until:
+                self._cooldown_active = False
+                gen_snapshot = self._cooldown_gen
+        if gen_snapshot is not None:
+            try:
+                with self.api_cooldown_lock:
+                    # 发送前二次确认：期间没有新熔断周期开始、冷却未被延长
+                    still_valid = (self._cooldown_gen == gen_snapshot
+                                   and time.time() >= self.api_cooldown_until)
+                if still_valid:
+                    self.send_tg_notification("✅ API 熔断已解除，恢复正常交易监控", level='info')
+                else:
+                    print("ℹ️ [R1] 跳过解除通知：已检测到新的熔断周期/冷却延长")
+            except Exception as e:
+                print(f"⚠️ [R1] 熔断解除通知发送失败: {e}")
 
     def _parse_binance_ban_time(self, error_msg: str) -> float:
         """从币安错误信息中解析封禁时间，返回需要等待的秒数，默认 300 秒"""
@@ -526,6 +566,38 @@ class CryptoTrader:
             except Exception:
                 pass
         return 300.0
+
+    def _alert_cooldown_start(self, reason: str, seconds: float):
+        """R1: 熔断进入告警（状态转换式，每个熔断周期只发一次 critical，防告警风暴）
+        同一周期内再次 429/418 只延长冷却（调用方已 max() 更新），不重复告警"""
+        with self.api_cooldown_lock:
+            if self._cooldown_active:
+                return  # 本周期已告警
+            self._cooldown_active = True
+            self._cooldown_gen += 1
+        # 锁外构建与发送：active_cnt 走本地状态文件，不持熔断锁、不发交易所请求
+        try:
+            expire_str = datetime.fromtimestamp(time.time() + seconds, BEIJING_TZ).strftime('%H:%M:%S')
+            active_cnt = 0
+            try:
+                # 状态结构: {symbol: {batch_id: batch_data}}，无包装键
+                for state in self.load_all_states().values():
+                    for b in state.values():
+                        if isinstance(b, dict) and b.get('is_active'):
+                            active_cnt += 1
+            except Exception:
+                active_cnt = -1
+            cnt_str = str(active_cnt) if active_cnt >= 0 else '未知(状态读取失败)'
+            self.send_tg_notification(
+                f"API 全局熔断已触发\n原因: {reason}\n"
+                f"预计冷却: {seconds:.0f} 秒（至北京时间 {expire_str}）\n"
+                f"受影响活跃批次: {cnt_str} 个\n"
+                f"熔断期间暂停新的交易所 API 请求；已存在于交易所的 SL/TP 条件单仍由交易所维护，"
+                f"但程序暂时无法补挂、修改或撤销订单。",
+                level='critical'
+            )
+        except Exception as e:
+            print(f"⚠️ [R1] 熔断告警发送失败: {e}")
 
     def _safe_api_call(self, func, *args, retries=5, delay=2, **kwargs):
         for i in range(retries):
@@ -590,6 +662,7 @@ class CryptoTrader:
                                 time.time() + ban_seconds
                             )
                         print(f"🚫 [全局熔断] IP 被封禁，统一冷却 {ban_seconds:.0f} 秒")
+                        self._alert_cooldown_start("IP 被 Binance 封禁(418/banned)", ban_seconds)  # R1
                         import traceback
                         traceback.print_exc()
                         # 🔥 等待冷却后重试
@@ -606,6 +679,7 @@ class CryptoTrader:
                             time.time() + global_cooldown
                         )
                     print(f"🛑 [429限频] 触发全局熔断 {global_cooldown:.1f} 秒 (第 {i + 1} 次重试)...")
+                    self._alert_cooldown_start("429 限频", global_cooldown)  # R1
                     self._wait_for_api_cooldown()
                     if i == retries - 1:
                         raise e
@@ -1394,6 +1468,52 @@ class CryptoTrader:
         print(f"❌ 查询持仓失败，已重试 {retries} 次")
         return None
 
+    def _check_sl_coverage(self, symbol: str, all_states: dict, current_pos: float) -> tuple[bool, str]:
+        """SG2: 加仓前风险闸门——任何已有仓位，只要系统无法证明其全部由有效 SL 覆盖，
+        就禁止创建新的风险仓位（Fail-Closed）。
+        - 只做判定不发通知（通知由调用方负责）；current_pos 由调用方单次快照传入，避免二次查询状态漂移
+        - 有效 SL = current_sl_id 存在且该 id 在交易所 open_orders 中；查询失败 = UNKNOWN = 拒绝
+        - 未成交批次（last_filled_count=0）无 SL 不算裸仓
+        - delta≠0（含负值，名义台账与交易所不一致）一律拒绝
+        返回 (allowed, reason)。"""
+        EPS = 1e-9
+        # ① 程序台账：已成交 active 批次的名义仓位与 SL id
+        program_position = 0.0
+        filled_batches = []  # [(batch_id, sl_id)]
+        for batch_id, b_data in (all_states.get(symbol, {}) or {}).items():
+            if not (isinstance(b_data, dict) and b_data.get('is_active')):
+                continue
+            last_filled = int(b_data.get('last_filled_count', 0) or 0)
+            if last_filled <= 0:
+                continue  # 未成交批次无需 SL
+            target_amounts = b_data.get('target_amounts', []) or []
+            program_position += sum(target_amounts[:last_filled])
+            filled_batches.append((batch_id, b_data.get('current_sl_id')))
+
+        # ② 差额判定（方案 A 严格）：正差=未归属手工仓位，负差=台账与交易所不一致
+        # 注意：未归属仓位即使手工设置了 SL 也无法确认归属（有 SL ≠ delta 归零），指引应为平仓而非设 SL
+        delta = current_pos - program_position
+        if delta > EPS:
+            return False, (f"存在未归属仓位 {delta:.6f}"
+                           f"（交易所仓位 {current_pos:.6f} > 程序台账 {program_position:.6f}，"
+                           f"未纳入程序批次管理）")
+        if delta < -EPS:
+            return False, (f"仓位与程序台账不一致"
+                           f"（台账 {program_position:.6f} > 交易所 {current_pos:.6f}），"
+                           f"无法确认保护状态，请人工核对")
+
+        # ③ SL 有效性校验：一次 fetch_open_orders，失败 = UNKNOWN = 拒绝
+        try:
+            open_orders = self._safe_api_call(self.exchange.fetch_open_orders, symbol)
+        except Exception as e:
+            return False, f"SL 状态查询失败（{str(e)[:80]}），无法确认保护状态"
+        open_ids = {str(o.get('id')) for o in open_orders}
+        missing = [bid for bid, sl_id in filled_batches
+                   if not sl_id or str(sl_id) not in open_ids]
+        if missing:
+            return False, f"批次 {', '.join(missing)} 缺少有效止损单（无 SL 或已被交易所撤除）"
+        return True, ""
+
     def _check_existing_conflicts(self, symbol: str, batch_id: str, all_states: dict) -> bool:
         print(f"\n🔍 正在针对批次 [{batch_id}] 进行防冲突扫描...")
 
@@ -1496,6 +1616,11 @@ class CryptoTrader:
     def execute_signal(self, signal):
         symbol = signal.symbol
         batch_id = signal.batch_id
+        # SG1: READY 门控——启动恢复未完成前禁止任何新风险（最终安全边界，任何调用路径必经）
+        # 注：只 print 不发 TG（防告警风暴，安全 Gate ≠ 通知系统），用户提示由 bot_runner B 层负责
+        if not self._ready:
+            print(f"🚫 [SG1] 系统未就绪，拒绝新信号 [{batch_id}] ({symbol}): {self._not_ready_reason}")
+            return None
         all_states = self.load_all_states()
         side = signal.side.upper()
 
@@ -1510,6 +1635,21 @@ class CryptoTrader:
             return None
 
         if current_pos > 0:
+            # SG2: 加仓前风险闸门——无法证明全部已有仓位（程序批次+未归属仓位）受有效 SL
+            # 保护时拒绝新批次（Fail-Closed，不变量②）。helper 只判定，此处负责告知用户。
+            allowed, sg2_reason = self._check_sl_coverage(symbol, all_states, current_pos)
+            if not allowed:
+                print(f"🚫 [SG2] 拒绝加仓信号 [{batch_id}]: {sg2_reason}")
+                try:
+                    self.send_tg_notification(
+                        f"⚠️【加仓信号被拒】批次 `{batch_id}` ({symbol})\n"
+                        f"原因: {sg2_reason}\n"
+                        f"未执行任何下单。如需程序继续开仓，请先平掉未归属仓位；"
+                        f"程序无法为未归属仓位确认保护状态。",
+                        level='warning')
+                except Exception:
+                    pass
+                return None
             print(
                 f"📈 【加仓模式】检测到当前已有 {side} 方向基础持仓 {current_pos} {base_currency}，本批次 [{batch_id}] 将独立挂单与独立计算风控！")
         else:
