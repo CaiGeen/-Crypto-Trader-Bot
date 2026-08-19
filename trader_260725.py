@@ -119,6 +119,9 @@ class CryptoTrader:
         self._active_monitors = set()
         self._active_monitors_lock = threading.Lock()
 
+        # 🔥 SG3-P1: 保护单无效告警节流（键=(batch_id, order_id, reason)，防告警风暴）
+        self._sg3_alerted = set()
+
         if verbose:
             print("正在连接交易所并同步服务器时间/加载元数据...")
         self._safe_api_call(self.exchange.load_time_difference)
@@ -1924,6 +1927,43 @@ class CryptoTrader:
             traceback.print_exc()
             return None
 
+    # ==================== SG3-P1: 保护单有效性校验 ====================
+
+    def _check_protection_order_validity(self, ord, expected_side, is_hedge_mode,
+                                         position_side, required_amount):
+        """SG3-P1: 校验保护单（SL/TP）有效性。返回 (valid, reason)。
+
+        纯读快照判断器——只用 open_orders_map 已拉取的订单数据，零新增 API。
+        只做事实判断，不触发任何策略动作（user_modified/need_recover/TG/下单全在监控循环决策）。
+        三项校验（ChatGPT 审定）：
+          ① 方向 side：SL/TP 必须与仓位反向（BUY 仓 → sell 保护单）
+          ② 保护语义：单向=reduceOnly/closePosition 任一 true；Hedge=side 已匹配 且 positionSide 匹配（LONG+BUY=加仓非保护）
+          ③ 数量：amount 非 None 时 ≥ required*(1-0.001)-1e-9（0.1% 容差）；None（closePosition 全仓平）跳过
+        明确不校验：stopPrice（策略参数，用户可改）、type（ccxt 归一化为 market，校验必误报）。"""
+        # ① 方向
+        if str(ord.get('side', '')).lower() != expected_side:
+            return False, f"方向错误(期望{expected_side}，实际{ord.get('side')})"
+        # ② 保护语义
+        info = ord.get('info', {}) or {}
+        if is_hedge_mode:
+            if str(info.get('positionSide', '')).upper() != str(position_side).upper():
+                return False, f"positionSide 不匹配(期望{position_side}，实际{info.get('positionSide')})"
+        else:
+            ro = str(info.get('reduceOnly') or '').lower()
+            cp = str(info.get('closePosition') or '').lower()
+            if ro != 'true' and cp != 'true':
+                return False, "缺少保护语义(reduceOnly/closePosition 均非 true)"
+        # ③ 数量（closePosition 单 amount=None → 跳过，全仓平语义天然覆盖）
+        amount = ord.get('amount')
+        if amount is not None:
+            try:
+                amount = float(amount)
+            except (TypeError, ValueError):
+                return False, f"数量字段异常({amount!r})"
+            if amount < required_amount * (1 - 0.001) - 1e-9:
+                return False, f"覆盖数量不足({amount} < {required_amount})"
+        return True, ""
+
     def _start_monitoring(self, symbol: str, batch_id: str, entry_orders: list, stop_steps: list,
                           take_profit_price: float,
                           current_sl_id: str, tp_order_id: str, batch_total_amount: float, target_amounts: list,
@@ -2557,6 +2597,33 @@ class CryptoTrader:
                                 current_sl_id = None
                                 need_recover_sl = True
 
+                # SG3-P1: 订单存在 ≠ 保护有效——SL 在 open_orders_map 中时校验方向/保护语义/数量
+                if current_sl_id and (str(current_sl_id) in open_orders_map) and has_entered_position and batch_filled_amount > 0:
+                    sl_ord = open_orders_map.get(str(current_sl_id))
+                    if sl_ord is not None:
+                        expected_side = 'sell' if side == 'BUY' else 'buy'
+                        position_side = (params_base or {}).get('positionSide', 'BOTH')
+                        valid, reason = self._check_protection_order_validity(
+                            sl_ord, expected_side, is_hedge_mode, position_side, batch_filled_amount)
+                        if not valid:
+                            dedup_key = (batch_id, str(current_sl_id), reason)
+                            if dedup_key not in self._sg3_alerted:
+                                self._sg3_alerted.add(dedup_key)
+                                self.send_tg_notification(
+                                    f"⚠️ [SG3-P1] 批次 {batch_id} 止损单异常（{reason}），"
+                                    f"{'已通知用户，不自动修改（用户已接管）' if user_modified else '程序将自动撤销重挂'}",
+                                    level='critical')
+                            if user_modified:
+                                print(f"ℹ️ [SG3-P1] 批次 {batch_id} 止损单无效({reason})，用户已接管，仅告警不自动修复")
+                            else:
+                                print(f"⚠️ [SG3-P1] 批次 {batch_id} 止损单无效({reason})，准备撤销重挂...")
+                                need_recover_sl = True
+                        else:
+                            # 订单已恢复有效 → 清理该订单节流记录，允许下次异常再报
+                            self._sg3_alerted = {
+                                k for k in self._sg3_alerted
+                                if not (k[0] == batch_id and k[1] == str(current_sl_id))}
+
                 if sl_triggered and sl_detail:
                     sl_exit_price = float(sl_detail.get('average') or 0.0)
                     if sl_exit_price == 0.0:
@@ -2648,6 +2715,33 @@ class CryptoTrader:
                                     need_recover_tp = True
                         except Exception as e:
                             print(f"⚠️ 无法拉取止盈单 {tp_order_id} 状态 ({e})，下轮重试...")
+
+                # SG3-P1: 订单存在 ≠ 保护有效——TP 在 open_orders_map 中时校验（与 SL 对称）
+                if tp_order_id and (str(tp_order_id) in open_orders_map) and has_entered_position and batch_filled_amount > 0:
+                    tp_ord = open_orders_map.get(str(tp_order_id))
+                    if tp_ord is not None:
+                        expected_side = 'sell' if side == 'BUY' else 'buy'
+                        position_side = (params_base or {}).get('positionSide', 'BOTH')
+                        valid, reason = self._check_protection_order_validity(
+                            tp_ord, expected_side, is_hedge_mode, position_side, batch_filled_amount)
+                        if not valid:
+                            dedup_key = (batch_id, str(tp_order_id), reason)
+                            if dedup_key not in self._sg3_alerted:
+                                self._sg3_alerted.add(dedup_key)
+                                self.send_tg_notification(
+                                    f"⚠️ [SG3-P1] 批次 {batch_id} 止盈单异常（{reason}），"
+                                    f"{'已通知用户，不自动修改（用户已接管）' if user_modified else '程序将自动撤销重挂'}",
+                                    level='critical')
+                            if user_modified:
+                                print(f"ℹ️ [SG3-P1] 批次 {batch_id} 止盈单无效({reason})，用户已接管，仅告警不自动修复")
+                            else:
+                                print(f"⚠️ [SG3-P1] 批次 {batch_id} 止盈单无效({reason})，准备撤销重挂...")
+                                need_recover_tp = True
+                        else:
+                            # 订单已恢复有效 → 清理该订单节流记录，允许下次异常再报
+                            self._sg3_alerted = {
+                                k for k in self._sg3_alerted
+                                if not (k[0] == batch_id and k[1] == str(tp_order_id))}
 
                 # R14: TP 从未创建成功(tp_order_id is None)时，如果有持仓且未用户修改，标记需要补挂
                 if tp_order_id is None and has_entered_position and batch_filled_amount > 0 and not user_modified:
