@@ -2,6 +2,7 @@
 import json
 import os
 import random
+import shutil
 import tempfile
 import time
 import ccxt
@@ -633,7 +634,10 @@ class CryptoTrader:
                     # 🔥 重同步加冷却：TIME_SYNC_COOLDOWN 秒窗口内不重复调 load_time_difference（P0-1）
                     if time.time() - self.last_time_sync > TIME_SYNC_COOLDOWN:
                         try:
-                            self.exchange.load_time_difference()
+                            # R6: 收编信号量限速保护。不套 _safe_api_call——此处位于其 except 分支内，
+                            # 嵌套调用在 sync 自身再抛 -1021 时有递归风险；重试职责由外层循环 continue 承担
+                            with self._api_semaphore:
+                                self.exchange.load_time_difference()
                             self.last_time_sync = time.time()
                             print(f"🔄 [时间同步] 已重新同步服务器时间")
                             time.sleep(2)  # 等待同步生效
@@ -732,21 +736,32 @@ class CryptoTrader:
                 print(f"⚠️ 读取状态文件失败: {e}")
         return {}
 
+    def _persist_states(self, all_states: dict) -> None:
+        """R12: 状态持久化唯一入口（调用方必须已持有 _state_lock）。
+        备份 last-known-good 到 .bak 后原子写入新状态。
+        边界：首次保存无文件则跳过备份；备份失败仅警告绝不阻断主保存
+        （C3 是恢复纵深，不改变既有保存契约）。"""
+        try:
+            if os.path.exists(STATE_FILE):
+                shutil.copy2(STATE_FILE, STATE_FILE + '.bak')
+        except Exception as bak_e:
+            print(f"⚠️ [R12] 状态备份失败（不阻断保存）: {bak_e}")
+        dir_name = os.path.dirname(STATE_FILE) or "."
+        try:
+            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+                json.dump(all_states, tf, indent=4, ensure_ascii=False)
+                temp_name = tf.name
+            os.replace(temp_name, STATE_FILE)
+        except Exception as e:
+            print(f"⚠️ 保存状态文件失败: {e}")
+
     def save_batch_state(self, symbol: str, batch_id: str, batch_data: dict):
         with self._state_lock:
             all_states = self.load_all_states()
             if symbol not in all_states:
                 all_states[symbol] = {}
             all_states[symbol][batch_id] = batch_data
-
-            dir_name = os.path.dirname(STATE_FILE) or "."
-            try:
-                with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
-                    json.dump(all_states, tf, indent=4, ensure_ascii=False)
-                    temp_name = tf.name
-                os.replace(temp_name, STATE_FILE)
-            except Exception as e:
-                print(f"⚠️ 保存状态文件失败: {e}")
+            self._persist_states(all_states)
 
     def clear_batch_state(self, symbol: str, batch_id: str):
         with self._state_lock:
@@ -755,18 +770,8 @@ class CryptoTrader:
                 del all_states[symbol][batch_id]
                 if not all_states[symbol]:
                     del all_states[symbol]
-
-                dir_name = os.path.dirname(STATE_FILE) or "."
-                try:
-                    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
-                        json.dump(all_states, tf, indent=4, ensure_ascii=False)
-                        temp_name = tf.name
-                    os.replace(temp_name, STATE_FILE)
-                    print(f"🧹 批次 [{batch_id}] 状态归档/清理完毕。")
-                except Exception as e:
-                    import traceback
-                    print(f"⚠️ 清理批次状态失败: {e}")
-                    traceback.print_exc()
+                self._persist_states(all_states)
+                print(f"🧹 批次 [{batch_id}] 状态归档/清理完毕。")
 
     def get_batch_summary(self, batch_id: str) -> dict | None:
         """
@@ -3788,6 +3793,21 @@ class CryptoTrader:
             print(f"❌ [限价平仓监控] 批次 {batch_id} 异常: {e}")
             import traceback
             traceback.print_exc()
+            # R10: 对齐主监控的 Fail-not-Silent（不变量⑧）
+            # 刻意不写 monitor_error 标记——该标记语义是"重启时跳过恢复并清理批次"，
+            # 而本线程异常时主监控仍健在，照抄会导致健康批次在重启时被误清（R11 模式）
+            try:
+                self.send_tg_notification(
+                    f"🚨 **限价平仓监控线程异常退出**\n"
+                    f"🆔 批次：`{batch_id}`\n"
+                    f"📋 限价单：`{order_id}`（仍挂在交易所，已无人跟踪）\n"
+                    f"💡 原因：`{str(e)[:200]}`\n"
+                    f"⚠️ 若限价单成交，主监控将按持仓归零兜底结算（费用口径可能异常）\n"
+                    f"💡 请检查限价单状态，必要时重启程序。",
+                    level='critical'
+                )
+            except Exception as tg_e:
+                print(f"⚠️ [R10] 告警发送失败: {tg_e}")  # 吞掉 TG 异常，不覆盖真因
 
         print(f"🧹 [限价平仓监控] 批次 {batch_id} 监控线程已退出")
 

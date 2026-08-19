@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import json
+import atexit
 import logging
 import asyncio
 import threading
@@ -97,6 +98,91 @@ USER_PENDING_INPUTS = {}
 
 # 🔥 测试命令的确认状态
 TEST_CONFIRM_STATE = {}
+
+# ==================== P0-2 单实例锁（防孤儿/双实例并发） ====================
+# 背景（2026-08-19 418 事故）：watchdog 手动停止路径不杀 bot_runner 子进程，
+# PyCharm Ctrl+F5 重启可能残留孤儿实例 → 多实例并发 = 多倍 API 配额消耗 + 重复挂单
+# v2（12:05 修正）：v1 文件锁在 taskkill 强杀（无 atexit）+ PID 复用下误判——
+# 改用 Windows 命名互斥体为权威判据（内核对象，进程死亡自动释放，免疫 PID 复用）；
+# 锁文件降级为纯诊断（写 PID 供人工排查，永不阻断启动）。
+LOCK_FILE = os.path.join(BASE_DIR, ".bot_instance.lock")
+BOT_EXIT_INSTANCE_REFUSED = 42  # 专用退出码：watchdog 据此不进入崩溃重启循环
+
+_mutex_handle = None  # 进程存活期间持有互斥体句柄
+
+
+def _release_instance_lock():
+    """释放互斥体并清理诊断锁文件（正常退出时；强杀时内核自动释放互斥体）"""
+    global _mutex_handle
+    try:
+        if _mutex_handle is not None:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.ReleaseMutex.restype = wintypes.BOOL
+            kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.ReleaseMutex(_mutex_handle)
+            kernel32.CloseHandle(_mutex_handle)
+            _mutex_handle = None
+    except Exception:
+        pass
+    try:
+        if os.path.exists(LOCK_FILE):
+            with open(LOCK_FILE, 'r') as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(LOCK_FILE)
+    except Exception:
+        pass
+
+
+def acquire_instance_lock():
+    """P0-2 v2: 单实例锁——互斥体已存在即拒绝启动（Fail-Closed，防 418 重演）
+    15:28 修正：ctypes 必须用 use_last_error=True + ctypes.get_last_error()——
+    直接调 kernel32.GetLastError() 会被 ctypes 内部调用覆盖（不可靠，实测漏判双实例）；
+    CreateMutexW 返回 64 位 HANDLE 需显式 restype，否则句柄截断。"""
+    global _mutex_handle
+    if sys.platform == 'win32':
+        import ctypes
+        from ctypes import wintypes
+        ERROR_ALREADY_EXISTS = 183
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.CreateMutexW(None, True, "Global\\my_crypto_bot_single_instance")
+        err = ctypes.get_last_error()  # 唯一可靠读取方式（kernel32.GetLastError 会被 ctypes 覆盖）
+        if err == ERROR_ALREADY_EXISTS:
+            if handle:
+                kernel32.CloseHandle(handle)
+            print("❌ 检测到另一个 Bot 实例正在运行（互斥体已存在），拒绝启动！")
+            print("   双实例会多倍消耗 API 配额（418 封禁风险）并可能重复挂单。")
+            print("   请先用任务管理器结束已有 python.exe 实例（或通过 watchdog 正常停止）。")
+            sys.exit(BOT_EXIT_INSTANCE_REFUSED)
+        _mutex_handle = handle
+    else:
+        # 非 Windows 退化方案：锁文件 + PID 存活检测（本项目实际运行环境为 Windows）
+        if os.path.exists(LOCK_FILE):
+            try:
+                with open(LOCK_FILE, 'r') as f:
+                    old_pid = int(f.read().strip())
+                os.kill(old_pid, 0)
+                print(f"❌ 检测到另一个 Bot 实例正在运行 (PID: {old_pid})，拒绝启动！")
+                sys.exit(BOT_EXIT_INSTANCE_REFUSED)
+            except (ValueError, ProcessLookupError):
+                pass
+            except PermissionError:
+                print(f"❌ 检测到另一个 Bot 实例正在运行 (PID 不可验证)，拒绝启动！")
+                sys.exit(BOT_EXIT_INSTANCE_REFUSED)
+    # 诊断锁文件（仅记录 PID 供排查，永不阻断启动）
+    try:
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+    atexit.register(_release_instance_lock)
 
 
 # ==================== 启动安全检查 ====================
@@ -369,7 +455,7 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            ticker = trader.exchange.fetch_ticker(symbol)
+            ticker = trader._safe_api_call(trader.exchange.fetch_ticker, symbol)  # R6: 收编进保护层
             current_price = float(ticker.get('last') or ticker.get('close') or 0.0)
             if current_price <= 0:
                 await safe_reply(update, f"❌ 无法获取 `{symbol}` 的当前市价，请检查交易对是否正确。",
@@ -701,7 +787,7 @@ async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            ticker = trader.exchange.fetch_ticker(target_symbol)
+            ticker = trader._safe_api_call(trader.exchange.fetch_ticker, target_symbol)  # R6: 收编进保护层
             current_price = float(ticker.get('last') or ticker.get('close') or 0.0)
         except Exception:
             current_price = 0.0
@@ -1960,6 +2046,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    acquire_instance_lock()  # P0-2: 单实例锁，双实例直接拒绝启动
+
     proxy_url = os.getenv("BINANCE_PROXY")
 
     request_kwargs = {"connect_timeout": 30.0, "read_timeout": 30.0, "write_timeout": 30.0}

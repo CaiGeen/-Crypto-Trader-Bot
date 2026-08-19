@@ -93,6 +93,37 @@ def get_restart_time_display(next_time: datetime) -> str:
 
 
 # ==================== 主程序管理 ====================
+# P0-1: 当前主程序进程（供停止时清理进程树——防"手动停止只杀 watchdog 漏杀 bot_runner"）
+_current_process = None
+
+
+def _kill_main_process_tree():
+    """P0-1: 强杀主程序进程树。
+    背景（2026-08-19 418 事故）：KeyboardInterrupt 路径原直接 sys.exit(0)，
+    bot_runner 子进程成为孤儿继续轮询交易所 → 与新实例并存 = 多倍 API 配额 + 重复挂单。
+    taskkill /T 连带子进程强杀（process.terminate 只杀根进程）。"""
+    global _current_process
+    proc = _current_process
+    _current_process = None
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            log_message(f"🧹 正在清理主程序进程树 (PID: {proc.pid})...")
+            if sys.platform == 'win32':
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                               capture_output=True, timeout=10)
+            else:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+            log_message("✅ 主程序进程树已清理")
+    except Exception as e:
+        log_message(f"⚠️ 清理主程序进程树失败: {e}（请手动检查残留 python 进程！）")
+
+
 def run_main_process():
     log_message("🚀 启动主程序...")
     try:
@@ -152,6 +183,9 @@ def main():
             time.sleep(30)
             continue
 
+        global _current_process
+        _current_process = process  # P0-1: 登记，供停止路径杀进程树
+
         # 🔥 启动后等待 5 秒，让主程序初始化
         log_message("⏳ 等待主程序初始化 (5 秒)...")
         time.sleep(5)
@@ -188,6 +222,11 @@ def main():
                 break
 
             if process.poll() is not None:
+                if process.returncode == 42:  # bot_runner 单实例锁拒绝（非崩溃，勿进重启循环）
+                    log_message("🚫 主程序因单实例锁拒绝启动（已有其他实例在运行），watchdog 停止。")
+                    log_message("   请先结束已有实例（任务管理器查 python.exe）后再启动。")
+                    _kill_main_process_tree()
+                    sys.exit(0)
                 restart_reason = f"⚠️ 程序异常退出 (退出码: {process.returncode})"
                 log_message(restart_reason)
                 break
@@ -275,10 +314,12 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         log_message("👋 用户手动停止 Watchdog")
+        _kill_main_process_tree()  # P0-1: 停止必须连带清理 bot_runner 进程树
         sys.exit(0)
     except Exception as e:
         log_message(f"❌ Watchdog 异常: {e}")
         import traceback
 
         traceback.print_exc()
+        _kill_main_process_tree()  # P0-1: 异常退出同样清理，防孤儿
         sys.exit(1)

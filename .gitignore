@@ -30,10 +30,12 @@ __pycache__/
 # ==========================================
 *.log
 trade_state.json
+trade_state.json.bak
 trade_stats.json
 signal.json
 .last_ip.txt
 .notify
+.bot_instance.lock
 
 # ==========================================
 # 内部数据与旧文档（不上传）
