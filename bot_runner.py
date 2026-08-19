@@ -497,10 +497,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 current_pos = abs(float(pos.get('contracts', 0) or pos.get('positionAmt', 0)))
                                 break
                     except Exception:
-                        current_pos = 0.0
+                        current_pos = None  # R11: UNKNOWN ≠ EMPTY，查询失败不得当作无持仓
 
-                    # 🔥 如果既没有挂单也没有持仓，清理这个无效批次
-                    if not has_pending and current_pos == 0:
+                    # 🔥 如果既没有挂单也没有持仓(已确认)，清理这个无效批次
+                    if not has_pending and current_pos is not None and current_pos == 0:
                         trader.clear_batch_state(symbol, batch_id)
                         cleaned_count += 1
                         print(f"🧹 [被动清理] 清理无效批次 {batch_id}")
@@ -1699,15 +1699,38 @@ async def run_trader_recovery_on_startup(trader: CryptoTrader):
         for attempt in range(3):
             try:
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, trader.recover_active_batches)
-                print("✅ [启动检测] 历史任务恢复校验完成！")
-                return
+                recovery_result = await loop.run_in_executor(None, trader.recover_active_batches)
+                if recovery_result:
+                    print("✅ [启动检测] 历史任务恢复校验完成！")
+                    return
+                else:
+                    # R3: 恢复失败不得报告成功，必须显式告警（Phase A: 让失败可见）
+                    print("🚨 [启动检测] 历史任务恢复失败！recover_active_batches 返回 False")
+                    try:
+                        trader.send_tg_notification(
+                            "🚨【资金安全】启动恢复失败！recover_active_batches 返回 False\n"
+                            "历史批次可能未正确恢复，请立即检查持仓和止损状态！",
+                            level='critical'
+                        )
+                    except Exception as tg_e:
+                        print(f"⚠️ TG 告警发送失败: {tg_e}")
+                    return
             except Exception as e:
                 if attempt < 2:
                     print(f"⚠️ [启动检测] 第 {attempt + 1} 次恢复失败，等待 10 秒后重试: {e}")
                     await asyncio.sleep(10)
                 else:
                     logging.exception(f"⚠️ 检查历史活跃任务失败 (已重试 3 次): {e}")
+                    # R3-v2: 重试耗尽不得静默，必须显式告警（不变量⑧ Fail-Closed but not Fail-Silent）
+                    try:
+                        trader.send_tg_notification(
+                            "🚨【资金安全】启动恢复异常！recover_active_batches 连续 3 次抛出异常\n"
+                            f"最后一次错误: {str(e)[:200]}\n"
+                            "历史批次状态未知，请立即检查持仓和止损！",
+                            level='critical'
+                        )
+                    except Exception as tg_e:
+                        print(f"⚠️ TG 告警发送失败: {tg_e}")
 
 
 async def send_summary_notification(app: Application):
@@ -1782,76 +1805,88 @@ async def on_post_init(app: Application):
             # 🔥 增加启动等待，让系统稳定
             await asyncio.sleep(5)
 
-            try:
-                notify_file = os.path.join(BASE_DIR, ".notify")
-                if os.path.exists(notify_file):
-                    with open(notify_file, "r", encoding="utf-8") as f:
-                        content = f.read().strip()
+            # 🔥 W2 修复（D-002）：由一次性执行改为定时轮询
+            # 原实现仅在启动时执行一次，trader 运行期写入的 .notify
+            # （如 IP 变化通知的 fallback 路径 _fallback_notify_file）永远不会被读取，
+            # 通知冗余度实际低于设计。改为每 10 秒检查一次。
+            while True:
+                try:
+                    notify_file = os.path.join(BASE_DIR, ".notify")
+                    if os.path.exists(notify_file):
+                        with open(notify_file, "r", encoding="utf-8") as f:
+                            content = f.read().strip()
 
-                    # 🔥 处理成功后才删除
-                    success = False
+                        # 🔥 处理成功后才删除
+                        success = False
 
-                    if '|' in content:
-                        parts = content.split('|', 2)
-                        if len(parts) >= 2:
-                            notify_type = parts[0]
-                            notify_msg = parts[1] if len(parts) > 1 else parts[0]
+                        if '|' in content:
+                            parts = content.split('|', 2)
+                            if len(parts) >= 2:
+                                notify_type = parts[0]
+                                notify_msg = parts[1] if len(parts) > 1 else parts[0]
 
-                            if notify_type == 'ip_notify':
-                                await app.bot.send_message(
-                                    chat_id=ALLOWED_USER_ID,
-                                    text=f"🌐 **IP 地址已变化！**\n\n{notify_msg}",
-                                    parse_mode='Markdown'
-                                )
-                                logging.info("📨 IP 备用通知已发送")
-                                success = True
+                                if notify_type == 'ip_notify':
+                                    await app.bot.send_message(
+                                        chat_id=ALLOWED_USER_ID,
+                                        text=f"🌐 **IP 地址已变化！**\n\n{notify_msg}",
+                                        parse_mode='Markdown'
+                                    )
+                                    logging.info("📨 IP 备用通知已发送")
+                                    success = True
 
-                            elif notify_type == 'crash_alert':
-                                await app.bot.send_message(
-                                    chat_id=ALLOWED_USER_ID,
-                                    text=f"💥 **程序崩溃报警！**\n\n{notify_msg}",
-                                    parse_mode='Markdown'
-                                )
-                                logging.info("📨 崩溃报警已发送")
-                                # 🔥 崩溃报警同步推送 QQ 邮箱（兜底通道）
-                                send_email_alert(f"💥 程序崩溃报警！\n\n{notify_msg}", subject="💥 程序崩溃报警")
-                                # 🔥 崩溃后也发送持仓汇总，让用户第一时间掌握仓位状态
-                                await send_summary_notification(app)
-                                success = True
+                                elif notify_type == 'crash_alert':
+                                    await app.bot.send_message(
+                                        chat_id=ALLOWED_USER_ID,
+                                        text=f"💥 **程序崩溃报警！**\n\n{notify_msg}",
+                                        parse_mode='Markdown'
+                                    )
+                                    logging.info("📨 崩溃报警已发送")
+                                    # 🔥 崩溃报警同步推送 QQ 邮箱（兜底通道）
+                                    send_email_alert(f"💥 程序崩溃报警！\n\n{notify_msg}", subject="💥 程序崩溃报警")
+                                    # 🔥 崩溃后也发送持仓汇总，让用户第一时间掌握仓位状态
+                                    await send_summary_notification(app)
+                                    success = True
 
-                            elif notify_type == 'summary_restart':
-                                logging.info("📊 Watchdog 重启，发送持仓汇总")
-                                await send_summary_notification(app)
-                                success = True
+                                elif notify_type == 'summary_restart':
+                                    logging.info("📊 Watchdog 重启，发送持仓汇总")
+                                    await send_summary_notification(app)
+                                    success = True
 
-                            elif notify_type == 'unknown':
-                                await app.bot.send_message(
-                                    chat_id=ALLOWED_USER_ID,
-                                    text=f"📨 **通知**\n{notify_msg}",
-                                    parse_mode='Markdown'
-                                )
-                                success = True
-                    else:
-                        await app.bot.send_message(
-                            chat_id=ALLOWED_USER_ID,
-                            text=f"📨 **通知**\n{content}",
-                            parse_mode='Markdown'
-                        )
-                        success = True
+                                elif notify_type == 'unknown':
+                                    await app.bot.send_message(
+                                        chat_id=ALLOWED_USER_ID,
+                                        text=f"📨 **通知**\n{notify_msg}",
+                                        parse_mode='Markdown'
+                                    )
+                                    success = True
+                        else:
+                            await app.bot.send_message(
+                                chat_id=ALLOWED_USER_ID,
+                                text=f"📨 **通知**\n{content}",
+                                parse_mode='Markdown'
+                            )
+                            success = True
 
-                    # 🔥 处理成功后才删除
-                    if success:
-                        try:
-                            os.remove(notify_file)
-                            print(f"📝 [通知] 已处理并删除 .notify")
-                        except Exception as e:
-                            print(f"⚠️ [通知] 删除 .notify 失败: {e}")
-                    else:
-                        print(f"⚠️ [通知] 处理失败，保留 .notify 供下次重试")
+                        # 🔥 处理成功后才删除
+                        if success:
+                            try:
+                                os.remove(notify_file)
+                                print(f"📝 [通知] 已处理并删除 .notify")
+                            except Exception as e:
+                                print(f"⚠️ [通知] 删除 .notify 失败: {e}")
+                        else:
+                            print(f"⚠️ [通知] 处理失败，保留 .notify 供下次重试")
 
-            except Exception as e:
-                logging.warning(f"⚠️ 处理通知失败: {e}")
-                await send_summary_notification(app)
+                except Exception as e:
+                    logging.warning(f"⚠️ 处理通知失败: {e}")
+                    # 🔥 兜底失败不应中断轮询（否则运行期通知链路永久失效）
+                    try:
+                        await send_summary_notification(app)
+                    except Exception as e2:
+                        logging.warning(f"⚠️ 发送汇总通知失败: {e2}")
+
+                # 🔥 轮询间隔 10 秒
+                await asyncio.sleep(10)
 
         asyncio.create_task(process_notifications())
 

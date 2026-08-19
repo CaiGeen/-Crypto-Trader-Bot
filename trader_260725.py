@@ -36,6 +36,9 @@ TAKER_FEE_RATE = 0.0005
 MAKER_FEE_RATE = 0.0002
 SLIPPAGE_BUFFER = 0.0002
 
+# -1021 时间戳错误重同步冷却（秒）：窗口内不重复调 load_time_difference（P0-1，堵放大器 A）
+TIME_SYNC_COOLDOWN = 60
+
 
 class CryptoTrader:
     def __init__(self, api_key: str, secret: str, is_demo: bool = False, proxy_url: str = None,
@@ -49,7 +52,7 @@ class CryptoTrader:
                 'defaultType': 'future',
                 'fetchCurrencies': False,
                 'adjustForTimeDifference': True,
-                'recvWindow': 10000,
+                'recvWindow': 20000,  # P1-1: 10000→20000，减少网络抖动导致的 -1021
             }
         }
 
@@ -555,13 +558,17 @@ class CryptoTrader:
 
                 # 🔥 -1021 时间戳错误特殊处理
                 if "-1021" in err_str or "recvwindow" in err_str:
-                    try:
-                        self.exchange.load_time_difference()
-                        self.last_time_sync = time.time()
-                        print(f"🔄 [时间同步] 已重新同步服务器时间")
-                        time.sleep(2)  # 等待同步生效
-                    except Exception as sync_e:
-                        print(f"⚠️ 时间同步失败: {sync_e}")
+                    # 🔥 重同步加冷却：TIME_SYNC_COOLDOWN 秒窗口内不重复调 load_time_difference（P0-1）
+                    if time.time() - self.last_time_sync > TIME_SYNC_COOLDOWN:
+                        try:
+                            self.exchange.load_time_difference()
+                            self.last_time_sync = time.time()
+                            print(f"🔄 [时间同步] 已重新同步服务器时间")
+                            time.sleep(2)  # 等待同步生效
+                        except Exception as sync_e:
+                            print(f"⚠️ 时间同步失败: {sync_e}")
+                    else:
+                        print(f"🔄 [时间同步] 冷却期内跳过重同步（上次同步 {time.time() - self.last_time_sync:.0f} 秒前）")
                     if i == retries - 1:
                         raise e
                     time.sleep(1)
@@ -591,12 +598,15 @@ class CryptoTrader:
                             raise e
                         continue
 
-                    # 普通 429：指数退避 + 随机抖动
-                    base_wait = 15 * (i + 1)
-                    jitter = random.uniform(0, 5)
-                    wait_time = base_wait + jitter
-                    print(f"🛑 [429限频] 休眠 {wait_time:.1f} 秒 (第 {i + 1} 次重试)...")
-                    time.sleep(wait_time)
+                    # 普通 429：触发全局熔断，所有线程一起降速（P0-2，堵恶化器 C）
+                    global_cooldown = 30 + random.uniform(0, 30)  # 30-60 秒全局冷却
+                    with self.api_cooldown_lock:
+                        self.api_cooldown_until = max(
+                            self.api_cooldown_until,
+                            time.time() + global_cooldown
+                        )
+                    print(f"🛑 [429限频] 触发全局熔断 {global_cooldown:.1f} 秒 (第 {i + 1} 次重试)...")
+                    self._wait_for_api_cooldown()
                     if i == retries - 1:
                         raise e
                     continue
@@ -788,7 +798,7 @@ class CryptoTrader:
             return False
 
         all_states = self.load_all_states()
-        has_recovered = False
+        recovered_count = 0  # R3-v2: 计数器与成败分离，返回值只表达"流程成功/失败"
         stale_batches = []
 
         for symbol, symbol_batches in all_states.items():
@@ -819,19 +829,21 @@ class CryptoTrader:
                                 current_pos = abs(float(pos.get('contracts', 0) or pos.get('positionAmt', 0)))
                                 break
                     except Exception:
-                        current_pos = 0.0
+                        current_pos = None  # R11: UNKNOWN ≠ EMPTY，查询失败不得当作无持仓
 
-                    has_position = current_pos > 0
+                    has_position = current_pos is not None and current_pos > 0
 
-                    # 🔥 如果既没有挂单也没有持仓，清理这个批次
-                    if not has_pending_orders and not has_position:
+                    # 🔥 如果既没有挂单也没有持仓(已确认)，清理这个批次
+                    if not has_pending_orders and not has_position and current_pos is not None:
                         print(f"  └─ 🧹 批次 [{batch_id}] 无挂单且无持仓，自动清理")
                         stale_batches.append((symbol, batch_id))
                         continue
+                    elif current_pos is None:
+                        print(f"  └─ ⚠️ 批次 [{batch_id}] 持仓查询失败(UNKNOWN)，保留批次不清理")
 
                     # 有挂单或持仓，正常恢复
                     print(f"  └─ ✅ 批次 [{batch_id}] 有效，正在接管监控...")
-                    has_recovered = True
+                    recovered_count += 1
 
                     try:
                         leverage = b_data.get('params_base', {}).get('leverage', 100)
@@ -897,7 +909,8 @@ class CryptoTrader:
             self.clear_batch_state(symbol, batch_id)
             print(f"  └─ 🧹 已清理无效批次 [{batch_id}]")
 
-        return has_recovered
+        print(f"✅ [状态恢复] 恢复流程完成，共接管 {recovered_count} 个历史活跃批次")
+        return True  # R3-v2: 返回值表达"流程成功/失败"而非"是否恢复过批次"；唯一失败路径=健康检查不通过(已提前 return False)
 
     def update_batch_tp(self, batch_id: str, new_tp_price: float) -> tuple[bool, str]:
         all_states = self.load_all_states()
@@ -1343,18 +1356,19 @@ class CryptoTrader:
         """
         active_count = self._get_active_batch_count()
 
+        # P1-2: 基准间隔整体上调（4H 级别交易无需 30 秒轮询），减少 API 权重消耗
         if active_count <= 2:
-            base_interval = 30.0
-            jitter_range = 10.0
-        elif active_count <= 4:
-            base_interval = 45.0
-            jitter_range = 15.0
-        elif active_count <= 6:
             base_interval = 60.0
             jitter_range = 20.0
-        else:
+        elif active_count <= 4:
+            base_interval = 75.0
+            jitter_range = 25.0
+        elif active_count <= 6:
             base_interval = 90.0
             jitter_range = 30.0
+        else:
+            base_interval = 120.0
+            jitter_range = 40.0
 
         return random.uniform(base_interval, base_interval + jitter_range)
 
@@ -1788,6 +1802,8 @@ class CryptoTrader:
 
         terminal_orders = set()
         fast_poll_count = 0
+        # P1-2: 连续网络错误计数器（用于动态降速，避免加重限流）
+        consecutive_network_errors = 0
 
         if filled_details is None or len(filled_details) != len(entry_orders):
             filled_details = [0.0] * len(entry_orders)
@@ -1835,6 +1851,9 @@ class CryptoTrader:
             while True:
                 # 🔥 根据活跃批次数量动态计算轮询间隔
                 sleep_interval = self._calculate_monitoring_interval()
+                if consecutive_network_errors > 0:
+                    # 🔥 连续网络错误 → 动态 ×3 降速（封顶 5 分钟），避免错误重试加重限流（P1-2）
+                    sleep_interval = min(sleep_interval * 3, 300.0)
                 if fast_poll_count > 0:
                     sleep_interval = min(sleep_interval, 3.0)
                     fast_poll_count -= 1
@@ -1852,8 +1871,10 @@ class CryptoTrader:
                 try:
                     open_orders = self._safe_api_call(self.exchange.fetch_open_orders, symbol)
                     open_orders_map = {str(ord['id']): ord for ord in open_orders}
+                    consecutive_network_errors = 0
                 except Exception as e:
-                    print(f"⚠️ 获取未结订单失败，等待下一次轮询: {e}")
+                    consecutive_network_errors += 1
+                    print(f"⚠️ 获取未结订单失败 (连续 {consecutive_network_errors} 次，已降速)，等待下一次轮询: {e}")
                     continue
 
                 batch_filled_count = 0
@@ -2300,7 +2321,7 @@ class CryptoTrader:
                             'last_filled_count': last_filled_count,
                             'filled_details': filled_details,
                             'total_entry_fee': total_entry_fee,
-                            'user_modified': False,
+                            'user_modified': latest_b_data.get('user_modified', False) if latest_b_data else False,  # R13-B: 保留现有值，不得硬编码覆盖
                             'pending_sl_orders': pending_sl_orders,
                             'prepared_tp_params': prepared_tp_params,
                             'layer_sl_params': layer_sl_params,
@@ -2482,6 +2503,11 @@ class CryptoTrader:
                                     need_recover_tp = True
                         except Exception as e:
                             print(f"⚠️ 无法拉取止盈单 {tp_order_id} 状态 ({e})，下轮重试...")
+
+                # R14: TP 从未创建成功(tp_order_id is None)时，如果有持仓且未用户修改，标记需要补挂
+                if tp_order_id is None and has_entered_position and batch_filled_amount > 0 and not user_modified:
+                    need_recover_tp = True
+                    print(f"⚠️ [TP 补挂] 批次 {batch_id} 止盈单缺失(未创建或创建失败)，准备补挂...")
 
                 if tp_triggered and tp_detail:
                     tp_exit_price = float(tp_detail.get('average') or 0.0)
@@ -2834,7 +2860,7 @@ class CryptoTrader:
                         'last_filled_count': last_filled_count,
                         'filled_details': filled_details,
                         'total_entry_fee': total_entry_fee,
-                        'user_modified': False,
+                        'user_modified': latest_b_data.get('user_modified', False) if latest_b_data else False,  # R13-B: 保留现有值，不得硬编码覆盖
                         'pending_sl_orders': pending_sl_orders,
                         'prepared_tp_params': prepared_tp_params,
                         'layer_sl_params': layer_sl_params,
@@ -2869,6 +2895,22 @@ class CryptoTrader:
                 f"💡 请检查仓位，必要时重启程序恢复监控。",
                 level='critical'
             )
+
+            # 🔥 W1 修复（D-002）：补写 monitor_error 标记
+            # recover_active_batches（L800）按此标记识别"监控线程曾崩溃"的批次，
+            # 设计意图是跳过自动恢复并清理（需人工确认），而非按正常批次逻辑恢复。
+            # 修复前全项目无任何位置写入该标记，设计意图落空。
+            # 注意：save_batch_state 是整对象替换，必须先 load 现有数据再只改此字段，
+            # 避免清空批次其他状态字段。
+            try:
+                all_states_w1 = self.load_all_states()
+                b_data_w1 = all_states_w1.get(symbol, {}).get(batch_id, {})
+                if b_data_w1:
+                    b_data_w1['monitor_error'] = True
+                    self.save_batch_state(symbol, batch_id, b_data_w1)
+                    print(f"  └─ 📝 [W1] 已写入 monitor_error 标记（重启时将跳过恢复并清理）")
+            except Exception as save_e:
+                print(f"  └─ ⚠️ [W1] 写入 monitor_error 标记失败: {save_e}")
 
         # ================================================================
         # 🔥 finally 块 - 确保清理工作始终执行
@@ -2910,15 +2952,17 @@ class CryptoTrader:
                         current_pos = abs(float(pos.get('contracts', 0) or pos.get('positionAmt', 0)))
                         break
             except Exception:
-                current_pos = 0.0
+                current_pos = None  # R11: UNKNOWN ≠ EMPTY，查询失败不得当作无持仓
 
-            # 如果无持仓，清理批次
-            if current_pos == 0:
+            # 如果确认无持仓，清理批次
+            if current_pos is not None and current_pos == 0:
                 all_states = self.load_all_states()
                 b_data = all_states.get(symbol, {}).get(batch_id, {})
                 if b_data:
                     self.clear_batch_state(symbol, batch_id)
                     print(f"  └─ 🧹 无持仓，已清理批次状态")
+            elif current_pos is None:
+                print(f"  └─ ⚠️ 持仓查询失败(UNKNOWN)，保留批次状态不清理")
             else:
                 print(f"  └─ 📌 有持仓 {current_pos}，保留批次状态")
 
