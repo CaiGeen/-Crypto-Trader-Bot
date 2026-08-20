@@ -46,9 +46,10 @@ RESULTS = []
 #    已累计：B2-0 helper(+27) + 补挂段 verify/classify(+39) + B2-2 补挂TP落盘(+55) + B2-3 闸门(+50)
 #    + B2-4 硬锁分支(+~50) + B2-5 骨架/registry更新/恢复护栏(+98)
 #    + B2-6 recover自愈分支(+24) + 骨架元数据(+6) + 新helper(_self_heal_no_id/_rebuild)(+185) = +215。
-A_LINES = {1190, 1339, 1553, 3345, 3419, 3912, 4065, 4191, 4467, 4609, 4746}  # 11 处保护单
-B_LINES = {2087}                                                              # 1 处开仓条件单
-C_LINES = {5010, 5193}                                                        # 2 处平仓单
+# ⚠️ 行号偏移记录：R1/R2/R3（ChatGPT 终审 2026-08-20）+~170 行后重新 Grep 实测 2026-08-20
+A_LINES = {1289, 1438, 1652, 3495, 3569, 4062, 4215, 4345, 4641, 4783, 4929}  # 11 处保护单
+B_LINES = {2238}                                                              # 1 处开仓条件单
+C_LINES = {5193, 5376}                                                        # 2 处平仓单
 ALL_LINES = A_LINES | B_LINES | C_LINES                                       # 14 处
 
 
@@ -372,6 +373,21 @@ def make_fake(states, open_orders):
     if hasattr(CryptoTrader, '_assert_create_allowed'):
         fake._assert_create_allowed = (
             lambda s, b, i, **k: CryptoTrader._assert_create_allowed(fake, s, b, i, **k))
+    # R2/R3（ChatGPT 终审 2026-08-20）：补挂止盈预检 helper 真实绑定——
+    # MagicMock 未绑定时 `_tp_update_blocked` 返回 truthy mock → `not` → False → H4 TP 恢复链整个被跳过。
+    # H4 中 TP=60000 > max(现价100, 成本100) → 真实 R2 判定 valid → 恢复放行。
+    if hasattr(CryptoTrader, '_tp_update_blocked'):
+        fake._tp_invalid_alerted = {}
+        fake._tp_update_blocked = (
+            lambda s, b, side, layer, tp, cost, **k:
+            CryptoTrader._tp_update_blocked(fake, s, b, side, layer, tp, cost, **k))
+        fake._mark_tp_param_invalid = (
+            lambda s, b, r: CryptoTrader._mark_tp_param_invalid(fake, s, b, r))
+        fake._clear_tp_param_invalid = (
+            lambda s, b: CryptoTrader._clear_tp_param_invalid(fake, s, b))
+        fake._check_tp_viability = (
+            lambda side, tp, cost, mark:
+            CryptoTrader._check_tp_viability(fake, side, tp, cost, mark))
     return fake
 
 

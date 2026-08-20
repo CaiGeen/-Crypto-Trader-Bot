@@ -117,6 +117,13 @@ def scenario_6():
     fake._build_intent = lambda **k: {'stub': True}
     fake._update_registry = lambda *a, **k: None
     fake._verify_order_created = lambda oid, sym, kind: 'success'
+    # R2/R3（ChatGPT 终审 2026-08-20）：预生成挂单段新增 TP 补挂预检 helper
+    #（本场景只测 READY Gate 独立性，TP 可行性校验语义由 test_sg4/sg3_p1 覆盖 → 纯桩放行）
+    fake._tp_invalid_alerted = {}
+    fake._tp_update_blocked = lambda *a, **k: False
+    fake._mark_tp_param_invalid = lambda *a, **k: None
+    fake._clear_tp_param_invalid = lambda *a, **k: None
+    fake._check_tp_viability = lambda *a, **k: (True, '')
     layer_sl_params = [{'symbol': SYMBOL, 'type': 'STOP_MARKET', 'side': 'sell',
                         'amount': 0.01, 'params': {'stopPrice': 100.0}}]
     prepared_tp_params = {'symbol': SYMBOL, 'type': 'TAKE_PROFIT_MARKET', 'side': 'sell',

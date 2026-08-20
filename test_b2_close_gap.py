@@ -38,9 +38,10 @@ BATCH = "batch_b2_close_gap"
 RESULTS = []
 
 # B2-8 收编的 5 处 create 调用点（实施后 Grep 实测 2026-08-20；后续插入代码行号会漂移 → 更新）
-#   #1 用户改TP  L1143  |  #2 用户改SL  L1292  |  #3 保本损  L1506
-#   #5 部分减仓SL L3292  |  #6 部分减仓TP L3365
-GAP_CREATE_LINES = {1190, 1339, 1553, 3345, 3419}
+#   #1 用户改TP  L1289  |  #2 用户改SL  L1438  |  #3 保本损  L1652
+#   #5 部分减仓SL L3495  |  #6 部分减仓TP L3569
+# ⚠️ 行号偏移记录：R1/R2/R3（ChatGPT 终审 2026-08-20）+~170 行后重新 Grep 实测 2026-08-20
+GAP_CREATE_LINES = {1289, 1438, 1652, 3495, 3569}
 
 
 def report(name, passed, detail=""):

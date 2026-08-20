@@ -112,6 +112,9 @@ def make_fake(create_results=None, open_normal=None, open_conditional=None,
     fake._get_current_position_amt = lambda s, is_hedge_mode=False, side=None: 0.0
     fake._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
     fake._validate_stop_losses = lambda signal, price: (True, '止损校验通过')
+    # R1（ChatGPT 终审 2026-08-20）：execute_signal 新增止盈价方向校验，需显式桩
+    #（MagicMock 属性自动 mock → `tp_is_valid, tp_msg = ...` 解包抛异常 → execute_signal 首 save 前中断）
+    fake._validate_take_profit = lambda signal, price: (True, '止盈校验通过')
     fake.send_tg_notification = lambda text, **k: fake.sent.append((k.get('level', 'info'), str(text)))
     fake._start_monitoring = lambda *a, **k: None
 

@@ -126,6 +126,9 @@ class CryptoTrader:
         self._gate_alert_counts = {}
         self._gate_alert_lock = threading.Lock()
 
+        # 🔥 运行时安全补丁 v2：TP 参数无效 critical 告警去重（键=batch_id，60 分钟窗口）
+        self._tp_invalid_alerted = {}
+
         if verbose:
             print("正在连接交易所并同步服务器时间/加载元数据...")
         self._safe_api_call(self.exchange.load_time_difference)
@@ -649,6 +652,102 @@ class CryptoTrader:
             keys_to_remove = [k for k in self._gate_alert_counts if k[0] == identity]
             for k in keys_to_remove:
                 del self._gate_alert_counts[k]
+
+    def _check_tp_viability(self, side, tp_price, cost_price, mark_price) -> tuple[bool, str]:
+        """R2 成交后止盈价可行性校验（ChatGPT 终审 2026-08-20）：
+        BUY: TP > max(现价, 持仓成本)；SELL: TP < min(现价, 持仓成本)。
+        现价维度防币安 -2021（"Order would immediately trigger"判定基准是现价）；
+        成本维度防无意义止盈（TP 低于成本）。
+        返回 (valid, reason)。"""
+        try:
+            tp_price = float(tp_price)
+            cost_price = float(cost_price or 0.0)
+            mark_price = float(mark_price or 0.0)
+        except (TypeError, ValueError):
+            return False, f"止盈价/成本/现价存在非法值（TP={tp_price}, cost={cost_price}, mark={mark_price}）"
+        if tp_price <= 0:
+            return False, f"止盈价无效（{tp_price}）"
+        if side == 'BUY':
+            if tp_price <= max(mark_price, cost_price):
+                return False, (f"BUY 止盈价 {tp_price} <= max(现价 {mark_price}, 持仓成本 {cost_price})，"
+                               f"币安将确定性拒绝(-2021)或无意义止盈")
+        else:
+            if tp_price >= min(mark_price, cost_price):
+                return False, (f"SELL 止盈价 {tp_price} >= min(现价 {mark_price}, 持仓成本 {cost_price})，"
+                               f"币安将确定性拒绝(-2021)或无意义止盈")
+        return True, ''
+
+    def _mark_tp_param_invalid(self, symbol, batch_id, reason):
+        """R2/R3: 止盈价确定性错误 → 写批次标记（补挂循环短路，不再打 Binance API）
+        + critical 告警（60 分钟窗口去重，键=batch_id）。"""
+        try:
+            latest_all = self.load_all_states()
+            b = latest_all.get(symbol, {}).get(batch_id)
+            if b is not None:
+                b['tp_param_invalid'] = {'reason': reason, 'ts': time.time()}
+                self.save_batch_state(symbol, batch_id, b)
+        except Exception as e:
+            print(f"⚠️ [TP参数无效] 写标记失败: {e}")
+        now = time.time()
+        if now - self._tp_invalid_alerted.get(batch_id, 0) >= 3600:
+            self._tp_invalid_alerted[batch_id] = now
+            try:
+                self.send_tg_notification(
+                    f"🚨 **止盈价不合理，挂单被跳过！**\n"
+                    f"🆔 批次：`{batch_id}`\n"
+                    f"📌 {reason}\n"
+                    f"💡 程序【不调用交易所】【不自动重试】。请用用户命令修正止盈价后，程序将自动恢复挂单。",
+                    level='critical'
+                )
+            except Exception as e:
+                print(f"⚠️ [TP参数无效] TG 发送失败: {e}")
+        else:
+            print(f"  └─ 🤫 [TP参数无效] 批次 {batch_id} 60 分钟内已告警，不重复")
+
+    def _clear_tp_param_invalid(self, symbol, batch_id):
+        """R2: 校验通过 → 清除批次标记（用户改价后自动恢复挂单）"""
+        try:
+            latest_all = self.load_all_states()
+            b = latest_all.get(symbol, {}).get(batch_id)
+            if b is not None and 'tp_param_invalid' in b:
+                del b['tp_param_invalid']
+                self.save_batch_state(symbol, batch_id, b)
+        except Exception:
+            pass
+
+    def _tp_update_blocked(self, symbol, batch_id, side, layer, tp_price, cost_price,
+                           mark_price=None, max_tp_fails=5) -> bool:
+        """补挂止盈前综合预检（ChatGPT 终审 2026-08-20）：
+        返回 True = 应跳过本轮止盈更新（不打 Binance create API）。三种短路：
+          a) 熔断短路：tp_fail_count 连续确定失败 ≥ max_tp_fails（对称 SL 的 MAX_SL_FAILS_PER_LAYER）
+          b) R2 可行性校验：BUY 需 TP > max(现价, 成本)；SELL 需 TP < min(现价, 成本)
+             —— 失败 = 确定性错误，不打 API + critical（60min 去重）+ 写 tp_param_invalid 标记
+          c) 已标记且仍不合理 → 静默跳过（不重复告警）；已标记但现合理（用户改价）→ 清标记放行
+        关键：标记不短路校验（否则用户改价后永远无法自愈），只短路"告警与 create"。"""
+        latest_all = self.load_all_states()
+        b = latest_all.get(symbol, {}).get(batch_id)
+        was_invalid = bool(b and b.get('tp_param_invalid'))
+        if b:
+            _tf = b.get('tp_fail_count') or {}
+            if _tf.get(str(layer), 0) >= max_tp_fails:
+                print(f"  └─ 🔥 [熔断保护] 批次 {batch_id} 第 {layer + 1} 层止盈单连续失败 ≥{max_tp_fails} 次，跳过自动重试")
+                return True
+        if mark_price is None:
+            try:
+                ticker = self._safe_api_call(self.exchange.fetch_ticker, symbol)
+                mark_price = float(ticker.get('last') or ticker.get('close') or 0.0)
+            except Exception:
+                mark_price = 0.0
+        valid, reason = self._check_tp_viability(side, tp_price, cost_price, mark_price)
+        if not valid:
+            if was_invalid:
+                print(f"  └─ 🤫 [TP参数无效] 批次 {batch_id} 止盈价仍不合理，静默跳过挂单（已有标记，等待用户修正）")
+                return True
+            print(f"  └─ ❌ [R2 预检] 止盈更新被跳过: {reason}")
+            self._mark_tp_param_invalid(symbol, batch_id, reason)
+            return True
+        self._clear_tp_param_invalid(symbol, batch_id)
+        return False
 
     def _safe_api_call(self, func, *args, retries=5, delay=2, **kwargs):
         for i in range(retries):
@@ -1856,6 +1955,47 @@ class CryptoTrader:
 
         return True, "✅ 所有止损价合理性校验通过！"
 
+    def _validate_take_profit(self, signal, current_mark_price: float) -> tuple[bool, str]:
+        """
+        R1 开仓前止盈价方向性校验（ChatGPT 终审 2026-08-20 补充）：
+        只拦"方向性错误"——BUY 时止盈价 ≤ 当前市价、SELL 时止盈价 ≥ 当前市价。
+        依据：条件单触发价必 > 市价（否则被跳过），成交价 ≥ 触发价 > 市价，
+        TP ≤ 市价 ⇒ TP 必 < 成交价 ⇒ TAKE_PROFIT_MARKET 卖单触发价 ≤ 现价 ⇒ 币安确定性 -2021。
+        不用 TP > max(所有层入场价)：阶梯入场场景 TP 低于未成交层触发价是合法的（ChatGPT 结论）。
+        返回: (是否通过, 错误信息)
+        """
+        side = signal.side.upper()
+        try:
+            tp_price = float(signal.take_profit or 0.0)
+        except (TypeError, ValueError):
+            tp_price = 0.0
+        if tp_price <= 0:
+            return False, f"❌ 止盈价无效（{tp_price}），无法校验"
+
+        if side == 'BUY':
+            # 做多：止盈价必须高于当前市价（否则卖单触发价 ≤ 现价 → -2021 确定性拒绝）
+            if tp_price <= current_mark_price:
+                return False, (
+                    f"❌ 止盈价方向错误！\n"
+                    f"   ├─ 方向: BUY（做多）\n"
+                    f"   ├─ 止盈价: {tp_price}\n"
+                    f"   ├─ 当前市价: {current_mark_price}\n"
+                    f"   └─ 做多时止盈价必须 > 当前市价（当前 {tp_price} <= {current_mark_price}），"
+                    f"币安将确定性拒绝（-2021 Order would immediately trigger）"
+                )
+        else:  # SELL
+            # 做空：止盈价必须低于当前市价（否则买单触发价 ≥ 现价 → -2021 确定性拒绝）
+            if tp_price >= current_mark_price:
+                return False, (
+                    f"❌ 止盈价方向错误！\n"
+                    f"   ├─ 方向: SELL（做空）\n"
+                    f"   ├─ 止盈价: {tp_price}\n"
+                    f"   ├─ 当前市价: {current_mark_price}\n"
+                    f"   └─ 做空时止盈价必须 < 当前市价（当前 {tp_price} >= {current_mark_price}），"
+                    f"币安将确定性拒绝（-2021 Order would immediately trigger）"
+                )
+        return True, "✅ 止盈价方向性校验通过！"
+
     def execute_signal(self, signal):
         symbol = signal.symbol
         batch_id = signal.batch_id
@@ -1917,6 +2057,17 @@ class CryptoTrader:
                 self.send_tg_notification(f"🚨 **挂单被阻断！**\n{msg}", level='critical')
                 return None
             print(msg)
+
+            # R1: 止盈价方向性校验（ChatGPT 终审 2026-08-20）——开仓前拦截确定性错误：
+            # BUY 需 TP > 现价、SELL 需 TP < 现价（币安 -2021 判定基准是现价）。
+            # 校验失败 = 参数确定错误，任何重试必失败 → 直接阻断整批，不挂任何开仓单。
+            print("\n🔍 [止盈价合理性校验中...]")
+            tp_is_valid, tp_msg = self._validate_take_profit(signal, current_mark_price)
+            if not tp_is_valid:
+                print(tp_msg)
+                self.send_tg_notification(f"🚨 **挂单被阻断！**\n{tp_msg}", level='critical')
+                return None
+            print(tp_msg)
 
             params_base = {}
             is_hedge_mode = False
@@ -2453,8 +2604,7 @@ class CryptoTrader:
             return False, (f"HARD_LOCK: identity `{identity}` fail_count≥5 但未置硬锁"
                            f"（异常数据/置锁写盘失败），保守禁止 Create，需人工核实")
         if state == 'FAILED':
-            self._gate_alert_clear(identity)
-            return True, ''  # 确定拒绝 → 允许经闸门重试（计数延续不清零，§8）
+            return True, ''  # 确定拒绝 → 允许经闸门重试（计数延续不清零，§8）——runtime补丁已移除误清
         if state == 'ABSENT':
             self._gate_alert_clear(identity)
             return True, ''  # 人工核实确无此单 → 允许重建
@@ -4138,7 +4288,11 @@ class CryptoTrader:
                                         self.save_batch_state(symbol, batch_id, latest_b_data)
 
                     # ========== 止盈更新 ==========
-                    if need_update_tp:
+                    # R2/R3: 补挂前综合预检（ChatGPT 终审 2026-08-20）——
+                    # 标记短路 / 层熔断短路 / 可行性校验（确定性错误不打 API + critical + 标记）
+                    if need_update_tp and not self._tp_update_blocked(
+                            symbol, batch_id, side, batch_filled_count - 1,
+                            formatted_tp_price, batch_entry_vwap):
                         if tp_order_id:
                             try:
                                 self._safe_api_call(self.exchange.cancel_order, tp_order_id, symbol,
@@ -4208,6 +4362,14 @@ class CryptoTrader:
                                 else:
                                     tp_order_id = new_tp_order['id']
                                     print(f"  └─ ✅ 止盈单已挂出: {formatted_tp_price} (ID: {tp_order_id})")
+                                    # 补挂 TP 成功 → 清零该层层级熔断计数（对称 SL L3951-3955 语义）
+                                    try:
+                                        _b2 = self.load_all_states().get(symbol, {}).get(batch_id, {})
+                                        if _b2 and _b2.get('tp_fail_count'):
+                                            _b2['tp_fail_count'].pop(str(batch_filled_count - 1), None)
+                                            self.save_batch_state(symbol, batch_id, _b2)
+                                    except Exception:
+                                        pass
                         except Exception as e:
                             print(f"  └─ ❌ 挂出止盈单失败: {e}")
                             tp_order_id = None
@@ -4232,7 +4394,19 @@ class CryptoTrader:
                                                                state='FAILED', id_known=False,
                                                                order_kind='conditional',
                                                                fail_count_incr=1)
-                                self.send_tg_notification(
+                                # 补挂 TP 层级别熔断计数（对称 SL 的 sl_fail_count，ChatGPT 终审 2026-08-20）
+                                try:
+                                    _b = self.load_all_states().get(symbol, {}).get(batch_id, {})
+                                    if _b:
+                                        _tf = _b.get('tp_fail_count') or {}
+                                        _tf[str(batch_filled_count - 1)] = _tf.get(str(batch_filled_count - 1), 0) + 1
+                                        _b['tp_fail_count'] = _tf
+                                        self.save_batch_state(symbol, batch_id, _b)
+                                except Exception:
+                                    pass
+                                # 告警去重：同一 identity + FAILED 类别最多 3 次 TG（与 gate 拒绝路径一致）
+                                self._gate_alert_notify(
+                                    tp_identity, 'FAILED',
                                     f"⚠️ **止盈单创建失败（FAILED）**\n"
                                     f"🆔 批次：`{batch_id}`\n"
                                     f"📊 第 {batch_filled_count} 层\n"
@@ -4679,7 +4853,9 @@ class CryptoTrader:
                             sl_fail_count[layer_key] = sl_fail_count.get(layer_key, 0) + 1
                             latest_b_data['sl_fail_count'] = sl_fail_count
                             self.save_batch_state(symbol, batch_id, latest_b_data)
-                        self.send_tg_notification(
+                        # 告警去重：同一 identity + FAILED 类别最多 3 次 TG（与 gate 拒绝路径一致）
+                        self._gate_alert_notify(
+                            identity, 'FAILED',
                             f"🚨 **止损单挂出失败(兜底)！**\n"
                             f"🆔 批次：`{batch_id}`\n"
                             f"📊 第 {idx + 1} 层\n"
@@ -4706,6 +4882,13 @@ class CryptoTrader:
         if latest_b_data and latest_b_data.get('tp_order_id') is None:
             position_side = 'LONG' if prepared_tp_params['side'] == 'sell' else 'SHORT'
             identity = self._protection_identity(batch_id, 'TP', idx, position_side)
+            # R2/R3: 成交后止盈价可行性预检（ChatGPT 终审 2026-08-20）——
+            # 确定性错误：不打 Binance API、1 次 critical（60min 去重）、写 tp_param_invalid 标记等人工修正。
+            # 首层成交瞬间成本≈成交价≈现价，cost 传 0.0 仅校验现价维度（-2021 判定基准）已足够。
+            _tp_side = 'BUY' if prepared_tp_params['side'] == 'sell' else 'SELL'
+            if self._tp_update_blocked(symbol, batch_id, _tp_side, idx,
+                                       prepared_tp_params['params'].get('stopPrice'), 0.0):
+                return
             try:
                 # B2-3: Create 仲裁闸门（§5.3）—— 同 identity 未决/已确认 → 禁新 create
                 allowed, gate_reason = self._assert_create_allowed(

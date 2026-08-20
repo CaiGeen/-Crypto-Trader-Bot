@@ -227,6 +227,21 @@ def make_fake(states, open_orders):
         lambda ord, expected_side, is_hedge_mode, position_side, required_amount:
         CryptoTrader._check_protection_order_validity(
             fake, ord, expected_side, is_hedge_mode, position_side, required_amount))
+    # R2/R3（ChatGPT 终审 2026-08-20）：补挂止盈预检 helper 真实绑定——
+    # MagicMock 未绑定时 `_tp_update_blocked` 返回 truthy mock → E 场景 TP 恢复链被跳过（cancel/create=0）。
+    # E 场景 TP=60000 > max(现价100, 成本100) → 真实 R2 判定 valid → 恢复放行。
+    if hasattr(CryptoTrader, '_tp_update_blocked'):
+        fake._tp_invalid_alerted = {}
+        fake._tp_update_blocked = (
+            lambda s, b, side, layer, tp, cost, **k:
+            CryptoTrader._tp_update_blocked(fake, s, b, side, layer, tp, cost, **k))
+        fake._mark_tp_param_invalid = (
+            lambda s, b, r: CryptoTrader._mark_tp_param_invalid(fake, s, b, r))
+        fake._clear_tp_param_invalid = (
+            lambda s, b: CryptoTrader._clear_tp_param_invalid(fake, s, b))
+        fake._check_tp_viability = (
+            lambda side, tp, cost, mark:
+            CryptoTrader._check_tp_viability(fake, side, tp, cost, mark))
     return fake
 
 
