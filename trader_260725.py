@@ -917,6 +917,12 @@ class CryptoTrader:
 
                     # 🔥 如果既没有挂单也没有持仓(已确认)，清理这个批次
                     if not has_pending_orders and not has_position and current_pos is not None:
+                        # B2-5 恢复护栏：骨架批次（entry_orders=[] 但 registry 有未决 ENTRY，
+                        # 如开仓前置落盘后崩溃）→ 保留证据待对账，不清理不接管（旧行为会误清理毁证据）
+                        if self._registry_has_unresolved_entries(b_data):
+                            print(f"  └─ ⚠️ 批次 [{batch_id}] 存在未决 ENTRY registry 记录"
+                                  f"（开仓骨架/崩溃窗口），保留证据待对账，不清理不接管")
+                            continue
                         print(f"  └─ 🧹 批次 [{batch_id}] 无挂单且无持仓，自动清理")
                         stale_batches.append((symbol, batch_id))
                         continue
@@ -1785,6 +1791,65 @@ class CryptoTrader:
 
             layer_sl_params = []
 
+            # ── B2-5（§5.6 + Case F）：进入开仓循环前，先落批次骨架 + 全部将尝试层 ENTRY 意图 ──
+            # 崩溃安全 Create：中途崩溃 → 交易所可能已有挂单，本地保留 identity 证据可对账/自愈。
+            # 价格过滤与主循环同规则：被跳过层不预写（不残留 PENDING_CREATE）。
+            # 恢复护栏（_registry_has_unresolved_entries）保证骨架批次不被自动清理。
+            position_side = 'LONG' if side == 'BUY' else 'SHORT'
+            skeleton_entry_layers = []
+            for _idx, (_raw_tp, _raw_amt) in enumerate(signal.entries):
+                _fp = float(self.exchange.price_to_precision(symbol, _raw_tp))
+                if side == 'BUY':
+                    if _fp <= current_mark_price:
+                        continue
+                else:
+                    if _fp >= current_mark_price:
+                        continue
+                skeleton_entry_layers.append(_idx)
+            skeleton_registry = {}
+            for _idx in skeleton_entry_layers:
+                _raw_tp, _raw_amt = signal.entries[_idx]
+                _fp = float(self.exchange.price_to_precision(symbol, _raw_tp))
+                skeleton_registry[self._protection_identity(batch_id, 'ENTRY', _idx, position_side)] = {
+                    'state': 'PENDING_CREATE',  # 意图先落盘：create 可能已发出 → 恢复时仲裁闸门禁重挂
+                    'id_known': False,
+                    'order_kind': 'conditional',
+                    'role': 'ENTRY',
+                    'layer': _idx,
+                    'side': position_side,
+                    'intent': self._build_intent(
+                        symbol=symbol, side=order_side,
+                        qty=float(self.exchange.amount_to_precision(symbol, _raw_amt)),
+                        order_type='STOP_MARKET', stop_price=_fp),
+                    'updated_at': time.time(),
+                }
+            skeleton = {
+                'is_active': True,
+                'batch_id': batch_id,
+                'symbol': symbol,
+                'side': side,
+                'entry_orders': [],
+                'stop_steps': [],
+                'take_profit_price': signal.take_profit,
+                'current_sl_id': None,
+                'tp_order_id': None,
+                'batch_total_amount': 0.0,
+                'target_amounts': [],
+                'params_base': params_base,
+                'is_hedge_mode': is_hedge_mode,
+                'last_filled_count': 0,
+                'filled_details': [],
+                'total_entry_fee': 0.0,
+                'user_modified': False,
+                'pending_sl_orders': [],
+                'prepared_tp_params': {},
+                'layer_sl_params': [],
+                'sl_fail_count': {},
+                'sl_failed_layers': [],
+                'protection_registry': skeleton_registry,
+            }
+            self.save_batch_state(symbol, batch_id, skeleton)
+
             for idx, (raw_trigger_price, raw_amount) in enumerate(signal.entries):
                 formatted_amount = float(self.exchange.amount_to_precision(symbol, raw_amount))
                 formatted_price = float(self.exchange.price_to_precision(symbol, raw_trigger_price))
@@ -1821,6 +1886,12 @@ class CryptoTrader:
                     active_stop_steps.append(signal.stop_loss_steps[idx])
                     batch_total_amount += formatted_amount
 
+                    # B2-5（§5.6 T2c）：create 成功 → PENDING_VERIFY + order_id + id_known=true
+                    self._update_registry(
+                        symbol, batch_id,
+                        self._protection_identity(batch_id, 'ENTRY', idx, position_side),
+                        state='PENDING_VERIFY', order_id=order['id'], id_known=True)
+
                     print(
                         f"  └─ 第 {idx + 1} 层条件{'买' if side == 'BUY' else '卖'}单已挂出: 触发价 {formatted_price} | 数量 {formatted_amount} (预设止损价: {formatted_sl_price}) (ID: {order['id']})")
 
@@ -1842,6 +1913,11 @@ class CryptoTrader:
                     if "-2021" in str(e):
                         print(
                             f"⚠️ [挂单失败] 第 {idx + 1} 层触发价 {formatted_price} 不满足{'高于' if side == 'BUY' else '低于'}市价条件，已自动跳过。")
+                        # B2-5（§5.6）：-2021 确定拒绝 → 该层 ABSENT（不残留 PENDING_CREATE、不计 FAILED）
+                        self._update_registry(
+                            symbol, batch_id,
+                            self._protection_identity(batch_id, 'ENTRY', idx, position_side),
+                            state='ABSENT')
                     else:
                         raise e
 
@@ -1891,6 +1967,15 @@ class CryptoTrader:
                 'sl_fail_count': {},
                 'sl_failed_layers': [],
             }
+            # B2-5（§5.6 T4）：完整批次状态落盘前，合并 registry 并把全部成功层 ENTRY → CONFIRMED
+            # （业务 Commit）。ABSENT（-2021）层保持不动；跳过滤层本就不在骨架中。
+            _latest_b = self.load_all_states().get(symbol, {}).get(batch_id, {})
+            _merged_registry = dict(_latest_b.get('protection_registry') or {})
+            for _identity, _entry in _merged_registry.items():
+                if _entry.get('role') == 'ENTRY' and _entry.get('state') in ('PENDING_CREATE', 'PENDING_VERIFY'):
+                    _entry['state'] = 'CONFIRMED'
+                    _entry['updated_at'] = time.time()
+            batch_state_data['protection_registry'] = _merged_registry
             self.save_batch_state(symbol, batch_id, batch_state_data)
 
             print(f"\n📊 {len(entry_orders)} 层开仓条件单布置完毕，本批次总配额数量: {batch_total_amount}")
@@ -2055,9 +2140,22 @@ class CryptoTrader:
 
     def _protection_identity(self, batch_id, role, layer, side):
         """B1/P0-2: 保护单幂等身份键（规格 §5.1）—— batch_id|role|L{layer}|side。
-        role ∈ {SL, TP}；side 为持仓方向（LONG/SHORT）。
+        role ∈ {SL, TP, ENTRY}；side 为持仓方向（LONG/SHORT）。
         含 batch_id → 旧批次/新批次同层不互认，杜绝跨批次收编错单（§13 场景⑨）。"""
         return f"{batch_id}|{role}|L{layer}|{side}"
+
+    def _registry_has_unresolved_entries(self, b_data):
+        """B2-5: registry 存在任一未决 ENTRY（PENDING_CREATE/PENDING_VERIFY/NOT_CONFIRMED/HARD_LOCK）
+        → True。恢复护栏：前置落盘骨架/崩溃窗口批次（entry_orders=[]）不得被自动清理，
+        保留证据待对账（旧行为 entry_orders=[] 且无持仓 → 自动清理 → 证据被毁，前置落盘失去意义）。
+        终态（CONFIRMED/ABSENT/FAILED/MISMATCH）→ False，照常清理，无回归。"""
+        reg = (b_data or {}).get('protection_registry') or {}
+        for entry in reg.values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get('state') in ('PENDING_CREATE', 'PENDING_VERIFY', 'NOT_CONFIRMED', 'HARD_LOCK'):
+                return True
+        return False
 
     def _update_registry(self, symbol, batch_id, identity, state=None, order_id=None,
                          id_known=None, order_kind=None, role=None, layer=None, side=None,
