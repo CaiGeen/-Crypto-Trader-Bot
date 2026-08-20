@@ -32,6 +32,70 @@ RESTART_MINUTE = 0
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 
 
+# ==================== Watchdog 安全补丁 v1（D-004，2026-08-20） ====================
+# 背景：双 watchdog 演练暴露三层缺陷——
+#   根因1: 子进程 stdout 为 PIPE 时 Python 按本地 ANSI 代码页（cp936）编码，
+#          emoji print 抛 UnicodeEncodeError，曾使单实例锁拒绝路径死在 print 上
+#          （退出码 42 变 1，见 bot_runner.py L160 拒绝提示）；
+#   根因2: 主程序持续启动失败时 watchdog 无限重启（无熔断）；
+#   根因3: crash_alert 无同因去重 -> TG+邮件通知风暴。
+# 修复：R1 编码保护 / R2 启动熔断 / R3 告警去重
+# 详见 D-004_Watchdog重复启动风暴_事故档案.md
+
+INIT_FAILURE_WINDOW = 60        # R2: 初始化窗口（秒）——窗口内退出视为启动失败（bot_runner 初始化含交易所连接，取保守值）
+MAX_INIT_FAILURES = 5           # R2: 连续启动失败上限 -> 熔断停止自动重启
+CRASH_ALERT_DEDUP_WINDOW = 600  # R3: 崩溃告警同因去重窗口（秒）
+
+
+def make_stdout_crash_safe():
+    """R1: 入口级编码保护——非 UTF-8 环境（GBK 控制台/管道）下 emoji print 不再抛
+    UnicodeEncodeError。拒绝/告警路径必须比正常路径更稳定，不能死在一句提示上。"""
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            if _stream is not None and hasattr(_stream, 'reconfigure'):
+                _stream.reconfigure(errors='replace')
+        except Exception:
+            pass
+
+
+# R3: crash_alert 同因去重状态（restart_reason -> 上次发送的 monotonic 时间）
+_crash_alert_last_sent = {}
+
+
+def crash_alert_allowed(reason: str) -> bool:
+    """R3: 同一 restart_reason 在去重窗口内只发 1 次（防通知风暴）。"""
+    now = time.monotonic()
+    last = _crash_alert_last_sent.get(reason)
+    if last is not None and (now - last) < CRASH_ALERT_DEDUP_WINDOW:
+        return False
+    _crash_alert_last_sent[reason] = now
+    return True
+
+
+def crash_alert_reset():
+    """R3: 主程序稳定运行后解除同因去重（下次崩溃重新提醒）。"""
+    _crash_alert_last_sent.clear()
+
+
+# R2: 连续启动失败计数（初始化窗口内退出的次数）
+_init_fail_count = 0
+
+
+def record_process_exit(uptime: float) -> bool:
+    """R2: 记录一次主程序退出。返回 True = 触发启动熔断（调用方应停止重启）。
+    - 初始化窗口内退出 -> 计数 +1，连续达 MAX_INIT_FAILURES -> True
+    - 稳定运行（超出窗口）-> 计数清零，并解除 R3 告警去重（恢复语义）"""
+    global _init_fail_count
+    if uptime < INIT_FAILURE_WINDOW:
+        _init_fail_count += 1
+        if _init_fail_count >= MAX_INIT_FAILURES:
+            return True
+    else:
+        _init_fail_count = 0
+        crash_alert_reset()
+    return False
+
+
 # ==================== 日志函数 ====================
 def log_message(msg: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -160,6 +224,7 @@ def monitor_process(process):
 
 # ==================== 主循环 ====================
 def main():
+    make_stdout_crash_safe()  # R1: 入口级编码保护（D-004 根因1）
     log_message("=" * 60)
     log_message("🛡️ Watchdog 守护进程启动 (稳定版 v2.2)")
     log_message(f"📁 工作目录: {BASE_DIR}")
@@ -177,6 +242,7 @@ def main():
             next_restart = None
             log_message("💤 定时重启已禁用，仅监控崩溃")
 
+        proc_start = time.monotonic()  # R2: 记录启动时刻（初始化窗口判定基准）
         process = run_main_process()
         if process is None:
             log_message("❌ 无法启动主程序，等待 30 秒后重试...")
@@ -271,6 +337,18 @@ def main():
                     pass
             log_message("✅ 主程序已终止")
 
+        # R2: 启动熔断判定（D-004 根因2）——稳定运行清零计数并解除 R3 去重；
+        # 初始化窗口内连续 MAX_INIT_FAILURES 次退出 -> 停止自动重启 + 1 条 critical
+        if record_process_exit(time.monotonic() - proc_start):
+            log_message(f"🛑 [启动熔断] 主程序连续 {MAX_INIT_FAILURES} 次在 {INIT_FAILURE_WINDOW} 秒内退出，"
+                        f"停止自动重启（最后原因: {restart_reason}），请人工排查！")
+            atomic_write_notify(
+                f"crash_alert|🚨【资金安全】🛑 Watchdog 启动熔断：主程序连续 "
+                f"{MAX_INIT_FAILURES} 次在 {INIT_FAILURE_WINDOW} 秒内退出，已停止自动重启。"
+                f"最后原因: {restart_reason}。请人工排查后再启动。")
+            _kill_main_process_tree()
+            sys.exit(1)
+
         if restart_reason:
             log_message(f"🔄 重启原因: {restart_reason}")
 
@@ -278,11 +356,16 @@ def main():
             is_crash = "崩溃" in restart_reason or "异常" in restart_reason or "退出码" in restart_reason
 
             if is_crash:
-                try:
-                    atomic_write_notify(f"crash_alert|{restart_reason}")
-                    log_message(f"💥 已发送崩溃报警: {restart_reason}")
-                except Exception as e:
-                    log_message(f"⚠️ 发送崩溃报警失败: {e}")
+                # R3: 同因去重（D-004 根因3）——同一 restart_reason 在
+                # CRASH_ALERT_DEDUP_WINDOW 秒内只发 1 次，防持续故障通知风暴
+                if crash_alert_allowed(restart_reason):
+                    try:
+                        atomic_write_notify(f"crash_alert|{restart_reason}")
+                        log_message(f"💥 已发送崩溃报警: {restart_reason}")
+                    except Exception as e:
+                        log_message(f"⚠️ 发送崩溃报警失败: {e}")
+                else:
+                    log_message(f"🔇 崩溃报警同因去重（{CRASH_ALERT_DEDUP_WINDOW}s 窗口内已发）: {restart_reason}")
 
             if ENABLE_SUMMARY_ON_RESTART:
                 # 如果 crash_alert 已写入 .notify，不覆盖它

@@ -15,6 +15,23 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+
+# R1 编码保护（Watchdog 安全补丁 v1，D-004 2026-08-20）：
+# stdout 为 PIPE（watchdog 接管）时 Python 按本地 ANSI 代码页（cp936）编码，emoji
+# print 抛 UnicodeEncodeError——曾使单实例锁拒绝路径死在 print 上（退出码 42 变 1），
+# 触发 watchdog 无限重启 + 通知风暴。拒绝/告警路径必须比正常路径更稳定。
+# （与 watchdog.py 同名函数一致；两进程独立启动，有意复制而非共享导入）
+def make_stdout_crash_safe():
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            if _stream is not None and hasattr(_stream, 'reconfigure'):
+                _stream.reconfigure(errors='replace')
+        except Exception:
+            pass
+
+
+make_stdout_crash_safe()
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
