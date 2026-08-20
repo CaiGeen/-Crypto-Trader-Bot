@@ -1077,7 +1077,7 @@ class CryptoTrader:
                 retries=1
             )
             # C5/SG4 Verify：返回≠success → 不 Commit（unknown→critical 不补单 / not_found→既有失败路径）
-            verify_result = self._verify_order_created(new_tp_order['id'], target_symbol)
+            verify_result = self._verify_order_created(new_tp_order['id'], target_symbol, 'conditional')
             if verify_result != 'success':
                 self.send_tg_notification(
                     self._verify_failure_msg("新止盈单", new_tp_order['id'], target_symbol, verify_result),
@@ -1196,7 +1196,7 @@ class CryptoTrader:
                 retries=1
             )
             # C5/SG4 Verify：返回≠success → 不 Commit（unknown→critical 不补单 / not_found→既有失败路径）
-            verify_result = self._verify_order_created(new_sl_order['id'], target_symbol)
+            verify_result = self._verify_order_created(new_sl_order['id'], target_symbol, 'conditional')
             if verify_result != 'success':
                 self.send_tg_notification(
                     self._verify_failure_msg("新止损单", new_sl_order['id'], target_symbol, verify_result),
@@ -1378,7 +1378,7 @@ class CryptoTrader:
                 retries=1
             )
             # C5/SG4 Verify：返回≠success → 不 Commit（unknown→critical 不补单 / not_found→既有失败路径）
-            verify_result = self._verify_order_created(new_sl_order['id'], symbol)
+            verify_result = self._verify_order_created(new_sl_order['id'], symbol, 'conditional')
             if verify_result != 'success':
                 self.send_tg_notification(
                     self._verify_failure_msg("保本损止损单", new_sl_order['id'], symbol, verify_result),
@@ -1991,23 +1991,125 @@ class CryptoTrader:
 
     # ==================== C5/SG4: Create→Verify→Commit ====================
 
-    def _verify_order_created(self, order_id, symbol):
-        """C5/SG4: 写侧三态验证——create_order 返回的 id 在交易所是否真实存在。
+    def _verify_order_created(self, order_id, symbol, order_kind='conditional'):
+        """C5/SG4 + B1(P0-3): 写侧三态验证——create_order 返回的 id 在交易所是否真实存在。
 
         Verify 必须用 fetch_order（事务确认点），不用 open_orders 快照（周期监控数据，
         不承担事务语义，且新单可能尚未进入本轮快照）。返回三态（禁止退化为 True/False）：
           'success'   → fetch_order 成功，订单真实存在 → 调用方才可 Commit
-          'not_found' → OrderNotFound，订单确实不存在 → 不 Commit + 既有失败路径（可安全重试）
+          'not_found' → OrderNotFound，订单确实不存在 → 不 Commit + NOT_CONFIRMED（禁重试禁补单）
           'unknown'   → 其他异常（NetworkError 等）→ 不 Commit + critical + 不自动补单
                         关键：UNKNOWN ≠ NOT_FOUND —— 网络未知不能被当成"不存在"（UNKNOWN ≠ EMPTY）。
+        order_kind（B1/P0-3，默认 'conditional' 兼容 C5 既有 2 参调用）：
+          'conditional' → STOP/TAKE_PROFIT 条件单，fetch_order 必须带 params={'stop': True} 走
+                          algo 端点；不带 stop=True 查条件单会命中普通端点 → 恒 not_found →
+                          假阴性（C5 实盘事故根因：12 处全误判 not_found → 无限重挂 24 孤儿单）。
+          'normal'      → 普通限价/市价单，走默认端点（不带 params）。
         """
         try:
-            self._safe_api_call(self.exchange.fetch_order, order_id, symbol, retries=1)
+            if order_kind == 'conditional':
+                self._safe_api_call(self.exchange.fetch_order, order_id, symbol,
+                                    params={'stop': True}, retries=1)
+            else:
+                self._safe_api_call(self.exchange.fetch_order, order_id, symbol, retries=1)
             return 'success'
         except ccxt.OrderNotFound:
             return 'not_found'
         except Exception:
             return 'unknown'
+
+    # ==================== B1/P0-2: create 异常精确分类 + 幂等键 + registry ====================
+
+    def _classify_create_exception(self, e):
+        """B1/P0-2: create_order 异常精确分类（规格 §3.2 FAILED 精确分类）：
+          'failed'  → ExchangeError 及其子类（确定拒绝：余额不足/无效订单/权限/OrderNotFound 等）
+                      → 可计数、可安全重试（FAILED 是唯一允许再次 Create 的自动路径）
+          'unknown' → NetworkError/RequestTimeout/RateLimitExceeded/其他 → 结果未知（id_unknown）
+                      关键：网络未知 ≠ 创建失败 —— 禁止计数、禁止自动补单（UNKNOWN ≠ EMPTY）。
+        ccxt 异常层次：ExchangeError 与 NetworkError 是两个独立分支（errors.py L70/L182 实证），
+        因此 isinstance(e, ccxt.ExchangeError) 为 False 即落入 unknown。"""
+        if isinstance(e, ccxt.ExchangeError):
+            return 'failed'
+        return 'unknown'
+
+    def _protection_identity(self, batch_id, role, layer, side):
+        """B1/P0-2: 保护单幂等身份键（规格 §5.1）—— batch_id|role|L{layer}|side。
+        role ∈ {SL, TP}；side 为持仓方向（LONG/SHORT）。
+        含 batch_id → 旧批次/新批次同层不互认，杜绝跨批次收编错单（§13 场景⑨）。"""
+        return f"{batch_id}|{role}|L{layer}|{side}"
+
+    def _update_registry(self, symbol, batch_id, identity, state=None, order_id=None,
+                         id_known=None, order_kind=None, role=None, layer=None, side=None):
+        """B1/P0-2: 保护单 registry 落盘（规格 §5.2）—— protection_registry[identity] 状态条目。
+        每次更新刷新 updated_at；load → modify → save（读最新状态再写，防覆盖并发修改）。
+        调用方必须持有监控线程/写侧锁（仲裁需持锁，§13 推论④）。"""
+        latest_all = self.load_all_states()
+        b = latest_all.get(symbol, {}).get(batch_id)
+        if b is None:
+            return
+        reg = b.setdefault('protection_registry', {})
+        entry = reg.setdefault(identity, {})
+        if state is not None:
+            entry['state'] = state
+        if order_id is not None:
+            entry['order_id'] = order_id
+        if id_known is not None:
+            entry['id_known'] = id_known
+        if order_kind is not None:
+            entry['order_kind'] = order_kind
+        if role is not None:
+            entry['role'] = role
+        if layer is not None:
+            entry['layer'] = layer
+        if side is not None:
+            entry['side'] = side
+        entry['updated_at'] = time.time()
+        self.save_batch_state(symbol, batch_id, b)
+
+    def _recheck_registry_self_heal(self, symbol, batch_id):
+        """B1/P0-2: registry 重查自愈（规格 §6.3）—— PENDING_VERIFY/NOT_CONFIRMED 条目重新 fetch：
+          fetch 成功    → CONFIRMED + 收编（补 Commit current_sl_id/tp_order_id，绝不新建）
+          OrderNotFound → NOT_CONFIRMED（维持，静默）
+          其他异常      → 维持 PENDING_VERIFY（结果未知，静默等下一轮重查）
+        只补 Commit 不 Create —— 防双单复活（§13 场景⑦：成功场景必须收编已存在订单）。"""
+        latest_all = self.load_all_states()
+        b = latest_all.get(symbol, {}).get(batch_id)
+        if b is None:
+            return
+        reg = b.get('protection_registry', {})
+        changed = False
+        for identity, entry in reg.items():
+            if entry.get('state') not in ('PENDING_VERIFY', 'NOT_CONFIRMED'):
+                continue
+            order_id = entry.get('order_id')
+            if not order_id:
+                continue
+            order_kind = entry.get('order_kind', 'conditional')
+            try:
+                if order_kind == 'conditional':
+                    self._safe_api_call(self.exchange.fetch_order, order_id, symbol,
+                                        params={'stop': True}, retries=1)
+                else:
+                    self._safe_api_call(self.exchange.fetch_order, order_id, symbol, retries=1)
+            except ccxt.OrderNotFound:
+                if entry.get('state') != 'NOT_CONFIRMED':
+                    entry['state'] = 'NOT_CONFIRMED'
+                    entry['updated_at'] = time.time()
+                    changed = True
+                continue
+            except Exception:
+                continue  # 结果未知 → 维持现状静默，等待下一轮重查
+            # fetch 成功 → CONFIRMED + 收编（只补 Commit 不新建）
+            role = entry.get('role')
+            if role == 'SL' and b.get('current_sl_id') is None:
+                b['current_sl_id'] = order_id
+            elif role == 'TP' and b.get('tp_order_id') is None:
+                b['tp_order_id'] = order_id
+            entry['state'] = 'CONFIRMED'
+            entry['updated_at'] = time.time()
+            changed = True
+        if changed:
+            self.save_batch_state(symbol, batch_id, b)
 
     def _verify_failure_msg(self, desc, order_id, symbol, verify_result):
         """C5/SG4: Verify 失败统一消息（unknown → 人工核实，防双单复活）。"""
@@ -2481,7 +2583,7 @@ class CryptoTrader:
                                     retries=1
                                 )
                                 # C5/SG4 Verify：成功才 Commit/撤旧/置id；unknown→critical 不补单；not_found→warning 不撤旧
-                                verify_result = self._verify_order_created(new_sl_order['id'], symbol)
+                                verify_result = self._verify_order_created(new_sl_order['id'], symbol, 'conditional')
                                 if verify_result != 'success':
                                     print(f"  └─ ❌ 新止损单验证失败({verify_result})，不 Commit/不撤旧: {new_sl_order['id']}")
                                     self.send_tg_notification(
@@ -2528,7 +2630,7 @@ class CryptoTrader:
                                     retries=1
                                 )
                                 # C5/SG4 Verify：成功才 Commit/撤旧/置id；unknown→critical 不补单；not_found→warning 不撤旧
-                                verify_result = self._verify_order_created(new_tp_order['id'], symbol)
+                                verify_result = self._verify_order_created(new_tp_order['id'], symbol, 'conditional')
                                 if verify_result != 'success':
                                     print(f"  └─ ❌ 新止盈单验证失败({verify_result})，不 Commit/不撤旧: {new_tp_order['id']}")
                                     self.send_tg_notification(
@@ -2984,7 +3086,7 @@ class CryptoTrader:
                                         retries=1
                                     )
                                     # C5/SG4 Verify：unknown→不 Commit 不补单 critical；not_found→既有失败路径（可安全重试）
-                                    verify_result = self._verify_order_created(new_sl_order['id'], symbol)
+                                    verify_result = self._verify_order_created(new_sl_order['id'], symbol, 'conditional')
                                     if verify_result == 'unknown':
                                         current_sl_id = None
                                         sl_success = False
@@ -3061,7 +3163,7 @@ class CryptoTrader:
                                                 retries=1
                                             )
                                             # C5/SG4 Verify：unknown→不 Commit 不补单 critical；not_found→既有失败路径
-                                            verify_result = self._verify_order_created(recovery_order['id'], symbol)
+                                            verify_result = self._verify_order_created(recovery_order['id'], symbol, 'conditional')
                                             if verify_result == 'unknown':
                                                 print(f"  └─ ❌ 降级恢复单创建结果未知(UNKNOWN)，不 Commit/不补单: {recovery_order['id']}")
                                                 self.send_tg_notification(
@@ -3152,7 +3254,7 @@ class CryptoTrader:
                                 retries=1
                             )
                             # C5/SG4 Verify：unknown→不 Commit 不补单 critical；not_found→warning 不 Commit
-                            verify_result = self._verify_order_created(new_tp_order['id'], symbol)
+                            verify_result = self._verify_order_created(new_tp_order['id'], symbol, 'conditional')
                             if verify_result != 'success':
                                 print(f"  └─ ❌ 止盈单验证失败({verify_result})，不 Commit: {new_tp_order['id']}")
                                 self.send_tg_notification(
@@ -3325,6 +3427,12 @@ class CryptoTrader:
                                            is_hedge_mode, params_base, stop_steps):
         """🔥 成交后立即使用预生成的参数挂止盈和止损单（1秒内完成）
         注意：此方法只在 current_sl_id 为 None 时调用，即首次成交时
+        B1/P0-2 语义（规格 §3.2/§5.1/§6.3/§13）：意图先落盘 → create → verify(kind) → 状态迁移：
+          verify success → CONFIRMED + Commit（current_sl_id/tp_order_id）
+          verify not_found → NOT_CONFIRMED（不 Commit/不计数/不补单 + critical）
+          verify unknown   → PENDING_VERIFY(id_known=True)（不 Commit/不计数/不补单 + critical）
+          create 抛 ExchangeError → 'failed' → FAILED（计数，既有失败路径，允许重试）
+          create 抛 NetworkError 等 → 'unknown' → PENDING_VERIFY(id_unknown)（不计数/不补单 + critical）
         """
         latest_all = self.load_all_states()
         latest_b_data = latest_all.get(symbol, {}).get(batch_id, {})
@@ -3336,8 +3444,14 @@ class CryptoTrader:
                 sl_params['amount'] = batch_filled_amount
                 if not is_hedge_mode:
                     sl_params['params']['reduceOnly'] = True
+                position_side = 'LONG' if sl_params['side'] == 'sell' else 'SHORT'
+                identity = self._protection_identity(batch_id, 'SL', idx, position_side)
 
                 try:
+                    # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知
+                    self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
+                                          id_known=False, order_kind='conditional', role='SL',
+                                          layer=idx, side=position_side)
                     new_sl_order = self._safe_api_call(
                         self.exchange.create_order,
                         symbol=sl_params['symbol'],
@@ -3347,16 +3461,37 @@ class CryptoTrader:
                         params=sl_params['params'],
                         retries=1
                     )
-                    # C5/SG4 Verify：unknown→不 Commit 不补单 critical；not_found→既有失败路径（可安全重试）
-                    verify_result = self._verify_order_created(new_sl_order['id'], sl_params['symbol'])
+                    # C5/SG4 + B1 Verify(kind)：unknown→PENDING_VERIFY；not_found→NOT_CONFIRMED
+                    verify_result = self._verify_order_created(new_sl_order['id'], sl_params['symbol'], 'conditional')
                     if verify_result == 'unknown':
+                        self._update_registry(symbol, batch_id, identity, state='PENDING_VERIFY',
+                                              order_id=new_sl_order['id'], id_known=True)
                         print(f"  └─ ⚡ 预生成止损单创建结果未知(UNKNOWN)，不 Commit/不补单: {new_sl_order['id']}")
                         self.send_tg_notification(
-                            self._verify_failure_msg("预生成止损单", new_sl_order['id'], sl_params['symbol'], 'unknown'),
+                            f"🚨 **预生成止损单创建结果未知（UNKNOWN）**\n"
+                            f"🆔 批次：`{batch_id}`\n"
+                            f"📊 第 {idx + 1} 层\n"
+                            f"⚠️ 网络异常，无法确认该订单是否已创建\n"
+                            f"💡 程序【未记录】此订单（不 Commit），不会自动补单\n"
+                            f"🛠️ 请到交易所核实是否存在该订单！",
                             level='critical')
                     elif verify_result == 'not_found':
-                        raise Exception(f"预生成止损单创建验证失败: OrderNotFound (id={new_sl_order['id']})")
+                        # 确定不存在 → NOT_CONFIRMED：禁重试禁补单，不计数（NOT_CONFIRMED ≠ FAILED）
+                        self._update_registry(symbol, batch_id, identity, state='NOT_CONFIRMED',
+                                              order_id=new_sl_order['id'], id_known=True)
+                        print(f"  └─ ⚡ 预生成止损单创建未确认(NOT_CONFIRMED)，不 Commit/不补单: {new_sl_order['id']}")
+                        self.send_tg_notification(
+                            f"🚨 **预生成止损单创建未确认（NOT_CONFIRMED）**\n"
+                            f"🆔 批次：`{batch_id}`\n"
+                            f"📊 第 {idx + 1} 层\n"
+                            f"⚠️ 交易所查询不到该订单（可能不存在或已被触发）\n"
+                            f"💡 程序【未记录】此订单（不 Commit），也不会自动补单\n"
+                            f"🛠️ 请到交易所核实持仓保护状态！",
+                            level='critical')
                     elif latest_b_data:
+                        # CONFIRMED → Commit
+                        self._update_registry(symbol, batch_id, identity, state='CONFIRMED',
+                                              order_id=new_sl_order['id'], id_known=True)
                         sl_price = sl_params['params']['stopPrice']
                         latest_b_data['current_sl_id'] = new_sl_order['id']
                         # 从待挂列表中移除当前层
@@ -3367,22 +3502,36 @@ class CryptoTrader:
                         self.save_batch_state(symbol, batch_id, latest_b_data)
                         print(f"  └─ ⚡ 预生成止损单已挂出: {sl_price} (ID: {new_sl_order['id']})")
                 except Exception as e:
-                    print(f"  └─ ⚡ 预生成止损单挂出失败: {e}")
-                    # 🔥 记录失败，发送告警
-                    if latest_b_data:
-                        sl_fail_count = latest_b_data.get('sl_fail_count', {})
-                        layer_key = str(idx)
-                        sl_fail_count[layer_key] = sl_fail_count.get(layer_key, 0) + 1
-                        latest_b_data['sl_fail_count'] = sl_fail_count
-                        self.save_batch_state(symbol, batch_id, latest_b_data)
-                    self.send_tg_notification(
-                        f"🚨 **止损单预生成挂单失败！**\n"
-                        f"🆔 批次：`{batch_id}`\n"
-                        f"📊 第 {idx + 1} 层\n"
-                        f"💡 原因：{str(e)[:100]}\n"
-                        f"⚠️ 程序将重试，请关注后续通知！",
-                        level='critical'
-                    )
+                    cls = self._classify_create_exception(e)
+                    if cls == 'unknown':
+                        # 结果未知（NetworkError/超时/限流等）→ PENDING_VERIFY(id_unknown)：不计数不补单
+                        self._update_registry(symbol, batch_id, identity, state='PENDING_VERIFY', id_known=False)
+                        print(f"  └─ ⚡ 预生成止损单创建结果未知(UNKNOWN)，不计数/不补单: {e}")
+                        self.send_tg_notification(
+                            f"🚨 **预生成止损单创建结果未知（UNKNOWN）**\n"
+                            f"🆔 批次：`{batch_id}`\n"
+                            f"📊 第 {idx + 1} 层\n"
+                            f"⚠️ 网络异常，无法确认订单是否已创建（订单 ID 未知）\n"
+                            f"💡 程序【未记录】此订单（不 Commit），不会自动补单\n"
+                            f"🛠️ 请到交易所核实是否存在该订单！",
+                            level='critical')
+                    else:
+                        # 确定拒绝（ExchangeError）→ FAILED：既有失败路径（计数 + 告警 + 允许重试）
+                        if latest_b_data:
+                            self._update_registry(symbol, batch_id, identity, state='FAILED')
+                            sl_fail_count = latest_b_data.get('sl_fail_count', {})
+                            layer_key = str(idx)
+                            sl_fail_count[layer_key] = sl_fail_count.get(layer_key, 0) + 1
+                            latest_b_data['sl_fail_count'] = sl_fail_count
+                            self.save_batch_state(symbol, batch_id, latest_b_data)
+                        self.send_tg_notification(
+                            f"🚨 **止损单预生成挂单失败！**\n"
+                            f"🆔 批次：`{batch_id}`\n"
+                            f"📊 第 {idx + 1} 层\n"
+                            f"💡 原因：{str(e)[:100]}\n"
+                            f"⚠️ 程序将重试，请关注后续通知！",
+                            level='critical'
+                        )
             else:
                 raw_sl_price = stop_steps[idx] if idx < len(stop_steps) else stop_steps[-1]
                 formatted_sl_price = float(self.exchange.price_to_precision(symbol, raw_sl_price))
@@ -3400,7 +3549,13 @@ class CryptoTrader:
                 else:
                     print(f"  └─ ⚠️ 无法确定止损方向 (layer_sl_params 为空且无 positionSide)，跳过本层止损")
                     return
+                position_side = 'LONG' if sl_side == 'sell' else 'SHORT'
+                identity = self._protection_identity(batch_id, 'SL', idx, position_side)
                 try:
+                    # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知
+                    self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
+                                          id_known=False, order_kind='conditional', role='SL',
+                                          layer=idx, side=position_side)
                     new_sl_order = self._safe_api_call(
                         self.exchange.create_order,
                         symbol=symbol,
@@ -3410,16 +3565,37 @@ class CryptoTrader:
                         params=sl_params,
                         retries=1
                     )
-                    # C5/SG4 Verify：unknown→不 Commit 不补单 critical；not_found→既有失败路径（可安全重试）
-                    verify_result = self._verify_order_created(new_sl_order['id'], symbol)
+                    # C5/SG4 + B1 Verify(kind)：unknown→PENDING_VERIFY；not_found→NOT_CONFIRMED
+                    verify_result = self._verify_order_created(new_sl_order['id'], symbol, 'conditional')
                     if verify_result == 'unknown':
+                        self._update_registry(symbol, batch_id, identity, state='PENDING_VERIFY',
+                                              order_id=new_sl_order['id'], id_known=True)
                         print(f"  └─ ⚡ 兜底止损单创建结果未知(UNKNOWN)，不 Commit/不补单: {new_sl_order['id']}")
                         self.send_tg_notification(
-                            self._verify_failure_msg("兜底止损单", new_sl_order['id'], symbol, 'unknown'),
+                            f"🚨 **兜底止损单创建结果未知（UNKNOWN）**\n"
+                            f"🆔 批次：`{batch_id}`\n"
+                            f"📊 第 {idx + 1} 层\n"
+                            f"⚠️ 网络异常，无法确认该订单是否已创建\n"
+                            f"💡 程序【未记录】此订单（不 Commit），不会自动补单\n"
+                            f"🛠️ 请到交易所核实是否存在该订单！",
                             level='critical')
                     elif verify_result == 'not_found':
-                        raise Exception(f"兜底止损单创建验证失败: OrderNotFound (id={new_sl_order['id']})")
+                        # 确定不存在 → NOT_CONFIRMED：禁重试禁补单，不计数（NOT_CONFIRMED ≠ FAILED）
+                        self._update_registry(symbol, batch_id, identity, state='NOT_CONFIRMED',
+                                              order_id=new_sl_order['id'], id_known=True)
+                        print(f"  └─ ⚡ 兜底止损单创建未确认(NOT_CONFIRMED)，不 Commit/不补单: {new_sl_order['id']}")
+                        self.send_tg_notification(
+                            f"🚨 **兜底止损单创建未确认（NOT_CONFIRMED）**\n"
+                            f"🆔 批次：`{batch_id}`\n"
+                            f"📊 第 {idx + 1} 层\n"
+                            f"⚠️ 交易所查询不到该订单（可能不存在或已被触发）\n"
+                            f"💡 程序【未记录】此订单（不 Commit），也不会自动补单\n"
+                            f"🛠️ 请到交易所核实持仓保护状态！",
+                            level='critical')
                     else:
+                        # CONFIRMED → Commit
+                        self._update_registry(symbol, batch_id, identity, state='CONFIRMED',
+                                              order_id=new_sl_order['id'], id_known=True)
                         latest_all = self.load_all_states()
                         latest_b_data = latest_all.get(symbol, {}).get(batch_id, {})
                         if latest_b_data:
@@ -3431,27 +3607,48 @@ class CryptoTrader:
                             self.save_batch_state(symbol, batch_id, latest_b_data)
                             print(f"  └─ ⚡ 止损单已挂出(兜底): {formatted_sl_price} (ID: {new_sl_order['id']})")
                 except Exception as e:
-                    print(f"  └─ ⚡ 止损单挂出失败(兜底): {e}")
-                    if latest_b_data:
-                        sl_fail_count = latest_b_data.get('sl_fail_count', {})
-                        layer_key = str(idx)
-                        sl_fail_count[layer_key] = sl_fail_count.get(layer_key, 0) + 1
-                        latest_b_data['sl_fail_count'] = sl_fail_count
-                        self.save_batch_state(symbol, batch_id, latest_b_data)
-                    self.send_tg_notification(
-                        f"🚨 **止损单挂出失败(兜底)！**\n"
-                        f"🆔 批次：`{batch_id}`\n"
-                        f"📊 第 {idx + 1} 层\n"
-                        f"💡 原因：{str(e)[:100]}\n"
-                        f"⚠️ 程序将重试，请关注后续通知！",
-                        level='critical'
-                    )
+                    cls = self._classify_create_exception(e)
+                    if cls == 'unknown':
+                        # 结果未知（NetworkError/超时/限流等）→ PENDING_VERIFY(id_unknown)：不计数不补单
+                        self._update_registry(symbol, batch_id, identity, state='PENDING_VERIFY', id_known=False)
+                        print(f"  └─ ⚡ 兜底止损单创建结果未知(UNKNOWN)，不计数/不补单: {e}")
+                        self.send_tg_notification(
+                            f"🚨 **兜底止损单创建结果未知（UNKNOWN）**\n"
+                            f"🆔 批次：`{batch_id}`\n"
+                            f"📊 第 {idx + 1} 层\n"
+                            f"⚠️ 网络异常，无法确认订单是否已创建（订单 ID 未知）\n"
+                            f"💡 程序【未记录】此订单（不 Commit），不会自动补单\n"
+                            f"🛠️ 请到交易所核实是否存在该订单！",
+                            level='critical')
+                    else:
+                        # 确定拒绝（ExchangeError）→ FAILED：既有失败路径（计数 + 告警 + 允许重试）
+                        if latest_b_data:
+                            self._update_registry(symbol, batch_id, identity, state='FAILED')
+                            sl_fail_count = latest_b_data.get('sl_fail_count', {})
+                            layer_key = str(idx)
+                            sl_fail_count[layer_key] = sl_fail_count.get(layer_key, 0) + 1
+                            latest_b_data['sl_fail_count'] = sl_fail_count
+                            self.save_batch_state(symbol, batch_id, latest_b_data)
+                        self.send_tg_notification(
+                            f"🚨 **止损单挂出失败(兜底)！**\n"
+                            f"🆔 批次：`{batch_id}`\n"
+                            f"📊 第 {idx + 1} 层\n"
+                            f"💡 原因：{str(e)[:100]}\n"
+                            f"⚠️ 程序将重试，请关注后续通知！",
+                            level='critical'
+                        )
         else:
             print(f"  └─ ⚡ 已存在止损单，等待主循环合并更新")
 
         # 挂止盈单（首次成交时挂，后续不重复挂）
         if latest_b_data and latest_b_data.get('tp_order_id') is None:
+            position_side = 'LONG' if prepared_tp_params['side'] == 'sell' else 'SHORT'
+            identity = self._protection_identity(batch_id, 'TP', idx, position_side)
             try:
+                # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知
+                self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
+                                      id_known=False, order_kind='conditional', role='TP',
+                                      layer=idx, side=position_side)
                 tp_params = prepared_tp_params.copy()
                 tp_params['amount'] = batch_filled_amount
                 if not is_hedge_mode:
@@ -3466,16 +3663,35 @@ class CryptoTrader:
                     params=tp_params['params'],
                     retries=1
                 )
-                # C5/SG4 Verify：unknown→不 Commit 不补单 critical；not_found→既有失败路径（可安全重试）
-                verify_result = self._verify_order_created(new_tp_order['id'], tp_params['symbol'])
+                # C5/SG4 + B1 Verify(kind)：unknown→PENDING_VERIFY；not_found→NOT_CONFIRMED
+                verify_result = self._verify_order_created(new_tp_order['id'], tp_params['symbol'], 'conditional')
                 if verify_result == 'unknown':
+                    self._update_registry(symbol, batch_id, identity, state='PENDING_VERIFY',
+                                          order_id=new_tp_order['id'], id_known=True)
                     print(f"  └─ ⚡ 预生成止盈单创建结果未知(UNKNOWN)，不 Commit/不补单: {new_tp_order['id']}")
                     self.send_tg_notification(
-                        self._verify_failure_msg("预生成止盈单", new_tp_order['id'], tp_params['symbol'], 'unknown'),
+                        f"🚨 **预生成止盈单创建结果未知（UNKNOWN）**\n"
+                        f"🆔 批次：`{batch_id}`\n"
+                        f"⚠️ 网络异常，无法确认该订单是否已创建\n"
+                        f"💡 程序【未记录】此订单（不 Commit），不会自动补单\n"
+                        f"🛠️ 请到交易所核实是否存在该订单！",
                         level='critical')
                 elif verify_result == 'not_found':
-                    raise Exception(f"预生成止盈单创建验证失败: OrderNotFound (id={new_tp_order['id']})")
+                    # 确定不存在 → NOT_CONFIRMED：禁重试禁补单，不计数（NOT_CONFIRMED ≠ FAILED）
+                    self._update_registry(symbol, batch_id, identity, state='NOT_CONFIRMED',
+                                          order_id=new_tp_order['id'], id_known=True)
+                    print(f"  └─ ⚡ 预生成止盈单创建未确认(NOT_CONFIRMED)，不 Commit/不补单: {new_tp_order['id']}")
+                    self.send_tg_notification(
+                        f"🚨 **预生成止盈单创建未确认（NOT_CONFIRMED）**\n"
+                        f"🆔 批次：`{batch_id}`\n"
+                        f"⚠️ 交易所查询不到该订单（可能不存在或已被触发）\n"
+                        f"💡 程序【未记录】此订单（不 Commit），也不会自动补单\n"
+                        f"🛠️ 请到交易所核实持仓保护状态！",
+                        level='critical')
                 else:
+                    # CONFIRMED → Commit
+                    self._update_registry(symbol, batch_id, identity, state='CONFIRMED',
+                                          order_id=new_tp_order['id'], id_known=True)
                     latest_all = self.load_all_states()
                     latest_b_data = latest_all.get(symbol, {}).get(batch_id, {})
                     if latest_b_data:
@@ -3483,7 +3699,20 @@ class CryptoTrader:
                         self.save_batch_state(symbol, batch_id, latest_b_data)
                         print(f"  └─ ⚡ 预生成止盈单已挂出: {tp_params['params']['stopPrice']} (ID: {new_tp_order['id']})")
             except Exception as e:
-                print(f"  └─ ⚡ 预生成止盈单挂出失败: {e}")
+                cls = self._classify_create_exception(e)
+                if cls == 'unknown':
+                    # 结果未知（NetworkError/超时/限流等）→ PENDING_VERIFY(id_unknown)：不计数不补单
+                    self._update_registry(symbol, batch_id, identity, state='PENDING_VERIFY', id_known=False)
+                    print(f"  └─ ⚡ 预生成止盈单创建结果未知(UNKNOWN)，不计数/不补单: {e}")
+                    self.send_tg_notification(
+                        f"🚨 **预生成止盈单创建结果未知（UNKNOWN）**\n"
+                        f"🆔 批次：`{batch_id}`\n"
+                        f"⚠️ 网络异常，无法确认订单是否已创建（订单 ID 未知）\n"
+                        f"💡 程序【未记录】此订单（不 Commit），不会自动补单\n"
+                        f"🛠️ 请到交易所核实是否存在该订单！",
+                        level='critical')
+                else:
+                    print(f"  └─ ⚡ 预生成止盈单挂出失败: {e}")
         else:
             print(f"  └─ ⚡ 已存在止盈单，等待主循环合并更新")
 

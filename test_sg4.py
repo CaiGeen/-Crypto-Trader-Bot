@@ -41,11 +41,13 @@ SYMBOL = "BTC/USDT:USDT"
 BATCH = "batch_sg4_001"
 RESULTS = []
 
-# A/B/C 级调用点行号（C5 实施后最终实测，Grep create_order 全量核实）
-# ⚠️ 实施后行号偏移说明：helper 插入(+21) + 修改类 3 处 verify 块 + B/C 级 retries=1(+3 行) → 以最终 Grep 为准
-A_LINES = {1071, 1190, 1372, 2475, 2522, 2978, 3055, 3146, 3342, 3405, 3461}  # 11 处保护单
+# A/B/C 级调用点行号（B1 实施后最终实测，Grep create_order 全量核实）
+# ⚠️ 实施后行号偏移说明：C5 时 helper 插入(+21) + 修改类 3 处 verify 块 + B/C 级 retries=1(+3 行)
+#    → B1(2026-08-20)：新增 4 个 helper(+118 行) + 重写 _place_prepared_orders_immediately(+229 行)
+#      预生成 SL/TP 3 处 3342/3405/3461 → 3456/3560/3658；监控段与平仓段整体下移。以最终 Grep 为准。
+A_LINES = {1071, 1190, 1372, 2577, 2624, 3080, 3157, 3248, 3456, 3560, 3658}  # 11 处保护单
 B_LINES = {1811}                                                              # 1 处开仓条件单
-C_LINES = {3677, 3860}                                                        # 2 处平仓单
+C_LINES = {3906, 4089}                                                        # 2 处平仓单
 ALL_LINES = A_LINES | B_LINES | C_LINES                                       # 14 处
 
 
