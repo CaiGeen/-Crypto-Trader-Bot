@@ -2018,6 +2018,27 @@ class CryptoTrader:
         except Exception:
             return 'unknown'
 
+    def _verify_and_update_registry(self, symbol, batch_id, identity, order_id, desc='保护单',
+                                    order_kind='conditional'):
+        """B2-0: create 成功后 verify 统一入口——按操作阶段区分异常语义（ChatGPT 评审①）：
+        verify 阶段 OrderNotFound ≠ create 阶段 ExchangeError（可能是查询延迟/路由参数错误/
+        交易所暂时不可见/订单已状态变化），因此：
+          success    → registry CONFIRMED，返回 'success'（调用方才可 Commit）
+          not_found  → registry NOT_CONFIRMED（不 Commit、不计数、不自动重挂），返回 'not_found'
+          unknown    → registry PENDING_VERIFY（结果未知，不计数不补单），返回 'unknown'
+        调用方只按返回值执行副作用；verify 分支内禁止 raise/计数/自动重挂（C5 事故模式）。"""
+        verify_result = self._verify_order_created(order_id, symbol, order_kind)
+        if verify_result == 'success':
+            self._update_registry(symbol, batch_id, identity, state='CONFIRMED',
+                                  order_id=order_id, id_known=True)
+        elif verify_result == 'not_found':
+            self._update_registry(symbol, batch_id, identity, state='NOT_CONFIRMED',
+                                  order_id=order_id, id_known=True)
+        else:
+            self._update_registry(symbol, batch_id, identity, state='PENDING_VERIFY',
+                                  order_id=order_id, id_known=True)
+        return verify_result
+
     # ==================== B1/P0-2: create 异常精确分类 + 幂等键 + registry ====================
 
     def _classify_create_exception(self, e):
@@ -2039,10 +2060,13 @@ class CryptoTrader:
         return f"{batch_id}|{role}|L{layer}|{side}"
 
     def _update_registry(self, symbol, batch_id, identity, state=None, order_id=None,
-                         id_known=None, order_kind=None, role=None, layer=None, side=None):
+                         id_known=None, order_kind=None, role=None, layer=None, side=None,
+                         intent=None):
         """B1/P0-2: 保护单 registry 落盘（规格 §5.2）—— protection_registry[identity] 状态条目。
         每次更新刷新 updated_at；load → modify → save（读最新状态再写，防覆盖并发修改）。
-        调用方必须持有监控线程/写侧锁（仲裁需持锁，§13 推论④）。"""
+        调用方必须持有监控线程/写侧锁（仲裁需持锁，§13 推论④）。
+        B2-2: intent 不可变（ChatGPT③）——首次写入后不覆盖，防后期参数漂移
+        导致自愈匹配失败/错收编。"""
         latest_all = self.load_all_states()
         b = latest_all.get(symbol, {}).get(batch_id)
         if b is None:
@@ -2063,14 +2087,82 @@ class CryptoTrader:
             entry['layer'] = layer
         if side is not None:
             entry['side'] = side
+        if intent is not None:
+            entry.setdefault('intent', intent)
         entry['updated_at'] = time.time()
         self.save_batch_state(symbol, batch_id, b)
 
+    def _build_intent(self, symbol, side, qty, order_type, stop_price=None, reduce_only=None):
+        """B2-2: 不可变 intent 指纹（ChatGPT③）—— identity 回答"是不是同一个逻辑订单"，
+        intent 回答"这个逻辑订单具体要下什么"（symbol/side/qty/order_type/stop_price/reduce_only）。
+        自愈匹配（_order_matches_intent）与 Create 仲裁（B2-3）均以此为准；
+        qty/stop_price 统一转 float，数值比较容忍交易所精度往返。"""
+        try:
+            qty = float(qty) if qty is not None else None
+        except (TypeError, ValueError):
+            qty = None
+        try:
+            stop_price = float(stop_price) if stop_price is not None else None
+        except (TypeError, ValueError):
+            stop_price = None
+        return {
+            'symbol': symbol,
+            'side': side,
+            'qty': qty,
+            'order_type': order_type,
+            'stop_price': stop_price,
+            'reduce_only': bool(reduce_only) if reduce_only is not None else None,
+        }
+
+    def _order_matches_intent(self, order, intent, symbol):
+        """B2-1: fetch 返回订单字段与 registry intent 完整比对（ChatGPT②）——
+        FOUND ≠ CONFIRMED；FOUND + intent 完整匹配 = CONFIRMED。
+        比对 symbol/side/order_type/reduceOnly/stopPrice/amount；缺失字段跳过（软检查），
+        明确不匹配即返回 False（宁可不收编，不可错收编）。
+        reduceOnly/stopPrice 顶层可能缺失（ccxt 4.5.68 映射特性）→ info 兜底。"""
+        try:
+            if str(order.get('symbol', '')) != str(intent.get('symbol', '')):
+                return False
+            o_side = str(order.get('side', '')).lower()
+            i_side = str(intent.get('side', '')).lower() if intent.get('side') else ''
+            if o_side and i_side and o_side != i_side:
+                return False
+            o_type = str(order.get('type', '')).upper().replace('_', '')
+            i_type = str(intent.get('order_type', '')).upper().replace('_', '')
+            if o_type and i_type and o_type != i_type:
+                return False
+            # reduceOnly：顶层 or info 兜底
+            ro = order.get('reduceOnly')
+            if ro is None and isinstance(order.get('info'), dict):
+                ro = order['info'].get('reduceOnly')
+            if ro is not None and intent.get('reduce_only') is not None:
+                if bool(ro) != bool(intent['reduce_only']):
+                    return False
+            # stopPrice：顶层 or info 兜底
+            sp = order.get('stopPrice')
+            if sp is None and isinstance(order.get('info'), dict):
+                sp = order['info'].get('stopPrice')
+            if sp is not None and intent.get('stop_price') is not None:
+                if abs(float(sp) - float(intent['stop_price'])) > max(
+                        1e-8, abs(float(intent['stop_price'])) * 1e-6):
+                    return False
+            # amount（qty）
+            amt = order.get('amount')
+            if amt is not None and intent.get('qty') is not None:
+                if abs(float(amt) - float(intent['qty'])) > max(
+                        1e-8, abs(float(intent['qty'])) * 1e-6):
+                    return False
+            return True
+        except Exception:
+            return False  # 解析失败 → 保守不匹配
+
     def _recheck_registry_self_heal(self, symbol, batch_id):
-        """B1/P0-2: registry 重查自愈（规格 §6.3）—— PENDING_VERIFY/NOT_CONFIRMED 条目重新 fetch：
-          fetch 成功    → CONFIRMED + 收编（补 Commit current_sl_id/tp_order_id，绝不新建）
-          OrderNotFound → NOT_CONFIRMED（维持，静默）
-          其他异常      → 维持 PENDING_VERIFY（结果未知，静默等下一轮重查）
+        """B1/P0-2 + B2-1: registry 重查自愈（规格 §6.3）—— PENDING_VERIFY/NOT_CONFIRMED 条目重新 fetch：
+          FOUND + intent 完整匹配 → CONFIRMED + 收编（补 Commit current_sl_id/tp_order_id，绝不新建）
+          FOUND 但 intent 不匹配 → MISMATCH + critical + 不收编（错单/旧单/其他批次单，ChatGPT②）
+          FOUND 无 intent       → 保守维持原状态，不收编（旧条目等待人工核实）
+          OrderNotFound         → NOT_CONFIRMED（维持，静默）
+          其他异常              → 维持 PENDING_VERIFY（结果未知，静默等下一轮重查）
         只补 Commit 不 Create —— 防双单复活（§13 场景⑦：成功场景必须收编已存在订单）。"""
         latest_all = self.load_all_states()
         b = latest_all.get(symbol, {}).get(batch_id)
@@ -2087,10 +2179,10 @@ class CryptoTrader:
             order_kind = entry.get('order_kind', 'conditional')
             try:
                 if order_kind == 'conditional':
-                    self._safe_api_call(self.exchange.fetch_order, order_id, symbol,
-                                        params={'stop': True}, retries=1)
+                    order = self._safe_api_call(self.exchange.fetch_order, order_id, symbol,
+                                                params={'stop': True}, retries=1)
                 else:
-                    self._safe_api_call(self.exchange.fetch_order, order_id, symbol, retries=1)
+                    order = self._safe_api_call(self.exchange.fetch_order, order_id, symbol, retries=1)
             except ccxt.OrderNotFound:
                 if entry.get('state') != 'NOT_CONFIRMED':
                     entry['state'] = 'NOT_CONFIRMED'
@@ -2099,7 +2191,25 @@ class CryptoTrader:
                 continue
             except Exception:
                 continue  # 结果未知 → 维持现状静默，等待下一轮重查
-            # fetch 成功 → CONFIRMED + 收编（只补 Commit 不新建）
+            # B2-1: FOUND ≠ CONFIRMED —— FOUND + intent 完整匹配 = CONFIRMED（ChatGPT②）
+            intent = entry.get('intent')
+            if not intent:
+                # 无 intent（旧条目/未落盘）：保守不收编，维持原状态等待人工核实
+                print(f"  └─ ⚠️ [自愈] 条目 {identity} 无 intent 指纹，保守不收编 (order_id={order_id})")
+                continue
+            if not self._order_matches_intent(order, intent, symbol):
+                # FOUND 但字段不匹配 → 错误订单/旧订单/其他批次订单：MISMATCH + critical + 不收编
+                entry['state'] = 'MISMATCH'
+                entry['updated_at'] = time.time()
+                changed = True
+                self.send_tg_notification(
+                    f"🚨 **自愈检测到订单意图不匹配（MISMATCH）**\n"
+                    f"🆔 批次：`{batch_id}` 身份：`{identity}`\n"
+                    f"📌 订单 `{order_id}` 与 registry 意图不符，【不收编】\n"
+                    f"🛠️ 请到交易所人工核实该订单！",
+                    level='critical')
+                continue
+            # FOUND + intent 完整匹配 → CONFIRMED + 收编（只补 Commit 不新建）
             role = entry.get('role')
             if role == 'SL' and b.get('current_sl_id') is None:
                 b['current_sl_id'] = order_id
@@ -3075,7 +3185,23 @@ class CryptoTrader:
                                         f"  └─ 🔥 [熔断保护] 第 {batch_filled_count} 层止损单已连续失败 {MAX_SL_FAILS_PER_LAYER} 次，跳过重试")
 
                             if not layer_failed:
+                                sl_identity = self._protection_identity(
+                                    batch_id, 'SL', batch_filled_count - 1,
+                                    params_base.get('positionSide', 'LONG' if side == 'BUY' else 'SHORT'))
                                 try:
+                                    # B2-2: 意图先落盘（崩溃安全）+ intent 指纹
+                                    self._update_registry(symbol, batch_id, sl_identity,
+                                                          state='PENDING_CREATE', id_known=False,
+                                                          order_kind='conditional', role='SL',
+                                                          layer=batch_filled_count - 1,
+                                                          side=params_base.get('positionSide',
+                                                                               'LONG' if side == 'BUY' else 'SHORT'),
+                                                          intent=self._build_intent(
+                                                              symbol=symbol, side=sl_side,
+                                                              qty=batch_filled_amount,
+                                                              order_type='STOP_MARKET',
+                                                              stop_price=sl_params.get('stopPrice'),
+                                                              reduce_only=sl_params.get('reduceOnly')))
                                     new_sl_order = self._safe_api_call(
                                         self.exchange.create_order,
                                         symbol=symbol,
@@ -3085,18 +3211,17 @@ class CryptoTrader:
                                         params=sl_params,
                                         retries=1
                                     )
-                                    # C5/SG4 Verify：unknown→不 Commit 不补单 critical；not_found→既有失败路径（可安全重试）
-                                    verify_result = self._verify_order_created(new_sl_order['id'], symbol, 'conditional')
-                                    if verify_result == 'unknown':
+                                    # B2-0 Verify 统一入口：success→CONFIRMED；not_found→NOT_CONFIRMED
+                                    #（不 raise/不计数/不自动重挂）；unknown→PENDING_VERIFY（不计数不补单）
+                                    verify_result = self._verify_and_update_registry(
+                                        symbol, batch_id, sl_identity, new_sl_order['id'], desc='补挂止损单')
+                                    if verify_result != 'success':
                                         current_sl_id = None
                                         sl_success = False
-                                        print(f"  └─ ❌ 止损单创建结果未知(UNKNOWN)，不 Commit/不补单: {new_sl_order['id']}")
+                                        print(f"  └─ ❌ 止损单验证失败({verify_result})，不 Commit/不补单/不重挂: {new_sl_order['id']}")
                                         self.send_tg_notification(
-                                            self._verify_failure_msg("止损单", new_sl_order['id'], symbol, 'unknown'),
-                                            level='critical')
-                                    elif verify_result == 'not_found':
-                                        raise Exception(
-                                            f"止损单创建验证失败: OrderNotFound (id={new_sl_order['id']})")
+                                            self._verify_failure_msg("止损单", new_sl_order['id'], symbol, verify_result),
+                                            level='critical' if verify_result == 'unknown' else 'warning')
                                     else:
                                         current_sl_id = new_sl_order['id']
                                         sl_success = True
@@ -3128,24 +3253,55 @@ class CryptoTrader:
                                     current_sl_id = None
                                     sl_success = False
 
-                                    # 🔥 记录失败次数
-                                    layer_key = str(batch_filled_count - 1)
-                                    sl_fail_count[layer_key] = sl_fail_count.get(layer_key, 0) + 1
-                                    print(
-                                        f"  └─ ⚠️ 第 {batch_filled_count} 层止损单失败次数: {sl_fail_count[layer_key]}/{MAX_SL_FAILS_PER_LAYER}")
-
-                                    # 如果达到熔断阈值，发送告警
-                                    if sl_fail_count[layer_key] >= MAX_SL_FAILS_PER_LAYER:
+                                    # B2-0: create 异常按操作阶段分流（ChatGPT①）——
+                                    # unknown（NetworkError 等）→ PENDING_VERIFY(id_unknown) 不计数不熔断
+                                    # 不降级恢复（可能已创建→再补=双单）；failed → 原计数+熔断+降级恢复
+                                    create_unknown = (self._classify_create_exception(e) == 'unknown')
+                                    if create_unknown:
+                                        sl_identity = self._protection_identity(
+                                            batch_id, 'SL', batch_filled_count - 1,
+                                            params_base.get('positionSide', 'LONG' if side == 'BUY' else 'SHORT'))
+                                        self._update_registry(symbol, batch_id, sl_identity,
+                                                              state='PENDING_VERIFY', id_known=False,
+                                                              order_kind='conditional')
                                         self.send_tg_notification(
-                                            f"🚨 **止损单熔断触发！**\n"
+                                            f"🚨 **止损单创建结果未知（UNKNOWN）**\n"
                                             f"🆔 批次：`{batch_id}`\n"
                                             f"📊 第 {batch_filled_count} 层\n"
-                                            f"⚠️ 止损单连续失败 {MAX_SL_FAILS_PER_LAYER} 次，已停止自动重试\n"
-                                            f"💡 请立即手动检查持仓并设置止损！",
+                                            f"⚠️ 网络异常，无法确认止损单是否已创建\n"
+                                            f"💡 程序【不计数】【不自动补单】，请到交易所核实！",
                                             level='critical'
                                         )
+                                        old_sl_price = None
+                                        old_sl_amount = None
+                                    else:
+                                        # 🔥 记录失败次数（仅确定拒绝 failed → FAILED 允许再次 Create）
+                                        sl_identity = self._protection_identity(
+                                            batch_id, 'SL', batch_filled_count - 1,
+                                            params_base.get('positionSide', 'LONG' if side == 'BUY' else 'SHORT'))
+                                        self._update_registry(symbol, batch_id, sl_identity,
+                                                              state='FAILED', id_known=False,
+                                                              order_kind='conditional')
+                                        layer_key = str(batch_filled_count - 1)
+                                        sl_fail_count[layer_key] = sl_fail_count.get(layer_key, 0) + 1
+                                        print(
+                                            f"  └─ ⚠️ 第 {batch_filled_count} 层止损单失败次数: {sl_fail_count[layer_key]}/{MAX_SL_FAILS_PER_LAYER}")
+
+                                        # 如果达到熔断阈值，发送告警
+                                        if sl_fail_count[layer_key] >= MAX_SL_FAILS_PER_LAYER:
+                                            self.send_tg_notification(
+                                                f"🚨 **止损单熔断触发！**\n"
+                                                f"🆔 批次：`{batch_id}`\n"
+                                                f"📊 第 {batch_filled_count} 层\n"
+                                                f"⚠️ 止损单连续失败 {MAX_SL_FAILS_PER_LAYER} 次，已停止自动重试\n"
+                                                f"💡 请立即手动检查持仓并设置止损！",
+                                                level='critical'
+                                            )
 
                                     if old_sl_price and old_sl_amount and old_sl_amount > 0:
+                                        recovery_identity = self._protection_identity(
+                                            batch_id, 'SL', batch_filled_count - 1,
+                                            params_base.get('positionSide', 'LONG' if side == 'BUY' else 'SHORT'))
                                         try:
                                             print(f"  └─ 🔄 降级保护：尝试用旧止损价 {old_sl_price} 恢复...")
                                             recovery_params = params_base.copy()
@@ -3153,6 +3309,19 @@ class CryptoTrader:
                                             if not is_hedge_mode:
                                                 recovery_params['reduceOnly'] = True
 
+                                            # B2-2: 意图先落盘（崩溃安全）+ intent 指纹
+                                            self._update_registry(symbol, batch_id, recovery_identity,
+                                                                  state='PENDING_CREATE', id_known=False,
+                                                                  order_kind='conditional', role='SL',
+                                                                  layer=batch_filled_count - 1,
+                                                                  side=params_base.get('positionSide',
+                                                                                       'LONG' if side == 'BUY' else 'SHORT'),
+                                                                  intent=self._build_intent(
+                                                                      symbol=symbol, side=sl_side,
+                                                                      qty=old_sl_amount,
+                                                                      order_type='STOP_MARKET',
+                                                                      stop_price=recovery_params.get('stopPrice'),
+                                                                      reduce_only=recovery_params.get('reduceOnly')))
                                             recovery_order = self._safe_api_call(
                                                 self.exchange.create_order,
                                                 symbol=symbol,
@@ -3162,18 +3331,17 @@ class CryptoTrader:
                                                 params=recovery_params,
                                                 retries=1
                                             )
-                                            # C5/SG4 Verify：unknown→不 Commit 不补单 critical；not_found→既有失败路径
-                                            verify_result = self._verify_order_created(recovery_order['id'], symbol, 'conditional')
-                                            if verify_result == 'unknown':
-                                                print(f"  └─ ❌ 降级恢复单创建结果未知(UNKNOWN)，不 Commit/不补单: {recovery_order['id']}")
+                                            # B2-0 Verify 统一入口：not_found→NOT_CONFIRMED 不 raise；unknown→PENDING_VERIFY
+                                            verify_result = self._verify_and_update_registry(
+                                                symbol, batch_id, recovery_identity, recovery_order['id'],
+                                                desc='降级恢复止损单')
+                                            if verify_result != 'success':
+                                                print(f"  └─ ❌ 降级恢复单验证失败({verify_result})，不 Commit/不补单: {recovery_order['id']}")
                                                 self.send_tg_notification(
                                                     self._verify_failure_msg("降级恢复止损单", recovery_order['id'],
-                                                                              symbol, 'unknown'),
-                                                    level='critical')
+                                                                              symbol, verify_result),
+                                                    level='critical' if verify_result == 'unknown' else 'warning')
                                                 sl_success = False
-                                            elif verify_result == 'not_found':
-                                                raise Exception(
-                                                    f"降级恢复单创建验证失败: OrderNotFound (id={recovery_order['id']})")
                                             else:
                                                 current_sl_id = recovery_order['id']
                                                 sl_success = True
@@ -3210,12 +3378,13 @@ class CryptoTrader:
                                                 sl_error_count = 0
                                     else:
                                         print(f"  └─ ⚠️ 无旧止损信息，无法降级恢复")
-                                        sl_error_count += 1
-                                        if sl_error_count >= MAX_SL_ERRORS:
-                                            print(
-                                                f"🚨 [熔断触发] 批次 {batch_id} 止损更新连续失败 {sl_error_count} 次，暂停 60 秒")
-                                            time.sleep(SL_COOLDOWN_SECONDS)
-                                            sl_error_count = 0
+                                        if not create_unknown:
+                                            sl_error_count += 1
+                                            if sl_error_count >= MAX_SL_ERRORS:
+                                                print(
+                                                    f"🚨 [熔断触发] 批次 {batch_id} 止损更新连续失败 {sl_error_count} 次，暂停 60 秒")
+                                                time.sleep(SL_COOLDOWN_SECONDS)
+                                                sl_error_count = 0
                             else:
                                 # 该层已被熔断，从待挂列表中移除
                                 if pending_sl_orders and batch_filled_count - 1 in pending_sl_orders:
@@ -3243,7 +3412,24 @@ class CryptoTrader:
                         if not is_hedge_mode:
                             tp_params['reduceOnly'] = True
 
+                        # B2-2: 意图先落盘（崩溃安全）+ intent 指纹
+                        tp_identity = self._protection_identity(
+                            batch_id, 'TP', batch_filled_count - 1,
+                            params_base.get('positionSide', 'LONG' if side == 'BUY' else 'SHORT'))
                         try:
+                            # B2-2: 崩溃安全——create 前先落盘 PENDING_CREATE + 不可变 intent 指纹
+                            self._update_registry(symbol, batch_id, tp_identity,
+                                                  state='PENDING_CREATE', id_known=False,
+                                                  order_kind='conditional', role='TP',
+                                                  layer=batch_filled_count - 1,
+                                                  side=params_base.get('positionSide',
+                                                                       'LONG' if side == 'BUY' else 'SHORT'),
+                                                  intent=self._build_intent(
+                                                      symbol=symbol, side=tp_side,
+                                                      qty=batch_filled_amount,
+                                                      order_type='TAKE_PROFIT_MARKET',
+                                                      stop_price=tp_params.get('stopPrice'),
+                                                      reduce_only=tp_params.get('reduceOnly')))
                             new_tp_order = self._safe_api_call(
                                 self.exchange.create_order,
                                 symbol=symbol,
@@ -3253,10 +3439,11 @@ class CryptoTrader:
                                 params=tp_params,
                                 retries=1
                             )
-                            # C5/SG4 Verify：unknown→不 Commit 不补单 critical；not_found→warning 不 Commit
-                            verify_result = self._verify_order_created(new_tp_order['id'], symbol, 'conditional')
+                            # B2-0 Verify 统一入口：not_found→NOT_CONFIRMED；unknown→PENDING_VERIFY
+                            verify_result = self._verify_and_update_registry(
+                                symbol, batch_id, tp_identity, new_tp_order['id'], desc='补挂止盈单')
                             if verify_result != 'success':
-                                print(f"  └─ ❌ 止盈单验证失败({verify_result})，不 Commit: {new_tp_order['id']}")
+                                print(f"  └─ ❌ 止盈单验证失败({verify_result})，不 Commit/不补单: {new_tp_order['id']}")
                                 self.send_tg_notification(
                                     self._verify_failure_msg("止盈单", new_tp_order['id'], symbol, verify_result),
                                     level='critical' if verify_result == 'unknown' else 'warning')
@@ -3267,6 +3454,34 @@ class CryptoTrader:
                         except Exception as e:
                             print(f"  └─ ❌ 挂出止盈单失败: {e}")
                             tp_order_id = None
+                            # B2-0/B2-2: create 异常按操作阶段分流（与补挂 SL 段一致）——
+                            # unknown（NetworkError 等）→ PENDING_VERIFY(id_unknown) 不计数不补单
+                            #（可能已创建=再补=双单风险，等自愈按 intent 确认）；failed → FAILED 允许再次 Create
+                            create_unknown = (self._classify_create_exception(e) == 'unknown')
+                            if create_unknown:
+                                self._update_registry(symbol, batch_id, tp_identity,
+                                                      state='PENDING_VERIFY', id_known=False,
+                                                      order_kind='conditional')
+                                self.send_tg_notification(
+                                    f"🚨 **止盈单创建结果未知（UNKNOWN）**\n"
+                                    f"🆔 批次：`{batch_id}`\n"
+                                    f"📊 第 {batch_filled_count} 层\n"
+                                    f"⚠️ 网络异常，无法确认止盈单是否已创建\n"
+                                    f"💡 程序【不计数】【不自动补单】，请到交易所核实！",
+                                    level='critical'
+                                )
+                            else:
+                                self._update_registry(symbol, batch_id, tp_identity,
+                                                      state='FAILED', id_known=False,
+                                                      order_kind='conditional')
+                                self.send_tg_notification(
+                                    f"⚠️ **止盈单创建失败（FAILED）**\n"
+                                    f"🆔 批次：`{batch_id}`\n"
+                                    f"📊 第 {batch_filled_count} 层\n"
+                                    f"⚠️ 交易所明确拒绝（余额不足/无效参数等），允许后续重试\n"
+                                    f"💡 请关注下一次风控更新是否重新挂单",
+                                    level='warning'
+                                )
 
                     if sl_success or tp_order_id:
                         risk_update_msg = (
@@ -3448,10 +3663,17 @@ class CryptoTrader:
                 identity = self._protection_identity(batch_id, 'SL', idx, position_side)
 
                 try:
-                    # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知
+                    # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知 + intent 指纹（B2-2）
                     self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
                                           id_known=False, order_kind='conditional', role='SL',
-                                          layer=idx, side=position_side)
+                                          layer=idx, side=position_side,
+                                          intent=self._build_intent(
+                                              symbol=sl_params['symbol'],
+                                              side=sl_params['side'],
+                                              qty=sl_params['amount'],
+                                              order_type=sl_params['type'],
+                                              stop_price=sl_params['params'].get('stopPrice'),
+                                              reduce_only=sl_params['params'].get('reduceOnly')))
                     new_sl_order = self._safe_api_call(
                         self.exchange.create_order,
                         symbol=sl_params['symbol'],
@@ -3552,10 +3774,17 @@ class CryptoTrader:
                 position_side = 'LONG' if sl_side == 'sell' else 'SHORT'
                 identity = self._protection_identity(batch_id, 'SL', idx, position_side)
                 try:
-                    # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知
+                    # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知 + intent 指纹（B2-2）
                     self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
                                           id_known=False, order_kind='conditional', role='SL',
-                                          layer=idx, side=position_side)
+                                          layer=idx, side=position_side,
+                                          intent=self._build_intent(
+                                              symbol=symbol,
+                                              side=sl_side,
+                                              qty=batch_filled_amount,
+                                              order_type='STOP_MARKET',
+                                              stop_price=sl_params.get('stopPrice'),
+                                              reduce_only=sl_params.get('reduceOnly')))
                     new_sl_order = self._safe_api_call(
                         self.exchange.create_order,
                         symbol=symbol,
@@ -3645,10 +3874,18 @@ class CryptoTrader:
             position_side = 'LONG' if prepared_tp_params['side'] == 'sell' else 'SHORT'
             identity = self._protection_identity(batch_id, 'TP', idx, position_side)
             try:
-                # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知
+                # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知 + intent 指纹（B2-2）
                 self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
                                       id_known=False, order_kind='conditional', role='TP',
-                                      layer=idx, side=position_side)
+                                      layer=idx, side=position_side,
+                                      intent=self._build_intent(
+                                          symbol=prepared_tp_params['symbol'],
+                                          side=prepared_tp_params['side'],
+                                          qty=batch_filled_amount,
+                                          order_type=prepared_tp_params['type'],
+                                          stop_price=prepared_tp_params['params'].get('stopPrice'),
+                                          reduce_only=(True if not is_hedge_mode
+                                                       else prepared_tp_params['params'].get('reduceOnly'))))
                 tp_params = prepared_tp_params.copy()
                 tp_params['amount'] = batch_filled_amount
                 if not is_hedge_mode:

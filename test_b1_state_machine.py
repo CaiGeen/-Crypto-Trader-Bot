@@ -210,14 +210,22 @@ def scenario_pregen_sl_not_found():
 # =====================================================================
 
 def scenario_recheck_self_heal():
-    # T7: PENDING_VERIFY(id_known) + fetch 成功 → CONFIRMED + 补 Commit
+    # T7: PENDING_VERIFY(id_known) + FOUND + intent 完整匹配 → CONFIRMED + 补 Commit
+    #（B2-1 升级：FOUND ≠ CONFIRMED；FOUND + intent 完整匹配 = CONFIRMED——ChatGPT②）
     states = _state_batch()
+    intent = {'symbol': SYMBOL, 'side': 'sell', 'qty': 0.1, 'order_type': 'STOP_MARKET',
+              'stop_price': 55000.0, 'reduce_only': True}
     states[SYMBOL][BATCH]['protection_registry'] = {
         'b1|SL|L0|LONG': {'state': 'PENDING_VERIFY', 'order_id': 'o_sl', 'id_known': True,
-                          'order_kind': 'conditional', 'role': 'SL', 'layer': 0, 'side': 'LONG'}
+                          'order_kind': 'conditional', 'role': 'SL', 'layer': 0, 'side': 'LONG',
+                          'intent': intent}
     }
     fake = _bind_helpers(_make_base_fake(), states)
-    fake.exchange.fetch_order.return_value = {'id': 'o_sl', 'status': 'NEW'}
+    fake.exchange.fetch_order.return_value = {
+        'id': 'o_sl', 'symbol': SYMBOL, 'side': 'sell', 'type': 'STOP_MARKET',
+        'stopPrice': 55000.0, 'amount': 0.1, 'reduceOnly': True,
+        'info': {'stopPrice': '55000.0', 'reduceOnly': 'true'},
+    }
     try:
         CryptoTrader._recheck_registry_self_heal(fake, SYMBOL, BATCH)
     except AttributeError as e:
