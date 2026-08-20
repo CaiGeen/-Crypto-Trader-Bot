@@ -122,6 +122,10 @@ class CryptoTrader:
         # 🔥 SG3-P1: 保护单无效告警节流（键=(batch_id, order_id, reason)，防告警风暴）
         self._sg3_alerted = set()
 
+        # 🔥 运行时安全补丁：gate 拒绝告警去重（键=(identity, reason_cat)，最多3次TG）
+        self._gate_alert_counts = {}
+        self._gate_alert_lock = threading.Lock()
+
         if verbose:
             print("正在连接交易所并同步服务器时间/加载元数据...")
         self._safe_api_call(self.exchange.load_time_difference)
@@ -526,7 +530,11 @@ class CryptoTrader:
                 time.sleep(300)
 
     def _wait_for_api_cooldown(self):
-        """等待全局 API 熔断结束"""
+        """等待全局 API 熔断结束。
+        运行时安全补丁：终端输出限频——进入时打印 1 次 + 每 60 秒 1 次进度提示，
+        消除多线程同时等待时的终端刷屏放大器。"""
+        _printed_enter = False
+        _last_progress = 0.0
         while True:
             with self.api_cooldown_lock:
                 wait_time = self.api_cooldown_until - time.time()
@@ -534,7 +542,13 @@ class CryptoTrader:
             if wait_time <= 0:
                 break
 
-            print(f"🚫 [API熔断] 等待 {wait_time:.1f} 秒...")
+            if not _printed_enter:
+                _printed_enter = True
+                _last_progress = time.time()
+                print(f"🚫 [API熔断] 进入冷却，预计等待 {wait_time:.0f} 秒...")
+            elif time.time() - _last_progress >= 60:
+                _last_progress = time.time()
+                print(f"🚫 [API熔断] 仍在冷却，剩余 {wait_time:.0f} 秒")
             time.sleep(min(wait_time, 5.0))
 
         # R1: 熔断解除通知（状态转换式，每个周期最多 1 条；多线程下仅 1 个线程能翻转 active）
@@ -602,6 +616,39 @@ class CryptoTrader:
             )
         except Exception as e:
             print(f"⚠️ [R1] 熔断告警发送失败: {e}")
+
+    def _gate_alert_notify(self, identity, gate_reason, msg, level='warning'):
+        """运行时安全补丁：gate 拒绝告警去重——
+        同一 identity + 同一拒绝类别，最多 3 次 TG；第 4 次起静默（print only）。
+        状态变化时由 _assert_create_allowed 返回 True 自动清除计数（_gate_alert_clear）。"""
+        if gate_reason.startswith('HARD_LOCK'):
+            return  # 硬锁已由调用方静默处理
+        # 提取拒绝类别
+        reason_cat = 'cooldown' if 'cooldown' in gate_reason.lower() else 'unknown'
+        for state_key in ('PENDING_CREATE', 'PENDING_VERIFY', 'NOT_CONFIRMED', 'CONFIRMED', 'MISMATCH', 'FAILED'):
+            if state_key in gate_reason:
+                reason_cat = state_key
+                break
+        key = (identity, reason_cat)
+        with self._gate_alert_lock:
+            count = self._gate_alert_counts.get(key, 0)
+            if count >= 3:
+                print(f"  └─ 🤫 [告警去重] `{identity}` ({reason_cat}) 已告警 {count} 次，本次静默")
+                return
+            self._gate_alert_counts[key] = count + 1
+            current = count + 1
+        suffix = f"（第{current}次/共3次）" if current < 3 else "（第3次/共3次，后续将静默）"
+        try:
+            self.send_tg_notification(msg + "\n📢 " + suffix, level=level)
+        except Exception as e:
+            print(f"⚠️ [告警去重] TG 发送失败: {e}")
+
+    def _gate_alert_clear(self, identity):
+        """运行时安全补丁：状态变化时清除该 identity 的告警计数（gate 通过时调用）"""
+        with self._gate_alert_lock:
+            keys_to_remove = [k for k in self._gate_alert_counts if k[0] == identity]
+            for k in keys_to_remove:
+                del self._gate_alert_counts[k]
 
     def _safe_api_call(self, func, *args, retries=5, delay=2, **kwargs):
         for i in range(retries):
@@ -2388,9 +2435,11 @@ class CryptoTrader:
         latest_all = self.load_all_states()
         b = latest_all.get(symbol, {}).get(batch_id)
         if b is None:
+            self._gate_alert_clear(identity)
             return True, ''
         entry = b.get('protection_registry', {}).get(identity)
         if entry is None:
+            self._gate_alert_clear(identity)
             return True, ''
         state = entry.get('state')
         # B2-4: HARD_LOCK 真熔断（§5.4）——置于状态检查最前；
@@ -2404,12 +2453,15 @@ class CryptoTrader:
             return False, (f"HARD_LOCK: identity `{identity}` fail_count≥5 但未置硬锁"
                            f"（异常数据/置锁写盘失败），保守禁止 Create，需人工核实")
         if state == 'FAILED':
+            self._gate_alert_clear(identity)
             return True, ''  # 确定拒绝 → 允许经闸门重试（计数延续不清零，§8）
         if state == 'ABSENT':
+            self._gate_alert_clear(identity)
             return True, ''  # 人工核实确无此单 → 允许重建
         if state in ('PENDING_CREATE', 'PENDING_VERIFY', 'NOT_CONFIRMED', 'CONFIRMED', 'MISMATCH'):
             if state == 'CONFIRMED' and replace_order_id and entry.get('order_id') == replace_order_id:
                 # B2-8 换挂语义：确认的旧单将被撤销替换（先撤后挂/先挂后撤，旧单物理离开）
+                self._gate_alert_clear(identity)
                 return True, ''
             return False, (f"identity `{identity}` 状态 `{state}` "
                            f"未终结/已确认/错单嫌疑，禁止再次 Create")
@@ -3272,7 +3324,8 @@ class CryptoTrader:
                                     replace_order_id=current_sl_id)
                                 if not allowed:
                                     print(f"  └─ 🚫 [仲裁] 跳过部分减仓换挂止损: {gate_reason}")
-                                    self.send_tg_notification(
+                                    self._gate_alert_notify(
+                                        sl_identity, gate_reason,
                                         f"⚠️ 部分减仓后止损换挂被仲裁拦截（旧单保留）\n"
                                         f"🆔 批次：`{batch_id}`\n📌 {gate_reason}",
                                         level='warning')
@@ -3345,7 +3398,8 @@ class CryptoTrader:
                                     replace_order_id=tp_order_id)
                                 if not allowed:
                                     print(f"  └─ 🚫 [仲裁] 跳过部分减仓换挂止盈: {gate_reason}")
-                                    self.send_tg_notification(
+                                    self._gate_alert_notify(
+                                        tp_identity, gate_reason,
                                         f"⚠️ 部分减仓后止盈换挂被仲裁拦截（旧单保留）\n"
                                         f"🆔 批次：`{batch_id}`\n📌 {gate_reason}",
                                         level='warning')
@@ -3831,7 +3885,8 @@ class CryptoTrader:
                                             print(f"  └─ 🔒 [硬锁] 跳过补挂止损单: {gate_reason}")
                                         else:
                                             print(f"  └─ 🚫 [仲裁] 跳过补挂止损单: {gate_reason}")
-                                            self.send_tg_notification(
+                                            self._gate_alert_notify(
+                                                sl_identity, gate_reason,
                                                 f"⚠️ **止损单创建被仲裁拦截**\n"
                                                 f"🆔 批次：`{batch_id}`\n"
                                                 f"📌 {gate_reason}\n"
@@ -3984,7 +4039,8 @@ class CryptoTrader:
                                                     print(f"  └─ 🔒 [硬锁] 跳过降级恢复: {gate_reason}")
                                                 else:
                                                     print(f"  └─ 🚫 [仲裁] 跳过降级恢复: {gate_reason}")
-                                                    self.send_tg_notification(
+                                                    self._gate_alert_notify(
+                                                        recovery_identity, gate_reason,
                                                         f"🚨 **降级恢复被仲裁拦截**\n"
                                                         f"🆔 批次：`{batch_id}`\n"
                                                         f"📌 {gate_reason}\n"
@@ -4109,7 +4165,8 @@ class CryptoTrader:
                                     print(f"  └─ 🔒 [硬锁] 跳过补挂止盈单: {gate_reason}")
                                 else:
                                     print(f"  └─ 🚫 [仲裁] 跳过补挂止盈单: {gate_reason}")
-                                    self.send_tg_notification(
+                                    self._gate_alert_notify(
+                                        tp_identity, gate_reason,
                                         f"⚠️ **止盈单创建被仲裁拦截**\n"
                                         f"🆔 批次：`{batch_id}`\n"
                                         f"📌 {gate_reason}\n"
@@ -4386,7 +4443,8 @@ class CryptoTrader:
                             print(f"  └─ 🔒 [硬锁] 跳过预生成止损单: {gate_reason}")
                         else:
                             print(f"  └─ 🚫 [仲裁] 跳过预生成止损单: {gate_reason}")
-                            self.send_tg_notification(
+                            self._gate_alert_notify(
+                                identity, gate_reason,
                                 f"⚠️ **预生成止损单被仲裁拦截**\n"
                                 f"🆔 批次：`{batch_id}`\n"
                                 f"📊 第 {idx + 1} 层\n"
@@ -4527,7 +4585,8 @@ class CryptoTrader:
                             print(f"  └─ 🔒 [硬锁] 跳过兜底止损单: {gate_reason}")
                         else:
                             print(f"  └─ 🚫 [仲裁] 跳过兜底止损单: {gate_reason}")
-                            self.send_tg_notification(
+                            self._gate_alert_notify(
+                                identity, gate_reason,
                                 f"⚠️ **兜底止损单被仲裁拦截**\n"
                                 f"🆔 批次：`{batch_id}`\n"
                                 f"📊 第 {idx + 1} 层\n"
@@ -4657,7 +4716,8 @@ class CryptoTrader:
                         print(f"  └─ 🔒 [硬锁] 跳过预生成止盈单: {gate_reason}")
                     else:
                         print(f"  └─ 🚫 [仲裁] 跳过预生成止盈单: {gate_reason}")
-                        self.send_tg_notification(
+                        self._gate_alert_notify(
+                            identity, gate_reason,
                             f"⚠️ **预生成止盈单被仲裁拦截**\n"
                             f"🆔 批次：`{batch_id}`\n"
                             f"📊 第 {idx + 1} 层\n"

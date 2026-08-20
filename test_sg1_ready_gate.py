@@ -109,6 +109,11 @@ def scenario_6():
     if hasattr(CryptoTrader, '_assert_create_allowed'):
         fake._assert_create_allowed = (
             lambda s, b, i, **k: CryptoTrader._assert_create_allowed(fake, s, b, i, **k))
+    # 运行时安全补丁：gate 告警去重 helper 桩（_assert_create_allowed True 路径会调用 _gate_alert_clear）
+    fake._gate_alert_counts = {}
+    fake._gate_alert_clear = lambda identity: None
+    fake._gate_alert_notify = lambda *a, **k: None
+    fake._classify_create_exception = lambda e: 'not_found'
     fake._build_intent = lambda **k: {'stub': True}
     fake._update_registry = lambda *a, **k: None
     fake._verify_order_created = lambda oid, sym, kind: 'success'
