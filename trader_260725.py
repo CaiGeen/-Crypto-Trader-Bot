@@ -965,6 +965,10 @@ class CryptoTrader:
                         print(f"  └─ ⚠️ 设置杠杆失败: {e}")
 
                     # 🔥 验证止损单是否存在
+                    # P0-F2 前置修复（ChatGPT 终审前置问题2）：UNKNOWN ≠ None
+                    #   旧代码 except Exception → current_sl_id=None → 监控线程误判"无SL"
+                    #   → 进入补挂链 → 双SL风险。修复：区分 OrderNotFound(确实不存在→清None)
+                    #   vs NetworkError/其他(UNKNOWN→保留ID+critical告警+不修改)
                     if b_data.get('current_sl_id'):
                         try:
                             sl_order = self._safe_api_call(
@@ -980,9 +984,22 @@ class CryptoTrader:
                                 b_data['current_sl_id'] = None
                             else:
                                 print(f"  └─ ✅ 止损单验证通过: {b_data['current_sl_id']}")
-                        except Exception as e:
-                            print(f"  └─ ⚠️ 无法验证止损单: {e}，将重新挂单")
+                        except ccxt.OrderNotFound:
+                            # 订单确实不存在（已撤销/已成交/已过期）→ 安全清除
+                            print(f"  └─ ℹ️ 止损单 {b_data['current_sl_id']} 已不存在(已撤销/成交)，清除 ID")
                             b_data['current_sl_id'] = None
+                        except Exception as e:
+                            # UNKNOWN：网络异常等 → 保留 current_sl_id，不转为 None
+                            # 防止监控线程误判"无SL"→ 补挂链 → 双SL 风险（UNKNOWN ≠ EMPTY）
+                            print(f"  └─ ⚠️ 止损单验证失败(UNKNOWN): {e}，保留 SL ID 不清除")
+                            self.send_tg_notification(
+                                f"🚨【资金安全】止损单验证失败(UNKNOWN)\n"
+                                f"标的: `{symbol}` | 批次: `{batch_id}`\n"
+                                f"SL ID: `{b_data['current_sl_id']}`\n"
+                                f"错误: {e}\n"
+                                f"⚠️ 保留 SL ID 未清除，监控不会自动补挂。请人工核实。",
+                                level='critical')
+                            # 不修改 b_data['current_sl_id'] — 保持 UNKNOWN 语义
 
                     # 🔥 清理可能残留的监控标记，然后启动监控线程
                     with self._active_monitors_lock:
@@ -1689,11 +1706,35 @@ class CryptoTrader:
             if b_data.get('current_sl_id'):
                 known_order_ids.add(str(b_data['current_sl_id']))
 
+        # P0-F1 前置修复（ChatGPT 终审前置问题1）：双通道扫描 + Fail-Closed
+        #   单通道 fetch_open_orders 看不到 algo 条件单（SL/TP），异常时 return False（放行）→ Fail-Open
+        #   修复：normal + stop=True 双通道合并去重，任一通道异常 → return True（阻断开仓）+ critical
         try:
-            open_orders = self._safe_api_call(self.exchange.fetch_open_orders, symbol)
+            normal_orders = self._safe_api_call(self.exchange.fetch_open_orders, symbol)
         except Exception as e:
-            print(f"⚠️ 获取未结订单失败: {e}")
-            return False
+            print(f"⚠️ 获取未结订单(普通通道)失败: {e}")
+            self.send_tg_notification(
+                f"🚨【资金安全】防冲突扫描失败(普通通道)，已阻断开仓\n"
+                f"标的: `{symbol}`\n错误: {e}",
+                level='critical')
+            return True  # Fail-Closed：无法确认安全 → 阻断
+
+        try:
+            stop_orders = self._safe_api_call(
+                self.exchange.fetch_open_orders, symbol, params={'stop': True})
+        except Exception as e:
+            print(f"⚠️ 获取未结订单(条件单通道)失败: {e}")
+            self.send_tg_notification(
+                f"🚨【资金安全】防冲突扫描失败(条件单通道)，已阻断开仓\n"
+                f"标的: `{symbol}`\n错误: {e}",
+                level='critical')
+            return True  # Fail-Closed
+
+        # 合并双通道结果，按订单 ID 去重
+        open_orders = {}
+        for ord in normal_orders + stop_orders:
+            open_orders[str(ord['id'])] = ord
+        open_orders = list(open_orders.values())
 
         unknown_orders = []
         for ord in open_orders:

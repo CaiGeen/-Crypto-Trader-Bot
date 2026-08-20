@@ -38,9 +38,9 @@ BATCH = "batch_b2_close_gap"
 RESULTS = []
 
 # B2-8 收编的 5 处 create 调用点（实施后 Grep 实测 2026-08-20；后续插入代码行号会漂移 → 更新）
-#   #1 用户改TP  L1126  |  #2 用户改SL  L1275  |  #3 保本损  L1489
-#   #5 部分减仓SL L3251  |  #6 部分减仓TP L3324
-GAP_CREATE_LINES = {1126, 1275, 1489, 3251, 3324}
+#   #1 用户改TP  L1143  |  #2 用户改SL  L1292  |  #3 保本损  L1506
+#   #5 部分减仓SL L3292  |  #6 部分减仓TP L3365
+GAP_CREATE_LINES = {1143, 1292, 1506, 3292, 3365}
 
 
 def report(name, passed, detail=""):
