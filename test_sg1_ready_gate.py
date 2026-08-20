@@ -103,6 +103,15 @@ def scenario_6():
             return {'id': f'ord_{len(calls)}'}
 
     fake.exchange = FakeExchange()
+    # B2-3/B2-4 闸门接入后，预挂路径需 B2 helper（纯桩；闸门/registry 语义由 B2 套件覆盖）
+    fake._api_cooldown_until = 0
+    fake._protection_identity = lambda batch_id, role, layer, side: f'{batch_id}|{role}|L{layer}|{side}'
+    if hasattr(CryptoTrader, '_assert_create_allowed'):
+        fake._assert_create_allowed = (
+            lambda s, b, i, **k: CryptoTrader._assert_create_allowed(fake, s, b, i, **k))
+    fake._build_intent = lambda **k: {'stub': True}
+    fake._update_registry = lambda *a, **k: None
+    fake._verify_order_created = lambda oid, sym, kind: 'success'
     layer_sl_params = [{'symbol': SYMBOL, 'type': 'STOP_MARKET', 'side': 'sell',
                         'amount': 0.01, 'params': {'stopPrice': 100.0}}]
     prepared_tp_params = {'symbol': SYMBOL, 'type': 'TAKE_PROFIT_MARKET', 'side': 'sell',

@@ -1795,6 +1795,14 @@ async def run_trader_recovery_on_startup(trader: CryptoTrader):
         for attempt in range(3):
             try:
                 loop = asyncio.get_running_loop()
+                # B2-4: 启动校验硬锁与解锁审计（规格 §5.5 + 重启恢复表 §6.2）——
+                # 必须在恢复前执行（恢复逻辑读 registry，需先保证硬锁状态正确）；
+                # 校验异常不阻断恢复（Fail-Closed 由恢复本身兜底）
+                try:
+                    await loop.run_in_executor(
+                        None, trader._validate_registry_locks_on_startup)
+                except Exception as lock_e:
+                    print(f"⚠️ [启动检测] 硬锁校验异常（不阻断恢复）: {lock_e}")
                 recovery_result = await loop.run_in_executor(None, trader.recover_active_batches)
                 if recovery_result:
                     trader._ready = True        # SG1: 唯一置位来源 = recover 明确返回 True（含 0 批次）

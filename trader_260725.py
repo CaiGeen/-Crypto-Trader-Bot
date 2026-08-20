@@ -2061,16 +2061,18 @@ class CryptoTrader:
 
     def _update_registry(self, symbol, batch_id, identity, state=None, order_id=None,
                          id_known=None, order_kind=None, role=None, layer=None, side=None,
-                         intent=None):
+                         intent=None, fail_count_incr=None, hard_locked=None):
         """B1/P0-2: 保护单 registry 落盘（规格 §5.2）—— protection_registry[identity] 状态条目。
         每次更新刷新 updated_at；load → modify → save（读最新状态再写，防覆盖并发修改）。
         调用方必须持有监控线程/写侧锁（仲裁需持锁，§13 推论④）。
         B2-2: intent 不可变（ChatGPT③）——首次写入后不覆盖，防后期参数漂移
-        导致自愈匹配失败/错收编。"""
+        导致自愈匹配失败/错收编。
+        B2-4: fail_count_incr 递增条目级 fail_count 并返回新值（HARD_LOCK 判定源，§5.4）；
+        hard_locked 落盘硬锁标记。"""
         latest_all = self.load_all_states()
         b = latest_all.get(symbol, {}).get(batch_id)
         if b is None:
-            return
+            return None
         reg = b.setdefault('protection_registry', {})
         entry = reg.setdefault(identity, {})
         if state is not None:
@@ -2089,8 +2091,15 @@ class CryptoTrader:
             entry['side'] = side
         if intent is not None:
             entry.setdefault('intent', intent)
+        new_fail_count = None
+        if fail_count_incr is not None:
+            new_fail_count = entry.get('fail_count', 0) + fail_count_incr
+            entry['fail_count'] = new_fail_count
+        if hard_locked is not None:
+            entry['hard_locked'] = hard_locked
         entry['updated_at'] = time.time()
         self.save_batch_state(symbol, batch_id, b)
+        return new_fail_count
 
     def _assert_create_allowed(self, symbol, batch_id, identity, desc='保护单'):
         """B2-3: Create 仲裁闸门（规格 §5.3 + §10.1 最小联动）——
@@ -2117,6 +2126,16 @@ class CryptoTrader:
         if entry is None:
             return True, ''
         state = entry.get('state')
+        # B2-4: HARD_LOCK 真熔断（§5.4）——置于状态检查最前；
+        # reason 以 'HARD_LOCK' 开头供调用点识别静默（进入时已 critical，此后静默）。
+        if state == 'HARD_LOCK' or entry.get('hard_locked'):
+            return False, (f"HARD_LOCK: identity `{identity}` 已硬锁"
+                           f"（fail_count={entry.get('fail_count', 0)}），等待人工解锁")
+        # 防御（不变量①⑧）：fail_count≥5 却未置锁 = 置锁写盘失败/旧数据 → 保守拒绝，
+        # 宁可不做不可错做；启动校验（_validate_registry_locks_on_startup）会补置锁。
+        if (entry.get('fail_count') or 0) >= 5:
+            return False, (f"HARD_LOCK: identity `{identity}` fail_count≥5 但未置硬锁"
+                           f"（异常数据/置锁写盘失败），保守禁止 Create，需人工核实")
         if state == 'FAILED':
             return True, ''  # 确定拒绝 → 允许经闸门重试（计数延续不清零，§8）
         if state == 'ABSENT':
@@ -2126,6 +2145,77 @@ class CryptoTrader:
                            f"未终结/已确认/错单嫌疑，禁止再次 Create")
         # 未知状态（防御）→ 保守禁止：宁可不做，不可错做（不变量①⑧）
         return False, f"identity `{identity}` 状态 `{state}` 未知，保守禁止 Create（需人工核实）"
+
+    def _validate_registry_locks_on_startup(self):
+        """B2-4: 启动校验全部 protection_registry 的硬锁与解锁审计（规格 §5.5 + 重启恢复表 §6.2）。
+        规则：
+          1. state=HARD_LOCK 且 hard_locked=false：无审计三字段 → 非法解锁，回滚 hard_locked=true + critical；
+             有审计三字段（unlock_reason/unlock_time/unlock_operator）→ 合法解锁（用户已核实），不干预
+          2. state=FAILED 且 fail_count>=5 未置锁（旧数据/崩溃窗口）→ 补置 hard_locked + critical
+          3. state=HARD_LOCK 且 hard_locked=true → 维持锁定（静默，等待人工）
+        返回 (rolled_back: int, alerted: int)。调用点：bot 启动恢复路径（run_trader_recovery_on_startup），
+        必须在 recover_active_batches 之前执行——恢复逻辑读 registry，需先保证硬锁状态正确。"""
+        all_states = self.load_all_states()
+        rolled_back = 0
+        alerted = 0
+        for symbol, sym_states in all_states.items():
+            if not isinstance(sym_states, dict):
+                continue
+            for batch_id, b in sym_states.items():
+                if not isinstance(b, dict):
+                    continue
+                reg = b.get('protection_registry') or {}
+                if not reg:
+                    continue
+                dirty = False
+                for identity, entry in reg.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    state = entry.get('state')
+                    hard_locked = entry.get('hard_locked')
+                    if state == 'HARD_LOCK' and not hard_locked:
+                        audit_ok = all(entry.get(k) for k in
+                                       ('unlock_reason', 'unlock_time', 'unlock_operator'))
+                        if not audit_ok:
+                            # 非法解锁（§5.5）：防"不知道为什么直接改 false"回到不可审计状态
+                            entry['hard_locked'] = True
+                            entry['updated_at'] = time.time()
+                            dirty = True
+                            rolled_back += 1
+                            self.send_tg_notification(
+                                f"🚨 **检测到非法解锁，已回滚为硬锁**\n"
+                                f"🆔 批次：`{batch_id}`\n"
+                                f"📌 identity：`{identity}`\n"
+                                f"⚠️ hard_locked=false 但缺少审计三字段"
+                                f"（unlock_reason / unlock_time / unlock_operator）\n"
+                                f"🔒 已回滚 hard_locked=true。如需解锁：\n"
+                                f"1. 到交易所核实该 identity 订单实际状态\n"
+                                f"2. 手改 trade_state.json 对应条目：state → ABSENT 或 CONFIRMED，"
+                                f"并同时写入 unlock_reason/unlock_time/unlock_operator",
+                                level='critical')
+                            alerted += 1
+                        # 有审计三字段 → 合法解锁，不干预（state 应已离开 HARD_LOCK）
+                    elif state == 'FAILED' and (entry.get('fail_count') or 0) >= 5 and not hard_locked:
+                        # 旧数据/崩溃窗口：fail_count≥5 未置锁 → 补置硬锁（重启恢复表 §6.2）
+                        entry['hard_locked'] = True
+                        entry['state'] = 'HARD_LOCK'
+                        entry['updated_at'] = time.time()
+                        dirty = True
+                        rolled_back += 1
+                        self.send_tg_notification(
+                            f"🚨 **检测到未置锁的 FAILED 记录，已补置硬锁**\n"
+                            f"🆔 批次：`{batch_id}`\n"
+                            f"📌 identity：`{identity}`\n"
+                            f"⚠️ fail_count={entry.get('fail_count')} ≥ 5 但未硬锁"
+                            f"（旧数据/置锁写盘崩溃窗口）\n"
+                            f"🔒 已补置 HARD_LOCK。请人工核实后按 §5.5 规范解锁",
+                            level='critical')
+                        alerted += 1
+                    # state=HARD_LOCK 且 hard_locked=true → 维持锁定（静默，等待人工）
+                    # 其他状态 → 不干预
+                if dirty:
+                    self.save_batch_state(symbol, batch_id, b)
+        return rolled_back, alerted
 
     def _build_intent(self, symbol, side, qty, order_type, stop_price=None, reduce_only=None):
         """B2-2: 不可变 intent 指纹（ChatGPT③）—— identity 回答"是不是同一个逻辑订单"，
@@ -3229,13 +3319,17 @@ class CryptoTrader:
                                     allowed, gate_reason = self._assert_create_allowed(
                                         symbol, batch_id, sl_identity, desc='补挂止损单')
                                     if not allowed:
-                                        print(f"  └─ 🚫 [仲裁] 跳过补挂止损单: {gate_reason}")
-                                        self.send_tg_notification(
-                                            f"⚠️ **止损单创建被仲裁拦截**\n"
-                                            f"🆔 批次：`{batch_id}`\n"
-                                            f"📌 {gate_reason}\n"
-                                            f"💡 程序不重复挂单，等待自愈重查确认",
-                                            level='warning')
+                                        if gate_reason.startswith('HARD_LOCK'):
+                                            # B2-4: 硬锁静默（进入时已 critical，此后不重复告警）
+                                            print(f"  └─ 🔒 [硬锁] 跳过补挂止损单: {gate_reason}")
+                                        else:
+                                            print(f"  └─ 🚫 [仲裁] 跳过补挂止损单: {gate_reason}")
+                                            self.send_tg_notification(
+                                                f"⚠️ **止损单创建被仲裁拦截**\n"
+                                                f"🆔 批次：`{batch_id}`\n"
+                                                f"📌 {gate_reason}\n"
+                                                f"💡 程序不重复挂单，等待自愈重查确认",
+                                                level='warning')
                                         current_sl_id = None
                                         sl_success = False
                                     else:
@@ -3329,9 +3423,10 @@ class CryptoTrader:
                                         sl_identity = self._protection_identity(
                                             batch_id, 'SL', batch_filled_count - 1,
                                             params_base.get('positionSide', 'LONG' if side == 'BUY' else 'SHORT'))
-                                        self._update_registry(symbol, batch_id, sl_identity,
-                                                              state='FAILED', id_known=False,
-                                                              order_kind='conditional')
+                                        new_fc = self._update_registry(symbol, batch_id, sl_identity,
+                                                                       state='FAILED', id_known=False,
+                                                                       order_kind='conditional',
+                                                                       fail_count_incr=1)
                                         layer_key = str(batch_filled_count - 1)
                                         sl_fail_count[layer_key] = sl_fail_count.get(layer_key, 0) + 1
                                         print(
@@ -3345,6 +3440,20 @@ class CryptoTrader:
                                                 f"📊 第 {batch_filled_count} 层\n"
                                                 f"⚠️ 止损单连续失败 {MAX_SL_FAILS_PER_LAYER} 次，已停止自动重试\n"
                                                 f"💡 请立即手动检查持仓并设置止损！",
+                                                level='critical'
+                                            )
+                                        # B2-4: registry fail_count≥5 → HARD_LOCK（§5.4）——
+                                        # 落盘硬锁标记 + 进入时 1 次 critical，此后闸门拦截静默
+                                        if new_fc is not None and new_fc >= 5:
+                                            self._update_registry(symbol, batch_id, sl_identity,
+                                                                  hard_locked=True)
+                                            self.send_tg_notification(
+                                                f"🚨 **HARD_LOCK 硬锁触发**\n"
+                                                f"🆔 批次：`{batch_id}`\n"
+                                                f"📊 第 {batch_filled_count} 层（identity：`{sl_identity}`）\n"
+                                                f"⚠️ 该 identity 连续确定失败 {new_fc} 次（≥5），已硬锁\n"
+                                                f"💡 程序不再自动重挂。请人工核实持仓后按 §5.5 规范解锁"
+                                                f"（写 unlock_reason/unlock_time/unlock_operator）",
                                                 level='critical'
                                             )
 
@@ -3363,13 +3472,17 @@ class CryptoTrader:
                                             allowed, gate_reason = self._assert_create_allowed(
                                                 symbol, batch_id, recovery_identity, desc='降级恢复止损单')
                                             if not allowed:
-                                                print(f"  └─ 🚫 [仲裁] 跳过降级恢复: {gate_reason}")
-                                                self.send_tg_notification(
-                                                    f"🚨 **降级恢复被仲裁拦截**\n"
-                                                    f"🆔 批次：`{batch_id}`\n"
-                                                    f"📌 {gate_reason}\n"
-                                                    f"💡 程序不重复挂单，等待自愈重查确认；请关注持仓保护状态！",
-                                                    level='critical')
+                                                if gate_reason.startswith('HARD_LOCK'):
+                                                    # B2-4: 硬锁静默（进入时已 critical，此后不重复告警）
+                                                    print(f"  └─ 🔒 [硬锁] 跳过降级恢复: {gate_reason}")
+                                                else:
+                                                    print(f"  └─ 🚫 [仲裁] 跳过降级恢复: {gate_reason}")
+                                                    self.send_tg_notification(
+                                                        f"🚨 **降级恢复被仲裁拦截**\n"
+                                                        f"🆔 批次：`{batch_id}`\n"
+                                                        f"📌 {gate_reason}\n"
+                                                        f"💡 程序不重复挂单，等待自愈重查确认；请关注持仓保护状态！",
+                                                        level='critical')
                                                 sl_success = False
                                             else:
                                                 # B2-2: 意图先落盘（崩溃安全）+ intent 指纹
@@ -3484,13 +3597,17 @@ class CryptoTrader:
                             allowed, gate_reason = self._assert_create_allowed(
                                 symbol, batch_id, tp_identity, desc='补挂止盈单')
                             if not allowed:
-                                print(f"  └─ 🚫 [仲裁] 跳过补挂止盈单: {gate_reason}")
-                                self.send_tg_notification(
-                                    f"⚠️ **止盈单创建被仲裁拦截**\n"
-                                    f"🆔 批次：`{batch_id}`\n"
-                                    f"📌 {gate_reason}\n"
-                                    f"💡 程序不重复挂单，等待自愈重查确认",
-                                    level='warning')
+                                if gate_reason.startswith('HARD_LOCK'):
+                                    # B2-4: 硬锁静默（进入时已 critical，此后不重复告警）
+                                    print(f"  └─ 🔒 [硬锁] 跳过补挂止盈单: {gate_reason}")
+                                else:
+                                    print(f"  └─ 🚫 [仲裁] 跳过补挂止盈单: {gate_reason}")
+                                    self.send_tg_notification(
+                                        f"⚠️ **止盈单创建被仲裁拦截**\n"
+                                        f"🆔 批次：`{batch_id}`\n"
+                                        f"📌 {gate_reason}\n"
+                                        f"💡 程序不重复挂单，等待自愈重查确认",
+                                        level='warning')
                                 tp_order_id = None
                             else:
                                 # B2-2: 崩溃安全——create 前先落盘 PENDING_CREATE + 不可变 intent 指纹
@@ -3547,9 +3664,10 @@ class CryptoTrader:
                                     level='critical'
                                 )
                             else:
-                                self._update_registry(symbol, batch_id, tp_identity,
-                                                      state='FAILED', id_known=False,
-                                                      order_kind='conditional')
+                                new_fc = self._update_registry(symbol, batch_id, tp_identity,
+                                                               state='FAILED', id_known=False,
+                                                               order_kind='conditional',
+                                                               fail_count_incr=1)
                                 self.send_tg_notification(
                                     f"⚠️ **止盈单创建失败（FAILED）**\n"
                                     f"🆔 批次：`{batch_id}`\n"
@@ -3558,6 +3676,19 @@ class CryptoTrader:
                                     f"💡 请关注下一次风控更新是否重新挂单",
                                     level='warning'
                                 )
+                                # B2-4: registry fail_count≥5 → HARD_LOCK（§5.4）
+                                if new_fc is not None and new_fc >= 5:
+                                    self._update_registry(symbol, batch_id, tp_identity,
+                                                          hard_locked=True)
+                                    self.send_tg_notification(
+                                        f"🚨 **HARD_LOCK 硬锁触发**\n"
+                                        f"🆔 批次：`{batch_id}`\n"
+                                        f"📊 第 {batch_filled_count} 层（identity：`{tp_identity}`）\n"
+                                        f"⚠️ 该 identity 连续确定失败 {new_fc} 次（≥5），已硬锁\n"
+                                        f"💡 程序不再自动重挂。请人工核实持仓后按 §5.5 规范解锁"
+                                        f"（写 unlock_reason/unlock_time/unlock_operator）",
+                                        level='critical'
+                                    )
 
                     if sl_success or tp_order_id:
                         risk_update_msg = (
@@ -3743,14 +3874,18 @@ class CryptoTrader:
                     allowed, gate_reason = self._assert_create_allowed(
                         symbol, batch_id, identity, desc='预生成止损单')
                     if not allowed:
-                        print(f"  └─ 🚫 [仲裁] 跳过预生成止损单: {gate_reason}")
-                        self.send_tg_notification(
-                            f"⚠️ **预生成止损单被仲裁拦截**\n"
-                            f"🆔 批次：`{batch_id}`\n"
-                            f"📊 第 {idx + 1} 层\n"
-                            f"📌 {gate_reason}\n"
-                            f"💡 程序不重复挂单，等待自愈重查确认",
-                            level='warning')
+                        if gate_reason.startswith('HARD_LOCK'):
+                            # B2-4: 硬锁静默（进入时已 critical，此后不重复告警）
+                            print(f"  └─ 🔒 [硬锁] 跳过预生成止损单: {gate_reason}")
+                        else:
+                            print(f"  └─ 🚫 [仲裁] 跳过预生成止损单: {gate_reason}")
+                            self.send_tg_notification(
+                                f"⚠️ **预生成止损单被仲裁拦截**\n"
+                                f"🆔 批次：`{batch_id}`\n"
+                                f"📊 第 {idx + 1} 层\n"
+                                f"📌 {gate_reason}\n"
+                                f"💡 程序不重复挂单，等待自愈重查确认",
+                                level='warning')
                     else:
                         # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知 + intent 指纹（B2-2）
                         self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
@@ -3828,8 +3963,9 @@ class CryptoTrader:
                             level='critical')
                     else:
                         # 确定拒绝（ExchangeError）→ FAILED：既有失败路径（计数 + 告警 + 允许重试）
+                        new_fc = self._update_registry(symbol, batch_id, identity, state='FAILED',
+                                                       fail_count_incr=1)
                         if latest_b_data:
-                            self._update_registry(symbol, batch_id, identity, state='FAILED')
                             sl_fail_count = latest_b_data.get('sl_fail_count', {})
                             layer_key = str(idx)
                             sl_fail_count[layer_key] = sl_fail_count.get(layer_key, 0) + 1
@@ -3843,6 +3979,18 @@ class CryptoTrader:
                             f"⚠️ 程序将重试，请关注后续通知！",
                             level='critical'
                         )
+                        # B2-4: registry fail_count≥5 → HARD_LOCK（§5.4）
+                        if new_fc is not None and new_fc >= 5:
+                            self._update_registry(symbol, batch_id, identity, hard_locked=True)
+                            self.send_tg_notification(
+                                f"🚨 **HARD_LOCK 硬锁触发**\n"
+                                f"🆔 批次：`{batch_id}`\n"
+                                f"📊 第 {idx + 1} 层（identity：`{identity}`）\n"
+                                f"⚠️ 该 identity 连续确定失败 {new_fc} 次（≥5），已硬锁\n"
+                                f"💡 程序不再自动重挂。请人工核实持仓后按 §5.5 规范解锁"
+                                f"（写 unlock_reason/unlock_time/unlock_operator）",
+                                level='critical'
+                            )
             else:
                 raw_sl_price = stop_steps[idx] if idx < len(stop_steps) else stop_steps[-1]
                 formatted_sl_price = float(self.exchange.price_to_precision(symbol, raw_sl_price))
@@ -3867,14 +4015,18 @@ class CryptoTrader:
                     allowed, gate_reason = self._assert_create_allowed(
                         symbol, batch_id, identity, desc='兜底止损单')
                     if not allowed:
-                        print(f"  └─ 🚫 [仲裁] 跳过兜底止损单: {gate_reason}")
-                        self.send_tg_notification(
-                            f"⚠️ **兜底止损单被仲裁拦截**\n"
-                            f"🆔 批次：`{batch_id}`\n"
-                            f"📊 第 {idx + 1} 层\n"
-                            f"📌 {gate_reason}\n"
-                            f"💡 程序不重复挂单，等待自愈重查确认",
-                            level='warning')
+                        if gate_reason.startswith('HARD_LOCK'):
+                            # B2-4: 硬锁静默（进入时已 critical，此后不重复告警）
+                            print(f"  └─ 🔒 [硬锁] 跳过兜底止损单: {gate_reason}")
+                        else:
+                            print(f"  └─ 🚫 [仲裁] 跳过兜底止损单: {gate_reason}")
+                            self.send_tg_notification(
+                                f"⚠️ **兜底止损单被仲裁拦截**\n"
+                                f"🆔 批次：`{batch_id}`\n"
+                                f"📊 第 {idx + 1} 层\n"
+                                f"📌 {gate_reason}\n"
+                                f"💡 程序不重复挂单，等待自愈重查确认",
+                                level='warning')
                     else:
                         # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知 + intent 指纹（B2-2）
                         self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
@@ -3953,8 +4105,9 @@ class CryptoTrader:
                             level='critical')
                     else:
                         # 确定拒绝（ExchangeError）→ FAILED：既有失败路径（计数 + 告警 + 允许重试）
+                        new_fc = self._update_registry(symbol, batch_id, identity, state='FAILED',
+                                                       fail_count_incr=1)
                         if latest_b_data:
-                            self._update_registry(symbol, batch_id, identity, state='FAILED')
                             sl_fail_count = latest_b_data.get('sl_fail_count', {})
                             layer_key = str(idx)
                             sl_fail_count[layer_key] = sl_fail_count.get(layer_key, 0) + 1
@@ -3968,6 +4121,18 @@ class CryptoTrader:
                             f"⚠️ 程序将重试，请关注后续通知！",
                             level='critical'
                         )
+                        # B2-4: registry fail_count≥5 → HARD_LOCK（§5.4）
+                        if new_fc is not None and new_fc >= 5:
+                            self._update_registry(symbol, batch_id, identity, hard_locked=True)
+                            self.send_tg_notification(
+                                f"🚨 **HARD_LOCK 硬锁触发**\n"
+                                f"🆔 批次：`{batch_id}`\n"
+                                f"📊 第 {idx + 1} 层（identity：`{identity}`）\n"
+                                f"⚠️ 该 identity 连续确定失败 {new_fc} 次（≥5），已硬锁\n"
+                                f"💡 程序不再自动重挂。请人工核实持仓后按 §5.5 规范解锁"
+                                f"（写 unlock_reason/unlock_time/unlock_operator）",
+                                level='critical'
+                            )
         else:
             print(f"  └─ ⚡ 已存在止损单，等待主循环合并更新")
 
@@ -3980,14 +4145,18 @@ class CryptoTrader:
                 allowed, gate_reason = self._assert_create_allowed(
                     symbol, batch_id, identity, desc='预生成止盈单')
                 if not allowed:
-                    print(f"  └─ 🚫 [仲裁] 跳过预生成止盈单: {gate_reason}")
-                    self.send_tg_notification(
-                        f"⚠️ **预生成止盈单被仲裁拦截**\n"
-                        f"🆔 批次：`{batch_id}`\n"
-                        f"📊 第 {idx + 1} 层\n"
-                        f"📌 {gate_reason}\n"
-                        f"💡 程序不重复挂单，等待自愈重查确认",
-                        level='warning')
+                    if gate_reason.startswith('HARD_LOCK'):
+                        # B2-4: 硬锁静默（进入时已 critical，此后不重复告警）
+                        print(f"  └─ 🔒 [硬锁] 跳过预生成止盈单: {gate_reason}")
+                    else:
+                        print(f"  └─ 🚫 [仲裁] 跳过预生成止盈单: {gate_reason}")
+                        self.send_tg_notification(
+                            f"⚠️ **预生成止盈单被仲裁拦截**\n"
+                            f"🆔 批次：`{batch_id}`\n"
+                            f"📊 第 {idx + 1} 层\n"
+                            f"📌 {gate_reason}\n"
+                            f"💡 程序不重复挂单，等待自愈重查确认",
+                            level='warning')
                 else:
                     # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知 + intent 指纹（B2-2）
                     self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
@@ -4064,7 +4233,23 @@ class CryptoTrader:
                         f"🛠️ 请到交易所核实是否存在该订单！",
                         level='critical')
                 else:
-                    print(f"  └─ ⚡ 预生成止盈单挂出失败: {e}")
+                    # B2-4: 确定拒绝（ExchangeError）→ FAILED：终结悬空的 PENDING_CREATE，
+                    # 允许经闸门重试（此前缺此分支 → registry 停在 PENDING_CREATE 被闸门永久拦截）
+                    new_fc = self._update_registry(symbol, batch_id, identity, state='FAILED',
+                                                   fail_count_incr=1)
+                    print(f"  └─ ⚡ 预生成止盈单挂出失败(FAILED)，可经闸门重试: {e}")
+                    # B2-4: registry fail_count≥5 → HARD_LOCK（§5.4）
+                    if new_fc is not None and new_fc >= 5:
+                        self._update_registry(symbol, batch_id, identity, hard_locked=True)
+                        self.send_tg_notification(
+                            f"🚨 **HARD_LOCK 硬锁触发**\n"
+                            f"🆔 批次：`{batch_id}`\n"
+                            f"📊 identity：`{identity}`\n"
+                            f"⚠️ 该 identity 连续确定失败 {new_fc} 次（≥5），已硬锁\n"
+                            f"💡 程序不再自动重挂。请人工核实持仓后按 §5.5 规范解锁"
+                            f"（写 unlock_reason/unlock_time/unlock_operator）",
+                            level='critical'
+                        )
         else:
             print(f"  └─ ⚡ 已存在止盈单，等待主循环合并更新")
 

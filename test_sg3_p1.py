@@ -207,6 +207,7 @@ def make_fake(states, open_orders):
     fake._active_monitors_lock = mock.MagicMock()
     fake._active_monitors = set()
     fake._sg3_alerted = set()  # SG3-P1 告警节流集合（实现后使用）
+    fake._api_cooldown_until = 0  # B2-3 gate 需真实数值（MagicMock getattr 陷阱）
 
     fake.sent = []
     fake.saved = []
@@ -219,6 +220,9 @@ def make_fake(states, open_orders):
     fake._notify_snapshot = lambda *a, **k: None
     # 显式绑定 helper：MagicMock 会自动创建任意属性，不绑定会返回 MagicMock →
     # `valid, reason = ...` 解包抛 ValueError 被监控循环外层 except 吞掉（SG2 同款坑）
+    if hasattr(CryptoTrader, '_assert_create_allowed'):
+        fake._assert_create_allowed = (
+            lambda s, b, i, **k: CryptoTrader._assert_create_allowed(fake, s, b, i, **k))
     fake._check_protection_order_validity = (
         lambda ord, expected_side, is_hedge_mode, position_side, required_amount:
         CryptoTrader._check_protection_order_validity(
