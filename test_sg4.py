@@ -41,13 +41,14 @@ SYMBOL = "BTC/USDT:USDT"
 BATCH = "batch_sg4_001"
 RESULTS = []
 
-# A/B/C 级调用点行号（B2-5 后最终实测，Grep create_order 全量核实）
+# A/B/C 级调用点行号（B2-6 后最终实测，Grep create_order 全量核实）
 # ⚠️ 实施后行号偏移说明：B2-3 六处接入点插入仲裁闸门（+50 行）→ 以最终 Grep 为准。
 #    已累计：B2-0 helper(+27) + 补挂段 verify/classify(+39) + B2-2 补挂TP落盘(+55) + B2-3 闸门(+50)
-#    + B2-4 硬锁分支(+~50) + B2-5 骨架/registry更新/恢复护栏(+98)。
-A_LINES = {1077, 1196, 1378, 2910, 2957, 3448, 3600, 3725, 4000, 4141, 4277}  # 11 处保护单
-B_LINES = {1876}                                                              # 1 处开仓条件单
-C_LINES = {4541, 4724}                                                        # 2 处平仓单
+#    + B2-4 硬锁分支(+~50) + B2-5 骨架/registry更新/恢复护栏(+98)
+#    + B2-6 recover自愈分支(+24) + 骨架元数据(+6) + 新helper(_self_heal_no_id/_rebuild)(+185) = +215。
+A_LINES = {1101, 1220, 1402, 3125, 3172, 3663, 3815, 3940, 4215, 4356, 4492}  # 11 处保护单
+B_LINES = {1906}                                                              # 1 处开仓条件单
+C_LINES = {4756, 4939}                                                        # 2 处平仓单
 ALL_LINES = A_LINES | B_LINES | C_LINES                                       # 14 处
 
 

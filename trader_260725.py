@@ -918,14 +918,38 @@ class CryptoTrader:
                     # 🔥 如果既没有挂单也没有持仓(已确认)，清理这个批次
                     if not has_pending_orders and not has_position and current_pos is not None:
                         # B2-5 恢复护栏：骨架批次（entry_orders=[] 但 registry 有未决 ENTRY，
-                        # 如开仓前置落盘后崩溃）→ 保留证据待对账，不清理不接管（旧行为会误清理毁证据）
+                        # 如开仓前置落盘后崩溃）→ 旧行为会误清理毁证据；B2-6 升级为对账自愈：
+                        #   无 ID（PENDING_CREATE/PENDING_VERIFY id_unknown）→ §6.3 身份签名匹配
+                        #   有 ID（PENDING_VERIFY/NOT_CONFIRMED）→ verify 自愈
+                        #   匹配收编 CONFIRMED → 重建 entry_orders → 正常接管监控（禁止补挂任何层）
+                        #   仍无法确认 → 保留证据待人工对账，不清理不接管
                         if self._registry_has_unresolved_entries(b_data):
                             print(f"  └─ ⚠️ 批次 [{batch_id}] 存在未决 ENTRY registry 记录"
-                                  f"（开仓骨架/崩溃窗口），保留证据待对账，不清理不接管")
+                                  f"（开仓骨架/崩溃窗口），尝试身份匹配自愈对账...")
+                            try:
+                                self._self_heal_no_id(symbol, batch_id)
+                                self._recheck_registry_self_heal(symbol, batch_id)
+                                rebuilt_orders, _rebuilt = self._rebuild_entry_orders_from_registry(
+                                    symbol, batch_id)
+                            except Exception as e:
+                                rebuilt_orders, _rebuilt = [], False
+                                print(f"  └─ ⚠️ 批次 [{batch_id}] 自愈对账异常: {e}")
+                            if _rebuilt and rebuilt_orders:
+                                # 收编成功 → 刷新本地视图，落入正常接管路径（下方"有挂单或持仓"）
+                                b_data = self.load_all_states().get(symbol, {}).get(batch_id, {})
+                                entry_orders = b_data.get('entry_orders', [])
+                                last_filled_count = b_data.get('last_filled_count', 0)
+                                has_pending_orders = len(entry_orders) > last_filled_count
+                                print(f"  └─ ✅ 批次 [{batch_id}] 身份匹配收编 "
+                                      f"{len(rebuilt_orders)} 层 ENTRY（零二次 Create），正常接管监控")
+                            else:
+                                print(f"  └─ ⚠️ 批次 [{batch_id}] 未决 ENTRY 无法确认"
+                                      f"（无匹配单/快照失败），保留证据待人工对账，不清理不接管")
+                                continue
+                        else:
+                            print(f"  └─ 🧹 批次 [{batch_id}] 无挂单且无持仓，自动清理")
+                            stale_batches.append((symbol, batch_id))
                             continue
-                        print(f"  └─ 🧹 批次 [{batch_id}] 无挂单且无持仓，自动清理")
-                        stale_batches.append((symbol, batch_id))
-                        continue
                     elif current_pos is None:
                         print(f"  └─ ⚠️ 批次 [{batch_id}] 持仓查询失败(UNKNOWN)，保留批次不清理")
 
@@ -1823,11 +1847,17 @@ class CryptoTrader:
                         order_type='STOP_MARKET', stop_price=_fp),
                     'updated_at': time.time(),
                 }
+            # B2-6（§6.3 + Case F）：骨架持久化 entry_layers/entry_stop_steps 元数据——
+            # 崩溃恢复收编 ENTRY 后重建 entry_orders/stop_steps/layer_sl_params 的权威映射
+            # （registry 条目只含 layer 序号，不含 SL 价格；此处补全层→SL 映射）
             skeleton = {
                 'is_active': True,
                 'batch_id': batch_id,
                 'symbol': symbol,
                 'side': side,
+                'entry_layers': list(skeleton_entry_layers),
+                'entry_stop_steps': [signal.stop_loss_steps[i] if i < len(signal.stop_loss_steps) else 0.0
+                                     for i in skeleton_entry_layers],
                 'entry_orders': [],
                 'stop_steps': [],
                 'take_profit_price': signal.take_profit,
@@ -2443,6 +2473,191 @@ class CryptoTrader:
             changed = True
         if changed:
             self.save_batch_state(symbol, batch_id, b)
+
+    def _self_heal_no_id(self, symbol, batch_id):
+        """B2-6（规格 §6.3）：无 ID 身份签名匹配自愈——处理 PENDING_CREATE / PENDING_VERIFY(id_unknown)
+        且无 order_id 的 ENTRY 条目。签名 = registry intent（B2-2 已落盘 6 字段）：
+          拉双通道 open orders 快照（normal + params={'stop':True}）合并成统一视图（§8 OrderSnapshot 语义：
+          任一通道失败 → view INVALID）：
+            命中且唯一   → CONFIRMED + 记录真实 order_id + id_known=True（收编，绝不 Create）
+            命中多条     → NOT_CONFIRMED + critical（人工裁决，禁止自动收编多条）
+            未命中（快照 VALID）→ NOT_CONFIRMED（缺席≠从未存在：单可能已触发终结，不变量①）
+            快照 INVALID → 维持 PENDING_VERIFY(id_unknown)（结果未知，静默下轮再试，不误判无单）
+        恢复路径只 Commit 不 Create（§6 恢复总原则：恢复不扩大风险）。"""
+        latest_all = self.load_all_states()
+        b = latest_all.get(symbol, {}).get(batch_id)
+        if b is None:
+            return
+        reg = b.get('protection_registry', {})
+        # 收集需无 ID 自愈的目标（ENTRY + 无 order_id + 未决态 + 有签名）
+        targets = []
+        for identity, entry in reg.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get('role') != 'ENTRY' or entry.get('order_id'):
+                continue  # 已有 ID → 走 verify 路径（_recheck_registry_self_heal）
+            if entry.get('state') not in ('PENDING_CREATE', 'PENDING_VERIFY'):
+                continue
+            if not entry.get('intent'):
+                continue  # 无签名（旧数据）→ 保守维持，等人工
+            targets.append((identity, entry))
+        if not targets:
+            return
+        # 双通道快照（§8 OrderSnapshot）：任一通道失败 → INVALID
+        try:
+            normal = self._safe_api_call(self.exchange.fetch_open_orders, symbol, retries=1)
+        except Exception:
+            normal = None
+        try:
+            conditional = self._safe_api_call(self.exchange.fetch_open_orders, symbol,
+                                              params={'stop': True}, retries=1)
+        except Exception:
+            conditional = None
+        if normal is None or conditional is None:
+            # 快照 INVALID → 全部目标转 PENDING_VERIFY(id_unknown)，静默下轮再试（不误判无单）
+            for _, entry in targets:
+                if entry.get('state') != 'PENDING_VERIFY' or entry.get('id_known'):
+                    entry['state'] = 'PENDING_VERIFY'
+                    entry['id_known'] = False
+                    entry['updated_at'] = time.time()
+            self.save_batch_state(symbol, batch_id, b)
+            return
+        # 合并统一视图（双通道按 id 去重，normal 优先保留字段）
+        orders_by_id = {}
+        for o in (normal or []):
+            if isinstance(o, dict) and o.get('id'):
+                orders_by_id.setdefault(o['id'], o)
+        for o in (conditional or []):
+            if isinstance(o, dict) and o.get('id'):
+                orders_by_id.setdefault(o['id'], o)
+        changed = False
+        for identity, entry in targets:
+            intent = entry.get('intent')
+            matches = [oid for oid, o in orders_by_id.items()
+                       if self._order_matches_intent(o, intent, symbol)]
+            if len(matches) == 1:
+                # 命中且唯一 → 收编 CONFIRMED + 记录真实 order_id（24 孤儿单通用防线）
+                entry['state'] = 'CONFIRMED'
+                entry['order_id'] = matches[0]
+                entry['id_known'] = True
+                entry['updated_at'] = time.time()
+                changed = True
+            elif len(matches) > 1:
+                # 命中多条 → NOT_CONFIRMED + critical（人工裁决，禁止自动收编多条）
+                entry['state'] = 'NOT_CONFIRMED'
+                entry['updated_at'] = time.time()
+                changed = True
+                self.send_tg_notification(
+                    f"🚨 **身份签名匹配命中多条订单（禁止自动收编）**\n"
+                    f"🆔 批次：`{batch_id}`\n"
+                    f"📌 身份：`{identity}`\n"
+                    f"⚠️ 快照中 {len(matches)} 条订单签名相同，【未收编】\n"
+                    f"🛠️ 请到交易所人工核实后按 §5.5 规范处理！",
+                    level='critical')
+            else:
+                # 快照 VALID 但未命中 → NOT_CONFIRMED（缺席≠从未存在：单可能已触发终结）
+                entry['state'] = 'NOT_CONFIRMED'
+                entry['updated_at'] = time.time()
+                changed = True
+        if changed:
+            self.save_batch_state(symbol, batch_id, b)
+
+    def _rebuild_entry_orders_from_registry(self, symbol, batch_id):
+        """B2-6（§6.3 + Case F）：从 protection_registry 重建 ENTRY 链——扫描全部
+        state=CONFIRMED 且带 order_id 的 ENTRY 条目，按 layer 升序收编真实 order_id → entry_orders；
+        同时用骨架元数据（entry_layers/entry_stop_steps/params_base/is_hedge_mode/side）重建
+        stop_steps / target_amounts / batch_total_amount / layer_sl_params / prepared_tp_params /
+        pending_sl_orders（恢复接管监控必需——否则层成交后 SL/TP 无参数可挂，违反不变量②）。
+        返回 (entry_orders: list, rebuilt: bool)。恢复路径只 Commit 不 Create。"""
+        latest_all = self.load_all_states()
+        b = latest_all.get(symbol, {}).get(batch_id)
+        if b is None:
+            return [], False
+        reg = b.get('protection_registry', {})
+        confirmed = []
+        for identity, entry in reg.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get('role') != 'ENTRY' or entry.get('state') != 'CONFIRMED':
+                continue
+            oid = entry.get('order_id')
+            if not oid:
+                continue
+            confirmed.append((int(entry.get('layer', 0)), oid, entry))
+        if not confirmed:
+            return [], False
+        confirmed.sort(key=lambda x: x[0])
+        entry_orders = [oid for _, oid, _ in confirmed]
+        b['entry_orders'] = entry_orders
+        # 骨架元数据重建（entry_layers 提供 layer→序号映射）
+        entry_layers = b.get('entry_layers') or []
+        entry_stop_steps = b.get('entry_stop_steps') or []
+        params_base = b.get('params_base') or {}
+        is_hedge_mode = bool(b.get('is_hedge_mode', False))
+        side = b.get('side', 'BUY')
+        sl_side = 'sell' if side == 'BUY' else 'buy'
+        stop_steps = []
+        target_amounts = []
+        layer_sl_params = []
+        batch_total_amount = 0.0
+        for layer, oid, entry in confirmed:
+            qty = (entry.get('intent') or {}).get('qty')
+            try:
+                qty = float(qty) if qty is not None else 0.0
+            except (TypeError, ValueError):
+                qty = 0.0
+            target_amounts.append(qty)
+            batch_total_amount += qty
+            if layer in entry_layers:
+                idx_in_skeleton = entry_layers.index(layer)
+                if idx_in_skeleton < len(entry_stop_steps):
+                    raw_sl_price = entry_stop_steps[idx_in_skeleton]
+                else:
+                    raw_sl_price = 0.0
+            else:
+                raw_sl_price = 0.0
+            try:
+                formatted_sl_price = float(self.exchange.price_to_precision(symbol, raw_sl_price))
+            except Exception:
+                formatted_sl_price = float(raw_sl_price or 0.0)
+            stop_steps.append(raw_sl_price)
+            sl_params = dict(params_base)
+            sl_params['stopPrice'] = formatted_sl_price
+            if not is_hedge_mode:
+                sl_params['reduceOnly'] = True
+            layer_sl_params.append({
+                'symbol': symbol,
+                'type': 'STOP_MARKET',
+                'side': sl_side,
+                'amount': qty,
+                'params': sl_params,
+            })
+        if stop_steps:
+            b['stop_steps'] = stop_steps
+        b['target_amounts'] = target_amounts
+        b['batch_total_amount'] = float(self.exchange.amount_to_precision(symbol, batch_total_amount))
+        b['layer_sl_params'] = layer_sl_params
+        # prepared_tp_params（止盈首次成交时挂，_place_prepared_orders_immediately 依赖）
+        try:
+            formatted_tp_price = float(self.exchange.price_to_precision(symbol, b.get('take_profit_price')))
+        except Exception:
+            formatted_tp_price = float(b.get('take_profit_price') or 0.0)
+        tp_params = dict(params_base)
+        tp_params['stopPrice'] = formatted_tp_price
+        if not is_hedge_mode:
+            tp_params['reduceOnly'] = True
+        b['prepared_tp_params'] = {
+            'symbol': symbol,
+            'type': 'TAKE_PROFIT_MARKET',
+            'side': sl_side,
+            'params': tp_params,
+        }
+        # pending_sl_orders：骨架阶段 last_filled_count=0（无成交）→ 全部层待挂 SL
+        if not b.get('last_filled_count'):
+            b['pending_sl_orders'] = list(range(len(entry_orders)))
+        b['updated_at'] = time.time()
+        self.save_batch_state(symbol, batch_id, b)
+        return entry_orders, True
 
     def _verify_failure_msg(self, desc, order_id, symbol, verify_result):
         """C5/SG4: Verify 失败统一消息（unknown → 人工核实，防双单复活）。"""
