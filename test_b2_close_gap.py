@@ -41,7 +41,7 @@ RESULTS = []
 #   #1 用户改TP  L1289  |  #2 用户改SL  L1438  |  #3 保本损  L1652
 #   #5 部分减仓SL L3495  |  #6 部分减仓TP L3569
 # ⚠️ 行号偏移记录：R1/R2/R3（ChatGPT 终审 2026-08-20）+~170 行后重新 Grep 实测 2026-08-20
-GAP_CREATE_LINES = {1289, 1438, 1652, 3495, 3569}
+GAP_CREATE_LINES = {1310, 1461, 1675, 3518, 3592}  # ChatGPT 终审补强 v3 + E2(+2) 后实测（2026-08-20）
 
 
 def report(name, passed, detail=""):
