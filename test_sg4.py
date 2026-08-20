@@ -41,12 +41,12 @@ SYMBOL = "BTC/USDT:USDT"
 BATCH = "batch_sg4_001"
 RESULTS = []
 
-# A/B/C 级调用点行号（B2-2 后最终实测，Grep create_order 全量核实）
-# ⚠️ 实施后行号偏移说明：B2-2 补挂 TP 段 PENDING_CREATE+intent 落盘与 except 分类分流
-#    （+55 行，L3415 段起）→ 以最终 Grep 为准。B2-0 helper(+27) + 补挂段 verify/classify（+39）已含。
-A_LINES = {1071, 1190, 1372, 2687, 2734, 3206, 3326, 3434, 3678, 3789, 3895}  # 11 处保护单
+# A/B/C 级调用点行号（B2-3 后最终实测，Grep create_order 全量核实）
+# ⚠️ 实施后行号偏移说明：B2-3 六处接入点插入仲裁闸门（+50 行）→ 以最终 Grep 为准。
+#    已累计：B2-0 helper(+27) + 补挂段 verify/classify(+39) + B2-2 补挂TP落盘(+55) + B2-3 闸门(+50)。
+A_LINES = {1071, 1190, 1372, 2722, 2769, 3256, 3389, 3510, 3767, 3891, 4010}  # 11 处保护单
 B_LINES = {1811}                                                              # 1 处开仓条件单
-C_LINES = {4143, 4326}                                                        # 2 处平仓单
+C_LINES = {4258, 4441}                                                        # 2 处平仓单
 ALL_LINES = A_LINES | B_LINES | C_LINES                                       # 14 处
 
 
@@ -349,6 +349,10 @@ def make_fake(states, open_orders):
     fake.saved = []
     fake.send_tg_notification = lambda text, **kw: fake.sent.append((kw.get('level', 'info'), str(text)))
     fake.save_batch_state = lambda s, b, d: fake.saved.append(dict(d))
+    # ⚠️ MagicMock 属性陷阱：getattr(fake, '_api_cooldown_until', 0) 在 MagicMock 上
+    # 返回自动 mock（吞掉默认值）→ time.time() < MagicMock 抛 TypeError（B2-3 闸门会检查 cooldown）。
+    # 必须显式置 0，否则真实 _assert_create_allowed 在 cooldown 比较处崩溃。
+    fake._api_cooldown_until = 0
     fake._cancel_remaining_entries = lambda *a, **k: None
     fake._cancel_limit_close_order = lambda *a, **k: None
     fake.clear_batch_state = lambda *a, **k: None
@@ -361,6 +365,11 @@ def make_fake(states, open_orders):
     # C5/SG4：恢复链场景需真实 verify（fake.exchange.fetch_order 为 MagicMock 自动成功 → 'success'）
     fake._verify_order_created = (
         lambda order_id, symbol: CryptoTrader._verify_order_created(fake, order_id, symbol))
+    # B2-3：Create 仲裁闸门必须绑定真实实现，否则自动 mock 返回 0 个值 →
+    # `allowed, reason = fake._assert_create_allowed(...)` 解包崩溃被 except 吞 → create 路径不执行。
+    if hasattr(CryptoTrader, '_assert_create_allowed'):
+        fake._assert_create_allowed = (
+            lambda s, b, i, **k: CryptoTrader._assert_create_allowed(fake, s, b, i, **k))
     return fake
 
 

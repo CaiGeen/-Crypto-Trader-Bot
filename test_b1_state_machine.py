@@ -45,6 +45,9 @@ def _make_base_fake():
     fake.saved = []
     fake.send_tg_notification = lambda text, **kw: fake.sent.append((kw.get('level', 'info'), str(text)))
     fake.save_batch_state = lambda s, b, d: fake.saved.append(dict(d))
+    # ⚠️ MagicMock 属性陷阱：getattr(fake, '_api_cooldown_until', 0) 在 MagicMock 上
+    # 返回自动 mock（吞掉默认值）→ time.time() < MagicMock 抛 TypeError。必须显式置 0。
+    fake._api_cooldown_until = 0
     return fake
 
 
@@ -57,6 +60,11 @@ def _bind_helpers(fake, states):
     fake._verify_order_created = lambda oid, sym, kind='conditional': CryptoTrader._verify_order_created(fake, oid, sym, kind)
     fake._classify_create_exception = lambda e: CryptoTrader._classify_create_exception(fake, e)
     fake._protection_identity = lambda b, r, l, s: CryptoTrader._protection_identity(fake, b, r, l, s)
+    # B2-3：Create 仲裁闸门必须绑定真实实现，否则自动 mock 返回 0 个值 →
+    # `allowed, reason = fake._assert_create_allowed(...)` 解包崩溃被 except 吞 → create 路径不执行。
+    if hasattr(CryptoTrader, '_assert_create_allowed'):
+        fake._assert_create_allowed = (
+            lambda s, b, i, **k: CryptoTrader._assert_create_allowed(fake, s, b, i, **k))
     return fake
 
 
