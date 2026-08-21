@@ -95,6 +95,10 @@ class CryptoTrader:
         self.registry_self_heal_interval = 30  # 秒
         self.self_heal_escalate_rounds = 10    # 连续未确认轮数（约 5 分钟）
         self._self_heal_unconfirmed_rounds = {}  # (symbol, batch_id, identity) → 连续未确认轮次
+        # F4b（事件3通知风暴，2026-08-21）：进程启动时刻——自愈 MISMATCH 针对启动前历史条目
+        # （updated_at < _process_start_ts）降级为 info 不告警：重启时的状态同步 ≠ 新资金风险。
+        # 边界：升级告警（连续 10 轮 ≈5 分钟仍查不到）不降级——持续查不到是真实异常，须人工核实。
+        self._process_start_ts = time.time()
 
         # 🔥 是否启用 IP 检测（云服务器有固定 IP 时可以禁用）
         self.IP_CHECK_ENABLED = os.getenv("IP_CHECK_ENABLED", "true").lower() == "true"
@@ -2760,28 +2764,55 @@ class CryptoTrader:
         }
 
     def _order_matches_intent(self, order, intent, symbol):
-        """B2-1: fetch 返回订单字段与 registry intent 完整比对（ChatGPT②）——
+        """B2-1 + F1（事件3通知风暴根因，2026-08-21）：fetch 返回订单字段与 registry intent 完整比对——
         FOUND ≠ CONFIRMED；FOUND + intent 完整匹配 = CONFIRMED。
         比对 symbol/side/order_type/reduceOnly/stopPrice/amount；缺失字段跳过（软检查），
         明确不匹配即返回 False（宁可不收编，不可错收编）。
-        reduceOnly/stopPrice 顶层可能缺失（ccxt 4.5.68 映射特性）→ info 兜底。"""
+        F1 现实映射修正——ccxt 归一化产物 vs Binance 原始字段（实证：4 条有效保护单全部被误判 MISMATCH）：
+          a) symbol：ccxt 统一格式 'BTC/USDT:USDT'，本地 intent 存 'BTCUSDT' → 去分隔符归一化再比
+          b) order_type：ccxt 顶层 type 对条件单归一化为 'market'（SG3-P1 共识：type 校验必误报）
+             → 条件单优先用 info.type（Binance 原始 STOP_MARKET/TAKE_PROFIT_MARKET）还原；
+             顶层 market 且 info.type 缺失 → 跳过 type 比对（软检查，防误杀有效单）
+          c) reduceOnly：info 里可能是字符串 'true'/'false'（Binance 原始）→ 统一转 bool"""
         try:
-            if str(order.get('symbol', '')) != str(intent.get('symbol', '')):
+            # a) symbol 归一化（防 'BTCUSDT' vs 'BTC/USDT:USDT' 误判）：
+            #    ccxt 统一格式 'BASE/QUOTE:SETTLE' → 取 BASE+QUOTE（'BTC/USDT:USDT'→'BTCUSDT'）
+            def _norm_sym(s):
+                s = str(s or '').upper()
+                if '/' in s:
+                    base, rest = s.split('/', 1)
+                    quote = rest.split(':', 1)[0]
+                    return (base + quote).replace('_', '')
+                return s.replace('/', '').replace(':', '').replace('_', '')
+            if _norm_sym(order.get('symbol')) != _norm_sym(intent.get('symbol')):
                 return False
             o_side = str(order.get('side', '')).lower()
             i_side = str(intent.get('side', '')).lower() if intent.get('side') else ''
             if o_side and i_side and o_side != i_side:
                 return False
+            # b) order_type：顶层 type 对条件单是 'market'（ccxt 归一化）→ info.type 还原
             o_type = str(order.get('type', '')).upper().replace('_', '')
             i_type = str(intent.get('order_type', '')).upper().replace('_', '')
-            if o_type and i_type and o_type != i_type:
-                return False
-            # reduceOnly：顶层 or info 兜底
+            if i_type:
+                info_type = None
+                if isinstance(order.get('info'), dict):
+                    info_type = str(order['info'].get('type', '')).upper().replace('_', '')
+                if info_type:
+                    o_type = info_type  # 条件单：优先用 Binance 原始类型还原
+                elif o_type == 'MARKET':
+                    o_type = ''  # 顶层 market 且无 info.type → 跳过 type 比对（软检查，SG3-P1 共识）
+                if o_type and o_type != i_type:
+                    return False
+            # c) reduceOnly：顶层 or info 兜底；Binance info 里是字符串 'true'/'false' → 统一 bool
             ro = order.get('reduceOnly')
             if ro is None and isinstance(order.get('info'), dict):
                 ro = order['info'].get('reduceOnly')
             if ro is not None and intent.get('reduce_only') is not None:
-                if bool(ro) != bool(intent['reduce_only']):
+                def _as_bool(v):
+                    if isinstance(v, str):
+                        return v.strip().lower() == 'true'
+                    return bool(v)
+                if _as_bool(ro) != _as_bool(intent['reduce_only']):
                     return False
             # stopPrice：顶层 or info 兜底
             sp = order.get('stopPrice')
@@ -2800,6 +2831,22 @@ class CryptoTrader:
             return True
         except Exception:
             return False  # 解析失败 → 保守不匹配
+
+    def _is_stale_pre_launch_entry(self, entry):
+        """F4b（2026-08-21）：启动窗口降级判断——registry 条目 updated_at 早于本进程启动时刻
+        = 启动前历史条目（重启时的状态同步，非本轮新创建）→ 自愈告警降级为 info。
+        返回 False 时照常 critical。防御性：_process_start_ts 缺失/非数值（测试 MagicMock 基座）
+        → 一律不降级（保守：宁多告警，不漏告警）。"""
+        try:
+            start_ts = getattr(self, '_process_start_ts', 0)
+            if not isinstance(start_ts, (int, float)) or not start_ts:
+                return False
+            ua = entry.get('updated_at') or 0
+            if not isinstance(ua, (int, float)) or not ua:
+                return False
+            return ua < start_ts
+        except Exception:
+            return False
 
     def _recheck_registry_self_heal(self, symbol, batch_id):
         """B1/P0-2 + B2-1: registry 重查自愈（规格 §6.3）—— PENDING_VERIFY/NOT_CONFIRMED 条目重新 fetch：
@@ -2859,6 +2906,23 @@ class CryptoTrader:
                 continue
             except Exception:
                 continue  # 结果未知 → 维持现状静默，等待下一轮重查
+            # F2（事件3通知风暴根因，2026-08-21）：订单生命周期分层——fetch 到 ≠ 订单有效。
+            # 已终结订单（canceled/expired/rejected/closed/triggered）→ 视为不存在，标 ABSENT，
+            # 不进 intent 比对、不告警（对齐启动恢复 L1155 valid_statuses 先例）。
+            # 实证：自愈 fetch 已撤销订单返回 status=canceled 对象（不抛 OrderNotFound）→
+            # 旧代码当 FOUND 进 intent 比对 → symbol/type 格式差异 → 误判 MISMATCH + critical。
+            valid_statuses = ('new', 'open', 'active')
+            _status = str(order.get('status', '')).lower()
+            if _status and _status not in valid_statuses:
+                entry['state'] = 'ABSENT'
+                entry['updated_at'] = time.time()
+                entry['terminated_reason'] = f'lifecycle_ended_status_{_status}'
+                changed = True
+                rounds = getattr(self, '_self_heal_unconfirmed_rounds', None)
+                if isinstance(rounds, dict):
+                    rounds.pop((symbol, batch_id, identity), None)
+                print(f"  └─ ℹ️ [自愈] 条目 {identity} 订单 {order_id} 已终结(status={_status})，标 ABSENT")
+                continue
             # B2-1: FOUND ≠ CONFIRMED —— FOUND + intent 完整匹配 = CONFIRMED（ChatGPT②）
             intent = entry.get('intent')
             if not intent:
@@ -2866,16 +2930,22 @@ class CryptoTrader:
                 print(f"  └─ ⚠️ [自愈] 条目 {identity} 无 intent 指纹，保守不收编 (order_id={order_id})")
                 continue
             if not self._order_matches_intent(order, intent, symbol):
+                # F4b（2026-08-21）：先判断是否启动前历史条目（用原 updated_at，勿在状态更新后判断）
+                is_legacy_entry = self._is_stale_pre_launch_entry(entry)
                 # FOUND 但字段不匹配 → 错误订单/旧订单/其他批次订单：MISMATCH + critical + 不收编
                 entry['state'] = 'MISMATCH'
                 entry['updated_at'] = time.time()
                 changed = True
-                self.send_tg_notification(
-                    f"🚨 **自愈检测到订单意图不匹配（MISMATCH）**\n"
-                    f"🆔 批次：`{batch_id}` 身份：`{identity}`\n"
-                    f"📌 订单 `{order_id}` 与 registry 意图不符，【不收编】\n"
-                    f"🛠️ 请到交易所人工核实该订单！",
-                    level='critical')
+                if is_legacy_entry:
+                    # F4b：启动前历史条目的状态同步 ≠ 新资金风险 → 降级为 info，不 TG/邮件
+                    print(f"  └─ ℹ️ [自愈] 历史条目 {identity} 与交易所实况不符，启动窗口降级（不告警）")
+                else:
+                    self.send_tg_notification(
+                        f"🚨 **自愈检测到订单意图不匹配（MISMATCH）**\n"
+                        f"🆔 批次：`{batch_id}` 身份：`{identity}`\n"
+                        f"📌 订单 `{order_id}` 与 registry 意图不符，【不收编】\n"
+                        f"🛠️ 请到交易所人工核实该订单！",
+                        level='critical')
                 continue
             # FOUND + intent 完整匹配 → CONFIRMED + 收编（只补 Commit 不新建）
             role = entry.get('role')
@@ -2919,8 +2989,8 @@ class CryptoTrader:
                 continue
             # 只处理带 order_id 的条目（PENDING_CREATE 无 id 跳过；其余状态均以实况裁决）
             try:
-                self._safe_api_call(self.exchange.fetch_order, order_id, symbol,
-                                    params={'stop': True}, retries=1)
+                order = self._safe_api_call(self.exchange.fetch_order, order_id, symbol,
+                                            params={'stop': True}, retries=1)
             except ccxt.OrderNotFound:
                 entry['state'] = 'ABSENT'
                 entry['updated_at'] = time.time()
@@ -2931,6 +3001,18 @@ class CryptoTrader:
             except Exception as e:
                 # 网络异常 → 结果未知：保留下轮重试，不撤销（未知 ≠ 不存在）
                 print(f"  └─ ⚠️ [滚动撤销] {role} 旧层 {identity} 查询失败，保留下轮: {e}")
+                continue
+            # F2（2026-08-21）：已终结订单（canceled/expired 等）→ 直接终结，不 cancel。
+            # 实证：R-C fetch 已撤销订单返回 status=canceled（不抛异常）→ 旧代码进 cancel 分支
+            # → cancel 已撤单抛 "Unknown order" → 跳过且不标 ABSENT（脏数据残留，如 TP L2 案例）。
+            valid_statuses = ('new', 'open', 'active')
+            _status = str(order.get('status', '')).lower()
+            if _status and _status not in valid_statuses:
+                entry['state'] = 'ABSENT'
+                entry['updated_at'] = time.time()
+                entry['terminated_reason'] = f'stale_layer_reconcile_status_{_status}'
+                changed = True
+                print(f"  └─ 🧹 [滚动撤销] {role} 旧层 {identity} 已终结(status={_status})，条目终结")
                 continue
             # 订单真实存在 → 撤销（旧层单被新汇总单替代）
             try:

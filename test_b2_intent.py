@@ -53,6 +53,11 @@ def _bind_helpers(fake, states):
         fake._build_intent = lambda **kw: CryptoTrader._build_intent(fake, **kw)
     if hasattr(CryptoTrader, '_order_matches_intent'):
         fake._order_matches_intent = lambda o, i, s: CryptoTrader._order_matches_intent(fake, o, i, s)
+    # F4b（2026-08-21）：启动窗口降级 helper 必须真实绑定——MagicMock 未绑定时自动 mock 返回
+    # truthy → 自愈 MISMATCH 被误判"历史条目"降级不告警 → T8 critical 断言假失败（经典 helper 未绑定陷阱）。
+    # 真实 helper 对 MagicMock 的 _process_start_ts（非数值）返回 False（保守不降级）→ 语义正确。
+    if hasattr(CryptoTrader, '_is_stale_pre_launch_entry'):
+        fake._is_stale_pre_launch_entry = lambda e: CryptoTrader._is_stale_pre_launch_entry(fake, e)
     return fake
 
 

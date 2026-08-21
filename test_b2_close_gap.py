@@ -44,7 +44,7 @@ RESULTS = []
 # ⚠️ R-A/B/C/D（事件3四件套，2026-08-21）再偏移 +8~+152，重新实测 2026-08-21（AST 函数归属核实）：
 #    用户改TP→update_batch_tp 1318 | 用户改SL→update_batch_sl 1469 | 保本损→_update_sl_no_validation 1683
 #    | 部分减仓SL→_start_monitoring 3670 | 部分减仓TP→_start_monitoring 3744
-GAP_CREATE_LINES = {1318, 1469, 1683, 3670, 3744}  # ChatGPT 终审补强 v3 + E2(+2) + R-A/B/C/D 后实测（2026-08-21）
+GAP_CREATE_LINES = {1322, 1473, 1687, 3752, 3826}  # ChatGPT 终审补强 v3 + E2(+2) + R-A/B/C/D 后实测（2026-08-21）；F1/F2/F4b 后 +4/+82 重新实测
 
 
 def report(name, passed, detail=""):

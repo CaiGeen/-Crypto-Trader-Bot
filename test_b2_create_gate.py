@@ -43,7 +43,7 @@ RESULTS = []
 # ⚠️ R-A/B/C/D（事件3四件套，2026-08-21）再偏移 +152~+174，重新实测 2026-08-21（AST 函数归属核实）：
 #    补挂SL→_start_monitoring 4241 | 降级恢复→_start_monitoring 4398 | 补挂TP→_start_monitoring 4528
 #    | 预生成SL→_place_prepared 4831 | 预生成SL兜底→_place_prepared 4978 | 预生成TP→_place_prepared 5130
-GATE_LINES = {4241, 4398, 4528, 4831, 4978, 5130}  # ChatGPT 终审补强 v3 + E2(+2) + R-A/B/C/D 后实测（2026-08-21）
+GATE_LINES = {4323, 4480, 4610, 4913, 5060, 5212}  # ChatGPT 终审补强 v3 + E2(+2) + R-A/B/C/D 后实测（2026-08-21）；F1/F2/F4b 后 +82 重新实测
 
 
 def report(name, passed, detail=""):

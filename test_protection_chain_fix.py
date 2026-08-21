@@ -60,6 +60,7 @@ def _bind_self_heal(fake, states):
     fake.save_batch_state = lambda s, b, d: fake.saved.append(dict(d))
     fake._order_matches_intent = lambda o, i, s: CryptoTrader._order_matches_intent(fake, o, i, s)
     fake._recheck_registry_self_heal = lambda s, b: CryptoTrader._recheck_registry_self_heal(fake, s, b)
+    fake._is_stale_pre_launch_entry = lambda e: CryptoTrader._is_stale_pre_launch_entry(fake, e)
     return fake
 
 
@@ -345,6 +346,220 @@ def t_rd_prune():
 
 
 # =====================================================================
+# F1：_order_matches_intent 现实映射（ccxt 归一化 vs Binance 原始字段）
+# =====================================================================
+def t_f1_intent_mapping():
+    # F1a: 本次风暴实证形态——ccxt 实盘返回 type='market' + info.type='STOP_MARKET'，
+    #      symbol='BTC/USDT:USDT' vs intent symbol='BTCUSDT'（本地格式）→ 必须 True
+    #      （旧代码 symbol/type 双恒不匹配 → 4 条有效保护单全被误判 MISMATCH）
+    fake = _make_base_fake()
+    order = {'id': 'o1', 'symbol': 'BTC/USDT:USDT', 'side': 'sell', 'type': 'market',
+             'amount': 0.43, 'stopPrice': 55000.0, 'reduceOnly': True, 'status': 'open',
+             'info': {'type': 'STOP_MARKET', 'reduceOnly': 'true'}}
+    intent = {'symbol': 'BTCUSDT', 'side': 'sell', 'qty': 0.43, 'order_type': 'STOP_MARKET',
+              'stop_price': 55000.0, 'reduce_only': True}
+    r = CryptoTrader._order_matches_intent(fake, order, intent, SYMBOL)
+    report("F1a ccxt归一化形态(symbol+type)匹配", r is True,
+           f"(返回 {r!r} → 须 True：旧代码 False=本次通知风暴根因)")
+
+    # F1b: symbol 双方 ccxt 格式 → True
+    fake = _make_base_fake()
+    order = {'id': 'o2', 'symbol': 'BTC/USDT:USDT', 'side': 'sell', 'type': 'STOP_MARKET',
+             'amount': 0.43, 'stopPrice': 55000.0, 'reduceOnly': True, 'status': 'open', 'info': {}}
+    intent = {'symbol': 'BTC/USDT:USDT', 'side': 'sell', 'qty': 0.43, 'order_type': 'STOP_MARKET',
+              'stop_price': 55000.0, 'reduce_only': True}
+    r = CryptoTrader._order_matches_intent(fake, order, intent, SYMBOL)
+    report("F1b symbol 格式归一化", r is True, f"(返回 {r!r} → 须 True)")
+
+    # F1c: type='market' + info.type 缺失 → 跳过 type 比对（软检查），其余字段匹配 → True
+    fake = _make_base_fake()
+    order = {'id': 'o3', 'symbol': 'BTCUSDT', 'side': 'sell', 'type': 'market',
+             'amount': 0.43, 'stopPrice': 55000.0, 'reduceOnly': True, 'status': 'open', 'info': {}}
+    intent = {'symbol': 'BTCUSDT', 'side': 'sell', 'qty': 0.43, 'order_type': 'STOP_MARKET',
+              'stop_price': 55000.0, 'reduce_only': True}
+    r = CryptoTrader._order_matches_intent(fake, order, intent, SYMBOL)
+    report("F1c market无info.type跳过type比对", r is True,
+           f"(返回 {r!r} → 须 True：顶层 market 且无 info.type → 软检查不误杀)")
+
+    # F1d: 真实不匹配（side 反了）→ 仍 False（安全语义不降低）
+    fake = _make_base_fake()
+    order = {'id': 'o4', 'symbol': 'BTCUSDT', 'side': 'buy', 'type': 'STOP_MARKET',
+             'amount': 0.43, 'stopPrice': 55000.0, 'reduceOnly': True, 'status': 'open', 'info': {}}
+    intent = {'symbol': 'BTCUSDT', 'side': 'sell', 'qty': 0.43, 'order_type': 'STOP_MARKET',
+              'stop_price': 55000.0, 'reduce_only': True}
+    r = CryptoTrader._order_matches_intent(fake, order, intent, SYMBOL)
+    report("F1d 真实不匹配仍拒", r is False, f"(返回 {r!r} → 须 False：side 反了)")
+
+    # F1e: reduceOnly 字符串 'false' vs True → False（防 bool('false')=True bug）
+    fake = _make_base_fake()
+    order = {'id': 'o5', 'symbol': 'BTCUSDT', 'side': 'sell', 'type': 'STOP_MARKET',
+             'amount': 0.43, 'stopPrice': 55000.0, 'status': 'open',
+             'info': {'reduceOnly': 'false'}}
+    intent = {'symbol': 'BTCUSDT', 'side': 'sell', 'qty': 0.43, 'order_type': 'STOP_MARKET',
+              'stop_price': 55000.0, 'reduce_only': True}
+    r = CryptoTrader._order_matches_intent(fake, order, intent, SYMBOL)
+    report("F1e reduceOnly字符串'false'识别", r is False,
+           f"(返回 {r!r} → 须 False：info reduceOnly='false' vs intent True)")
+
+    # F1f: reduceOnly 字符串 'true' vs True → True
+    fake = _make_base_fake()
+    order = {'id': 'o6', 'symbol': 'BTCUSDT', 'side': 'sell', 'type': 'STOP_MARKET',
+             'amount': 0.43, 'stopPrice': 55000.0, 'status': 'open',
+             'info': {'reduceOnly': 'true'}}
+    intent = {'symbol': 'BTCUSDT', 'side': 'sell', 'qty': 0.43, 'order_type': 'STOP_MARKET',
+              'stop_price': 55000.0, 'reduce_only': True}
+    r = CryptoTrader._order_matches_intent(fake, order, intent, SYMBOL)
+    report("F1f reduceOnly字符串'true'识别", r is True, f"(返回 {r!r} → 须 True)")
+
+
+# =====================================================================
+# F2：订单生命周期分层（fetch 到 ≠ 有效；status ∉ {new,open,active} → 终结）
+# =====================================================================
+def t_f2_lifecycle():
+    # F2a: 自愈 fetch 返回 status='canceled' → ABSENT + 不告警 + terminated_reason 落盘
+    #      （实证：已撤订单 fetch 返回 canceled 对象不抛 OrderNotFound → 旧代码当 FOUND）
+    ident = f"{BATCH}|SL|L0|LONG"
+    reg = {ident: {'state': 'NOT_CONFIRMED', 'order_id': 'o_sl0', 'order_kind': 'conditional',
+                   'role': 'SL', 'layer': 0, 'side': 'LONG', 'intent': _sl_intent(),
+                   'updated_at': 1000.0}}
+    states = _state_batch(protection_registry=reg)
+    fake = _bind_self_heal(_make_base_fake(), states)
+    fake._self_heal_unconfirmed_rounds = {}
+    fake._self_heal_escalate_rounds = 10
+    fake.exchange.fetch_order.return_value = {
+        'id': 'o_sl0', 'symbol': SYMBOL, 'side': 'sell', 'type': 'STOP_MARKET',
+        'amount': 0.43, 'stopPrice': 55000.0, 'reduceOnly': True, 'status': 'canceled', 'info': {}}
+    fake._recheck_registry_self_heal(SYMBOL, BATCH)
+    entry = states[SYMBOL][BATCH]['protection_registry'][ident]
+    alerted = len(fake.sent)
+    report("F2a 自愈canceled→ABSENT不告警",
+           entry.get('state') == 'ABSENT' and bool(entry.get('terminated_reason')) and alerted == 0,
+           f"(state={entry.get('state')!r}, reason={entry.get('terminated_reason')!r}, sent={alerted} → 须 ABSENT+0)")
+
+    # F2b: R-C fetch status='canceled' → ABSENT + 不调 cancel（旧代码 cancel 已撤单抛错→脏数据残留）
+    ident_l0 = f"{BATCH}|SL|L0|LONG"
+    ident_l1 = f"{BATCH}|SL|L1|LONG"
+    reg = {
+        ident_l0: {'state': 'CONFIRMED', 'order_id': 'o_old0', 'order_kind': 'conditional',
+                   'role': 'SL', 'layer': 0, 'side': 'LONG', 'intent': _sl_intent(0.43)},
+        ident_l1: {'state': 'CONFIRMED', 'order_id': 'o_new1', 'order_kind': 'conditional',
+                   'role': 'SL', 'layer': 1, 'side': 'LONG', 'intent': _sl_intent(0.817)},
+    }
+    states = _state_batch(current_sl_id='o_new1', protection_registry=reg)
+    fake = _make_base_fake()
+    fake.load_all_states = lambda: states
+    fake.save_batch_state = lambda s, b, d: fake.saved.append(dict(d))
+    fake.exchange.fetch_order.return_value = {
+        'id': 'o_old0', 'symbol': SYMBOL, 'side': 'sell', 'type': 'STOP_MARKET',
+        'amount': 0.43, 'stopPrice': 55000.0, 'reduceOnly': True, 'status': 'canceled', 'info': {}}
+    CryptoTrader._reconcile_stale_protection_layers(fake, SYMBOL, BATCH, 'SL', keep_order_id='o_new1')
+    reg = states[SYMBOL][BATCH]['protection_registry']
+    l0 = reg[ident_l0]
+    n_cancel = fake.exchange.cancel_order.call_count
+    report("F2b R-C canceled→ABSENT不cancel",
+           l0.get('state') == 'ABSENT' and bool(l0.get('terminated_reason')) and n_cancel == 0,
+           f"(L0={l0.get('state')!r}, reason={l0.get('terminated_reason')!r}, cancel={n_cancel} → 须 ABSENT+0)")
+
+    # F2c: 自愈 status='open'（有效）→ 正常走 intent 匹配（F2 不误杀有效单）
+    ident = f"{BATCH}|SL|L0|LONG"
+    reg = {ident: {'state': 'NOT_CONFIRMED', 'order_id': 'o_sl0', 'order_kind': 'conditional',
+                   'role': 'SL', 'layer': 0, 'side': 'LONG', 'intent': _sl_intent()}}
+    states = _state_batch(protection_registry=reg)
+    fake = _bind_self_heal(_make_base_fake(), states)
+    fake._self_heal_unconfirmed_rounds = {}
+    fake._self_heal_escalate_rounds = 10
+    fake.exchange.fetch_order.return_value = {
+        'id': 'o_sl0', 'symbol': SYMBOL, 'side': 'sell', 'type': 'STOP_MARKET',
+        'amount': 0.43, 'stopPrice': 55000.0, 'reduceOnly': True, 'status': 'open', 'info': {}}
+    fake._recheck_registry_self_heal(SYMBOL, BATCH)
+    entry = states[SYMBOL][BATCH]['protection_registry'][ident]
+    report("F2c 自愈open→正常CONFIRMED", entry.get('state') == 'CONFIRMED',
+           f"(state={entry.get('state')!r} → 须 CONFIRMED：有效单不被 F2 误杀)")
+
+    # F2d: R-C status='open'（有效旧层）→ 仍走 cancel 撤销（行为不回归）
+    reg = {
+        ident_l0: {'state': 'CONFIRMED', 'order_id': 'o_old0', 'order_kind': 'conditional',
+                   'role': 'SL', 'layer': 0, 'side': 'LONG', 'intent': _sl_intent(0.43)},
+        ident_l1: {'state': 'CONFIRMED', 'order_id': 'o_new1', 'order_kind': 'conditional',
+                   'role': 'SL', 'layer': 1, 'side': 'LONG', 'intent': _sl_intent(0.817)},
+    }
+    states = _state_batch(current_sl_id='o_new1', protection_registry=reg)
+    fake = _make_base_fake()
+    fake.load_all_states = lambda: states
+    fake.save_batch_state = lambda s, b, d: fake.saved.append(dict(d))
+    fake.exchange.fetch_order.return_value = {
+        'id': 'o_old0', 'symbol': SYMBOL, 'side': 'sell', 'type': 'STOP_MARKET',
+        'amount': 0.43, 'stopPrice': 55000.0, 'reduceOnly': True, 'status': 'open', 'info': {}}
+    CryptoTrader._reconcile_stale_protection_layers(fake, SYMBOL, BATCH, 'SL', keep_order_id='o_new1')
+    reg = states[SYMBOL][BATCH]['protection_registry']
+    l0 = reg[ident_l0]
+    cancel_ids = [c.args[0] for c in fake.exchange.cancel_order.call_args_list]
+    report("F2d R-C open→仍撤销", l0.get('state') == 'ABSENT' and 'o_old0' in cancel_ids,
+           f"(L0={l0.get('state')!r}, cancel={cancel_ids} → 有效旧层照常撤销)")
+
+
+# =====================================================================
+# F4b：启动窗口通知降级（历史条目 MISMATCH → 降级，不 TG/邮件）
+# =====================================================================
+def t_f4b_launch_window():
+    ident = f"{BATCH}|SL|L0|LONG"
+    intent_mismatch = _sl_intent(stop_price=99999.0)  # stop_price 不符 → 必 MISMATCH
+
+    # F4b-1: 历史条目（updated_at < _process_start_ts）MISMATCH → 标状态但静默
+    reg = {ident: {'state': 'NOT_CONFIRMED', 'order_id': 'o_sl0', 'order_kind': 'conditional',
+                   'role': 'SL', 'layer': 0, 'side': 'LONG', 'intent': intent_mismatch,
+                   'updated_at': 1000.0}}
+    states = _state_batch(protection_registry=reg)
+    fake = _bind_self_heal(_make_base_fake(), states)
+    fake._self_heal_unconfirmed_rounds = {}
+    fake._self_heal_escalate_rounds = 10
+    fake._process_start_ts = 2000.0  # 启动时刻晚于条目 updated_at → 历史条目
+    fake.exchange.fetch_order.return_value = {
+        'id': 'o_sl0', 'symbol': SYMBOL, 'side': 'sell', 'type': 'STOP_MARKET',
+        'amount': 0.43, 'stopPrice': 55000.0, 'reduceOnly': True, 'status': 'open', 'info': {}}
+    fake._recheck_registry_self_heal(SYMBOL, BATCH)
+    entry = states[SYMBOL][BATCH]['protection_registry'][ident]
+    alerted = any('MISMATCH' in s for _, s in fake.sent)
+    report("F4b-1 历史条目MISMATCH降级", entry.get('state') == 'MISMATCH' and not alerted,
+           f"(state={entry.get('state')!r}, MISMATCH告警={alerted} → 标状态但静默)")
+
+    # F4b-2: 本轮新条目（updated_at >= _process_start_ts）MISMATCH → 照常 critical
+    reg = {ident: {'state': 'NOT_CONFIRMED', 'order_id': 'o_sl0', 'order_kind': 'conditional',
+                   'role': 'SL', 'layer': 0, 'side': 'LONG', 'intent': intent_mismatch,
+                   'updated_at': 3000.0}}
+    states = _state_batch(protection_registry=reg)
+    fake = _bind_self_heal(_make_base_fake(), states)
+    fake._self_heal_unconfirmed_rounds = {}
+    fake._self_heal_escalate_rounds = 10
+    fake._process_start_ts = 2000.0  # 条目 updated_at(3000) 晚于启动 → 新条目
+    fake.exchange.fetch_order.return_value = {
+        'id': 'o_sl0', 'symbol': SYMBOL, 'side': 'sell', 'type': 'STOP_MARKET',
+        'amount': 0.43, 'stopPrice': 55000.0, 'reduceOnly': True, 'status': 'open', 'info': {}}
+    fake._recheck_registry_self_heal(SYMBOL, BATCH)
+    alerted = any('MISMATCH' in s for _, s in fake.sent)
+    report("F4b-2 新条目MISMATCH照常critical", alerted,
+           f"(MISMATCH告警={alerted} → 须 True：新风险必须告警)")
+
+    # F4b-3: _process_start_ts 缺失（MagicMock 未绑定）→ 保守不降级（宁多告警不漏告警）
+    reg = {ident: {'state': 'NOT_CONFIRMED', 'order_id': 'o_sl0', 'order_kind': 'conditional',
+                   'role': 'SL', 'layer': 0, 'side': 'LONG', 'intent': intent_mismatch,
+                   'updated_at': 1000.0}}
+    states = _state_batch(protection_registry=reg)
+    fake = _bind_self_heal(_make_base_fake(), states)
+    fake._self_heal_unconfirmed_rounds = {}
+    fake._self_heal_escalate_rounds = 10
+    # 不设置 _process_start_ts：MagicMock getattr 陷阱 → getattr 返回自动 mock（非数值）
+    # → helper isinstance 防御 → 不降级 → 照常 critical（保守）
+    fake.exchange.fetch_order.return_value = {
+        'id': 'o_sl0', 'symbol': SYMBOL, 'side': 'sell', 'type': 'STOP_MARKET',
+        'amount': 0.43, 'stopPrice': 55000.0, 'reduceOnly': True, 'status': 'open', 'info': {}}
+    fake._recheck_registry_self_heal(SYMBOL, BATCH)
+    alerted = any('MISMATCH' in s for _, s in fake.sent)
+    report("F4b-3 start_ts缺失保守告警", alerted,
+           f"(MISMATCH告警={alerted} → 须 True：无法判断历史 → 保守 critical)")
+
+
+# =====================================================================
 # 源码断言：4 项修复全部接入（防锚点漂移用子串计数）
 # =====================================================================
 def t_source_asserts():
@@ -372,6 +587,14 @@ def t_source_asserts():
     report("T20/R-D已接入", rd_marker and n_rd >= 2,
            f"(标记={rd_marker}, helper 引用 {n_rd} 处 → 须 >=2: 1 调用 + 1 定义)")
 
+    # T21: F1/F2/F4b 接入标记（事件3通知风暴修复）
+    f1 = src.count('F1（事件3通知风暴根因') >= 1
+    f2a = src.count('F2（事件3通知风暴根因') >= 1
+    f2b = src.count('F2（2026-08-21）：已终结订单') >= 1
+    f4b = src.count('_is_stale_pre_launch_entry') >= 2  # 定义 + MISMATCH 调用
+    report("T21/F1+F2+F4b已接入", f1 and f2a and f2b and f4b,
+           f"(F1标记={f1}, F2自愈={f2a}, F2滚动撤销={f2b}, F4b引用={f4b})")
+
 
 # =====================================================================
 def main():
@@ -379,10 +602,13 @@ def main():
     t_rb_self_heal()
     t_rc_reconcile()
     t_rd_prune()
+    t_f1_intent_mapping()
+    t_f2_lifecycle()
+    t_f4b_launch_window()
     t_source_asserts()
     passed = sum(1 for _, p in RESULTS if p)
     total = len(RESULTS)
-    print(f"\n{'#' * 60}\n事件3修复专项测试（R-A/B/C/D）：{passed}/{total} 通过\n{'#' * 60}")
+    print(f"\n{'#' * 60}\n事件3修复专项测试（R-A/B/C/D + F1/F2/F4b）：{passed}/{total} 通过\n{'#' * 60}")
     if passed < total:
         sys.exit(1)
 
