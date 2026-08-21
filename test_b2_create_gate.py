@@ -43,7 +43,10 @@ RESULTS = []
 # ⚠️ R-A/B/C/D（事件3四件套，2026-08-21）再偏移 +152~+174，重新实测 2026-08-21（AST 函数归属核实）：
 #    补挂SL→_start_monitoring 4241 | 降级恢复→_start_monitoring 4398 | 补挂TP→_start_monitoring 4528
 #    | 预生成SL→_place_prepared 4831 | 预生成SL兜底→_place_prepared 4978 | 预生成TP→_place_prepared 5130
-GATE_LINES = {4323, 4480, 4610, 4913, 5060, 5212}  # ChatGPT 终审补强 v3 + E2(+2) + R-A/B/C/D 后实测（2026-08-21）；F1/F2/F4b 后 +82 重新实测
+# ⚠️ F1/F2/F3（事件4 TP死锁修复，2026-08-21）在 _start_monitoring 插入 ~170 行 → 6 处 GATE 接入点再偏移 +256~+282，
+#    重新 Grep 实测 2026-08-21（逐行核对 create_order 上下文）：
+#    补挂SL→4497 | 降级恢复→4654 | 补挂TP→4826 | 预生成SL→5129 | 预生成SL兜底→5276 | 预生成TP→5428
+GATE_LINES = {4497, 4654, 4826, 5129, 5276, 5428}  # F1/F2/F3 后重新 Grep 实测（2026-08-21，AST 函数归属核实）
 
 
 def report(name, passed, detail=""):

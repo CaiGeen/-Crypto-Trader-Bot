@@ -2573,7 +2573,8 @@ class CryptoTrader:
 
     def _update_registry(self, symbol, batch_id, identity, state=None, order_id=None,
                          id_known=None, order_kind=None, role=None, layer=None, side=None,
-                         intent=None, fail_count_incr=None, hard_locked=None):
+                         intent=None, fail_count_incr=None, hard_locked=None,
+                         terminated_reason=None):
         """B1/P0-2: 保护单 registry 落盘（规格 §5.2）—— protection_registry[identity] 状态条目。
         每次更新刷新 updated_at；load → modify → save（读最新状态再写，防覆盖并发修改）。
         调用方必须持有监控线程/写侧锁（仲裁需持锁，§13 推论④）。
@@ -2609,6 +2610,8 @@ class CryptoTrader:
             entry['fail_count'] = new_fail_count
         if hard_locked is not None:
             entry['hard_locked'] = hard_locked
+        if terminated_reason is not None:
+            entry['terminated_reason'] = terminated_reason
         entry['updated_at'] = time.time()
         self.save_batch_state(symbol, batch_id, b)
         return new_fail_count
@@ -2831,6 +2834,68 @@ class CryptoTrader:
             return True
         except Exception:
             return False  # 解析失败 → 保守不匹配
+
+    def _adjudicate_recreate_before_repair(self, symbol, batch_id, identity):
+        """F3（2026-08-21 事件4）：补挂前的 registry 实况裁决——治愈"批次级 id 缺失 + registry
+        CONFIRMED"死锁态（R14 每轮补挂 → 闸门永久拦截，registry 永不终结）。
+        返回 (verdict, order_id)：
+          ('allow', None)    → registry 无条目 / 已终结(ABSENT/FAILED) → 允许补挂
+          ('adopt', id)      → CONFIRMED/未决 且 fetch 在场且 intent 匹配 → 收养已有订单（防双挂）
+          ('mismatch', None) → 在场但 intent 不匹配 → 已 critical 告警，禁止自动处理
+          ('hold', None)     → 网络异常 / 结果未知 → 保守保留下轮（不补挂不收养，防双单）
+        防双单核心：任何未终结状态在 fetch 确认终结前，一律不自动补挂（对齐 B2-3 仲裁 §5.3）。"""
+        try:
+            latest_all = self.load_all_states()
+            entry = (latest_all.get(symbol, {}).get(batch_id, {})
+                     .get('protection_registry', {}).get(identity))
+            if not entry:
+                return 'allow', None
+            state = entry.get('state')
+            order_id = entry.get('order_id')
+            if state in ('ABSENT', 'FAILED'):
+                return 'allow', None
+            if state == 'MISMATCH':
+                return 'mismatch', None
+            if state in ('CONFIRMED', 'PENDING_VERIFY', 'NOT_CONFIRMED') and order_id:
+                try:
+                    order = self._safe_api_call(self.exchange.fetch_order, order_id, symbol,
+                                                retries=1, params={'stop': True})
+                except ccxt.OrderNotFound:
+                    # 交易所已清除 → 视同终结 → ABSENT 放行补挂（对齐 S33 语义）
+                    self._update_registry(symbol, batch_id, identity, state='ABSENT',
+                                          terminated_reason='f3_adjudicate_order_not_found')
+                    return 'allow', None
+                except Exception:
+                    return 'hold', None  # 网络异常 → 结果未知，保留下轮
+                valid_statuses = ('new', 'open', 'active')
+                status = str(order.get('status', '')).lower()
+                if status and status not in valid_statuses:
+                    # 已终结（canceled/expired/closed/triggered）→ ABSENT 放行补挂
+                    self._update_registry(symbol, batch_id, identity, state='ABSENT',
+                                          terminated_reason=f'f3_adjudicate_status_{status}')
+                    return 'allow', None
+                # 在场：intent 匹配 → 收养（补 Commit，绝不再 create——防双单复活）
+                intent = entry.get('intent')
+                if intent and self._order_matches_intent(order, intent, symbol):
+                    if state != 'CONFIRMED':
+                        self._update_registry(symbol, batch_id, identity, state='CONFIRMED')
+                    return 'adopt', order_id
+                if state == 'CONFIRMED':
+                    # 在场但与记录意图不符 → 错单/旧单嫌疑：critical 告警，禁止自动处理
+                    self.send_tg_notification(
+                        f"🚨 **保护单补挂前置裁决：订单与意图不匹配**\n"
+                        f"🆔 批次：`{batch_id}`\n"
+                        f"📌 身份：`{identity}`\n"
+                        f"📌 订单：`{order_id}`\n"
+                        f"⚠️ registry 确认有单但在场订单与记录意图不符（错单/旧单嫌疑）\n"
+                        f"💡 程序不自动处理，请人工核实后手动清理",
+                        level='critical')
+                    return 'mismatch', None
+                return 'hold', None  # 未决态在场但不匹配 → 保守
+            # PENDING_CREATE（意图已落盘，create 可能已发出）→ 结果未知，保守
+            return 'hold', None
+        except Exception:
+            return 'hold', None  # 任何异常 → 保守保留下轮
 
     def _is_stale_pre_launch_entry(self, entry):
         """F4b（2026-08-21）：启动窗口降级判断——registry 条目 updated_at 早于本进程启动时刻
@@ -3939,8 +4004,31 @@ class CryptoTrader:
                 need_recover_sl = False
 
                 # 🔥 兜底：有持仓但无止损单时，触发恢复（覆盖重启后SL丢失场景）
+                # F3（2026-08-21 事件4）：与 TP R14 对称——补挂前先裁决 registry 实况，
+                # 防"registry CONFIRMED + current_sl_id 丢失"死锁（闸门永久拦截补挂）。
                 if not current_sl_id and has_entered_position and batch_filled_amount > 0:
-                    need_recover_sl = True
+                    sl_identity_r14 = self._protection_identity(
+                        batch_id, 'SL', batch_filled_count - 1,
+                        params_base.get('positionSide', 'LONG' if side == 'BUY' else 'SHORT'))
+                    verdict, found_id = self._adjudicate_recreate_before_repair(
+                        symbol, batch_id, sl_identity_r14)
+                    if verdict == 'allow':
+                        need_recover_sl = True
+                        print(f"⚠️ [SL 补挂] 批次 {batch_id} 止损单缺失(未创建或创建失败)，准备补挂...")
+                    elif verdict == 'adopt' and found_id:
+                        current_sl_id = found_id
+                        print(f"✅ [F3 收养] 批次 {batch_id} 止损单实为在场 ({found_id})，收养防双挂")
+                        try:
+                            _lb = self.load_all_states().get(symbol, {}).get(batch_id, {})
+                            if _lb:
+                                _lb['current_sl_id'] = found_id
+                                self.save_batch_state(symbol, batch_id, _lb)
+                        except Exception:
+                            pass
+                    elif verdict == 'mismatch':
+                        print(f"🚫 [F3 裁决] 批次 {batch_id} 止损单在场但不匹配，已 critical 告警，不自动处理")
+                    else:
+                        print(f"⏸️ [F3 裁决] 批次 {batch_id} 止损单结果未知，保守保留下轮")
 
                 if current_sl_id and (str(current_sl_id) not in open_orders_map) and has_entered_position:
                     sl_id_str = str(current_sl_id)
@@ -3962,6 +4050,23 @@ class CryptoTrader:
                             terminal_orders.add(sl_id_str)
                         elif sl_status in ['canceled', 'expired']:
                             terminal_orders.add(sl_id_str)
+                            # F2（2026-08-21 事件4）：物理单已终结 → registry 同步终结为 ABSENT。
+                            # 否则 CONFIRMED 条目永不终结 → 后续补挂被闸门永久拦截（死锁根因）。
+                            # 遍历 registry 按 order_id 精确匹配 identity（防 layer 漂移），找不到再回退最新层。
+                            _latest_check = self.load_all_states().get(symbol, {}).get(batch_id, {})
+                            _reg_target = None
+                            for _k, _v in (_latest_check.get('protection_registry') or {}).items():
+                                if str(_v.get('order_id', '')) == str(sl_id_str):
+                                    _reg_target = _k
+                                    break
+                            if _reg_target is None:
+                                _reg_target = self._protection_identity(
+                                    batch_id, 'SL', batch_filled_count - 1,
+                                    params_base.get('positionSide',
+                                                    'LONG' if side == 'BUY' else 'SHORT'))
+                            self._update_registry(symbol, batch_id, _reg_target,
+                                                  state='ABSENT',
+                                                  terminated_reason=f'terminal_status_{sl_status}')
                             # 🔥 检查是否是程序主动撤单（平仓时撤销）
                             latest_all_check = self.load_all_states()
                             latest_b_data_check = latest_all_check.get(symbol, {}).get(batch_id, {})
@@ -4079,6 +4184,22 @@ class CryptoTrader:
                                 terminal_orders.add(tp_id_str)
                             elif tp_status in ['canceled', 'expired']:
                                 terminal_orders.add(tp_id_str)
+                                # F2（2026-08-21 事件4）：物理单已终结 → registry 同步终结为 ABSENT。
+                                # 否则 CONFIRMED 条目永不终结 → 后续补挂被闸门永久拦截（死锁根因）。
+                                _latest_check = self.load_all_states().get(symbol, {}).get(batch_id, {})
+                                _reg_target = None
+                                for _k, _v in (_latest_check.get('protection_registry') or {}).items():
+                                    if str(_v.get('order_id', '')) == str(tp_id_str):
+                                        _reg_target = _k
+                                        break
+                                if _reg_target is None:
+                                    _reg_target = self._protection_identity(
+                                        batch_id, 'TP', batch_filled_count - 1,
+                                        params_base.get('positionSide',
+                                                        'LONG' if side == 'BUY' else 'SHORT'))
+                                self._update_registry(symbol, batch_id, _reg_target,
+                                                      state='ABSENT',
+                                                      terminated_reason=f'terminal_status_{tp_status}')
                                 # 🔥 检查是否是程序主动撤单（平仓时撤销）
                                 latest_all_check = self.load_all_states()
                                 latest_b_data_check = latest_all_check.get(symbol, {}).get(batch_id, {})
@@ -4123,10 +4244,33 @@ class CryptoTrader:
                                 k for k in self._sg3_alerted
                                 if not (k[0] == batch_id and k[1] == str(tp_order_id))}
 
-                # R14: TP 从未创建成功(tp_order_id is None)时，如果有持仓且未用户修改，标记需要补挂
+                # R14 + F3: TP 从未创建成功(tp_order_id is None)时，如果有持仓且未用户修改，标记需要补挂
+                # F3（2026-08-21 事件4）：补挂前先裁决 registry 实况——治愈"registry CONFIRMED +
+                # 批次级 id 丢失"死锁态：物理单已终结 → 放行补挂；仍在场 → 收养防双挂；不匹配 → 告警。
                 if tp_order_id is None and has_entered_position and batch_filled_amount > 0 and not user_modified:
-                    need_recover_tp = True
-                    print(f"⚠️ [TP 补挂] 批次 {batch_id} 止盈单缺失(未创建或创建失败)，准备补挂...")
+                    tp_identity_r14 = self._protection_identity(
+                        batch_id, 'TP', batch_filled_count - 1,
+                        params_base.get('positionSide', 'LONG' if side == 'BUY' else 'SHORT'))
+                    verdict, found_id = self._adjudicate_recreate_before_repair(
+                        symbol, batch_id, tp_identity_r14)
+                    if verdict == 'allow':
+                        need_recover_tp = True
+                        print(f"⚠️ [TP 补挂] 批次 {batch_id} 止盈单缺失(未创建或创建失败)，准备补挂...")
+                    elif verdict == 'adopt' and found_id:
+                        tp_order_id = found_id
+                        print(f"✅ [F3 收养] 批次 {batch_id} 止盈单实为在场 ({found_id})，收养防双挂")
+                        # 补批次级 id 落盘（收养后 R14 不再触发，且风控段可直接复用）
+                        try:
+                            _lb = self.load_all_states().get(symbol, {}).get(batch_id, {})
+                            if _lb:
+                                _lb['tp_order_id'] = found_id
+                                self.save_batch_state(symbol, batch_id, _lb)
+                        except Exception:
+                            pass
+                    elif verdict == 'mismatch':
+                        print(f"🚫 [F3 裁决] 批次 {batch_id} 止盈单在场但不匹配，已 critical 告警，不自动处理")
+                    else:
+                        print(f"⏸️ [F3 裁决] 批次 {batch_id} 止盈单结果未知，保守保留下轮")
 
                 if tp_triggered and tp_detail:
                     tp_exit_price = float(tp_detail.get('average') or 0.0)
@@ -4253,19 +4397,49 @@ class CryptoTrader:
                                 pass
 
                         if old_sl_id:
-                            try:
-                                self._safe_api_call(self.exchange.cancel_order, old_sl_id, symbol,
-                                                    params={'stop': True})
-                                print(f"  └─ 已撤销旧止损单: {old_sl_id}")
-                                old_sl_id = None
-                            except Exception as e:
-                                if "Unknown order" in str(e) or "-2011" in str(e):
-                                    print(f"  └─ 旧止损单 {old_sl_id} 已不存在，跳过")
+                            # F1（2026-08-21 事件4）：替换旧单前先过仲裁闸门（replace 语义）——
+                            # CONFIRMED + replace_order_id==entry.order_id → 放行先撤后建；
+                            # 未决态/硬锁 → 拒绝替换（保留原单、不撤销、不创建，等自愈/人工）。
+                            # 原结构"先撤销再闸门检查（未传 replace_order_id）"→ CONFIRMED 拦截 →
+                            # current_sl_id=None 落盘 → 下轮缺失检测又补挂 → 闸门永久拦截（死锁）。
+                            sl_identity_pre = self._protection_identity(
+                                batch_id, 'SL', batch_filled_count - 1,
+                                params_base.get('positionSide', 'LONG' if side == 'BUY' else 'SHORT'))
+                            allowed_r, reason_r = self._assert_create_allowed(
+                                symbol, batch_id, sl_identity_pre, desc='替换止损单',
+                                replace_order_id=old_sl_id)
+                            if not allowed_r:
+                                # 拒绝替换 → 保留原单（old_sl_id 不清空 → 下方创建分支自然跳过）
+                                print(f"  └─ 🚫 [仲裁] 跳过替换止损单（保留原单）: {reason_r}")
+                                self._gate_alert_notify(
+                                    sl_identity_pre, reason_r,
+                                    f"⚠️ **止损单替换被仲裁拦截**\n"
+                                    f"🆔 批次：`{batch_id}`\n"
+                                    f"📌 {reason_r}\n"
+                                    f"💡 程序保留原单不重复挂单，等待自愈重查确认",
+                                    level='warning')
+                            else:
+                                try:
+                                    self._safe_api_call(self.exchange.cancel_order, old_sl_id, symbol,
+                                                        params={'stop': True})
+                                    print(f"  └─ 已撤销旧止损单: {old_sl_id} → registry ABSENT")
+                                    # F1: 撤销确认 → registry 终结为 ABSENT（旧单物理离开 → 允许安全重建）
+                                    self._update_registry(symbol, batch_id, sl_identity_pre,
+                                                          state='ABSENT',
+                                                          terminated_reason='canceled_by_update_replace')
                                     old_sl_id = None
-                                else:
-                                    print(f"  └─ ⚠️ 撤销旧止损单失败: {e}")
-                                    sl_error_count += 1
-                                    continue
+                                except Exception as e:
+                                    if "Unknown order" in str(e) or "-2011" in str(e):
+                                        print(f"  └─ 旧止损单 {old_sl_id} 已不存在 → registry ABSENT")
+                                        self._update_registry(symbol, batch_id, sl_identity_pre,
+                                                              state='ABSENT',
+                                                              terminated_reason='order_not_found_on_replace')
+                                        old_sl_id = None
+                                    else:
+                                        # F1: 网络异常 fail-closed——不清 id、不创建，保留下轮（防双单）
+                                        print(f"  └─ ⚠️ 撤销旧止损单失败: {e}")
+                                        sl_error_count += 1
+                                        continue
 
                         if old_sl_id is None:
                             sl_params = params_base.copy()
@@ -4558,40 +4732,82 @@ class CryptoTrader:
                     if need_update_tp and not self._tp_update_blocked(
                             symbol, batch_id, side, batch_filled_count - 1,
                             formatted_tp_price, batch_entry_vwap):
+                        # B2-2: 意图先落盘（崩溃安全）+ intent 指纹（F1: identity 上移供撤销前闸门复用）
+                        tp_identity = self._protection_identity(
+                            batch_id, 'TP', batch_filled_count - 1,
+                            params_base.get('positionSide', 'LONG' if side == 'BUY' else 'SHORT'))
+
+                        # F1（2026-08-21 事件4）：替换旧单前先过仲裁闸门（replace 语义）——
+                        # 原结构"先撤销再闸门检查（未传 replace_order_id）"→ CONFIRMED 拦截 →
+                        # tp_order_id=None 落盘 → R14 每轮补挂 → 闸门永久拦截（registry 永不终结 = 死锁）。
+                        # 拒绝/网络异常 → 保留原单（tp_skip_create=True → 下方闸门走 F1 分支不清 id）。
+                        tp_skip_create = False
                         if tp_order_id:
-                            try:
-                                self._safe_api_call(self.exchange.cancel_order, tp_order_id, symbol,
-                                                    params={'stop': True})
-                            except Exception:
-                                pass
+                            allowed_r, reason_r = self._assert_create_allowed(
+                                symbol, batch_id, tp_identity, desc='替换止盈单',
+                                replace_order_id=tp_order_id)
+                            if not allowed_r:
+                                print(f"  └─ 🚫 [仲裁] 跳过替换止盈单（保留原单）: {reason_r}")
+                                self._gate_alert_notify(
+                                    tp_identity, reason_r,
+                                    f"⚠️ **止盈单替换被仲裁拦截**\n"
+                                    f"🆔 批次：`{batch_id}`\n"
+                                    f"📌 {reason_r}\n"
+                                    f"💡 程序保留原单不重复挂单，等待自愈重查确认",
+                                    level='warning')
+                                tp_skip_create = True
+                            else:
+                                try:
+                                    self._safe_api_call(self.exchange.cancel_order, tp_order_id, symbol,
+                                                        params={'stop': True})
+                                    print(f"  └─ 已撤销旧止盈单: {tp_order_id} → registry ABSENT")
+                                    # F1: 撤销确认 → registry 终结为 ABSENT（旧单物理离开 → 允许安全重建）
+                                    self._update_registry(symbol, batch_id, tp_identity,
+                                                          state='ABSENT',
+                                                          terminated_reason='canceled_by_update_replace')
+                                    tp_order_id = None
+                                except Exception as e:
+                                    if "Unknown order" in str(e) or "-2011" in str(e):
+                                        print(f"  └─ 旧止盈单 {tp_order_id} 已不存在 → registry ABSENT")
+                                        self._update_registry(symbol, batch_id, tp_identity,
+                                                              state='ABSENT',
+                                                              terminated_reason='order_not_found_on_replace')
+                                        tp_order_id = None
+                                    else:
+                                        # F1: 网络异常 fail-closed——不清 id、不创建，保留下轮（防双单）
+                                        print(f"  └─ ⚠️ 撤销旧止盈单失败: {e}，保留原单下轮再试")
+                                        tp_skip_create = True
 
                         tp_params = params_base.copy()
                         tp_params['stopPrice'] = formatted_tp_price
                         if not is_hedge_mode:
                             tp_params['reduceOnly'] = True
 
-                        # B2-2: 意图先落盘（崩溃安全）+ intent 指纹
-                        tp_identity = self._protection_identity(
-                            batch_id, 'TP', batch_filled_count - 1,
-                            params_base.get('positionSide', 'LONG' if side == 'BUY' else 'SHORT'))
                         try:
                             # B2-3: Create 仲裁闸门（§5.3）—— 同 identity 未决/已确认 → 禁新 create
-                            allowed, gate_reason = self._assert_create_allowed(
-                                symbol, batch_id, tp_identity, desc='补挂止盈单')
+                            if tp_skip_create:
+                                allowed, gate_reason = False, 'F1_replace_blocked_skip_create'
+                            else:
+                                allowed, gate_reason = self._assert_create_allowed(
+                                    symbol, batch_id, tp_identity, desc='补挂止盈单')
                             if not allowed:
-                                if gate_reason.startswith('HARD_LOCK'):
-                                    # B2-4: 硬锁静默（进入时已 critical，此后不重复告警）
-                                    print(f"  └─ 🔒 [硬锁] 跳过补挂止盈单: {gate_reason}")
+                                if gate_reason == 'F1_replace_blocked_skip_create':
+                                    # F1: 替换被阻断 → 保留原单（不清 id → 落盘保持 → R14 不触发）
+                                    print(f"  └─ ⏭️ [F1] 替换被阻断，保留原止盈单 (id={tp_order_id})")
                                 else:
-                                    print(f"  └─ 🚫 [仲裁] 跳过补挂止盈单: {gate_reason}")
-                                    self._gate_alert_notify(
-                                        tp_identity, gate_reason,
-                                        f"⚠️ **止盈单创建被仲裁拦截**\n"
-                                        f"🆔 批次：`{batch_id}`\n"
-                                        f"📌 {gate_reason}\n"
-                                        f"💡 程序不重复挂单，等待自愈重查确认",
-                                        level='warning')
-                                tp_order_id = None
+                                    if gate_reason.startswith('HARD_LOCK'):
+                                        # B2-4: 硬锁静默（进入时已 critical，此后不重复告警）
+                                        print(f"  └─ 🔒 [硬锁] 跳过补挂止盈单: {gate_reason}")
+                                    else:
+                                        print(f"  └─ 🚫 [仲裁] 跳过补挂止盈单: {gate_reason}")
+                                        self._gate_alert_notify(
+                                            tp_identity, gate_reason,
+                                            f"⚠️ **止盈单创建被仲裁拦截**\n"
+                                            f"🆔 批次：`{batch_id}`\n"
+                                            f"📌 {gate_reason}\n"
+                                            f"💡 程序不重复挂单，等待自愈重查确认",
+                                            level='warning')
+                                    tp_order_id = None
                             else:
                                 # B2-2: 崩溃安全——create 前先落盘 PENDING_CREATE + 不可变 intent 指纹
                                 self._update_registry(symbol, batch_id, tp_identity,
