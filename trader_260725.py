@@ -88,6 +88,14 @@ class CryptoTrader:
         self.last_ip_check_time = 0
         self.IP_CHECK_INTERVAL = 600  # 10 分钟
 
+        # R-B（事件3根因B）：运行期 registry 自愈重查周期 + 持续未确认升级告警阈值。
+        # 原 _recheck_registry_self_heal 只在启动恢复调用一次 → NOT_CONFIRMED 永久卡死。
+        # 主循环每 registry_self_heal_interval 秒重查一次；连续 self_heal_escalate_rounds 轮
+        # 仍查不到 → critical 告警一次（L1 生命周期不变量：失败状态通知 + 人工接管入口）。
+        self.registry_self_heal_interval = 30  # 秒
+        self.self_heal_escalate_rounds = 10    # 连续未确认轮数（约 5 分钟）
+        self._self_heal_unconfirmed_rounds = {}  # (symbol, batch_id, identity) → 连续未确认轮次
+
         # 🔥 是否启用 IP 检测（云服务器有固定 IP 时可以禁用）
         self.IP_CHECK_ENABLED = os.getenv("IP_CHECK_ENABLED", "true").lower() == "true"
         if not self.IP_CHECK_ENABLED and self.verbose:
@@ -2484,6 +2492,23 @@ class CryptoTrader:
                 self._safe_api_call(self.exchange.fetch_order, order_id, symbol, retries=1)
             return 'success'
         except ccxt.OrderNotFound:
+            # R-A（事件3根因A）：create 后立即 fetch 命中 Binance algo 端点可见性延迟
+            #（事件3实证：4/4 单 create 成功但 0 秒 verify 全部 OrderNotFound 假阴性）。
+            # OrderNotFound 短窗口重试（2s × 3）：仍查不到才返回 not_found；
+            # 重试期网络异常 → unknown（结果未知 ≠ 不存在，UNKNOWN ≠ EMPTY）。
+            for _attempt in range(3):
+                time.sleep(2)
+                try:
+                    if order_kind == 'conditional':
+                        self._safe_api_call(self.exchange.fetch_order, order_id, symbol,
+                                            params={'stop': True}, retries=1)
+                    else:
+                        self._safe_api_call(self.exchange.fetch_order, order_id, symbol, retries=1)
+                    return 'success'
+                except ccxt.OrderNotFound:
+                    continue
+                except Exception:
+                    return 'unknown'
             return 'not_found'
         except Exception:
             return 'unknown'
@@ -2792,6 +2817,10 @@ class CryptoTrader:
         changed = False
         for identity, entry in reg.items():
             if entry.get('state') not in ('PENDING_VERIFY', 'NOT_CONFIRMED'):
+                # R-B: 条目已终结/确认 → 清理累计未确认轮次（防内存膨胀）
+                rounds = getattr(self, '_self_heal_unconfirmed_rounds', None)
+                if isinstance(rounds, dict):
+                    rounds.pop((symbol, batch_id, identity), None)
                 continue
             order_id = entry.get('order_id')
             if not order_id:
@@ -2808,6 +2837,25 @@ class CryptoTrader:
                     entry['state'] = 'NOT_CONFIRMED'
                     entry['updated_at'] = time.time()
                     changed = True
+                # R-B: 持续未确认升级告警（L1 生命周期不变量：失败状态通知 + 人工接管入口）——
+                # 连续 N 轮仍查不到 → critical 一次（不刷屏；成功/终结后计数自动清零）。
+                # 触发一次即止，避免告警风暴（若此后成功又再度失败，可再次触发）。
+                rounds = getattr(self, '_self_heal_unconfirmed_rounds', None)
+                if not isinstance(rounds, dict):
+                    rounds = {}
+                    self._self_heal_unconfirmed_rounds = rounds
+                key = (symbol, batch_id, identity)
+                rounds[key] = rounds.get(key, 0) + 1
+                threshold = getattr(self, '_self_heal_escalate_rounds', 10)
+                if rounds[key] == threshold:
+                    self.send_tg_notification(
+                        f"🚨 **保护单持续无法确认（请人工核实）**\n"
+                        f"🆔 批次：`{batch_id}`\n"
+                        f"📌 身份：`{identity}`\n"
+                        f"📌 订单：`{order_id}`\n"
+                        f"⚠️ 程序连续 {rounds[key]} 轮自愈重查仍查不到该订单\n"
+                        f"💡 订单可能未真正创建、已触发或已被撤销。请到交易所核实持仓保护状态！",
+                        level='critical')
                 continue
             except Exception:
                 continue  # 结果未知 → 维持现状静默，等待下一轮重查
@@ -2838,8 +2886,99 @@ class CryptoTrader:
             entry['state'] = 'CONFIRMED'
             entry['updated_at'] = time.time()
             changed = True
+            # R-B: 确认成功 → 清零持续未确认轮次
+            rounds = getattr(self, '_self_heal_unconfirmed_rounds', None)
+            if isinstance(rounds, dict):
+                rounds.pop((symbol, batch_id, identity), None)
         if changed:
             self.save_batch_state(symbol, batch_id, b)
+
+    def _reconcile_stale_protection_layers(self, symbol, batch_id, role, keep_order_id=None):
+        """R-C（事件3根因C）：滚动撤销链补强 —— 新层汇总保护单已确认后，撤销 registry 中
+        同 role 旧层带 order_id 的单（防层叠重复：多张旧层单叠加理论平仓量 > 实际持仓）。
+        事件3实证：verify 假阴性 → current_sl_id 恒 null → 旧层单永不撤销 → L0(0.43)+L1(0.817)
+        层叠。本方法只撤销不创建（新单已确认，撤销旧单无空窗）：
+          fetch 存在       → cancel + 条目终结（ABSENT）
+          OrderNotFound    → 已不存在（被撤/已触发/从未成功）→ 条目终结（ABSENT）
+          网络异常         → 结果未知，保留下轮重试（未知 ≠ 不存在，不误撤）
+        keep_order_id：新挂汇总单 ID，跳过（不得撤销自己）。
+        调用点：主循环补挂 SL/TP 成功段 + 预生成 SL/TP 成功段（均为新单已 Commit 后）。"""
+        latest_all = self.load_all_states()
+        b = latest_all.get(symbol, {}).get(batch_id)
+        if b is None:
+            return
+        reg = b.get('protection_registry', {})
+        changed = False
+        for identity, entry in reg.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get('role') != role:
+                continue
+            order_id = entry.get('order_id')
+            if not order_id or order_id == keep_order_id:
+                continue
+            # 只处理带 order_id 的条目（PENDING_CREATE 无 id 跳过；其余状态均以实况裁决）
+            try:
+                self._safe_api_call(self.exchange.fetch_order, order_id, symbol,
+                                    params={'stop': True}, retries=1)
+            except ccxt.OrderNotFound:
+                entry['state'] = 'ABSENT'
+                entry['updated_at'] = time.time()
+                entry['terminated_reason'] = 'stale_layer_reconcile_not_found'
+                changed = True
+                print(f"  └─ 🧹 [滚动撤销] {role} 旧层 {identity} 已不存在(order_id={order_id})，条目终结")
+                continue
+            except Exception as e:
+                # 网络异常 → 结果未知：保留下轮重试，不撤销（未知 ≠ 不存在）
+                print(f"  └─ ⚠️ [滚动撤销] {role} 旧层 {identity} 查询失败，保留下轮: {e}")
+                continue
+            # 订单真实存在 → 撤销（旧层单被新汇总单替代）
+            try:
+                self._safe_api_call(self.exchange.cancel_order, order_id, symbol,
+                                    params={'stop': True}, retries=1)
+                print(f"  └─ 🧹 [滚动撤销] 已撤销 {role} 旧层单 {identity} (order_id={order_id})")
+            except Exception as e:
+                if "Unknown order" in str(e) or "-2011" in str(e):
+                    print(f"  └─ 🧹 [滚动撤销] {role} 旧层单 {order_id} 已不存在，跳过")
+                else:
+                    print(f"  └─ ⚠️ [滚动撤销] {role} 旧层单撤销失败，保留下轮: {e}")
+                    continue
+            entry['state'] = 'ABSENT'
+            entry['updated_at'] = time.time()
+            entry['terminated_reason'] = 'stale_layer_reconcile_cancelled'
+            changed = True
+        if changed:
+            self.save_batch_state(symbol, batch_id, b)
+
+    def _prune_pending_sl_by_registry(self, symbol, batch_id, pending_sl_orders):
+        """R-D（事件3根因D）：registry 已有 order_id 的层无论 verify 结果都移出待挂列表。
+        语义澄清：pending_sl_orders = "需要创建保护单"；create 已返回 id = 创建已发生 →
+        不再待创建；NOT_CONFIRMED/PENDING_VERIFY 的确认/收编由 R-B 运行期自愈负责。
+        事件3实证：NOT_CONFIRMED 层永不从 pending 移除 → 每轮补挂尝试被仲裁闸门拦截 →
+        无限循环（gate 告警 3 次后静默，但层叠未解）。本方法按 registry 实况裁决：
+          条目 role=SL 且 layer=idx 且 order_id 非空 → 移出 pending（无论状态）。
+        直接原地修改调用方 list 并落盘；返回是否移除了任何层。"""
+        if not pending_sl_orders:
+            return False
+        latest_all = self.load_all_states()
+        b = latest_all.get(symbol, {}).get(batch_id)
+        if not b:
+            return False
+        reg = b.get('protection_registry', {})
+        removed = []
+        for idx in list(pending_sl_orders):
+            for entry in reg.values():
+                if (isinstance(entry, dict) and entry.get('role') == 'SL'
+                        and entry.get('layer') == idx and entry.get('order_id')):
+                    pending_sl_orders.remove(idx)
+                    removed.append(idx)
+                    break
+        if removed:
+            b['pending_sl_orders'] = pending_sl_orders
+            self.save_batch_state(symbol, batch_id, b)
+            print(f"  └─ 📝 [R-D] registry 已有 order_id 的层 {removed} 移出待挂列表"
+                  f"（确认由运行期自愈负责）")
+        return bool(removed)
 
     def _self_heal_no_id(self, symbol, batch_id):
         """B2-6（规格 §6.3）：无 ID 身份签名匹配自愈——处理 PENDING_CREATE / PENDING_VERIFY(id_unknown)
@@ -3061,6 +3200,8 @@ class CryptoTrader:
 
         terminal_orders = set()
         fast_poll_count = 0
+        # R-B: 运行期周期自愈重查时间戳（每 registry_self_heal_interval 秒一次）
+        last_registry_self_heal_time = 0
         # P1-2: 连续网络错误计数器（用于动态降速，避免加重限流）
         consecutive_network_errors = 0
 
@@ -3119,6 +3260,17 @@ class CryptoTrader:
 
                 time.sleep(sleep_interval)
                 self._sync_time_if_needed()
+
+                # 🔥 R-B: 运行期周期自愈重查（事件3根因B）——每 ~30s 重查一次 registry 未决条目
+                #（PENDING_VERIFY/NOT_CONFIRMED）：FOUND+intent 匹配 → CONFIRMED + 收编 Commit，
+                # 解开"verify 假阴性 → 永久卡死"（原自愈只在启动恢复调用一次，运行期零机制）。
+                now = time.time()
+                if now - last_registry_self_heal_time >= self.registry_self_heal_interval:
+                    last_registry_self_heal_time = now
+                    try:
+                        self._recheck_registry_self_heal(symbol, batch_id)
+                    except Exception as e:
+                        print(f"  └─ ⚠️ [自愈] registry 周期重查异常: {e}")
 
                 # 🔥 定期主动检测 IP（每 5 分钟）
                 now = time.time()
@@ -3956,6 +4108,10 @@ class CryptoTrader:
 
                 # ==================== 处理待补挂止损 ====================
                 if pending_sl_orders and has_entered_position and batch_filled_amount > 0:
+                    # R-D（事件3根因D）：registry 已有 order_id 的层无论 verify 结果都移出待挂列表
+                    #（create 已返回 id = 创建已发生；NOT_CONFIRMED/PENDING_VERIFY 由 R-B 运行期
+                    # 自愈重查确认/收编）→ 防"闸门拦截 + pending 永不清空"的无限循环
+                    self._prune_pending_sl_by_registry(symbol, batch_id, pending_sl_orders)
                     all_processed = True
                     for layer_idx in pending_sl_orders:
                         if layer_idx < len(filled_layers) and filled_layers[layer_idx]:
@@ -4105,6 +4261,10 @@ class CryptoTrader:
                                             current_sl_id = new_sl_order['id']
                                             sl_success = True
                                             print(f"  └─ ✅ 止损单已挂出: {formatted_new_sl_price} (ID: {current_sl_id})")
+                                            # R-C（事件3根因C）：滚动撤销链补强——新汇总单已确认，
+                                            # 撤销 registry 中旧层同 role 单（防层叠重复：理论平仓量 > 实际持仓）
+                                            self._reconcile_stale_protection_layers(
+                                                symbol, batch_id, 'SL', keep_order_id=current_sl_id)
 
                                             # 🔥 安全移除已处理的 pending_sl_orders
                                             if pending_sl_orders:
@@ -4385,6 +4545,9 @@ class CryptoTrader:
                                 else:
                                     tp_order_id = new_tp_order['id']
                                     print(f"  └─ ✅ 止盈单已挂出: {formatted_tp_price} (ID: {tp_order_id})")
+                                    # R-C（事件3根因C）：滚动撤销链补强——撤销 registry 旧层 TP 单
+                                    self._reconcile_stale_protection_layers(
+                                        symbol, batch_id, 'TP', keep_order_id=tp_order_id)
                                     # 补挂 TP 成功 → 清零该层层级熔断计数（对称 SL L3951-3955 语义）
                                     try:
                                         _b2 = self.load_all_states().get(symbol, {}).get(batch_id, {})
@@ -4713,6 +4876,11 @@ class CryptoTrader:
                             latest_b_data['pending_sl_orders'] = pending
                             self.save_batch_state(symbol, batch_id, latest_b_data)
                             print(f"  └─ ⚡ 预生成止损单已挂出: {sl_price} (ID: {new_sl_order['id']})")
+                            # R-C（事件3根因C）：滚动撤销链补强——预生成路径可能因 current_sl_id
+                            # 为 None 而对后续层补挂（verify 假阴性未 Commit 时），须撤销 registry
+                            # 旧层 SL 单（防层叠重复）
+                            self._reconcile_stale_protection_layers(
+                                symbol, batch_id, 'SL', keep_order_id=new_sl_order['id'])
                 except Exception as e:
                     cls = self._classify_create_exception(e)
                     if cls == 'unknown':
@@ -4859,6 +5027,9 @@ class CryptoTrader:
                                 latest_b_data['pending_sl_orders'] = pending
                                 self.save_batch_state(symbol, batch_id, latest_b_data)
                                 print(f"  └─ ⚡ 止损单已挂出(兜底): {formatted_sl_price} (ID: {new_sl_order['id']})")
+                                # R-C（事件3根因C）：滚动撤销链补强——撤销 registry 旧层 SL 单
+                                self._reconcile_stale_protection_layers(
+                                    symbol, batch_id, 'SL', keep_order_id=new_sl_order['id'])
                 except Exception as e:
                     cls = self._classify_create_exception(e)
                     if cls == 'unknown':
@@ -5001,6 +5172,9 @@ class CryptoTrader:
                             latest_b_data['tp_order_id'] = new_tp_order['id']
                             self.save_batch_state(symbol, batch_id, latest_b_data)
                             print(f"  └─ ⚡ 预生成止盈单已挂出: {tp_params['params']['stopPrice']} (ID: {new_tp_order['id']})")
+                            # R-C（事件3根因C）：滚动撤销链补强——撤销 registry 旧层 TP 单
+                            self._reconcile_stale_protection_layers(
+                                symbol, batch_id, 'TP', keep_order_id=new_tp_order['id'])
             except Exception as e:
                 cls = self._classify_create_exception(e)
                 if cls == 'unknown':

@@ -49,9 +49,13 @@ RESULTS = []
 # ⚠️ 行号偏移记录：R1/R2/R3（ChatGPT 终审 2026-08-20）+~170 行后重新 Grep 实测 2026-08-20
 #    → ChatGPT 终审补强 v3（成本边界+熔断通知+FAILED恢复，2026-08-20 晚）后再次实测：
 #      实测 create 调用点 = [1308, 1459, 1673, 2259, 3516, 3590, 4083, 4236, 4366, 4666, 4808, 4957, 5223, 5406]
-A_LINES = {1310, 1461, 1675, 3518, 3592, 4085, 4238, 4368, 4668, 4810, 4959}  # 11 处保护单
-B_LINES = {2261}                                                              # 1 处开仓条件单
-C_LINES = {5225, 5408}                                                        # 2 处平仓单
+# ⚠️ R-A/B/C/D（事件3四件套，2026-08-21，a6c485a 之后）再偏移 +8~+174，重新实测 2026-08-21：
+#      实测 create 调用点 = [1318, 1469, 1683, 2269, 3670, 3744, 4241, 4398, 4528, 4831, 4978, 5130, 5399, 5582]
+#      函数映射（AST 核实）：update_batch_tp/sl/_update_sl_no_validation/_start_monitoring(5)/_place_prepared(3)
+#      为保护单（A）；execute_signal 为开仓（B）；close_position_market/limit 为平仓（C）。
+A_LINES = {1318, 1469, 1683, 3670, 3744, 4241, 4398, 4528, 4831, 4978, 5130}  # 11 处保护单
+B_LINES = {2269}                                                              # 1 处开仓条件单
+C_LINES = {5399, 5582}                                                        # 2 处平仓单
 ALL_LINES = A_LINES | B_LINES | C_LINES                                       # 14 处
 
 
@@ -358,6 +362,13 @@ def make_fake(states, open_orders):
     # 返回自动 mock（吞掉默认值）→ time.time() < MagicMock 抛 TypeError（B2-3 闸门会检查 cooldown）。
     # 必须显式置 0，否则真实 _assert_create_allowed 在 cooldown 比较处崩溃。
     fake._api_cooldown_until = 0
+    # R-B（事件3根因B，2026-08-21）：运行期周期自愈插入点
+    # `now - last_registry_self_heal_time >= self.registry_self_heal_interval` 直接比较
+    # 属性 → MagicMock 自动属性参与 >= 抛 TypeError → 监控循环第一轮崩溃退出 →
+    # 恢复链 cancel/create/告警全部落空（H1/H3/H4 回归根因）。必须绑定真实数值。
+    fake.registry_self_heal_interval = 30.0
+    fake.self_heal_escalate_rounds = 10
+    fake._self_heal_unconfirmed_rounds = {}
     fake._cancel_remaining_entries = lambda *a, **k: None
     fake._cancel_limit_close_order = lambda *a, **k: None
     fake.clear_batch_state = lambda *a, **k: None

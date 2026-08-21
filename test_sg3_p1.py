@@ -208,6 +208,13 @@ def make_fake(states, open_orders):
     fake._active_monitors = set()
     fake._sg3_alerted = set()  # SG3-P1 告警节流集合（实现后使用）
     fake._api_cooldown_until = 0  # B2-3 gate 需真实数值（MagicMock getattr 陷阱）
+    # R-B（事件3根因B，2026-08-21）：运行期周期自愈插入点
+    # `now - last_registry_self_heal_time >= self.registry_self_heal_interval` 直接比较
+    # 属性 → MagicMock 自动属性参与 >= 抛 TypeError → 监控循环第一轮崩溃退出 →
+    # 恢复链 cancel/create/告警全部落空（H/C/E 组回归根因）。必须绑定真实数值。
+    fake.registry_self_heal_interval = 30.0
+    fake.self_heal_escalate_rounds = 10
+    fake._self_heal_unconfirmed_rounds = {}
 
     fake.sent = []
     fake.saved = []
