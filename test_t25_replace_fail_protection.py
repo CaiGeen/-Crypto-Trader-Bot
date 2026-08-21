@@ -9,10 +9,10 @@ ChatGPT 建议：replace 失败后必须明确"旧保护状态"，验证两套�
   T25-B（部分减仓段，先建后撤）：永远优先保留旧保护——
         create new 失败 / verify 失败 → 旧单仍在场 + registry 不误标 → 下轮 F3 裁决 hold 不双挂
 
-源码锚点（2026-08-21 17:2x 实测，AST 函数归属核实）：
-  F1 SL 段：_assert_create_allowed(replace) L4422 → cancel L4437 → ABSENT L4441
-            create L4511 → verify L4521 → except 分流 L4560（unknown→PENDING_VERIFY L4573 / failed→FAILED L4591）
-  部分减仓 SL 段：create L3820 → verify L3829 → 失败分支 L3831（不Commit不撤旧）→ 撤旧 L3842 → except L3851（旧单保留）
+源码锚点（2026-08-21 19:3x 实测，GLM审计修复后 +23 漂移）：
+  F1 SL 段：_assert_create_allowed(replace) L4445 → cancel L4460 → ABSENT L4464
+            create L4534 → verify L4544 → except 分流 L4583（unknown→PENDING_VERIFY L4596 / failed→FAILED L4614）
+  部分减仓 SL 段：create L3843 → verify L3852 → 失败分支 L3854（不Commit不撤旧）→ 撤旧 L3865 → except L3874（旧单保留）
 运行：.venv/Scripts/python.exe test_t25_replace_fail_protection.py（ccxt 只在项目 .venv）
 """
 import ast
@@ -168,18 +168,18 @@ def t_b_partial_reduce_keep_old():
     lines = src.splitlines()
     create_at = [i + 1 for i, ln in enumerate(lines) if 'self.exchange.create_order,' in ln]
     cancel_at = [i + 1 for i, ln in enumerate(lines) if 'self.exchange.cancel_order,' in ln]
-    # 部分减仓 SL 段：create 在 L3820、cancel 在 L3842（Grep 实测，AST 函数归属核实）
-    create_line = 3820 if 3820 in create_at else None
-    cancel_line = 3842 if 3842 in cancel_at else None
-    seg = '\n'.join(lines[3835:3875])  # 部分减仓 SL 段 create→verify→撤旧→except 区间
+    # 部分减仓 SL 段：create 在 L3843、cancel 在 L3865（Grep 实测，AST 函数归属核实）
+    create_line = 3843 if 3843 in create_at else None
+    cancel_line = 3865 if 3865 in cancel_at else None
+    seg = '\n'.join(lines[3858:3898])  # 部分减仓 SL 段 create→verify→撤旧→except 区间
     report("B1/先建后撤+旧单保留注释",
-           create_line == 3820 and cancel_line == 3842 and create_line < cancel_line
+           create_line == 3843 and cancel_line == 3865 and create_line < cancel_line
            and '旧单保留' in seg and '挂新失败' in seg,
            f"(create={create_line}, cancel={cancel_line}, 注释存在={'旧单保留' in seg and '挂新失败' in seg})")
 
     # B2: 源码断言——verify 失败分支"不 Commit/不撤旧"（registry 不写 ABSENT、不调 cancel_order）
     lines2 = src.splitlines()
-    vf_seg = '\n'.join(lines2[3828:3838])  # verify_result != 'success' → 日志+告警（L3831-3835）
+    vf_seg = '\n'.join(lines2[3851:3861])  # verify_result != 'success' → 日志+告警（L3854-3858）
     report("B2/verify失败不Commit不撤旧",
            '不 Commit/不撤旧' in vf_seg and 'cancel_order' not in vf_seg,
            f"(不Commit/不撤旧={'不 Commit/不撤旧' in vf_seg}, 无cancel={'cancel_order' not in vf_seg})")

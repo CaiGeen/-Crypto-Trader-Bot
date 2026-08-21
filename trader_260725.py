@@ -1420,6 +1420,9 @@ class CryptoTrader:
 
         ticker = self._safe_api_call(self.exchange.fetch_ticker, target_symbol)
         current_mark_price = float(ticker.get('last') or ticker.get('close') or 0.0)
+        # 🔥 修复漏洞4：ticker 异常返回空时市价为 0，后续方向性校验失效
+        if current_mark_price <= 0:
+            return False, f"❌ 获取市价异常（返回 {current_mark_price}），无法校验止损价方向"
 
         if side == 'BUY':
             if formatted_sl_price >= current_mark_price:
@@ -1941,6 +1944,8 @@ class CryptoTrader:
 
             print("🧹 自动清理孤儿挂单中...")
             cleaned_count = 0
+            failed_count = 0
+            failed_ids = []
             for ord in unknown_orders:
                 try:
                     self._safe_api_call(self.exchange.cancel_order, ord['id'], symbol, params={'stop': True})
@@ -1948,10 +1953,22 @@ class CryptoTrader:
                     cleaned_count += 1
                 except Exception as e:
                     print(f"  └─ ⚠️ 撤销失败: {ord['id']} - {e}")
+                    failed_count += 1
+                    failed_ids.append(str(ord['id']))
 
             if cleaned_count > 0:
                 print(f"🧹 孤儿挂单已清理完毕 (共清理 {cleaned_count} 个)！")
                 time.sleep(0.5)
+
+            # 🔥 修复漏洞3：撤销失败时 Fail-Closed（原代码撤失败只 print 不阻断 → 孤儿单仍在场却放行开仓）
+            if failed_count > 0:
+                self.send_tg_notification(
+                    f"🚨【资金安全】孤儿挂单撤销失败，已阻断开仓\n"
+                    f"标的: `{symbol}`\n"
+                    f"失败 {failed_count} 个: {', '.join(failed_ids)}\n"
+                    f"请手动撤销后重试",
+                    level='critical')
+                return True  # Fail-Closed：孤儿单仍在场 → 阻断
 
             return False
 
@@ -2085,6 +2102,12 @@ class CryptoTrader:
             # 🔥 获取当前市价用于止损价校验
             ticker = self._safe_api_call(self.exchange.fetch_ticker, symbol)
             current_mark_price = float(ticker.get('last') or ticker.get('close') or 0.0)
+            # 🔥 修复漏洞4：ticker 异常返回空时市价为 0，后续校验（tp > 0 即通过）会失效
+            if current_mark_price <= 0:
+                msg = f"❌ 获取市价异常（返回 {current_mark_price}），已阻断挂单"
+                print(msg)
+                self.send_tg_notification(f"🚨 **挂单被阻断！**\n标的: `{symbol}`\n{msg}", level='critical')
+                return None
             print(f"🌐 当前最新市场价格: {current_mark_price} USDT")
 
             # 🔥 止损价合理性校验（在挂单前拦截不合理数据）
@@ -5648,17 +5671,18 @@ class CryptoTrader:
         if current_filled_amount <= 0:
             return False, f"⚠️ 批次 `{batch_id}` 尚未建仓，无需平仓"
 
-        # 🔥 标记这是程序主动撤单，监控线程将静默退出
-        target_b_data['is_programmatic_cancel'] = True
-        target_b_data['pending_close'] = True
-        self.save_batch_state(target_symbol, batch_id, target_b_data)
-
-        # 获取当前市价
+        # 🔥 修复漏洞1b：先获取市价，成功后再设 flags（原代码先设 flags 再取 ticker，
+        # ticker 失败时 flags 已落盘 → 监控线程误判"程序平仓中"不恢复 SL）
         try:
             ticker = self._safe_api_call(self.exchange.fetch_ticker, target_symbol)
             current_price = float(ticker.get('last') or ticker.get('close') or 0.0)
         except Exception as e:
             return False, f"❌ 获取市价失败: {e}"
+
+        # 标记程序主动平仓，监控线程将静默退出（ticker 已成功，安全设 flags）
+        target_b_data['is_programmatic_cancel'] = True
+        target_b_data['pending_close'] = True
+        self.save_batch_state(target_symbol, batch_id, target_b_data)
 
         # 计算均价和预估盈亏
         filled_details = target_b_data.get('filled_details', [])
@@ -5678,7 +5702,7 @@ class CryptoTrader:
 
         # 执行市价平仓
         try:
-            # 先撤销所有未成交的开仓条件单
+            # 先撤销所有未成交的开仓条件单（保护单不撤，仍在位保护仓位）
             entry_orders = target_b_data.get('entry_orders', [])
             for idx, order_id in enumerate(entry_orders):
                 if idx >= last_filled_count:
@@ -5688,7 +5712,21 @@ class CryptoTrader:
                     except Exception:
                         pass
 
-            # 撤销止盈止损单
+            # 🔥 修复漏洞1：先市价平仓，成功后再撤 SL/TP（原代码先撤 SL/TP 再平仓，
+            # 若平仓失败则裸仓无保护且监控线程因 is_programmatic_cancel 不补挂）
+            # reduceOnly 平仓后 SL/TP 即使短暂存在也不会反向开仓，风险远低于先撤保护再赌平仓
+            close_side = 'sell' if side == 'BUY' else 'buy'
+            order = self._safe_api_call(
+                self.exchange.create_order,
+                symbol=target_symbol,
+                type='MARKET',
+                side=close_side,
+                amount=current_filled_amount,
+                params={'reduceOnly': True},
+                retries=1
+            )
+
+            # 平仓成功 — 现在安全撤销保护单
             if target_b_data.get('tp_order_id'):
                 try:
                     self._safe_api_call(self.exchange.cancel_order, target_b_data['tp_order_id'], target_symbol,
@@ -5704,18 +5742,6 @@ class CryptoTrader:
                     print(f"  └─ 已撤销止损单: {target_b_data['current_sl_id']}")
                 except Exception:
                     pass
-
-            # 市价平仓（C5：create_order 非幂等，禁止盲重；reduceOnly 仅保证业务结果不超仓）
-            close_side = 'sell' if side == 'BUY' else 'buy'
-            order = self._safe_api_call(
-                self.exchange.create_order,
-                symbol=target_symbol,
-                type='MARKET',
-                side=close_side,
-                amount=current_filled_amount,
-                params={'reduceOnly': True},
-                retries=1
-            )
 
             # 获取实际成交价格
             actual_price = float(order.get('average') or order.get('price') or current_price)
@@ -5765,6 +5791,22 @@ class CryptoTrader:
             return True, result_msg
 
         except Exception as e:
+            # 🔥 修复漏洞1b：失败回滚 — 清除 flags，恢复监控线程保护能力
+            # （SL/TP 未被撤销仍在交易所保护仓位，清除 flags 后监控线程恢复正常补挂）
+            try:
+                rollback_states = self.load_all_states()
+                rollback_b_data = rollback_states.get(target_symbol, {}).get(batch_id, {})
+                if rollback_b_data:
+                    rollback_b_data['is_programmatic_cancel'] = False
+                    rollback_b_data['pending_close'] = False
+                    self.save_batch_state(target_symbol, batch_id, rollback_b_data)
+                    print(f"  └─ 🔄 平仓失败回滚：已清除 is_programmatic_cancel/pending_close，监控线程恢复保护")
+            except Exception as rollback_err:
+                print(f"  └─ ⚠️ 回滚失败: {rollback_err}（需人工检查批次状态）")
+                self.send_tg_notification(
+                    f"🚨【资金安全】市价平仓失败且回滚异常！\n批次: {batch_id}\n"
+                    f"请立即检查仓位是否仍有 SL 保护！",
+                    level='critical')
             return False, f"❌ 市价平仓失败: {e}"
 
     # ==================== 新增：限价平仓（支持最优价和自定义价） ====================
@@ -5819,12 +5861,7 @@ class CryptoTrader:
         if current_filled_amount <= 0:
             return False, f"⚠️ 批次 `{batch_id}` 尚未建仓，无需平仓"
 
-        # 🔥 标记这是程序主动撤单，监控线程将静默退出
-        target_b_data['is_programmatic_cancel'] = True
-        target_b_data['pending_close'] = True
-        self.save_batch_state(target_symbol, batch_id, target_b_data)
-
-        # 获取当前市价
+        # 🔥 修复漏洞1b：先获取市价，成功后再设 flags（与市价平仓对称修复）
         try:
             ticker = self._safe_api_call(self.exchange.fetch_ticker, target_symbol)
             current_price = float(ticker.get('last') or ticker.get('close') or 0.0)
@@ -5832,6 +5869,11 @@ class CryptoTrader:
             ask = float(ticker.get('ask') or current_price)
         except Exception as e:
             return False, f"❌ 获取市价失败: {e}"
+
+        # 标记程序主动平仓，监控线程将静默退出（ticker 已成功，安全设 flags）
+        target_b_data['is_programmatic_cancel'] = True
+        target_b_data['pending_close'] = True
+        self.save_batch_state(target_symbol, batch_id, target_b_data)
 
         # 确定挂单价格
         if price is None:
@@ -5949,6 +5991,18 @@ class CryptoTrader:
             return True, result_msg
 
         except Exception as e:
+            # 🔥 修复漏洞1b：失败回滚 — 清除 flags，恢复监控线程保护能力
+            # （限价平仓不撤 SL，仓位仍受保护，但 flags 残留会导致监控线程不补挂）
+            try:
+                rollback_states = self.load_all_states()
+                rollback_b_data = rollback_states.get(target_symbol, {}).get(batch_id, {})
+                if rollback_b_data:
+                    rollback_b_data['is_programmatic_cancel'] = False
+                    rollback_b_data['pending_close'] = False
+                    self.save_batch_state(target_symbol, batch_id, rollback_b_data)
+                    print(f"  └─ 🔄 挂限价单失败回滚：已清除 is_programmatic_cancel/pending_close")
+            except Exception as rollback_err:
+                print(f"  └─ ⚠️ 回滚失败: {rollback_err}")
             return False, f"❌ 挂限价平仓单失败: {e}"
 
     # ==================== 新增：监控限价平仓单 ====================
