@@ -955,7 +955,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         return action_type, batch_id
 
     # ========== 保本 ==========
-    if data.startswith("be_"):
+    if data.startswith("be_") and not data.startswith(("be_confirm_", "be_cancel_")):
         USER_PENDING_INPUTS.pop(chat_id, None)
 
         batch_id = data.replace("be_", "")
