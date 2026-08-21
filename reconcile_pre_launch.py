@@ -254,8 +254,15 @@ def main():
 
     # 4c. 本地有持仓但无 SL/TP = 裸仓风险
     # F3（2026-08-21）：本地 key 'BTCUSDT' vs ccxt 'BTC/USDT:USDT' 归一化比对（防误判无持仓）
+    # F3b（2026-08-21）：与 trader F1 _norm_sym 对齐——按 base+quote 提取，
+    #   修"去分隔符版把 'BTC/USDT:USDT' 变成 'BTCUSDTUSDT'（结算币重复）→ 4d 恒误报无持仓"
     def _norm_symbol(s):
-        return str(s or '').replace('/', '').replace(':', '').upper()
+        s = str(s or '').upper()
+        if '/' in s:
+            base, rest = s.split('/', 1)
+            quote = rest.split(':', 1)[0]
+            return (base + quote).replace('_', '')
+        return s.replace('/', '').replace(':', '').replace('_', '')
 
     for b in local_batches:
         has_position = False
