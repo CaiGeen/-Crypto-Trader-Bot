@@ -1346,6 +1346,9 @@ class CryptoTrader:
             target_b_data['take_profit_price'] = formatted_tp_price
             target_b_data['tp_order_id'] = new_tp_id
             target_b_data['user_modified'] = True
+            # 第二轮审查（2026-08-21）：成功改价 = 参数已恢复有效 → 清 tp_param_invalid 脏标记
+            # （此前 _clear 只在自动补挂预检调用，用户命令路径从未清理 → 状态文件长期带脏标记）
+            self._clear_tp_param_invalid(target_symbol, batch_id)
             self.save_batch_state(target_symbol, batch_id, target_b_data)
 
             self.send_tg_notification(
@@ -4055,18 +4058,24 @@ class CryptoTrader:
                             # 遍历 registry 按 order_id 精确匹配 identity（防 layer 漂移），找不到再回退最新层。
                             _latest_check = self.load_all_states().get(symbol, {}).get(batch_id, {})
                             _reg_target = None
+                            _reg_fallback = False
                             for _k, _v in (_latest_check.get('protection_registry') or {}).items():
                                 if str(_v.get('order_id', '')) == str(sl_id_str):
                                     _reg_target = _k
                                     break
                             if _reg_target is None:
+                                # 第二轮审查（2026-08-21）：fallback 用独立 reason 落盘，审计可区分
+                                # "精确匹配终结" 与 "回退猜测终结"（误终结由 F3 adopt/mismatch 兜底）
+                                _reg_fallback = True
                                 _reg_target = self._protection_identity(
                                     batch_id, 'SL', batch_filled_count - 1,
                                     params_base.get('positionSide',
                                                     'LONG' if side == 'BUY' else 'SHORT'))
                             self._update_registry(symbol, batch_id, _reg_target,
                                                   state='ABSENT',
-                                                  terminated_reason=f'terminal_status_{sl_status}')
+                                                  terminated_reason=(f'terminal_status_{sl_status}_fallback'
+                                                                     if _reg_fallback
+                                                                     else f'terminal_status_{sl_status}'))
                             # 🔥 检查是否是程序主动撤单（平仓时撤销）
                             latest_all_check = self.load_all_states()
                             latest_b_data_check = latest_all_check.get(symbol, {}).get(batch_id, {})
@@ -4188,18 +4197,23 @@ class CryptoTrader:
                                 # 否则 CONFIRMED 条目永不终结 → 后续补挂被闸门永久拦截（死锁根因）。
                                 _latest_check = self.load_all_states().get(symbol, {}).get(batch_id, {})
                                 _reg_target = None
+                                _reg_fallback = False
                                 for _k, _v in (_latest_check.get('protection_registry') or {}).items():
                                     if str(_v.get('order_id', '')) == str(tp_id_str):
                                         _reg_target = _k
                                         break
                                 if _reg_target is None:
+                                    # 第二轮审查（2026-08-21）：fallback 用独立 reason 落盘（同 SL 段）
+                                    _reg_fallback = True
                                     _reg_target = self._protection_identity(
                                         batch_id, 'TP', batch_filled_count - 1,
                                         params_base.get('positionSide',
                                                         'LONG' if side == 'BUY' else 'SHORT'))
                                 self._update_registry(symbol, batch_id, _reg_target,
                                                       state='ABSENT',
-                                                      terminated_reason=f'terminal_status_{tp_status}')
+                                                      terminated_reason=(f'terminal_status_{tp_status}_fallback'
+                                                                         if _reg_fallback
+                                                                         else f'terminal_status_{tp_status}'))
                                 # 🔥 检查是否是程序主动撤单（平仓时撤销）
                                 latest_all_check = self.load_all_states()
                                 latest_b_data_check = latest_all_check.get(symbol, {}).get(batch_id, {})

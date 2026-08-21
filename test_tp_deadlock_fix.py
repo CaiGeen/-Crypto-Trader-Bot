@@ -271,7 +271,9 @@ def t_source_asserts():
            f"(取消替换/订单不存在终结标记共 {n_absent_reason} 处 → 需>=2：SL段+TP段)")
 
     # T19: F2——terminal 检测分支写 registry ABSENT（canceled/expired 同步终结）
-    n_term = src.count("terminated_reason=f'terminal_status_")
+    # 第二轮审查（2026-08-21）改多行三元表达式（精确+_fallback 双 reason），
+    # "terminated_reason=f'..." 连续子串被拆断 → 改统计 f'terminal_status_（当前 4 处：SL 2 + TP 2）
+    n_term = src.count("f'terminal_status_")
     report("T19/F2 terminal→ABSENT", n_term >= 2,
            f"(terminal_status_ 终结标记 {n_term} 处 → 需>=2：SL+TP)")
 

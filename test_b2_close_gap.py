@@ -47,7 +47,10 @@ RESULTS = []
 # ⚠️ F1/F2/F3（事件4 TP死锁修复，2026-08-21）在 _start_monitoring 插入 ~170 行 → 部分减仓 SL/TP 偏移 +147，
 #    重新 Grep 实测 2026-08-21（逐行核对 create_order 上下文）：
 #    用户改TP→1322 | 用户改SL→1473 | 保本损→1687 | 部分减仓SL→3817 | 部分减仓TP→3891
-GAP_CREATE_LINES = {1322, 1473, 1687, 3817, 3891}  # F1/F2/F3 后重新 Grep 实测（2026-08-21，AST 函数归属核实）
+# ⚠️ 第二轮审查（2026-08-21 17:2x）：update_batch_tp 清 invalid flag(+3) → 用户改SL/保本损 +3，部分减仓 +3；
+#    F2 SL/TP fallback reason(+11) 在 3820 之后 → 部分减仓/部分减仓TP 再 +11 → 用户改TP→1322 | 用户改SL→1476 |
+#    保本损→1690 | 部分减仓SL→3820 | 部分减仓TP→3894（Grep 实测，AST 函数归属核实）
+GAP_CREATE_LINES = {1322, 1476, 1690, 3820, 3894}  # 第二轮审查后重新 Grep 实测（2026-08-21，AST 函数归属核实）
 
 
 def report(name, passed, detail=""):
