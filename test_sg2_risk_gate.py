@@ -69,6 +69,16 @@ class HelperFake:
     def _check_sl_coverage(self, symbol, all_states, current_pos):
         return CryptoTrader._check_sl_coverage(self, symbol, all_states, current_pos)
 
+    # D-006（2026-08-28）：execute_signal 新前置依赖——绑定真实账户风控闸门三件套（防假回归）
+    def _check_account_risk(self, all_states, signal, stats_file=None):
+        return CryptoTrader._check_account_risk(self, all_states, signal, stats_file)
+
+    def _count_active_batches(self, all_states):
+        return CryptoTrader._count_active_batches(self, all_states)
+
+    def _get_today_realized_pnl(self, stats_file=None):
+        return CryptoTrader._get_today_realized_pnl(self, stats_file)
+
 
 class ExecFake(HelperFake):
     """execute_signal 集成 fake：_ready=True（SG1 放行），注入持仓/状态"""

@@ -434,6 +434,106 @@ class CryptoTrader:
         except Exception as e:
             print(f"⚠️ [盈亏记录] 写入失败: {e}")
 
+    def _count_active_batches(self, all_states):
+        """D-006: 统计全账户活跃批次数与带活跃批次的交易对集合（零 API，只读本地状态文件）"""
+        total = 0
+        symbols = set()
+        for sym, symbol_batches in (all_states or {}).items():
+            if not isinstance(symbol_batches, dict):
+                continue
+            for b_id, b_data in symbol_batches.items():
+                if isinstance(b_data, dict) and b_data.get('is_active'):
+                    total += 1
+                    symbols.add(sym)
+        return total, symbols
+
+    def _get_today_realized_pnl(self, stats_file=None):
+        """D-006: 求当日（北京时间）已实现盈亏总和，数据源 trade_stats.json。
+        返回 (pnl_sum, ok)：
+        - 文件不存在 = 无历史 = (0.0, True)
+        - 文件存在但读不出 / JSON 非法 / 根节点非 dict = (0.0, False) → 调用方 Fail-Closed
+        （与 D-005 去重表损坏 Fail-Closed 同哲学：未知状态 ≠ 允许）"""
+        if stats_file is None:
+            stats_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_stats.json")
+        if not os.path.exists(stats_file):
+            return 0.0, True
+        try:
+            with open(stats_file, "r", encoding="utf-8") as f:
+                stats = json.load(f)
+        except Exception:
+            return 0.0, False
+        if not isinstance(stats, dict) or not isinstance(stats.get("trades", []), list):
+            return 0.0, False
+        today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+        total = 0.0
+        for t in stats["trades"]:
+            if not isinstance(t, dict):
+                continue
+            t_time = t.get("time")
+            if not isinstance(t_time, str) or not t_time.startswith(today):
+                continue
+            try:
+                total += float(t.get("net_pnl", 0.0))
+            except (TypeError, ValueError):
+                continue
+        return round(total, 4), True
+
+    def _check_account_risk(self, all_states, signal, stats_file=None):
+        """D-006: 账户层风控闸门（只判定不通知——通知由 execute_signal 调用方负责，沿用 SG 门风格）。
+        限额调用时读 env 不缓存（改 .env 即时生效，无需重启）；限额 <=0 视为禁用。
+        已批准限额（2026-08-28）：批次 3 / 交易对 1 / 日亏损暂不启用（0）/ MAX_LEVERAGE 100。
+        返回 (allowed, reason)。"""
+        # RISK_MAX_ACTIVE_BATCHES: 活跃批次总数达到上限即拒绝新批次
+        try:
+            max_batches = int(os.getenv("RISK_MAX_ACTIVE_BATCHES", "3"))
+        except (TypeError, ValueError):
+            max_batches = 3
+        # RISK_MAX_ACTIVE_SYMBOLS: 新交易对会使带仓交易对数超上限即拒绝（同 symbol 加仓放行）
+        try:
+            max_symbols = int(os.getenv("RISK_MAX_ACTIVE_SYMBOLS", "1"))
+        except (TypeError, ValueError):
+            max_symbols = 1
+        # RISK_DAILY_REALIZED_LOSS_LIMIT: 当日已实现亏损上限 USDT（0 = 暂不启用）
+        try:
+            daily_loss_limit = float(os.getenv("RISK_DAILY_REALIZED_LOSS_LIMIT", "0") or 0)
+        except (TypeError, ValueError):
+            daily_loss_limit = 0.0
+        # MAX_LEVERAGE: 杠杆上限（与 bot_runner 统一配置；现役代码此前无 trader 层强制，本闸门补齐）
+        try:
+            max_leverage = int(os.getenv("MAX_LEVERAGE", "100"))
+        except (TypeError, ValueError):
+            max_leverage = 100
+
+        total_batches, active_symbols = self._count_active_batches(all_states)
+        if max_batches > 0 and total_batches >= max_batches:
+            return False, (f"活跃批次总数 {total_batches} 已达上限 {max_batches}"
+                           f"（RISK_MAX_ACTIVE_BATCHES）")
+        if max_symbols > 0:
+            new_symbol = signal.symbol not in active_symbols
+            effective_symbols = len(active_symbols) + (1 if new_symbol else 0)
+            if effective_symbols > max_symbols:
+                return False, (f"带活跃批次的交易对数将达 {effective_symbols}，超过上限 {max_symbols}"
+                               f"（RISK_MAX_ACTIVE_SYMBOLS，当前: {sorted(active_symbols)}）")
+        try:
+            leverage = int(signal.leverage)
+        except (TypeError, ValueError):
+            return False, f"信号杠杆值非法: {signal.leverage!r}"
+        if leverage <= 0:
+            return False, f"信号杠杆 {leverage}x 非正值"
+        if max_leverage > 0 and leverage > max_leverage:
+            return False, f"信号杠杆 {leverage}x 超过上限 {max_leverage}x（MAX_LEVERAGE）"
+
+        if daily_loss_limit > 0:
+            pnl_today, stats_ok = self._get_today_realized_pnl(stats_file)
+            if not stats_ok:
+                return False, ("trade_stats.json 损坏，无法评估当日盈亏（Fail-Closed）。"
+                               "修复或删除该文件后下一条信号自动恢复，无需重启；"
+                               "期间存量批次的止盈止损/平仓/监控不受影响")
+            if pnl_today <= -daily_loss_limit:
+                return False, (f"当日已实现亏损 {pnl_today:.2f} USDT 已达上限 {daily_loss_limit:.2f}"
+                               f"（RISK_DAILY_REALIZED_LOSS_LIMIT，北京时间次日自动重置）")
+        return True, ""
+
     def _build_position_snapshot(self, exclude_batch_id: str = None) -> str:
         """构建当前所有活跃批次的持仓快照（仅读状态文件，零 API 开销）
         exclude_batch_id: 排除指定批次（用于平仓后显示"剩余"批次）"""
@@ -2061,6 +2161,22 @@ class CryptoTrader:
             return None
         all_states = self.load_all_states()
         side = signal.side.upper()
+
+        # D-006: 账户层风控闸门（2026-08-28）——策略限额 Fail-Closed，只拦新开仓路径。
+        # 存量批次的止盈止损/平仓/监控不受影响；/force 不绕过本闸门（只绕 D-005 去重）。
+        risk_allowed, risk_reason = self._check_account_risk(all_states, signal)
+        if not risk_allowed:
+            print(f"🚫 [D-006] 账户层风控拒绝信号 [{batch_id}] ({symbol}): {risk_reason}")
+            try:
+                self.send_tg_notification(
+                    f"⚠️【账户层风控拦截】批次 `{batch_id}` ({symbol})\n"
+                    f"原因: {risk_reason}\n"
+                    f"未执行任何下单。存量批次的止盈/止损/平仓/监控不受影响。\n"
+                    f"如确需开仓：调整 .env 限额（即时生效无需重启）或先平掉部分仓位。",
+                    level='warning')
+            except Exception:
+                pass
+            return None
 
         if self._check_existing_conflicts(symbol, batch_id, all_states):
             return None

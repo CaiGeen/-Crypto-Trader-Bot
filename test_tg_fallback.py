@@ -129,6 +129,10 @@ def scenario_4():
     fake._get_current_position_amt = lambda *a, **k: 0.03      # delta=+0.03 手工仓
     fake._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
     fake._check_sl_coverage = lambda sym, st, pos: CryptoTrader._check_sl_coverage(fake, sym, st, pos)
+    # D-006（2026-08-28）：绑定真实账户风控闸门三件套（execute_signal 新前置依赖，防假回归）
+    fake._check_account_risk = lambda st, sig, stats_file=None: CryptoTrader._check_account_risk(fake, st, sig, stats_file)
+    fake._count_active_batches = lambda st: CryptoTrader._count_active_batches(fake, st)
+    fake._get_today_realized_pnl = lambda stats_file=None: CryptoTrader._get_today_realized_pnl(fake, stats_file)
     fake.send_tg_notification = lambda text, **k: CryptoTrader.send_tg_notification(fake, text, **k)
     fake.exchange = ex
 

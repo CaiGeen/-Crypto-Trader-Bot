@@ -99,6 +99,11 @@ def make_fake(create_results=None):
     # R1（ChatGPT 终审 2026-08-20）：execute_signal 新增止盈价方向校验，需显式桩
     #（MagicMock 属性自动 mock → `tp_is_valid, tp_msg = ...` 解包抛异常 → execute_signal 首 save 前中断）
     fake._validate_take_profit = lambda signal, price: (True, '止盈校验通过')
+    # D-006（2026-08-28）：execute_signal 新增账户风控闸门——绑定真实实现三件套
+    #（MagicMock 未绑定 helper → 解包/比较假回归坑，3 次实证；必须显式绑定）
+    fake._check_account_risk = lambda st, sig, stats_file=None: CryptoTrader._check_account_risk(fake, st, sig, stats_file)
+    fake._count_active_batches = lambda st: CryptoTrader._count_active_batches(fake, st)
+    fake._get_today_realized_pnl = lambda stats_file=None: CryptoTrader._get_today_realized_pnl(fake, stats_file)
     fake.send_tg_notification = lambda text, **k: fake.sent.append((k.get('level', 'info'), str(text)))
     fake._start_monitoring = lambda *a, **k: None
 

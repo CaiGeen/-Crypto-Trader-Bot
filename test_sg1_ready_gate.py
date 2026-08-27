@@ -36,6 +36,7 @@ class FakeSignal:
         self.symbol = SYMBOL
         self.batch_id = BATCH
         self.side = "BUY"
+        self.leverage = 20  # D-006（2026-08-28）：execute_signal 新增账户风控闸门需读取杠杆
 
 
 class GateFake:
@@ -47,6 +48,17 @@ class GateFake:
         self.gate_passed = False
         self.conflict_check_called = False
         self.tg_sent = []
+
+    # D-006（2026-08-28）：绑定真实账户风控闸门三件套（防假回归；
+    # helper 不依赖 self 状态，委托 CryptoTrader 实实现即可）
+    def _check_account_risk(self, all_states, signal, stats_file=None):
+        return CryptoTrader._check_account_risk(self, all_states, signal, stats_file)
+
+    def _count_active_batches(self, all_states):
+        return CryptoTrader._count_active_batches(self, all_states)
+
+    def _get_today_realized_pnl(self, stats_file=None):
+        return CryptoTrader._get_today_realized_pnl(self, stats_file)
 
     # 以下全部是"闸门之后"才会触发的依赖 —— 被调用即证明已过闸
     def load_all_states(self):
