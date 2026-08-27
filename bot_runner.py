@@ -3,6 +3,8 @@ import os
 import re
 import sys
 import json
+import time
+import hashlib
 import atexit
 import logging
 import asyncio
@@ -314,7 +316,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎯 管理\n"
         "• /be 批次号     一键保本\n"
         "• /close 批次号  平仓\n"
-        "• /cancel 批次号 取消未成交挂单\n\n"
+        "• /cancel 批次号 取消未成交挂单\n"
+        "• /force 指纹码  放行被幂等拦截的重复信号\n\n"
         "💡 发送 JSON 信号或上传 signal.json 也可下单\n"
         "💡 批次卡片上的 [保本] [平仓] [撤单] 按钮可快速操作"
     )
@@ -1704,6 +1707,138 @@ async def handle_quick_signal(update: Update, context: ContextTypes.DEFAULT_TYPE
         await safe_reply(update, f"❌ 解析快捷指令失败: {e}")
 
 
+# ==================== D-005: 信号入口幂等去重（2026-08-27） ====================
+# 背景：parser 每次解析重新生成 batch_id（parser.py L129 时间戳+uuid）→ 同一信号
+# 重发 / 快捷指令双击 = 全新 batch_id → _check_existing_conflicts 批次冲突检查必然
+# 不命中 → 走加仓模式重复开仓（实证）。三条入口（JSON 消息 / /signal 快捷指令 /
+# 文件触发）全部汇聚 run_trader_execution，此处是唯一咽喉。
+# 设计（GLM 初稿 + ChatGPT 交叉审 + 两处反驳定稿）：
+#   - 指纹 = 信号全字段 dump 剔除 batch_id（每次重生成必须排除；未来新字段自动入哈希）
+#   - 状态只有 EXECUTING / SUCCESS，无 FAILED——execute_signal 的 except 兜底直接
+#     return None 且不清理已挂单（trader L2457-2461），"干净失败"与"部分成交后异常"
+#     返回值不可分，置 FAILED 允许重发会造成仓位翻倍。改用 10 分钟时间窗自解 +
+#     /force 人工放行（放行前提示核对交易所挂单）= Fail-Closed but not Fail-Stuck
+#   - 每次操作 load→modify→tmp+os.replace 原子写，不留内存唯一状态（重启/多进程安全）
+#   - dedup 是 best-effort 防误触防线，文件损坏时降级为空表放行；SG1/SG2 仍是硬安全闸门
+DEDUP_FILE = os.path.join(BASE_DIR, "signal_dedup.json")
+SIGNAL_DEDUP_WINDOW_SEC = 600           # 同指纹拦截窗口（秒）
+SIGNAL_DEDUP_RETENTION_SEC = 72 * 3600  # 记录保留时长（事故回溯）
+FORCE_APPROVAL_TTL_SEC = 300            # /force 放行有效期（秒）
+
+
+def _signal_fingerprint(signal) -> str:
+    """D-005: 信号内容指纹（sha256）。全字段参与、剔除 batch_id——batch_id 每次
+    解析重新生成，入哈希会令去重失效；future 新字段自动纳入。"""
+    payload = {
+        'symbol': str(signal.symbol),
+        'side': str(signal.side).upper(),
+        'leverage': signal.leverage,
+        'entries': [[float(p), float(a)] for p, a in (signal.entries or [])],
+        'stop_loss_steps': [float(x) for x in (signal.stop_loss_steps or [])],
+        'take_profit': float(signal.take_profit),
+        'initial_stop_loss': float(signal.initial_stop_loss),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def _load_dedup(path=None, now=None) -> dict:
+    """加载去重表并清理超过保留期的记录；文件损坏/不存在时降级为空表。"""
+    now = time.time() if now is None else now
+    p = path or DEDUP_FILE
+    data = {}
+    try:
+        if os.path.exists(p):
+            with open(p, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+    except Exception as e:
+        print(f"⚠️ [D-005] 去重表读取失败，降级为空表（best-effort 防线，SG1/SG2 仍兜底）: {e}")
+    # 保留期清理（72h）
+    pruned = {k: v for k, v in data.items()
+              if isinstance(v, dict) and (now - v.get('last_seen', 0)) < SIGNAL_DEDUP_RETENTION_SEC}
+    return pruned
+
+
+def _save_dedup(data: dict, path=None) -> None:
+    """原子写（tmp + os.replace）。调用方均在 TRADER_LOCK 内的事件循环同步段执行，
+    无 await 切点 → 无并发写竞争。"""
+    p = path or DEDUP_FILE
+    tmp = p + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+
+
+def _check_and_record_dedup(fingerprint: str, now=None, path=None):
+    """检查并记录（一次完成）。返回 (allowed: bool, info: str)。
+    - approved 有效期内：清除标记放行本次（一次性人工放行）
+    - 同指纹 last_seen 距今 < 窗口：拒绝
+    - 其余（首次 / 窗口已过）：记录 EXECUTING 并放行
+    注意：尝试即记录 EXECUTING（非成功才记）——TRADER_LOCK 内双击的第二个任务
+    会看到第一个任务的 EXECUTING 而被拦。"""
+    now = time.time() if now is None else now
+    data = _load_dedup(path, now)
+    rec = data.get(fingerprint)
+    if rec is not None:
+        approved_ts = rec.get('approved_ts')
+        if rec.get('approved') and approved_ts is not None \
+                and (now - approved_ts) <= FORCE_APPROVAL_TTL_SEC:
+            rec['approved'] = False
+            rec['approved_ts'] = None
+            rec['status'] = 'EXECUTING'
+            rec['last_seen'] = now
+            _save_dedup(data, path)
+            return True, 'force-approved'
+        age = now - rec.get('last_seen', 0)
+        if age < SIGNAL_DEDUP_WINDOW_SEC:
+            remain = int(SIGNAL_DEDUP_WINDOW_SEC - age)
+            info = (f"上次执行 {int(age)} 秒前（batch: {rec.get('batch_id') or '未知'}，"
+                    f"状态 {rec.get('status')}），拦截窗口剩 {remain} 秒")
+            return False, info
+    data[fingerprint] = {
+        'status': 'EXECUTING', 'first_seen': now, 'last_seen': now,
+        'batch_id': None, 'approved': False, 'approved_ts': None,
+    }
+    _save_dedup(data, path)
+    return True, 'first-seen' if rec is None else 'window-expired'
+
+
+def _mark_dedup_result(fingerprint: str, batch_id, now=None, path=None) -> None:
+    """执行结束回写结果。batch_id 非空 → SUCCESS；None → 保持 EXECUTING
+    （干净失败与部分成交不可分，不置 FAILED，靠时间窗自解 + /force 人工裁决）。"""
+    now = time.time() if now is None else now
+    data = _load_dedup(path, now)
+    rec = data.get(fingerprint)
+    if rec is None:
+        rec = {'first_seen': now, 'approved': False, 'approved_ts': None}
+        data[fingerprint] = rec
+    rec['status'] = 'SUCCESS' if batch_id else 'EXECUTING'
+    rec['batch_id'] = batch_id
+    rec['last_seen'] = now
+    _save_dedup(data, path)
+
+
+def _approve_dedup_force(short_id: str, now=None, path=None):
+    """/force 放行：按指纹前缀匹配（≥4 位、必须唯一），打一次性 approved 标记。
+    返回 (ok: bool, msg: str)。"""
+    now = time.time() if now is None else now
+    short_id = (short_id or '').strip().lower()
+    if len(short_id) < 4:
+        return False, "指纹短码至少需要 4 位十六进制字符"
+    data = _load_dedup(path, now)
+    matches = [k for k in data if k.lower().startswith(short_id)]
+    if not matches:
+        return False, f"72 小时内未找到指纹 {short_id} 对应的信号记录"
+    if len(matches) > 1:
+        return False, f"指纹 {short_id} 前缀匹配到 {len(matches)} 条记录，请提供更长前缀"
+    rec = data[matches[0]]
+    rec['approved'] = True
+    rec['approved_ts'] = now
+    _save_dedup(data, path)
+    return True, matches[0][:8]
+
+
 async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with TRADER_LOCK:
         try:
@@ -1750,7 +1885,31 @@ async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYP
                 print(f"   │  └─ 第{i}层: 入场 {price} | 数量 {amount} | 止损 {sl}")
             print(f"   └─ 止盈目标: {signal.take_profit}")
 
+            # 🔥 D-005: 幂等去重闸门——在 batch 创建之前拦截重复信号（唯一咽喉，
+            # 三条入口全覆盖；TRADER_LOCK 保证串行，原子写无锁竞争）
+            fingerprint = _signal_fingerprint(signal)
+            allowed, dedup_info = _check_and_record_dedup(fingerprint)
+            if not allowed:
+                short_id = fingerprint[:8]
+                print(f"🚫 [D-005] 重复信号已拦截 [{short_id}]: {dedup_info}")
+                await safe_reply(
+                    update,
+                    f"🛡 **重复信号已拦截**（D-005 幂等保护）\n\n"
+                    f"🧬 指纹：`{short_id}`\n"
+                    f"📊 {dedup_info}\n\n"
+                    f"💡 同参数信号 {SIGNAL_DEDUP_WINDOW_SEC // 60} 分钟内视为重复"
+                    f"（防快捷指令双击/信号重发导致重复开仓）。\n"
+                    f"如确需再次开仓：\n"
+                    f"1️⃣ 先核对交易所当前挂单与持仓（防上次执行部分成交）\n"
+                    f"2️⃣ 发送 `/force {short_id}` 放行\n"
+                    f"3️⃣ 在 {FORCE_APPROVAL_TTL_SEC // 60} 分钟内重发原信号",
+                    parse_mode='Markdown')
+                return
+
             batch_id = await loop.run_in_executor(None, trader.execute_signal, signal)
+            # D-005: 执行结束回写（None 不置 FAILED——干净失败与部分成交不可分，
+            # 保持 EXECUTING 由时间窗自解，防部分成交后重发翻倍仓位）
+            _mark_dedup_result(fingerprint, batch_id)
 
             if batch_id:
                 all_states = trader.load_all_states()
@@ -1805,6 +1964,34 @@ async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYP
             logging.exception("🚨 交易引擎运行崩溃:")
             print(f"\n❌ 异常详情: {e}")
             await safe_reply(update, f"🚨 **挂单失败/引擎异常**:\n`{str(e)}`", parse_mode='Markdown')
+
+
+async def force_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """D-005: 人工放行被幂等去重拦截的信号。不直接执行任何交易——只打一次性
+    approved 标记，执行仍必须走 run_trader_execution 唯一入口（防第二执行路径）。"""
+    if not is_authorized(update.effective_user.id):
+        await safe_reply(update, "🚫 未授权的访问！")
+        return
+    try:
+        if not context.args or not context.args[0]:
+            await safe_reply(
+                update,
+                "用法：`/force <指纹短码>`\n"
+                "（短码见重复信号拦截提示，至少 4 位）",
+                parse_mode='Markdown')
+            return
+        ok, msg = _approve_dedup_force(context.args[0])
+        if ok:
+            await safe_reply(
+                update,
+                f"✅ 已放行信号指纹 `{msg}`（{FORCE_APPROVAL_TTL_SEC // 60} 分钟内有效，仅一次）。\n\n"
+                f"⚠️ 请确认已核对交易所当前挂单与持仓（防上次执行部分成交）。\n"
+                f"👉 现在请重发原信号。",
+                parse_mode='Markdown')
+        else:
+            await safe_reply(update, f"❌ 放行失败：{msg}", parse_mode='Markdown')
+    except Exception as e:
+        await safe_reply(update, f"❌ /force 处理失败: {e}")
 
 
 async def run_trader_recovery_on_startup(trader: CryptoTrader):
@@ -2107,6 +2294,7 @@ def main():
     app.add_handler(CommandHandler("be", be_command))
     app.add_handler(CommandHandler("close", close_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("force", force_command))
 
     app.add_handler(CommandHandler("tp", tp_command))
     app.add_handler(CommandHandler("sl", sl_command))
