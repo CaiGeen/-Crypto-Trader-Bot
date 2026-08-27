@@ -1741,19 +1741,30 @@ def _signal_fingerprint(signal) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
 
 
+class DedupCorruptedError(Exception):
+    """D-005 补丁：signal_dedup.json 存在但不可读/非法。安全组件故障 → Fail-Closed：
+    阻断新开仓并告警，绝不静默降级为空表（SG1 哲学：未知状态 ≠ 允许）。"""
+
+
 def _load_dedup(path=None, now=None) -> dict:
-    """加载去重表并清理超过保留期的记录；文件损坏/不存在时降级为空表。"""
+    """加载去重表并清理超过保留期的记录。
+
+    - 文件不存在：正常（首次运行/已清理）→ 空表
+    - 文件存在但读不出 / JSON 非法 / 根节点非 dict：抛 DedupCorruptedError
+      （安全组件损坏必须 Fail-Closed，且不得用新表覆盖损坏文件消灭证据）
+    """
     now = time.time() if now is None else now
     p = path or DEDUP_FILE
     data = {}
-    try:
-        if os.path.exists(p):
+    if os.path.exists(p):
+        try:
             with open(p, 'r', encoding='utf-8') as f:
                 loaded = json.load(f)
-            if isinstance(loaded, dict):
-                data = loaded
-    except Exception as e:
-        print(f"⚠️ [D-005] 去重表读取失败，降级为空表（best-effort 防线，SG1/SG2 仍兜底）: {e}")
+        except Exception as e:
+            raise DedupCorruptedError(f"{p} 读取/解析失败: {e}")
+        if not isinstance(loaded, dict):
+            raise DedupCorruptedError(f"{p} 根节点不是 JSON 对象: {type(loaded).__name__}")
+        data = loaded
     # 保留期清理（72h）
     pruned = {k: v for k, v in data.items()
               if isinstance(v, dict) and (now - v.get('last_seen', 0)) < SIGNAL_DEDUP_RETENTION_SEC}
@@ -1776,9 +1787,15 @@ def _check_and_record_dedup(fingerprint: str, now=None, path=None):
     - 同指纹 last_seen 距今 < 窗口：拒绝
     - 其余（首次 / 窗口已过）：记录 EXECUTING 并放行
     注意：尝试即记录 EXECUTING（非成功才记）——TRADER_LOCK 内双击的第二个任务
-    会看到第一个任务的 EXECUTING 而被拦。"""
+    会看到第一个任务的 EXECUTING 而被拦。
+    损坏态：_load_dedup 抛 DedupCorruptedError → (False, "CORRUPT: ...")，
+    不写表不覆盖，由调用方负责响亮告警。"""
     now = time.time() if now is None else now
-    data = _load_dedup(path, now)
+    try:
+        data = _load_dedup(path, now)
+    except DedupCorruptedError as e:
+        print(f"🚨 [D-005] 去重表损坏，新开仓 Fail-Closed 阻断: {e}")
+        return False, f"CORRUPT: {e}"
     rec = data.get(fingerprint)
     if rec is not None:
         approved_ts = rec.get('approved_ts')
@@ -1806,9 +1823,15 @@ def _check_and_record_dedup(fingerprint: str, now=None, path=None):
 
 def _mark_dedup_result(fingerprint: str, batch_id, now=None, path=None) -> None:
     """执行结束回写结果。batch_id 非空 → SUCCESS；None → 保持 EXECUTING
-    （干净失败与部分成交不可分，不置 FAILED，靠时间窗自解 + /force 人工裁决）。"""
+    （干净失败与部分成交不可分，不置 FAILED，靠时间窗自解 + /force 人工裁决）。
+    损坏态：best-effort 跳过记账（闸门是执行点、此处只是记账；且绝不能让
+    损坏异常掩盖 execute_signal 已成功的回执路径）。"""
     now = time.time() if now is None else now
-    data = _load_dedup(path, now)
+    try:
+        data = _load_dedup(path, now)
+    except DedupCorruptedError as e:
+        print(f"⚠️ [D-005] 回写时去重表损坏，跳过记账（不影响本次执行结果）: {e}")
+        return
     rec = data.get(fingerprint)
     if rec is None:
         rec = {'first_seen': now, 'approved': False, 'approved_ts': None}
@@ -1826,7 +1849,11 @@ def _approve_dedup_force(short_id: str, now=None, path=None):
     short_id = (short_id or '').strip().lower()
     if len(short_id) < 4:
         return False, "指纹短码至少需要 4 位十六进制字符"
-    data = _load_dedup(path, now)
+    try:
+        data = _load_dedup(path, now)
+    except DedupCorruptedError as e:
+        return False, (f"去重表损坏，/force 不可用（安全组件 Fail-Closed）。"
+                       f"请先删除或修复 signal_dedup.json: {e}")
     matches = [k for k in data if k.lower().startswith(short_id)]
     if not matches:
         return False, f"72 小时内未找到指纹 {short_id} 对应的信号记录"
@@ -1889,6 +1916,20 @@ async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYP
             # 三条入口全覆盖；TRADER_LOCK 保证串行，原子写无锁竞争）
             fingerprint = _signal_fingerprint(signal)
             allowed, dedup_info = _check_and_record_dedup(fingerprint)
+            if not allowed and str(dedup_info).startswith("CORRUPT"):
+                # 🔥 D-005 补丁：安全组件损坏 → Fail-Closed（仅阻断新开仓路径；
+                # /tp /sl /close 与监控线程不经过此闸门，已有仓位管理不受影响）
+                print(f"🚨 [D-005] 去重表损坏，信号已被 Fail-Closed 阻断: {dedup_info}")
+                await safe_reply(
+                    update,
+                    f"🚨 **【资金安全】信号去重表损坏，新开仓已全部阻断**\n\n"
+                    f"🧬 `{fingerprint[:8]}` 信号被拒（防重复开仓防线故障）\n"
+                    f"❗ `{DEDUP_FILE}` 无法读取\n\n"
+                    f"🛠 **恢复方法**：删除或修复 `signal_dedup.json`，"
+                    f"下一条信号自动恢复，**无需重启进程**\n"
+                    f"ℹ️ 期间已有仓位的止盈/止损/平仓管理不受影响",
+                    parse_mode='Markdown')
+                return
             if not allowed:
                 short_id = fingerprint[:8]
                 print(f"🚫 [D-005] 重复信号已拦截 [{short_id}]: {dedup_info}")

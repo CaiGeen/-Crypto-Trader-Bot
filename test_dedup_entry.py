@@ -23,10 +23,11 @@ D-005（2026-08-27 信号入口幂等去重）专项测试
   T8  /force TTL 过期不再放行
   T9  execute_signal 返回 None 不置 FAILED（保持 EXECUTING，防部分成交重发翻倍）
   T10 72h 保留期清理
-  T11 去重表损坏降级为空表（best-effort，SG1/SG2 仍兜底）
+  T11 去重表损坏 → Fail-Closed（抛 DedupCorruptedError + 阻断 + 不覆盖损坏文件）
   T12 /force 前缀歧义拒绝 + 过短短码拒绝
   T13 stop_loss_steps 参与指纹（不同阶梯止损 = 不同信号）
   T14 源码锚点：闸门位于 execute_signal 之前、/force 注册、唯一入口不旁路
+  T15 /force 损坏态明确拒绝 + _mark_dedup_result 损坏态 best-effort 不抛异常
 
 运行：.venv/Scripts/python.exe test_dedup_entry.py（ccxt 只在项目 .venv）
 """
@@ -135,15 +136,48 @@ def main():
     loaded = bot_runner._load_dedup(dedup_path, now=T0 + bot_runner.SIGNAL_DEDUP_RETENTION_SEC + 1)
     report("T10 超 72h 记录被清理", fp_old not in loaded)
 
-    # ---------- T11 去重表损坏降级 ----------
+    # ---------- T11 去重表损坏 → Fail-Closed ----------
     with open(dedup_path, 'w', encoding='utf-8') as f:
         f.write("{corrupted json !!!")
-    loaded = bot_runner._load_dedup(dedup_path, now=T0)
-    ok9, _ = bot_runner._check_and_record_dedup(fp_a, now=T0, path=dedup_path)
-    report("T11 损坏文件降级为空表且放行（best-effort 防线）",
-           loaded == {} and ok9 is True)
+    with open(dedup_path, encoding='utf-8') as f:
+        corrupt_before = f.read()
+    raised = False
+    try:
+        bot_runner._load_dedup(dedup_path, now=T0)
+    except bot_runner.DedupCorruptedError:
+        raised = True
+    ok9, info9 = bot_runner._check_and_record_dedup(fp_a, now=T0, path=dedup_path)
+    with open(dedup_path, encoding='utf-8') as f:
+        corrupt_after = f.read()
+    report("T11 损坏文件 Fail-Closed：抛异常 + 阻断 + CORRUPT 标记 + 不覆盖损坏文件",
+           raised and ok9 is False and str(info9).startswith('CORRUPT')
+           and corrupt_before == corrupt_after)
+
+    # ---------- T15 /force 损坏态拒绝 + _mark best-effort ----------
+    okf, msgf = bot_runner._approve_dedup_force("abcdef0", now=T0, path=dedup_path)
+    mark_no_raise = True
+    try:
+        bot_runner._mark_dedup_result(fp_a, 'b_x', now=T0, path=dedup_path)
+    except Exception:
+        mark_no_raise = False
+    with open(dedup_path, encoding='utf-8') as f:
+        corrupt_final = f.read()
+    report("T15 /force 损坏态明确拒绝 + _mark_dedup_result best-effort 不抛异常不覆盖",
+           okf is False and '损坏' in msgf and mark_no_raise
+           and corrupt_final == corrupt_before)
 
     # ---------- T12 /force 前缀校验 ----------
+    # JSON 合法但根节点非 dict 同样 Fail-Closed（防静默降级后门）
+    with open(dedup_path, 'w', encoding='utf-8') as f:
+        f.write('[1, 2, 3]')
+    raised2 = False
+    try:
+        bot_runner._load_dedup(dedup_path, now=T0)
+    except bot_runner.DedupCorruptedError:
+        raised2 = True
+    report("T11b JSON 合法但根节点非 dict 同样 Fail-Closed", raised2)
+    # 恢复一张干净有效的表（T11/T15 已验证损坏态行为）
+    bot_runner._save_dedup({}, dedup_path)
     ok_short, msg_short = bot_runner._approve_dedup_force("ab", now=T0, path=dedup_path)
     ok_none, msg_none = bot_runner._approve_dedup_force("deadbee", now=T0, path=dedup_path)
     # 造两条同前缀记录验证歧义拒绝
@@ -172,8 +206,11 @@ def main():
     anchor_mark = "_mark_dedup_result(fingerprint, batch_id)" in src
     # 闸门必须出现在 execute_signal 调用之前（含 force 闸门那一次在内的第一次出现）
     first_gate = src.find("_check_and_record_dedup(fingerprint)")
-    report("T14 闸门先于 execute_signal + /force 注册 + 结果回写",
-           anchor_gate != -1 and first_gate < anchor_exec and anchor_force and anchor_mark)
+    anchor_corrupt_gate = 'startswith("CORRUPT")' in src
+    anchor_corrupt_force = '/force 不可用' in src
+    report("T14 闸门先于 execute_signal + /force 注册 + 结果回写 + 损坏态双侧锚点",
+           anchor_gate != -1 and first_gate < anchor_exec and anchor_force and anchor_mark
+           and anchor_corrupt_gate and anchor_corrupt_force)
 
     # ---------- 汇总 ----------
     failed = [n for n, p in RESULTS if not p]
