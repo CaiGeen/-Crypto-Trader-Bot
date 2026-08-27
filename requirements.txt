@@ -1,4 +1,4 @@
-ccxt>=4.5.68
+ccxt==4.5.68
 python-telegram-bot>=22.8
 python-dotenv>=1.2.2
 pytz>=2024.1
