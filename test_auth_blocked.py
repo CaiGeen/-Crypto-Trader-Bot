@@ -573,6 +573,105 @@ def s14_startup_integration():
            f'recover调用={len(rec_calls_b)} ready={t2._ready}')
 
 
+# ==================== S15（Batch 3）：/auth_reset 命令处理器集成 ====================
+
+def s15_auth_reset_command():
+    """Batch 3 场景 5 增量：命令入口行为（探活底层逻辑 S7/S14 已覆盖，不重复）。
+    最小 fake 对象（无成熟 Update/Context mock 惯例，不引入模拟框架）：
+    update.effective_user.id / update.message.reply_text / context.bot_data。
+    ChatGPT 特别验收点：一次命令 = 恰一次受控恢复链调用，命令入口不得独立重复探活
+    （FakeTrader 不绑定 exchange → 任何旁路直连 API 都会 AttributeError 兜底暴露）。"""
+    import asyncio
+    import bot_runner
+
+    class FakeMsg:
+        def __init__(self):
+            self.replies = []
+        async def reply_text(self, text, parse_mode=None, reply_markup=None):
+            self.replies.append(text)
+            return None
+
+    class FakeUser:
+        def __init__(self, uid):
+            self.id = uid
+
+    class FakeUpdate:
+        def __init__(self, uid):
+            self.effective_user = FakeUser(uid)
+            self.message = FakeMsg()
+
+    class FakeContext:
+        def __init__(self, trader):
+            self.bot_data = {'global_trader': trader}
+
+    def make_fake_trader(recovery_result):
+        calls = []
+        class FakeTrader:
+            # 唯一受控入口：恢复链（命令处理器只应通过它触达探活）
+            def _attempt_auth_recovery(self):
+                calls.append(1)
+                return recovery_result
+            # 命令入口若绕过恢复链直接调 _safe_api_call / fetch_balance → 计数器暴露
+            def _safe_api_call(self, *a, **k):
+                calls.append('bypass_safe_api')
+                raise AssertionError('命令入口绕过恢复链直调 _safe_api_call')
+            @property
+            def exchange(self):
+                raise AssertionError('命令入口绕过恢复链直连 exchange')
+        return FakeTrader(), calls
+
+    async def invoke(update, ctx):
+        await bot_runner.auth_reset_command(update, ctx)
+
+    auth_id = bot_runner.ALLOWED_USER_ID
+
+    # A: 未授权 → 🚫 拒绝 + 恢复链零调用
+    ft_a, calls_a = make_fake_trader((True, 'ok'))
+    ua = FakeUpdate(auth_id + 1)
+    asyncio.run(invoke(ua, FakeContext(ft_a)))
+    a_ok = (len(calls_a) == 0
+            and len(ua.message.replies) == 1 and '未授权' in ua.message.replies[0])
+
+    # B: trader 未初始化 → ❌ 提示 + 恢复链零调用
+    ub = FakeUpdate(auth_id)
+    asyncio.run(invoke(ub, FakeContext(None)))
+    b_ok = (len(ub.message.replies) == 1
+            and '未初始化' in ub.message.replies[0])
+
+    # C: 授权 + 恢复链成功 → 恰 1 次恢复链调用 + ✅ 回执 + 前置 🔄 提示（共 2 条回复）
+    ft_c, calls_c = make_fake_trader((True, '解锁成功：对账完成'))
+    uc = FakeUpdate(auth_id)
+    asyncio.run(invoke(uc, FakeContext(ft_c)))
+    r_c = uc.message.replies
+    c_ok = (calls_c == [1]                                  # 恰一次，无 bypass 记录
+            and len(r_c) == 2                               # 🔄 开始 + ✅ 结果
+            and '开始鉴权恢复' in r_c[0]
+            and r_c[1].startswith('✅') and '解锁成功' in r_c[1])
+
+    # D: 授权 + 恢复链失败 → 恰 1 次调用 + 🔒 回执（保持 BLOCKED 语义由恢复链内部保证，S7 已测）
+    ft_d, calls_d = make_fake_trader((False, '探活失败，保持封锁'))
+    ud = FakeUpdate(auth_id)
+    asyncio.run(invoke(ud, FakeContext(ft_d)))
+    r_d = ud.message.replies
+    d_ok = (calls_d == [1]
+            and len(r_d) == 2
+            and '开始鉴权恢复' in r_d[0]
+            and r_d[1].startswith('🔒') and '保持封锁' in r_d[1])
+
+    # E: 恢复链抛异常 → ❌ 异常回执，不崩命令处理器
+    ft_e, calls_e = make_fake_trader((True, 'x'))
+    ft_e._attempt_auth_recovery = lambda: (_ for _ in ()).throw(RuntimeError('boom'))
+    ue = FakeUpdate(auth_id)
+    asyncio.run(invoke(ue, FakeContext(ft_e)))
+    e_ok = (len(ue.message.replies) == 2
+            and ue.message.replies[1].startswith('❌') and 'boom' in ue.message.replies[1])
+
+    report('S15 /auth_reset 命令入口', a_ok and b_ok and c_ok and d_ok and e_ok,
+           f'未授权: 零调用={len(calls_a)==0}；未初始化: 提示={b_ok}；'
+           f'成功: 调用={calls_c} 回复={len(r_c)}；失败: 调用={calls_d} 回复={len(r_d)}；'
+           f'异常: 回复={ue.message.replies[1][:20] if len(ue.message.replies)>1 else None}')
+
+
 # ==================== 主流程 ====================
 
 def main():
@@ -580,7 +679,7 @@ def main():
                s4_five_monitor_cycles, s5_l920_dynamic_zero, s6_auth_probe_whitelist,
                s7_recovery_paths, s8_blind_safe_order, s9_watchdog_queue_format,
                s10_trader_queue_format, s11_corrupt_fail_closed, s12_init_survives_persistent_lock,
-               s13_channel_semantics, s14_startup_integration):
+               s13_channel_semantics, s14_startup_integration, s15_auth_reset_command):
         try:
             fn()
         except Exception as e:

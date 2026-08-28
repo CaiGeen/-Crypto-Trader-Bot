@@ -22,6 +22,8 @@ D-010 Batch 1（bot_runner 消费侧）离线验收测试（不连真实 Telegra
   S10 crash_alert 分支行为保持：TG 成功 + email + summary_cb 各 1 次
   S11 summary_restart 分支：summary 失败计 1 轮（有界重试）
   S12 state 损坏 → 重置为 {}（SILENCED 丢失但有界 3 轮，不崩溃）
+  S13（Batch 3）watchdog_alert 分支：🐕 前缀 + 无 email/summary 副作用
+  S14（Batch 3）auth_blocked 分支：🔒 前缀 + 无 email 副作用 + TG 失败有界 SILENCED 路径
 
 用法: .venv\\Scripts\\python.exe test_notify_queue.py
 """
@@ -428,6 +430,82 @@ def scenario_12():
         env.close()
 
 
+def scenario_13():
+    """S13（Batch 3）watchdog_alert 分支：🐕 前缀 + 普通 TG + 无 email/summary 副作用
+    （W2 终审批定：独立类型语义，不复用 crash_alert 的崩溃/重启副作用）"""
+    env = Env()
+    try:
+        env.enqueue("20260828_110000_111111_20202020",
+                    "watchdog_alert|watchdog v2.2 检测到异常: bot 心跳超时")
+        bot = FakeTgBot()
+        email_calls, summary_calls = [], []
+
+        async def summary_cb():
+            summary_calls.append(1)
+
+        stats = run_round(bot, env, summary_cb=summary_cb,
+                          email_cb=lambda *a, **k: email_calls.append(a))
+
+        ok = (stats.get('sent') == 1
+              and len(bot.sent) == 1
+              and '🐕' in bot.sent[0][0] and 'Watchdog 告警' in bot.sent[0][0]
+              and '心跳超时' in bot.sent[0][0]
+              and len(email_calls) == 0                     # 无 email 副作用
+              and len(summary_calls) == 0                   # 无 summary 副作用
+              and env.queue_files() == [])                  # DONE 后清队列
+        report("S13 watchdog_alert: 🐕前缀+无email/summary副作用", ok,
+               f"(sent={stats.get('sent')}, email={len(email_calls)}, "
+               f"summary={len(summary_calls)}, 前缀={'🐕' in bot.sent[0][0] if bot.sent else False})")
+    finally:
+        env.close()
+
+
+def scenario_14():
+    """S14（Batch 3）auth_blocked 分支：🔒 前缀 + 普通 TG + 无 email 副作用
+    （Email 由 trader critical 级直发负责，队列事件只做 TG 侧兜底；TG 失败纯文本 fallback）"""
+    env = Env()
+    try:
+        eid = "20260828_110000_111111_30303030"
+        env.enqueue(eid, "auth_blocked|已进入盲区安全模式：仅停止交易操作")
+        bot = FakeTgBot()
+        email_calls, summary_calls = [], []
+
+        async def summary_cb():
+            summary_calls.append(1)
+
+        stats = run_round(bot, env, summary_cb=summary_cb,
+                          email_cb=lambda *a, **k: email_calls.append(a))
+
+        ok_a = (stats.get('sent') == 1
+                and len(bot.sent) == 1
+                and '🔒' in bot.sent[0][0] and '鉴权封锁' in bot.sent[0][0]
+                and '盲区安全模式' in bot.sent[0][0]
+                and len(email_calls) == 0 and len(summary_calls) == 0
+                and env.queue_files() == [])
+
+        # TG 失败 → 有界重试 3 轮 → SILENCED（独立 env：成功路 DONE 后已清队列，C2 语义）
+        env2 = Env()
+        try:
+            eid2 = "20260828_120000_111111_40404040"
+            env2.enqueue(eid2, "auth_blocked|已进入盲区安全模式：仅停止交易操作")
+            bot2 = FakeTgBot(always_fail=True)
+            for _ in range(3):
+                run_round(bot2, env2, summary_cb=summary_cb,
+                          email_cb=lambda *a, **k: email_calls.append(a))
+            st = env2.state().get(eid2, {})
+            ok_b = (st.get('status') == 'SILENCED' and st.get('failed_attempts') == 3
+                    and env2.queue_files() == [f"{eid2}.notify"]  # 证据保留
+                    and len(email_calls) == 0)                     # 失败路径同样无 email 副作用
+        finally:
+            env2.close()
+
+        report("S14 auth_blocked: 🔒前缀+无email副作用+SILENCED路径", ok_a and ok_b,
+               f"(成功路: sent={stats.get('sent')} email={len(email_calls)}；"
+               f"失败路: status={st.get('status')} attempts={st.get('failed_attempts')})")
+    finally:
+        env.close()
+
+
 if __name__ == '__main__':
     scenario_1()
     scenario_2()
@@ -441,6 +519,8 @@ if __name__ == '__main__':
     scenario_10()
     scenario_11()
     scenario_12()
+    scenario_13()
+    scenario_14()
     print("\n" + "#" * 60)
     failed = [n for n, p in RESULTS if not p]
     if failed:
