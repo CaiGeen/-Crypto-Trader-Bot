@@ -24,6 +24,10 @@ D-010 Batch 2（trader/watchdog 写入侧 + AUTH_BLOCKED）离线验收测试
   S10 trader 入队格式闭环：ip_notify|{msg}，消费端可解析 + Email 通道（T5）
   S11 auth_blocked.json 损坏 → Fail-Closed（按 BLOCKED 处理）+ 损坏告警去重
   S12 持久锁存在时 CryptoTrader.__init__ 不崩溃（跳过启动初始化 API，零网络调用）
+  S13 三通道真实语义（ChatGPT 复审补充）：AUTH_BLOCKED=三通道并行（队列无条件）；
+      IP=双通道+队列 fallback-only（用户裁定 B，设计稿同步）
+  S14 真实启动集成路径（ChatGPT 复审补充）：持久锁启动→探活恰1次→败=保持锁且
+      recover 不可达；成=RECOVERING→reconcile→UNBLOCKED→READY（无普通 API 绕过）
 
 用法: .venv\\Scripts\\python.exe test_auth_blocked.py
 """
@@ -94,6 +98,10 @@ def make_trader(tmp, pre_auth=None, configure=None):
             t = CryptoTrader('k', 's')
     t._min_api_interval = 0
     t._api_cooldown_until = 0
+    # 测试隔离：IP 持久化重定向 + 固定基线（S2/S10/S13 曾依赖项目根 last_ip.txt 的
+    # 跨运行残留做去重判定，导致偶发 FAIL——2026-08-28 S13 复审时发现并根治）
+    t.ip_file = os.path.join(str(tmp), 'last_ip.txt')
+    t.last_known_ip = '0.0.0.0'
     if configure:
         configure(ex)
     t._sent = []
@@ -161,14 +169,27 @@ def s2_2015_triggers_block():
         report('S2 -2015 触发', False, f'异常类型错误: {type(e).__name__}')
         return
     data = auth_file_of(t)
+    # 队列事件（S13 复审补充）：AUTH_BLOCKED 告警的队列通道为无条件写入，不依赖 TG 成败。
+    # 测试环境无 tg_bot → IP 事件也按 fallback 契约入队（ip_notify），故队列 = ip_notify + auth_blocked
+    qdir = t.notify_queue_dir
+    q_files = [f for f in os.listdir(qdir) if f.endswith('.notify')] if os.path.isdir(qdir) else []
+    types_in_queue = []
+    import bot_runner as _br
+    for f in q_files:
+        with open(os.path.join(qdir, f), encoding='utf-8') as fh:
+            typ, msg = _br._parse_notify_content(fh.read())
+        types_in_queue.append(typ)
+    q_ok = (types_in_queue.count('auth_blocked') == 1
+            and set(types_in_queue) <= {'auth_blocked', 'ip_notify'})
     ok = (data.get('blocked') is True
           and ex.fetch_positions.call_count == 1        # 无 5 次重试
           and any('盲区' in m for m in t._sent)          # 三通道告警含盲区字样
           and len(t._emails) >= 1                        # Email 通道（critical 级）
+          and q_ok                                        # 队列事件无条件入队（三通道第3路）
           and t.last_known_ip == '1.2.3.4')              # IP 提取仍生效
     report('S2 -2015 触发', ok,
            f'blocked={data.get("blocked")} 调用数={ex.fetch_positions.call_count} '
-           f'TG={len(t._sent)} Email={len(t._emails)} ip={t.last_known_ip}')
+           f'TG={len(t._sent)} Email={len(t._emails)} 队列={types_in_queue} ip={t.last_known_ip}')
 
 
 # ==================== S3 普通 API 零调用（场景 7 核心） ====================
@@ -434,13 +455,132 @@ def s12_init_survives_persistent_lock():
            f'{ex.load_time_difference.call_count + ex.load_markets.call_count + ex.fetch_time.call_count}（应为 0）')
 
 
+# ==================== S13 三通道真实语义（ChatGPT 复审 2026-08-28 补充） ====================
+# 钉死两路径正式契约（用户裁定 B，设计稿 v3.2 同步）：
+#   AUTH_BLOCKED 事件 = 完整三通道并行（TG/Email 路径 + 队列事件**无条件写入**，互不依赖）
+#   IP 变更事件     = TG + Email 双通道并行；队列仅 TG 失败时 fallback（安全网定位）
+
+def s13_channel_semantics():
+    import bot_runner
+
+    # --- AUTH_BLOCKED 路径（_enter_auth_blocked）：三通道互不依赖 ---
+    def run_blocked_case(tg_raises, queue_raises):
+        t, ex = make_trader(tempfile.mkdtemp(prefix='d010b2_s13a_'))
+        if tg_raises:
+            def bad_tg(text, **k):
+                raise RuntimeError('TG down')
+            t.send_tg_notification = bad_tg
+        else:
+            t.send_tg_notification = lambda text, **k: t._sent.append(str(text))
+        if queue_raises:
+            def bad_queue(*a, **k):
+                raise RuntimeError('queue down')
+            t._enqueue_notify_event = bad_queue
+        t._enter_auth_blocked('测试原因')
+        qdir = t.notify_queue_dir
+        files = [f for f in os.listdir(qdir) if f.endswith('.notify')] if os.path.isdir(qdir) else []
+        if queue_raises:
+            # 象限3 契约：队列写入失败 → 无文件产生、异常被 _enter_auth_blocked 吞掉
+            # （不向外传播）、TG 已发出、锁仍写入——通道独立失败边界
+            q_ok = len(files) == 0
+        else:
+            q_ok = len(files) == 1
+            if q_ok:
+                with open(os.path.join(qdir, files[0]), encoding='utf-8') as fh:
+                    content = fh.read()
+                typ, msg = bot_runner._parse_notify_content(content)
+                q_ok = typ == 'auth_blocked' and '盲区' in msg
+        # 锁写入与 TG 发出互不受另一通道失败影响
+        locked = auth_file_of(t).get('blocked') is True
+        tg_ok = (len(t._sent) == 0) if tg_raises else (len(t._sent) == 1)
+        return q_ok and locked and tg_ok
+
+    # 象限1：TG 成功 → 队列仍有 1 个 auth_blocked 事件（无条件，非 fallback）
+    q1 = run_blocked_case(tg_raises=False, queue_raises=False)
+    # 象限2：TG 失败 → 队列仍有 1 + 锁仍写入（Fail-Closed but not Fail-Silent）
+    q2 = run_blocked_case(tg_raises=True, queue_raises=False)
+    # 象限3：队列写入失败 → 不阻塞 TG 已发出 + 锁仍写入（通道独立失败边界）
+    q3 = run_blocked_case(tg_raises=False, queue_raises=True)
+
+    # --- IP 路径（_record_ip_change）：双通道并行 + 队列 fallback-only ---
+    def run_ip_case(tg_ok):
+        t, ex = make_trader(tempfile.mkdtemp(prefix='d010b2_s13b_'))
+        t._try_async_send = lambda text: tg_ok
+        t._record_ip_change('9.9.9.9', source='binance_error')
+        qdir = t.notify_queue_dir
+        files = [f for f in os.listdir(qdir) if f.endswith('.notify')] if os.path.isdir(qdir) else []
+        return len(files), len(t._emails)
+
+    n_tg_ok, mail_ok = run_ip_case(True)       # TG 成功 → 队列 0（fallback-only 契约）
+    n_tg_fail, mail_fail = run_ip_case(False)  # TG 失败 → 队列 1（安全网兜住）
+    ip_ok = (n_tg_ok == 0 and n_tg_fail == 1 and mail_ok >= 1 and mail_fail >= 1)
+
+    report('S13 三通道真实语义', q1 and q2 and q3 and ip_ok,
+           f'AUTH_BLOCKED象限: TG成功={q1} TG失败={q2} 队列失败={q3}；'
+           f'IP路径: TG成功队列={n_tg_ok} TG失败队列={n_tg_fail} Email={mail_ok}/{mail_fail}')
+
+
+# ==================== S14 真实启动 AUTH_BLOCKED 集成路径（ChatGPT 复审补充） ====================
+# 覆盖 run_trader_recovery_on_startup 全链路（非函数级）：
+# 持久锁启动 → 启动探活恰 1 次 → 失败保持 BLOCKED 且 recover_active_batches 不可达
+# / 成功 → RECOVERING → reconcile → UNBLOCKED → READY；全程普通 API 不绕过闸门
+
+def s14_startup_integration():
+    import asyncio
+    import bot_runner
+
+    # --- A) 探活失败路径 ---
+    tmp_a = tempfile.mkdtemp(prefix='d010b2_s14a_')
+    t, ex = make_trader(tmp_a, pre_auth=dict(BLOCKED_JSON))
+    ex.fetch_balance = mock.MagicMock(side_effect=Exception(ERR_2015))
+    rec_calls = []
+    t.recover_active_batches = lambda: rec_calls.append(1) or True
+    trace_a = []
+    orig_save_a = t._save_auth_state
+    t._save_auth_state = lambda s, r='': trace_a.append(s) or orig_save_a(s, r)
+    bot_runner.TRADER_LOCK = asyncio.Lock()    # 测试内换新锁（防跨 event loop 复用报错）
+    asyncio.run(bot_runner.run_trader_recovery_on_startup(t))
+    d_a = auth_file_of(t)
+    a_ok = (ex.fetch_balance.call_count == 1          # 探活恰 1 次
+            and d_a.get('blocked') is True and d_a.get('state') == 'BLOCKED'
+            and len(rec_calls) == 0                    # 探活败 → 常规恢复不可达（不反复重试）
+            and bool(t._not_ready_reason) and t._ready is False
+            and ex.fetch_positions.call_count == 0)    # 锁定期普通 API = 0
+
+    # --- B) 探活成功路径 ---
+    tmp_b = tempfile.mkdtemp(prefix='d010b2_s14b_')
+    t2, ex2 = make_trader(tmp_b, pre_auth=dict(BLOCKED_JSON))
+    probe_log = []
+    ex2.fetch_balance = mock.MagicMock(side_effect=lambda *a, **k: probe_log.append('probe') or {})
+    rec_calls_b = []
+    t2.recover_active_batches = lambda: rec_calls_b.append(1) or True
+    trace_b = []
+    orig_save_b = t2._save_auth_state
+    t2._save_auth_state = lambda s, r='': trace_b.append(s) or orig_save_b(s, r)
+    bot_runner.TRADER_LOCK = asyncio.Lock()
+    asyncio.run(bot_runner.run_trader_recovery_on_startup(t2))
+    d_b = auth_file_of(t2)
+    b_ok = (len(probe_log) == 1                        # 整个启动流程只产生一次探活
+            and d_b.get('blocked') is False and d_b.get('state') == 'UNBLOCKED'
+            and trace_b == ['RECOVERING', 'UNBLOCKED']  # clear 前必经 RECOVERING（无半恢复）
+            and len(rec_calls_b) == 2                  # 恢复链内 1 次 + 常规恢复幂等二跑 1 次（既有设计）
+            and t2._ready is True and t2._not_ready_reason == '')
+
+    report('S14 真实启动集成路径', a_ok and b_ok,
+           f'探活败: probe={ex.fetch_balance.call_count} state={d_a.get("state")} '
+           f'recover调用={len(rec_calls)} ready={t._ready}；'
+           f'探活成: probe={len(probe_log)} state={d_b.get("state")} trace={trace_b} '
+           f'recover调用={len(rec_calls_b)} ready={t2._ready}')
+
+
 # ==================== 主流程 ====================
 
 def main():
     for fn in (s1_gate_position_ast, s2_2015_triggers_block, s3_zero_network_calls,
                s4_five_monitor_cycles, s5_l920_dynamic_zero, s6_auth_probe_whitelist,
                s7_recovery_paths, s8_blind_safe_order, s9_watchdog_queue_format,
-               s10_trader_queue_format, s11_corrupt_fail_closed, s12_init_survives_persistent_lock):
+               s10_trader_queue_format, s11_corrupt_fail_closed, s12_init_survives_persistent_lock,
+               s13_channel_semantics, s14_startup_integration):
         try:
             fn()
         except Exception as e:
