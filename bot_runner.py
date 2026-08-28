@@ -4,10 +4,12 @@ import re
 import sys
 import json
 import time
+import uuid
 import hashlib
 import atexit
 import logging
 import asyncio
+import tempfile
 import threading
 from datetime import datetime
 from dotenv import load_dotenv
@@ -73,6 +75,15 @@ ALLOWED_USER_ID = int(ALLOWED_USER_ID.strip())
 # 🔥 MAX_LEVERAGE 统一配置
 MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "100"))
 
+# 🔥 D-010 通知事件队列（Batch 1 消费侧，2026-08-28）
+# 旧 .notify 单文件 → .notify_queue/ 一事件一文件；计数持久化；3 轮失败 SILENCED；
+# Markdown → 纯文本降级；失败路径不再触发汇总刷屏（E4）
+# 设计稿：.workbuddy/memory/discussions/D-010_通知链路加固与2015分流_设计确认稿_v3.md（v3.1 实施约束）
+NOTIFY_QUEUE_DIR = os.path.join(BASE_DIR, ".notify_queue")
+NOTIFY_STATE_FILE = os.path.join(BASE_DIR, ".notify.state.json")
+NOTIFY_AUDIT_LOG = os.path.join(BASE_DIR, ".notify_audit.log")
+NOTIFY_MAX_ATTEMPTS = 3   # v3.1 C2：每事件最多 3 轮（每轮 Markdown→纯文本两败才计 1 轮）
+
 # 🔥 QQ 邮箱发送串行锁（限制同时最多 1 个 SMTP 连接）
 EMAIL_SEND_LOCK = threading.Lock()
 
@@ -108,6 +119,284 @@ def send_email_alert(text: str, subject: str = "交易告警") -> None:
                 logging.warning(f"⚠️ [邮件] 发送失败: {e}")
 
     threading.Thread(target=_do_send, daemon=True).start()
+
+
+# ==================== D-010 通知事件队列（Batch 1 消费侧） ====================
+# v3.1 实施约束（ChatGPT 复核批准）：
+#   C1 进程级原子入队：tmp 写入 → flush → os.replace；防进程崩溃半文件，不承诺断电级 durability
+#   C2 有限重试 + 有界重复投递：成功删除窗口崩溃 → 极端重复 ≤1 次；失败 3 轮 → SILENCED 永停
+#   C3 queue/state 双向不一致恢复：queue有state无→新建ACTIVE正常发；state有queue无→ORPHAN_STATE_IGNORED 不重发
+#   C4 SILENCED 检查先于任何 Telegram 调用；SILENCED 永不自动回 ACTIVE
+# event_id = 事件实例身份（文件名/计数键）；content_sha256 = 内容指纹（仅审计，不做计数键、不做去重）
+
+def _generate_notify_event_id() -> str:
+    """事件实例身份：{YYYYMMDD_HHMMSS_ffffff}_{uuid4 前 8 hex}，唯一性由随机性保证"""
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:8]
+
+
+def _write_notify_event_file(content: str, queue_dir: str | None = None) -> str | None:
+    """C1 进程级原子入队：tmp 写入 → flush → os.replace(tmp, final)。
+    只有原子替换完成后才视为"已入队"；失败返回 None（调用方自行降级）。"""
+    qdir = queue_dir or NOTIFY_QUEUE_DIR
+    try:
+        os.makedirs(qdir, exist_ok=True)
+        event_id = _generate_notify_event_id()
+        final_path = os.path.join(qdir, f"{event_id}.notify")
+        fd, tmp_path = tempfile.mkstemp(dir=qdir, prefix=".tmp_", suffix=".notify")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+            os.replace(tmp_path, final_path)
+            return event_id
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
+    except Exception as e:
+        print(f"⚠️ [D-010] 通知事件入队失败: {e}")
+        logging.warning(f"⚠️ [D-010] 通知事件入队失败: {e}")
+        return None
+
+
+def _migrate_legacy_notify(base_dir: str | None = None) -> str | None:
+    """场景 6：旧单文件 .notify → .notify_queue/ 一次性迁移（进程启动时调用一次）。
+    迁移成功返回 event_id；无旧文件/空文件返回 None。"""
+    base = base_dir or BASE_DIR
+    legacy = os.path.join(base, ".notify")
+    if not os.path.isfile(legacy):
+        return None
+    try:
+        with open(legacy, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            try:
+                os.remove(legacy)
+                print(f"📝 [D-010] 旧 .notify 为空，已直接移除")
+            except Exception:
+                pass
+            return None
+        event_id = _write_notify_event_file(content, queue_dir=os.path.join(base, ".notify_queue"))
+        if event_id:
+            try:
+                os.remove(legacy)
+                print(f"📝 [D-010] 旧 .notify 已迁移为事件 {event_id} 并移除原文件")
+            except Exception as e:
+                # 旧文件删除失败：留在原地，下一轮迁移会再入队一次（有界重复，C2 语义）
+                print(f"⚠️ [D-010] 旧 .notify 迁移后删除失败（下轮重试迁移）: {e}")
+            return event_id
+        return None
+    except Exception as e:
+        print(f"⚠️ [D-010] 旧 .notify 迁移失败（保留原文件）: {e}")
+        return None
+
+
+def _load_notify_state(state_file: str | None = None) -> dict:
+    """加载 .notify.state.json。损坏/非 dict → 重置 {}（SILENCED 记忆丢失但有界 3 轮，不崩溃）"""
+    path = state_file or NOTIFY_STATE_FILE
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception as e:
+        print(f"⚠️ [D-010] notify state 损坏，计数重置（最多重试 {NOTIFY_MAX_ATTEMPTS} 轮）: {e}")
+        return {}
+
+
+def _save_notify_state(state: dict, state_file: str | None = None) -> None:
+    """原子写 state（tmp → flush → os.replace，与 trade_state.json 同惯例）"""
+    path = state_file or NOTIFY_STATE_FILE
+    try:
+        d = os.path.dirname(path) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=d, prefix=".tmp_", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=1)
+            f.flush()
+        os.replace(tmp_path, path)
+    except Exception as e:
+        print(f"⚠️ [D-010] notify state 保存失败: {e}")
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _append_notify_audit(event_id: str, status: str, attempts: int,
+                         evidence: str, audit_log: str | None = None) -> None:
+    """SILENCED / ORPHAN_STATE_IGNORED 审计留痕：append-only 单行 TSV（D-007 归一预留）。
+    best-effort：写失败仅告警不阻塞 state 主流程。"""
+    path = audit_log or NOTIFY_AUDIT_LOG
+    line = (f"{datetime.now().isoformat(timespec='seconds')}\t{event_id}\t"
+            f"{status}\tattempts={attempts}\t{evidence}\n")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        print(f"⚠️ [D-010] audit 写入失败（证据仍在 state/队列文件）: {e}")
+
+
+async def _send_notify_with_fallback(bot, chat_id: int, text: str) -> bool:
+    """Markdown → 失败 → 纯文本（parse_mode=None）重发一次；两败才返回 False。
+    与 trader send_tg_notification L346-361 主路径降级语义对齐（v3：纯文本 fallback 为唯一修复）。"""
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown')
+        return True
+    except Exception:
+        pass
+    try:
+        await bot.send_message(chat_id=chat_id, text=text)   # 纯文本
+        return True
+    except Exception:
+        return False
+
+
+def _parse_notify_content(content: str) -> tuple:
+    """解析事件文件内容（沿用旧 .notify 的 type|msg 格式，新旧写入方共用）"""
+    if '|' in content:
+        parts = content.split('|', 2)
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+    return 'unknown', content
+
+
+async def _process_notify_queue_once(bot, chat_id: int,
+                                     state_file: str | None = None,
+                                     queue_dir: str | None = None,
+                                     audit_log: str | None = None,
+                                     summary_cb=None,
+                                     email_cb=None) -> dict:
+    """D-010 Batch 1 单轮队列消费（生产循环 10s 周期的单轮体，路径可注入供离线测试）。
+
+    消费顺序（C4 锁死）：读队列 → 读/建 state → SILENCED 则跳过（不调 TG）→ ACTIVE 才发送。
+    每轮 = Markdown → 失败 → 纯文本，两败才计 1 轮；3 轮 → SILENCED（保留文件/state/audit）。
+    """
+    qdir = queue_dir or NOTIFY_QUEUE_DIR
+    state = _load_notify_state(state_file)
+    stats = {'processed': 0, 'sent': 0, 'failed_rounds': 0, 'silenced': 0, 'skipped_silenced': 0}
+
+    files = []
+    if os.path.isdir(qdir):
+        files = sorted(f for f in os.listdir(qdir) if f.endswith(".notify"))
+    queue_ids = {f[:-len(".notify")] for f in files}
+
+    # C3 对偶面：state 有 queue 无（非 SILENCED）→ ORPHAN_STATE_IGNORED，不重发，audit 留痕后清条目
+    # （SILENCED 条目按设计永久保留，即使证据文件被人工清理也保持静默记录）
+    for eid in list(state.keys()):
+        if eid not in queue_ids and isinstance(state[eid], dict) and state[eid].get('status') != 'SILENCED':
+            _append_notify_audit(eid, 'ORPHAN_STATE_IGNORED',
+                                 state[eid].get('failed_attempts', 0), '-', audit_log)
+            print(f"ℹ️ [D-010] ORPHAN_STATE_IGNORED：state 有记录但队列文件不存在，不重发: {eid}")
+            logging.info(f"[D-010] ORPHAN_STATE_IGNORED: {eid}")
+            state.pop(eid, None)
+
+    for fname in files:
+        event_id = fname[:-len(".notify")]
+        fpath = os.path.join(qdir, fname)
+        evidence = f".notify_queue/{fname}"
+
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except Exception as e:
+            print(f"⚠️ [D-010] 读取事件文件失败（跳过本轮）: {fpath}: {e}")
+            continue
+        if not content:
+            # 原子入队下不应出现半文件；出现即异常残留，清理避免每轮空转
+            try:
+                os.remove(fpath)
+                print(f"📝 [D-010] 空事件文件已清理: {fname}")
+            except Exception:
+                pass
+            continue
+
+        # C3：queue 有 state 无 → 新建 ACTIVE 正常发送
+        st = state.get(event_id)
+        if not isinstance(st, dict):
+            st = {
+                'content_sha256': hashlib.sha256(content.encode('utf-8')).hexdigest(),
+                'failed_attempts': 0,
+                'status': 'ACTIVE',
+                'first_seen': datetime.now().isoformat(timespec='seconds'),
+                'last_attempt': datetime.now().isoformat(timespec='seconds'),
+            }
+            state[event_id] = st
+
+        # C4：SILENCED 检查先于任何 Telegram 调用
+        if st.get('status') == 'SILENCED':
+            print(f"🔇 [D-010] 通知已静默，未删除告警: {event_id}")
+            stats['skipped_silenced'] += 1
+            continue
+
+        notify_type, notify_msg = _parse_notify_content(content)
+        stats['processed'] += 1
+        ok = False
+
+        if notify_type == 'summary_restart':
+            logging.info("📊 Watchdog 重启，发送持仓汇总")
+            if summary_cb is not None:
+                try:
+                    await summary_cb()
+                    ok = True
+                except Exception as e:
+                    logging.warning(f"⚠️ 汇总通知发送失败: {e}")
+        else:
+            if notify_type == 'ip_notify':
+                text = f"🌐 **IP 地址已变化！**\n\n{notify_msg}"
+            elif notify_type == 'crash_alert':
+                text = f"💥 **程序崩溃报警！**\n\n{notify_msg}"
+            else:
+                text = f"📨 **通知**\n{notify_msg}"
+
+            ok = await _send_notify_with_fallback(bot, chat_id, text)
+
+            if ok:
+                if notify_type == 'ip_notify':
+                    logging.info("📨 IP 备用通知已发送")
+                elif notify_type == 'crash_alert':
+                    logging.info("📨 崩溃报警已发送")
+                    # 🔥 崩溃报警同步推送邮箱 + 持仓汇总（成功路径一次性，与旧行为一致）
+                    (email_cb or send_email_alert)(f"💥 程序崩溃报警！\n\n{notify_msg}",
+                                                   subject="💥 程序崩溃报警")
+                    if summary_cb is not None:
+                        try:
+                            await summary_cb()
+                        except Exception as e:
+                            logging.warning(f"⚠️ 崩溃后汇总发送失败: {e}")
+
+        if ok:
+            # C2 DONE 语义 = 发送成功 + 删除完成；删除失败 → 下轮重发一次（有界重复）
+            try:
+                os.remove(fpath)
+                state.pop(event_id, None)
+                print(f"📝 [D-010] 通知已送达并删除事件文件: {fname}")
+            except Exception as e:
+                print(f"⚠️ [D-010] 删除事件文件失败（下轮将重发一次，有界）: {fname}: {e}")
+            stats['sent'] += 1
+        else:
+            # 失败计轮：state 持久化，重启不重置（C2/C3 语义）
+            st['failed_attempts'] = st.get('failed_attempts', 0) + 1
+            st['last_attempt'] = datetime.now().isoformat(timespec='seconds')
+            stats['failed_rounds'] += 1
+            if st['failed_attempts'] >= NOTIFY_MAX_ATTEMPTS:
+                st['status'] = 'SILENCED'
+                _append_notify_audit(event_id, 'SILENCED', st['failed_attempts'], evidence, audit_log)
+                print(f"🔇 [D-010] 通知连续 {st['failed_attempts']} 轮发送失败，已进入 SILENCED"
+                      f"（停止重试，未删除告警，证据保留）: {event_id}")
+                logging.warning(f"🔇 [D-010] NOTIFY_SILENCED: {event_id} attempts={st['failed_attempts']}"
+                                f" evidence={evidence}")
+                stats['silenced'] += 1
+            else:
+                print(f"⚠️ [D-010] 通知发送失败（第 {st['failed_attempts']}/{NOTIFY_MAX_ATTEMPTS} 轮），"
+                      f"保留队列与计数: {event_id}")
+
+    _save_notify_state(state, state_file)
+    return stats
 
 # 全局异步互斥锁
 TRADER_LOCK = asyncio.Lock()
@@ -2158,85 +2447,20 @@ async def on_post_init(app: Application):
             # 🔥 增加启动等待，让系统稳定
             await asyncio.sleep(5)
 
-            # 🔥 W2 修复（D-002）：由一次性执行改为定时轮询
-            # 原实现仅在启动时执行一次，trader 运行期写入的 .notify
-            # （如 IP 变化通知的 fallback 路径 _fallback_notify_file）永远不会被读取，
-            # 通知冗余度实际低于设计。改为每 10 秒检查一次。
+            # 🔥 W2 修复（D-002）：由一次性执行改为定时轮询（保留历史，D-010 在此基础上队列化）
+            # 🔥 D-010 场景 6：旧单文件 .notify → .notify_queue/ 一次性迁移
+            _migrate_legacy_notify()
+
             while True:
                 try:
-                    notify_file = os.path.join(BASE_DIR, ".notify")
-                    if os.path.exists(notify_file):
-                        with open(notify_file, "r", encoding="utf-8") as f:
-                            content = f.read().strip()
-
-                        # 🔥 处理成功后才删除
-                        success = False
-
-                        if '|' in content:
-                            parts = content.split('|', 2)
-                            if len(parts) >= 2:
-                                notify_type = parts[0]
-                                notify_msg = parts[1] if len(parts) > 1 else parts[0]
-
-                                if notify_type == 'ip_notify':
-                                    await app.bot.send_message(
-                                        chat_id=ALLOWED_USER_ID,
-                                        text=f"🌐 **IP 地址已变化！**\n\n{notify_msg}",
-                                        parse_mode='Markdown'
-                                    )
-                                    logging.info("📨 IP 备用通知已发送")
-                                    success = True
-
-                                elif notify_type == 'crash_alert':
-                                    await app.bot.send_message(
-                                        chat_id=ALLOWED_USER_ID,
-                                        text=f"💥 **程序崩溃报警！**\n\n{notify_msg}",
-                                        parse_mode='Markdown'
-                                    )
-                                    logging.info("📨 崩溃报警已发送")
-                                    # 🔥 崩溃报警同步推送 QQ 邮箱（兜底通道）
-                                    send_email_alert(f"💥 程序崩溃报警！\n\n{notify_msg}", subject="💥 程序崩溃报警")
-                                    # 🔥 崩溃后也发送持仓汇总，让用户第一时间掌握仓位状态
-                                    await send_summary_notification(app)
-                                    success = True
-
-                                elif notify_type == 'summary_restart':
-                                    logging.info("📊 Watchdog 重启，发送持仓汇总")
-                                    await send_summary_notification(app)
-                                    success = True
-
-                                elif notify_type == 'unknown':
-                                    await app.bot.send_message(
-                                        chat_id=ALLOWED_USER_ID,
-                                        text=f"📨 **通知**\n{notify_msg}",
-                                        parse_mode='Markdown'
-                                    )
-                                    success = True
-                        else:
-                            await app.bot.send_message(
-                                chat_id=ALLOWED_USER_ID,
-                                text=f"📨 **通知**\n{content}",
-                                parse_mode='Markdown'
-                            )
-                            success = True
-
-                        # 🔥 处理成功后才删除
-                        if success:
-                            try:
-                                os.remove(notify_file)
-                                print(f"📝 [通知] 已处理并删除 .notify")
-                            except Exception as e:
-                                print(f"⚠️ [通知] 删除 .notify 失败: {e}")
-                        else:
-                            print(f"⚠️ [通知] 处理失败，保留 .notify 供下次重试")
-
+                    await _process_notify_queue_once(
+                        app.bot, ALLOWED_USER_ID,
+                        summary_cb=lambda: send_summary_notification(app),
+                    )
                 except Exception as e:
-                    logging.warning(f"⚠️ 处理通知失败: {e}")
-                    # 🔥 兜底失败不应中断轮询（否则运行期通知链路永久失效）
-                    try:
-                        await send_summary_notification(app)
-                    except Exception as e2:
-                        logging.warning(f"⚠️ 发送汇总通知失败: {e2}")
+                    # 🔥 E4 修复（D-010）：兜底失败只记录，不再调用 send_summary_notification——
+                    # 错误处理路径不得产生新的通知副作用（8-28 事故：通知链路故障时每 10s 刷汇总）
+                    logging.warning(f"⚠️ 处理通知队列失败: {e}")
 
                 # 🔥 轮询间隔 10 秒
                 await asyncio.sleep(10)
