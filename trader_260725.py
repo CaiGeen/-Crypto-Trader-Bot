@@ -9,6 +9,7 @@ import ccxt
 import threading
 import asyncio
 import re
+import uuid
 from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
@@ -40,6 +41,38 @@ SLIPPAGE_BUFFER = 0.0002
 
 # -1021 时间戳错误重同步冷却（秒）：窗口内不重复调 load_time_difference（P0-1，堵放大器 A）
 TIME_SYNC_COOLDOWN = 60
+
+# ==================== D-010 Batch 2：AUTH_BLOCKED 鉴权熔断（盲区安全模式） ====================
+# 设计依据：discussions/D-010_通知链路加固与2015分流_设计确认稿_v3.md + Batch2_实施方案_改动点清单.md
+# ChatGPT 终审 2026-08-28 三条钉死约束：
+#   1. 闸门位于 _safe_api_call 的 retry loop 与 try 之前，raise 于 try 外
+#   2. L920 load_time_difference 直连点必须 AST + 动态 mock 零网络调用双验证
+#   3. BLIND-SAFE 恢复顺序锁死：probe → RECOVERING → reconcile → clear（Fail-Closed，绝不半恢复）
+
+# 鉴权失败白名单（ChatGPT 终审裁定：白名单式分类，不做模糊关键词猜测。
+# -2015 Invalid API-key/IP/permissions、-2014 API-key format invalid、-1022 Signature 不合法。
+# 注意：原实现的裸 "permissions" 模糊匹配已移除——普通业务参数错误/订单状态错误/余额不足
+# 等一律不得进入 AUTH_BLOCKED，仍走原有重试路径）
+AUTH_BLOCKED_ERROR_PATTERNS = ("-2015", "-2014", "-1022", "invalid api-key")
+
+AUTH_BLOCKED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auth_blocked.json")
+NOTIFY_QUEUE_DIR_TRADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".notify_queue")
+
+# T4：盲区休眠（监控线程收到 AuthBlockedError → 300s 纯本地等待，零 API）
+AUTH_BLIND_SLEEP_SECONDS = 300
+
+
+class AuthBlockedError(Exception):
+    """D-010 不变量⑨：AUTH_BLOCKED（盲区安全模式）下普通 Binance API 调用被拒绝。
+    唯一放行路径 = _safe_api_call(..., auth_probe=True)，且该参数仅允许出现在
+    _attempt_auth_recovery（探活，唯一触发点 = bot_runner 启动探活 + /auth_reset 命令）。"""
+    pass
+
+
+def _generate_notify_event_id() -> str:
+    """D-010 T1：事件实例身份（文件名/计数键/审计引用）。
+    与 bot_runner._generate_notify_event_id 格式完全一致（写入端-消费端契约）："""
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:8]
 
 
 class CryptoTrader:
@@ -144,14 +177,27 @@ class CryptoTrader:
         # 熔断持续期间仅 1 次 critical，成功挂出时清除 → 下次熔断可再提醒）
         self._tp_breaker_alerted = {}
 
+        # 🔥 D-010 Batch 2：AUTH_BLOCKED 盲区安全模式（auth_blocked.json 持久化，损坏 Fail-Closed）
+        self.auth_blocked_file = AUTH_BLOCKED_FILE        # 测试可重定向
+        self.notify_queue_dir = NOTIFY_QUEUE_DIR_TRADER   # T1 写入端队列目录（测试可重定向）
+        self._auth_corruption_alerted = False             # 锁文件损坏告警去重（进程内一次）
+        self._auth_recovering = False                     # T6：RECOVERING 期间仅恢复链线程放行
+        self._auth_recovery_thread = None                 # T6：恢复链线程身份（threading.current_thread()）
+        self._auth_recovery_lock = threading.Lock()       # B1：恢复链单飞（/auth_reset 与启动探活共用）
+
         if verbose:
             print("正在连接交易所并同步服务器时间/加载元数据...")
-        self._safe_api_call(self.exchange.load_time_difference)
-        self._safe_api_call(self.exchange.load_markets, True)
+        try:
+            self._safe_api_call(self.exchange.load_time_difference)
+            self._safe_api_call(self.exchange.load_markets, True)
 
-        # 🔥 强制同步服务器时间
-        self._safe_api_call(self.exchange.fetch_time)
-        self._safe_api_call(self.exchange.load_time_difference)
+            # 🔥 强制同步服务器时间
+            self._safe_api_call(self.exchange.fetch_time)
+            self._safe_api_call(self.exchange.load_time_difference)
+        except AuthBlockedError as e:
+            # 🔥 D-010 B3 前置：持久锁存在时跳过启动初始化 API（零网络请求），
+            # 探活与恢复交给 bot_runner 启动探活 / /auth_reset 命令（避免构造崩溃导致命令入口不可用）
+            print(f"🔒 [D-010] 检测到 AUTH_BLOCKED 持久锁，跳过启动初始化 API 调用: {e}")
 
         self.last_time_sync = time.time()
 
@@ -240,6 +286,13 @@ class CryptoTrader:
 
         sent = self._try_async_send(msg)
 
+        # 🔥 D-010 T5：IP 变更三通道——Email 独立并行发送（不依赖 TG 成败；
+        # 8-28 事故"IP 变更无邮件提醒"根因补齐。critical 语义对齐：邮箱兜底通道）
+        try:
+            self._send_email_alert(msg, subject="⚠️ IP 地址变化告警")
+        except Exception as e:
+            print(f"⚠️ [IP告警] Email 发送失败: {e}")
+
         if not sent:
             self._fallback_notify_file(ip, source)
 
@@ -269,7 +322,9 @@ class CryptoTrader:
             return False
 
     def _fallback_notify_file(self, ip: str, source: str = "binance_error"):
-        """备用方式：写入 .notify 文件，由 bot_runner 在启动后发送"""
+        """备用方式：D-010 Batch 2 起写入 .notify_queue/{event_id}.notify 事件队列
+        （原单槽 .notify 互相覆盖已淘汰），由 bot_runner 消费循环送达。
+        写入端不写 state——C3 语义：queue 有 state 无 → 消费端新建 ACTIVE 正常发送。"""
         try:
             # 构建纯文本消息（去掉 Markdown 特殊字符）
             plain_msg = (
@@ -279,20 +334,175 @@ class CryptoTrader:
                 f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"请将新 IP 添加到币安 API 白名单！"
             )
-
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            notify_file = os.path.join(base_dir, ".notify")
-            content = f"ip_notify|{plain_msg}"
-
-            with tempfile.NamedTemporaryFile("w", dir=base_dir, delete=False, encoding="utf-8") as tf:
-                tf.write(content)
-                tmp_name = tf.name
-            os.replace(tmp_name, notify_file)
-            print(f"📝 [备用通知] 已写入 .notify 文件: {notify_file}")
+            event_id = self._enqueue_notify_event("ip_notify", plain_msg)
+            if event_id:
+                print(f"📝 [备用通知] 已入队事件 {event_id} → {self.notify_queue_dir}")
         except Exception as e:
             import traceback
             print(f"⚠️ [备用通知] 写入失败: {e}")
             traceback.print_exc()
+
+    def _enqueue_notify_event(self, notify_type: str, plain_msg: str) -> str | None:
+        """D-010 T1/三通道：进程级原子入队（C1：tmp → flush → os.replace）。
+        落点 .notify_queue/{event_id}.notify，内容 `type|msg`（写入-消费端共用契约）。
+        type 只描述事件来源/语义，不承担去重职责。失败返回 None（调用方自行降级）。"""
+        qdir = self.notify_queue_dir
+        tmp_path = None
+        try:
+            os.makedirs(qdir, exist_ok=True)
+            event_id = _generate_notify_event_id()
+            final_path = os.path.join(qdir, f"{event_id}.notify")
+            fd, tmp_path = tempfile.mkstemp(dir=qdir, prefix=".tmp_", suffix=".notify")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(f"{notify_type}|{plain_msg}")
+                f.flush()
+            os.replace(tmp_path, final_path)
+            return event_id
+        except Exception as e:
+            print(f"⚠️ [D-010] 通知事件入队失败: {e}")
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            return None
+
+    # ==================== D-010 Batch 2：AUTH_BLOCKED 状态管理 ====================
+
+    def _load_auth_state(self) -> dict:
+        """读取 auth_blocked.json。返回 {'locked': bool, 'state': str, 'reason': str}。
+        文件不存在 → 未锁。存在但无法可靠解析 → 状态未知 = Fail-Closed 按 BLOCKED 处理
+        （ChatGPT 终审批定：程序无法证明"当前没有 AUTH_BLOCKED"时继续访问 API 不安全），
+        且必须显式告警，不伪装成正常运行。告警进程内去重（每次损坏进程生命周期仅 1 次）。"""
+        path = self.auth_blocked_file
+        if not os.path.exists(path):
+            return {'locked': False, 'state': 'UNBLOCKED', 'reason': ''}
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                state = str(data.get('state', 'BLOCKED')).upper()
+                locked = bool(data.get('blocked', True)) and state != 'UNBLOCKED'
+                return {'locked': locked, 'state': state,
+                        'reason': str(data.get('reason', ''))}
+            raise ValueError(f"非 dict 结构: {type(data).__name__}")
+        except Exception as e:
+            if not self._auth_corruption_alerted:
+                self._auth_corruption_alerted = True
+                self._alert_auth_state_corrupted(e)
+            return {'locked': True, 'state': 'BLOCKED',
+                    'reason': f'AUTH_BLOCKED 状态文件损坏，系统进入 Fail-Closed 盲区安全模式（{e}）'}
+
+    def _alert_auth_state_corrupted(self, exc: Exception) -> None:
+        """锁文件损坏告警（三通道 + 含 Fail-Closed/盲区字样，不伪装正常运行）"""
+        msg = (f"🚨 AUTH_BLOCKED 状态文件损坏（auth_blocked.json 无法解析）\n"
+               f"系统进入 Fail-Closed 盲区安全模式（BLIND-SAFE）：无法证明当前没有鉴权封锁，"
+               f"按已封锁处理，全部 Binance API 已停摆。\n"
+               f"解析错误: {exc}\n"
+               f"处理方式：人工检查/修复或删除 auth_blocked.json 后重启（重启会走启动探活恢复链）\n"
+               f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"\n{'=' * 60}\n🔒 {msg}\n{'=' * 60}")
+        try:
+            self.send_tg_notification(msg, level='critical')   # critical → 自动 Email 兜底
+        except Exception as e:
+            print(f"⚠️ [D-010] 锁损坏告警 TG 发送失败: {e}")
+        try:
+            self._enqueue_notify_event("auth_blocked", msg)    # 队列事件（消费端安全网）
+        except Exception as e:
+            print(f"⚠️ [D-010] 锁损坏告警入队失败: {e}")
+
+    def _save_auth_state(self, state: str, reason: str) -> None:
+        """原子写 auth_blocked.json（tmp → flush → os.replace，项目惯例）。
+        state ∈ {BLOCKED, RECOVERING, UNBLOCKED}；UNBLOCKED 保留在文件中作审计痕迹（blocked=false）。"""
+        path = self.auth_blocked_file
+        data = {'blocked': state in ('BLOCKED', 'RECOVERING'), 'state': state,
+                'reason': reason[:500],
+                'updated_at': time.strftime('%Y-%m-%d %H:%M:%S')}
+        tmp_path = None
+        try:
+            d = os.path.dirname(path) or '.'
+            fd, tmp_path = tempfile.mkstemp(dir=d, prefix='.tmp_', suffix='.json')
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+                f.flush()
+            os.replace(tmp_path, path)
+        except Exception as e:
+            print(f"⚠️ [D-010] auth_blocked.json 写入失败: {e}")
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    def _enter_auth_blocked(self, reason: str) -> None:
+        """进入 AUTH_BLOCKED 盲区安全模式：写锁 + 三通道告警（TG + Email + 队列事件）。
+        告警文本必须包含"盲区安全模式"字样与已知盲区声明（设计稿 §3.3，用户知情）。"""
+        try:
+            self._save_auth_state('BLOCKED', reason)
+        except Exception:
+            pass  # _save_auth_state 内部已打印告警；闸门在后续调用重读文件兜底
+        msg = (f"鉴权失败，程序已进入盲区安全模式（BLIND-SAFE）\n"
+               f"原因: {reason[:300]}\n"
+               f"已知盲区：仓位可能已被 SL/TP 平掉而程序不知；无法撤改剩余条件单；无法同步仓位状态\n"
+               f"安全依赖：交易所侧既有 SL/TP 条件单继续生效\n"
+               f"全部 Binance API 调用已停摆（普通调用 0 次网络请求）\n"
+               f"恢复方式：修复 IP 白名单/API 权限后发送 /auth_reset（探活→对账→自动解锁）\n"
+               f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"\n{'=' * 60}\n🔒 [D-010] {msg}\n{'=' * 60}")
+        try:
+            self.send_tg_notification(msg, level='critical')   # TG + Email（critical 自动邮箱兜底）
+        except Exception as e:
+            print(f"⚠️ [D-010] AUTH_BLOCKED TG 告警失败: {e}")
+        try:
+            self._enqueue_notify_event("auth_blocked", msg)    # 队列事件（消费循环安全网）
+        except Exception as e:
+            print(f"⚠️ [D-010] AUTH_BLOCKED 队列事件入队失败: {e}")
+
+    def _attempt_auth_recovery(self) -> tuple:
+        """BLIND-SAFE 恢复链（ChatGPT 钉死约束 3，顺序锁死 Fail-Closed）：
+        auth_probe 探活 → 成功 → RECOVERING（锁保持，仅恢复链线程可用 API）
+        → reconcile（复用 recover_active_batches，R-A/B/C/D 自愈家族）
+        → reconcile 成功 → clear（UNBLOCKED）→ 普通监控恢复。
+        任一步失败 → 保持锁（绝不半恢复，绝不"probe 成功直接 clear"）。
+        单飞：_auth_recovery_lock 非阻塞获取（/auth_reset 与启动探活共用，防并发探活）。"""
+        if not self._auth_recovery_lock.acquire(blocking=False):
+            return False, "已有恢复链在运行中，请稍候再试（防并发探活）"
+        try:
+            # Step 1：探活（唯一放行路径：auth_probe=True → fetch_balance，1 次受控网络请求）
+            try:
+                self._safe_api_call(self.exchange.fetch_balance, auth_probe=True)
+            except Exception as e:
+                self._save_auth_state('BLOCKED', f'探活失败，保持锁定: {e}')
+                return False, f"探活失败（保持 AUTH_BLOCKED 盲区安全模式）: {e}"
+            # Step 2：RECOVERING（锁保持；仅本恢复链线程的 API 调用放行）
+            self._save_auth_state('RECOVERING', '探活成功，reconcile 进行中（锁保持）')
+            self._auth_recovering = True
+            self._auth_recovery_thread = threading.current_thread()
+            try:
+                # Step 3：reconcile——复用既有启动恢复链（向交易所现实收敛，盲区期不一致由其兜住）
+                try:
+                    ok = self.recover_active_batches()
+                except Exception as e:
+                    ok = False
+                    print(f"🚨 [D-010] 恢复期 reconcile 异常: {e}")
+                if not ok:
+                    self._save_auth_state('BLOCKED', '恢复期 reconcile 失败，重新锁定（Fail-Closed）')
+                    return False, "reconcile 失败，保持 AUTH_BLOCKED（盲区安全模式），可稍后重试 /auth_reset"
+                # Step 4：clear（顺序锁死：先 reconcile 后 clear——绝不半恢复）
+                self._save_auth_state('UNBLOCKED', '探活 + reconcile 均成功，鉴权已恢复')
+                msg = ("鉴权已恢复（盲区安全模式解除）\n"
+                       f"探活与对账均成功，普通监控已恢复。\n"
+                       f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                try:
+                    self.send_tg_notification(msg, level='info')
+                except Exception as e:
+                    print(f"⚠️ [D-010] 恢复成功 TG 通知失败: {e}")
+                return True, "恢复完成：探活 + reconcile 均成功，已解锁"
+            finally:
+                self._auth_recovering = False
+                self._auth_recovery_thread = None
+        finally:
+            self._auth_recovery_lock.release()
 
     def _extract_ip_from_error(self, error_msg: str) -> str | None:
         """从币安错误信息中提取 IP 地址"""
@@ -880,7 +1090,21 @@ class CryptoTrader:
         self._clear_tp_param_invalid(symbol, batch_id)
         return False
 
-    def _safe_api_call(self, func, *args, retries=5, delay=2, **kwargs):
+    def _safe_api_call(self, func, *args, retries=5, delay=2, auth_probe=False, **kwargs):
+        # 🔥 D-010 Batch 2（ChatGPT 钉死约束 1）：AUTH_BLOCKED 入口闸门——
+        # 位于 for retry loop 与 try 之前，raise 于 try 外。锁定期内下方 -1021 分支的
+        # load_time_difference() 直连物理不可达（AST + 动态 mock 双验证，test S1/S5）。
+        # 白名单仅两条放行：① auth_probe=True（探活，全库仅 _attempt_auth_recovery 一处出现）
+        # ② RECOVERING 态且调用线程 == 恢复链线程（reconcile 期间仅恢复链可用 API）
+        if not auth_probe:
+            auth = self._load_auth_state()
+            if auth['locked'] and not (
+                auth['state'] == 'RECOVERING'
+                and self._auth_recovering
+                and threading.current_thread() is self._auth_recovery_thread
+            ):
+                raise AuthBlockedError(
+                    f"[盲区安全模式] API 调用被拒绝（状态={auth['state']}）：{auth['reason'][:200]}")
         for i in range(retries):
             # 🔥 每次重试都检查全局熔断（感知其他线程设置的冷却）
             self._wait_for_api_cooldown()
@@ -898,16 +1122,21 @@ class CryptoTrader:
             except Exception as e:
                 err_str = str(e).lower()
 
-                # 🔥 检测到 IP 相关错误
-                if "-2015" in err_str or "invalid api-key" in err_str or "permissions" in err_str:
+                # 🔥 D-010 Batch 2：明确鉴权失败白名单分流（ChatGPT 终审：白名单式分类，
+                # 不做模糊关键词猜测——普通业务参数错误/订单状态错误/余额不足不进 AUTH_BLOCKED，
+                # 仍走原有重试路径。原实现的裸 "permissions" 匹配已移除，-2015 错误文本自身含
+                # "permissions" 字样，码匹配已覆盖）
+                if any(p in err_str for p in AUTH_BLOCKED_ERROR_PATTERNS):
                     ip = self._extract_ip_from_error(str(e))
                     if ip:
                         print(f"🔍 [IP检测] 币安报告的 IP: {ip} (当前记录的 IP: {self.last_known_ip})")
                         self._record_ip_change(ip, source="binance_error")
-                    if i == retries - 1:
-                        raise e
-                    time.sleep(delay)
-                    continue
+                    # 立即进入 AUTH_BLOCKED 盲区安全模式 + 三通道告警，停止无意义重试
+                    # （旧行为 sleep+continue 最多 5 次重试 → 已删除；8-28 事故刷屏根因之一）
+                    self._enter_auth_blocked(err_str)
+                    raise AuthBlockedError(
+                        f"鉴权失败已进入盲区安全模式（BLIND-SAFE），API 已全部停摆。"
+                        f"原始错误: {str(e)[:300]}")
 
                 # 🔥 -1021 时间戳错误特殊处理
                 if "-1021" in err_str or "recvwindow" in err_str:
@@ -3572,6 +3801,12 @@ class CryptoTrader:
                     open_orders = self._safe_api_call(self.exchange.fetch_open_orders, symbol)
                     open_orders_map = {str(ord['id']): ord for ord in open_orders}
                     consecutive_network_errors = 0
+                except AuthBlockedError as abe:
+                    # 🔥 D-010 T4：盲区休眠——300s 纯本地等待（零 API），醒来重读锁文件，
+                    # 仍锁继续睡（闸门在 _safe_api_call 入口本地读 auth_blocked.json，无网络请求）
+                    print(f"🔒 [盲区安全模式] 监控轮询跳过（{AUTH_BLIND_SLEEP_SECONDS}s 后重查锁状态）: {abe}")
+                    time.sleep(AUTH_BLIND_SLEEP_SECONDS)
+                    continue
                 except Exception as e:
                     consecutive_network_errors += 1
                     print(f"⚠️ 获取未结订单失败 (连续 {consecutive_network_errors} 次，已降速)，等待下一次轮询: {e}")

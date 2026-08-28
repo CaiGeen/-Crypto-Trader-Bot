@@ -182,8 +182,8 @@ def t_no_repair_semantics_and_source():
     # C4: 源码断言——F2 分支区分 程序撤单/用户修改/外部撤销（is_programmatic / user_modified）
     src = open('trader_260725.py', encoding='utf-8').read()
     lines = src.splitlines()
-    sl_seg = '\n'.join(lines[4199:4249])  # F2 SL terminal 分支（D-006 插码 +116 偏移后实测，2026-08-28）
-    tp_seg = '\n'.join(lines[4334:4384])  # F2 TP terminal 分支
+    sl_seg = '\n'.join(lines[4434:4484])  # F2 SL terminal 分支（D-010 Batch2 插码 +235 偏移后实测，2026-08-28）
+    tp_seg = '\n'.join(lines[4569:4619])  # F2 TP terminal 分支
     report("C4/F2区分程序撤单/用户修改/外部撤销",
            'is_programmatic_cancel' in sl_seg and 'user_modified' in sl_seg
            and 'need_recover_sl = True' in sl_seg
@@ -200,7 +200,7 @@ def t_no_repair_semantics_and_source():
 
     # C6: 行为——用户修改（user_modified=True）撤单后不自动补挂（need_recover 不触发）
     #     即 F2 分支 user_modified → current_sl_id=None 但无 need_recover（修改后实测 L4105-4107 区）
-    seg_user = '\n'.join(lines[4217:4229])  # user_modified 分支（D-006 后偏移 +116）
+    seg_user = '\n'.join(lines[4452:4464])  # user_modified 分支（Batch2 后偏移 +235）
     report("C6/用户修改撤单不自动补挂",
            '用户主动修改' in seg_user and '不再自动补挂' in seg_user,
            f"(user_modified分支={'用户主动修改' in seg_user and '不再自动补挂' in seg_user})")

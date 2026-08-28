@@ -282,7 +282,10 @@ async def _process_notify_queue_once(bot, chat_id: int,
 
     files = []
     if os.path.isdir(qdir):
-        files = sorted(f for f in os.listdir(qdir) if f.endswith(".notify"))
+        # D-010 Batch 2：排除写入中断残留的 tmp 文件（mkstemp prefix=".tmp_" suffix=".notify"
+        # 同样以 .notify 结尾，不排除会被误当事件消费——写入端崩溃窗口的半文件）
+        files = sorted(f for f in os.listdir(qdir)
+                       if f.endswith(".notify") and not f.startswith(".tmp_"))
     queue_ids = {f[:-len(".notify")] for f in files}
 
     # C3 对偶面：state 有 queue 无（非 SILENCED）→ ORPHAN_STATE_IGNORED，不重发，audit 留痕后清条目
@@ -350,6 +353,14 @@ async def _process_notify_queue_once(bot, chat_id: int,
                 text = f"🌐 **IP 地址已变化！**\n\n{notify_msg}"
             elif notify_type == 'crash_alert':
                 text = f"💥 **程序崩溃报警！**\n\n{notify_msg}"
+            elif notify_type == 'watchdog_alert':
+                # D-010 B2（W2/E5 对偶面）：watchdog 通用告警——独立类型语义（不复用
+                # crash_alert 的"崩溃/重启"语义，ChatGPT 终审批定）；普通 TG 发送，无 email/汇总副作用
+                text = f"🐕 **Watchdog 告警**\n\n{notify_msg}"
+            elif notify_type == 'auth_blocked':
+                # D-010 B2：AUTH_BLOCKED 三通道的队列事件（TG 已由 trader 直发过时为
+                # 崩溃窗口重复投递，C2 语义接受）；普通 TG 发送，无 email 副作用（Email 由 trader critical 级负责）
+                text = f"🔒 **鉴权封锁告警（盲区安全模式）**\n\n{notify_msg}"
             else:
                 text = f"📨 **通知**\n{notify_msg}"
 
@@ -606,7 +617,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /be 批次号     一键保本\n"
         "• /close 批次号  平仓\n"
         "• /cancel 批次号 取消未成交挂单\n"
-        "• /force 指纹码  放行被幂等拦截的重复信号\n\n"
+        "• /force 指纹码  放行被幂等拦截的重复信号\n"
+        "• /auth_reset  解除鉴权封锁（探活→对账→自动解锁）\n\n"
         "💡 发送 JSON 信号或上传 signal.json 也可下单\n"
         "💡 批次卡片上的 [保本] [平仓] [撤单] 按钮可快速操作"
     )
@@ -2324,8 +2336,51 @@ async def force_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, f"❌ /force 处理失败: {e}")
 
 
+async def auth_reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """D-010 B1：AUTH_BLOCKED 人工解除——唯一命令入口。
+    走 BLIND-SAFE 恢复链（probe → RECOVERING → reconcile → clear，顺序锁死 Fail-Closed，
+    trader._attempt_auth_recovery 实现），绝不直接清锁文件。
+    单飞由 trader._auth_recovery_lock 保证（与启动探活互斥，防并发探活）。"""
+    if not is_authorized(update.effective_user.id):
+        await safe_reply(update, "🚫 未授权的访问！")
+        return
+    trader = context.bot_data.get('global_trader')
+    if trader is None:
+        await safe_reply(update, "❌ trader 未初始化，无法执行恢复")
+        return
+    await safe_reply(update, "🔄 开始鉴权恢复：探活（fetch_balance 单次）→ 对账 → 解锁…")
+    try:
+        loop = asyncio.get_running_loop()
+        ok, msg = await loop.run_in_executor(None, trader._attempt_auth_recovery)
+    except Exception as e:
+        await safe_reply(update, f"❌ /auth_reset 执行异常: {e}")
+        return
+    if ok:
+        await safe_reply(update, f"✅ {msg}", parse_mode='Markdown')
+    else:
+        await safe_reply(update, f"🔒 {msg}", parse_mode='Markdown')
+
+
 async def run_trader_recovery_on_startup(trader: CryptoTrader):
     async with TRADER_LOCK:
+        # 🔥 D-010 B3：启动探活（每次重启最多 1 次）——仅当 auth_blocked.json 显示锁定时执行。
+        # 探活 = auth_probe=True 的 fetch_balance（不变量⑨唯一放行路径之一）；
+        # 走 BLIND-SAFE 恢复链 probe → RECOVERING → reconcile → clear（顺序锁死 Fail-Closed），
+        # 失败保持锁并告警（恢复链内部三通道），绝不半恢复
+        try:
+            auth = trader._load_auth_state()
+            if auth.get('locked'):
+                print(f"🔒 [D-010] 检测到 AUTH_BLOCKED 持久锁（状态={auth.get('state')}），执行启动探活恢复链…")
+                loop = asyncio.get_running_loop()
+                ok, msg = await loop.run_in_executor(None, trader._attempt_auth_recovery)
+                if not ok:
+                    trader._not_ready_reason = f"鉴权未恢复，保持盲区安全模式：{str(msg)[:150]}"
+                    # 告警已由恢复链内部三通道发出（Fail-Closed but not Fail-Silent）
+                    return
+                print(f"✅ [D-010] 启动恢复链完成: {msg}")
+        except Exception as e:
+            print(f"⚠️ [D-010] 启动探活检查异常（不阻断常规恢复）: {e}")
+
         for attempt in range(3):
             try:
                 loop = asyncio.get_running_loop()
@@ -2560,6 +2615,8 @@ def main():
     app.add_handler(CommandHandler("close", close_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("force", force_command))
+    # 🔥 D-010 B1：AUTH_BLOCKED 人工解除命令（BLIND-SAFE 恢复链唯一命令入口）
+    app.add_handler(CommandHandler("auth_reset", auth_reset_command))
 
     app.add_handler(CommandHandler("tp", tp_command))
     app.add_handler(CommandHandler("sl", sl_command))

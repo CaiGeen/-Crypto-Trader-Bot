@@ -14,6 +14,7 @@ import time
 import signal
 import subprocess
 import threading
+import uuid
 from datetime import datetime, timedelta
 import pytz
 
@@ -108,24 +109,41 @@ def log_message(msg: str):
         pass
 
 
+def _generate_notify_event_id() -> str:
+    """D-010 W1：事件实例身份，与 bot_runner/_trader 写入端格式完全对齐
+    （{YYYYMMDD_HHMMSS_ffffff}_{uuid4 前 8 hex}，写入-消费端契约）"""
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:8]
+
+
 def atomic_write_notify(content: str):
-    """原子方式写入 .notify 文件（只写不删，由 bot_runner 负责删除）"""
+    """D-010 W1（C1 进程级原子入队）：写入 .notify_queue/{event_id}.notify 事件队列。
+    原单槽 .notify（os.replace 覆盖写，多事件互相覆盖风险）已淘汰；watchdog 只写不删，
+    由 bot_runner 消费循环负责消费与删除。内容格式 `type|msg`（type 描述事件来源/语义，
+    不承担去重职责）。"""
     try:
-        notify_file = os.path.join(BASE_DIR, ".notify")
+        queue_dir = os.path.join(BASE_DIR, ".notify_queue")
+        os.makedirs(queue_dir, exist_ok=True)
+        event_id = _generate_notify_event_id()
+        notify_file = os.path.join(queue_dir, f"{event_id}.notify")
         tmp_file = notify_file + ".tmp"
         with open(tmp_file, "w", encoding="utf-8") as f:
             f.write(content)
+            f.flush()
         os.replace(tmp_file, notify_file)
-        log_message(f"📝 已写入 .notify")
+        log_message(f"📝 已入队通知事件 {event_id}")
     except Exception as e:
-        log_message(f"⚠️ 原子写入 .notify 失败: {e}")
+        log_message(f"⚠️ 原子写入通知队列失败: {e}")
 
 
 def send_tg_notification(text: str):
+    """D-010 W2（E5 死格式修复）：原实现写 `{iso时间}|{text}`——消费端按 `type|msg`
+    解析时 type=iso 时间戳，匹配不到任何已知分支（死格式）。改为 `watchdog_alert|{text}`
+    专用类型（不复用 crash_alert：crash_alert 已有"主程序崩溃/重启"既定语义，
+    watchdog 其他告警不必然等于 crash——ChatGPT 终审批定）。"""
     try:
-        atomic_write_notify(f"{datetime.now().isoformat()}|{text}")
+        atomic_write_notify(f"watchdog_alert|{text}")
     except Exception as e:
-        log_message(f"⚠️ 发送通知失败: {e}")
+        log_message(f"⚠️ 发送 watchdog 通知失败: {e}")
 
 
 def get_next_restart_time() -> datetime:
@@ -368,26 +386,30 @@ def main():
                     log_message(f"🔇 崩溃报警同因去重（{CRASH_ALERT_DEDUP_WINDOW}s 窗口内已发）: {restart_reason}")
 
             if ENABLE_SUMMARY_ON_RESTART:
-                # 如果 crash_alert 已写入 .notify，不覆盖它
-                notify_file = os.path.join(BASE_DIR, ".notify")
-                if not os.path.exists(notify_file):
-                    try:
-                        atomic_write_notify(f"summary_restart|重启后持仓汇总")
-                        log_message("📊 已请求发送重启后持仓汇总")
-                    except Exception as e:
-                        log_message(f"⚠️ 请求汇总失败: {e}")
-                else:
-                    log_message("📊 crash_alert 已写入，跳过 summary_restart")
+                # 🔥 D-010 W3：队列模型下 crash_alert 与 summary_restart 为独立事件文件，
+                # 互不覆盖（原"检查 .notify 存在防覆盖"的单槽逻辑已无必要，直接入队）
+                try:
+                    atomic_write_notify(f"summary_restart|重启后持仓汇总")
+                    log_message("📊 已请求发送重启后持仓汇总")
+                except Exception as e:
+                    log_message(f"⚠️ 请求汇总失败: {e}")
 
             time.sleep(3)
 
-        # 🔥 注意：watchdog 不再删除 .notify 文件
-        # 由 bot_runner 读取后负责删除
-        # 只清理可能残留的临时文件
+        # 🔥 D-010 W3：通知文件由 bot_runner 队列消费负责删除；此处仅清理可能残留的
+        # 临时文件（旧单槽 .notify.tmp + 队列写入中断残留 {event_id}.notify.tmp）
         try:
-            tmp_file = os.path.join(BASE_DIR, ".notify.tmp")
-            if os.path.exists(tmp_file):
-                os.remove(tmp_file)
+            legacy_tmp = os.path.join(BASE_DIR, ".notify.tmp")
+            if os.path.exists(legacy_tmp):
+                os.remove(legacy_tmp)
+            queue_dir = os.path.join(BASE_DIR, ".notify_queue")
+            if os.path.isdir(queue_dir):
+                for leftover in os.listdir(queue_dir):
+                    if leftover.endswith(".tmp"):
+                        try:
+                            os.remove(os.path.join(queue_dir, leftover))
+                        except Exception:
+                            pass
         except Exception:
             pass
 

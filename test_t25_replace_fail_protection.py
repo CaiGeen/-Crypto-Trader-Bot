@@ -168,18 +168,18 @@ def t_b_partial_reduce_keep_old():
     lines = src.splitlines()
     create_at = [i + 1 for i, ln in enumerate(lines) if 'self.exchange.create_order,' in ln]
     cancel_at = [i + 1 for i, ln in enumerate(lines) if 'self.exchange.cancel_order,' in ln]
-    # 部分减仓 SL 段：create 在 L3959、cancel 在 L3981（D-006 插码 +116 偏移后 AST 重新实测，2026-08-28）
-    create_line = 3959 if 3959 in create_at else None
-    cancel_line = 3981 if 3981 in cancel_at else None
-    seg = '\n'.join(lines[3974:4014])  # 部分减仓 SL 段 create→verify→撤旧→except 区间
+    # 部分减仓 SL 段：create 在 L4194、cancel 在 L4216（D-010 Batch2 插码 +235 偏移后 AST 重新实测，2026-08-28）
+    create_line = 4194 if 4194 in create_at else None
+    cancel_line = 4216 if 4216 in cancel_at else None
+    seg = '\n'.join(lines[4209:4249])  # 部分减仓 SL 段 create→verify→撤旧→except 区间
     report("B1/先建后撤+旧单保留注释",
-           create_line == 3959 and cancel_line == 3981 and create_line < cancel_line
+           create_line == 4194 and cancel_line == 4216 and create_line < cancel_line
            and '旧单保留' in seg and '挂新失败' in seg,
            f"(create={create_line}, cancel={cancel_line}, 注释存在={'旧单保留' in seg and '挂新失败' in seg})")
 
     # B2: 源码断言——verify 失败分支"不 Commit/不撤旧"（registry 不写 ABSENT、不调 cancel_order）
     lines2 = src.splitlines()
-    vf_seg = '\n'.join(lines2[3967:3977])  # verify_result != 'success' → 日志+告警（D-006 后偏移 +116）
+    vf_seg = '\n'.join(lines2[4202:4212])  # verify_result != 'success' → 日志+告警（Batch2 后偏移 +235）
     report("B2/verify失败不Commit不撤旧",
            '不 Commit/不撤旧' in vf_seg and 'cancel_order' not in vf_seg,
            f"(不Commit/不撤旧={'不 Commit/不撤旧' in vf_seg}, 无cancel={'cancel_order' not in vf_seg})")
