@@ -100,7 +100,7 @@ def make_fake(create_results=None):
     if hasattr(CryptoTrader, '_commit_registry_txn'):
         fake._commit_registry_txn = (
             lambda s, b, **k: CryptoTrader._commit_registry_txn(fake, s, b, **k))
-    fake.clear_batch_state = lambda s, b: fake.states.get(s, {}).pop(b, None)
+    fake.clear_batch_state = lambda s, b, **k: fake.states.get(s, {}).pop(b, None)
     fake._check_existing_conflicts = lambda s, b, all_states: False
     fake._get_current_position_amt = lambda s, is_hedge_mode=False, side=None: 0.0
     fake._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
@@ -282,7 +282,7 @@ def scenario_full_success():
 def _recovery_fake(states, cleared):
     fake = make_fake()
     fake.states = copy.deepcopy(states)
-    fake.clear_batch_state = lambda s, b: (cleared.append(b), fake.states.get(s, {}).pop(b, None))
+    fake.clear_batch_state = lambda s, b, **k: (cleared.append(b), fake.states.get(s, {}).pop(b, None))
     return fake
 
 

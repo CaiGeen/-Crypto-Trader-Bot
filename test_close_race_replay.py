@@ -272,7 +272,7 @@ def make_fake(store, ex):
     fake._state_lock = threading.Lock()
     fake.load_all_states = lambda: store.load()
     fake.save_batch_state = lambda s, b, d: CryptoTrader.save_batch_state(fake, s, b, d)
-    fake.clear_batch_state = lambda s, b: CryptoTrader.clear_batch_state(fake, s, b)
+    fake.clear_batch_state = lambda s, b, **k: CryptoTrader.clear_batch_state(fake, s, b, **k)
     fake._persist_states = lambda all_s: store.persist(all_s)
     # registry 状态机 / 仲裁闸门 / F1-F3 裁决 / verify：全部真实实现
     for name in ('_update_registry', '_assert_create_allowed', '_adjudicate_recreate_before_repair',
@@ -292,7 +292,13 @@ def make_fake(store, ex):
     # P0 Batch C 墓碑/merge 五件套（未绑定 → _merge_batch_state 返回 MagicMock
     # 污染 store，批次落盘变空 dict，G1 冻结/G2 终态/G3 相位断言全空——2026-08-29 实证）
     '_load_tombstones', '_persist_tombstones', '_prune_tombstones',
-    '_collect_batch_order_ids', '_merge_batch_state'):
+    '_collect_batch_order_ids', '_merge_batch_state',
+    # P0 Batch B converge/proof 六件套（2026-08-29：clear 调用点现走 converge→proof→clear，
+    # 未绑定 → proof 恒 None → 批次永不清理（场景5 UNEXPECTED-FAIL 实证）；
+    # _converge_alert 不绑真实 dict → 拒绝告警静默丢失）
+    '_converge_batch_orders_before_clear', '_converge_cancel_order',
+    '_get_amount_precision', '_batch_has_active_exposure',
+    '_verify_clear_proof', '_converge_alert'):
         _bind_real(fake, name)
     # C2 墓碑文件重定向 tmp（防 clear 写项目根 trade_tombstones.json）
     fake.tombstone_file = os.path.join(tempfile.gettempdir(),
@@ -304,6 +310,7 @@ def make_fake(store, ex):
     fake._gate_alert_counts = {}
     fake._gate_alert_lock = threading.Lock()
     fake._sg3_alerted = set()
+    fake._converge_alert_counts = {}   # P0 Batch B：真实 dict（MagicMock → 告警静默丢失）
     fake.registry_self_heal_interval = 1e18    # 守卫不可达（R-B 自愈重查）
     fake.last_ip_check_time = time.time()
     fake.IP_CHECK_INTERVAL = 1e9               # IP 检查守卫不可达
@@ -665,8 +672,11 @@ def assert_scenario(ev, tag):
     tp_reason = _tp_mid.get('terminated_reason')
     sl_state = _sl_mid.get('state')
     sl_reason = _sl_mid.get('terminated_reason')
-    report(tag, 'G2/N14 TP 终态落库（IDENT_TP → PROGRAMMATIC_CANCELED/close_requested_canceled）',
-           tp_state == 'PROGRAMMATIC_CANCELED' and tp_reason == 'close_requested_canceled',
+    # P0 Batch B（B0/修正2，2026-08-29）：结算段撤 TP 的 registry reason 由
+    # close_requested_canceled（close_position_limit 挂单前撤旧值）更新为
+    # close_settled_canceled_tp（结算时刻终态，ChatGPT 终审钉死值，审计定位）
+    report(tag, 'G2/N14 TP 终态落库（IDENT_TP → PROGRAMMATIC_CANCELED/close_settled_canceled_tp）',
+           tp_state == 'PROGRAMMATIC_CANCELED' and tp_reason == 'close_settled_canceled_tp',
            expect_red=False,
            detail=f"IDENT_TP registry state={tp_state!r}, reason={tp_reason!r}")
     report(tag, 'G2b/N14 SL 终态落库（IDENT_SL → PROGRAMMATIC_CANCELED/close_settled_canceled）',

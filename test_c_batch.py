@@ -52,14 +52,34 @@ def _make_fake(state_file, tomb_file):
     fake.send_tg_notification = lambda text, **kw: fake.sent.append(
         (kw.get('level', 'info'), str(text)))
     # 真实实现绑定（hasattr 保护：Batch C 未实施时缺失 helper → 走 MagicMock → RED）
+    # P0 Batch B（2026-08-29）：clear_batch_state 内部依赖的新 helper 必须显式绑定
+    # （MagicMock 坑第 8 次实证：_verify_clear_proof 未绑定 → 返回 MagicMock 恒非 None
+    #  → proof 恒被拒且 _converge_alert 无副作用静默丢告警）
     for _n in ('save_batch_state', 'clear_batch_state', 'load_all_states',
                '_persist_states', '_load_tombstones', '_persist_tombstones',
                '_prune_tombstones', '_merge_batch_state',
-               '_collect_batch_order_ids', '_assert_create_allowed'):
+               '_collect_batch_order_ids', '_assert_create_allowed',
+               '_verify_clear_proof', '_converge_alert',
+               '_batch_has_active_exposure', '_get_amount_precision',
+               '_converge_cancel_order', '_converge_batch_orders_before_clear'):
         if hasattr(CryptoTrader, _n):
             setattr(fake, _n,
                     (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(fake, *a, **k))())
+    # ⚠️ 不绑真实 dict → getattr MagicMock 非 dict → 告警静默丢失
+    fake._converge_alert_counts = {}
     return fake
+
+
+def _proof_for(batch_id, symbol=SYMBOL, scope='FULL'):
+    """P0 Batch B（2026-08-29）适配：clear_batch_state 现为 proof 门（Fail-Closed），
+    直调清理须提交最小合法 proof。本测试文件关注 Batch C 墓碑语义，交易所侧
+    收敛由 test_b_batch.py 专项覆盖，此处 proof 仅构造门校验所需六键。"""
+    return {
+        'batch_id': batch_id, 'symbol': symbol, 'checked_at': time.time(),
+        'scope': scope, 'position_zero': True,
+        'state_ids_resolved': [], 'exchange_scan': 'zero',
+        'l1_canceled': [], 'l2_canceled': [], 'l3_orphans': [],
+    }
 
 
 def _batch(**over):
@@ -129,7 +149,7 @@ def t_tombstone():
         # TC1: clear → 墓碑落盘（含 symbol/side/cleared_at/converged/known ids）
         env.write_state({SYMBOL: {'batch_c': _batch(
             protection_registry={IDENT_SL: _reg(state='PROGRAMMATIC_CANCELED', order_id='sl1')})}})
-        fake.clear_batch_state(SYMBOL, 'batch_c')
+        fake.clear_batch_state(SYMBOL, 'batch_c', proof=_proof_for('batch_c'))
         tomb = env.load_tomb().get('batch_c')
         report("TC1/clear写墓碑(含converged/known_order_ids)",
                isinstance(tomb, dict) and tomb.get('symbol') == SYMBOL
@@ -158,7 +178,7 @@ def t_tombstone():
         fake = _make_fake(env.state_file, env.tomb_file)
         # TC4: TTL 过期墓碑 → save 放行
         env.write_state({SYMBOL: {'batch_c': _batch()}})
-        fake.clear_batch_state(SYMBOL, 'batch_c')
+        fake.clear_batch_state(SYMBOL, 'batch_c', proof=_proof_for('batch_c'))
         tomb = env.load_tomb()
         if 'batch_c' in tomb:  # RED 阶段 clear 未写墓碑 → 直接 FAIL 容错
             tomb['batch_c']['cleared_at'] = time.time() - 8 * 24 * 3600  # 8 天前 > TTL 7 天
@@ -172,10 +192,10 @@ def t_tombstone():
         fake = _make_fake(env.state_file, env.tomb_file)
         # TC5: clear 幂等——重复 clear 不覆盖原墓碑 cleared_at
         env.write_state({SYMBOL: {'batch_c': _batch()}})
-        fake.clear_batch_state(SYMBOL, 'batch_c')
+        fake.clear_batch_state(SYMBOL, 'batch_c', proof=_proof_for('batch_c'))
         t1 = env.load_tomb().get('batch_c', {}).get('cleared_at')
         time.sleep(0.02)
-        fake.clear_batch_state(SYMBOL, 'batch_c')
+        fake.clear_batch_state(SYMBOL, 'batch_c', proof=_proof_for('batch_c'))
         t2 = env.load_tomb().get('batch_c', {}).get('cleared_at')
         report("TC5/clear幂等不覆盖墓碑", t1 is not None and t2 == t1, f"(t1={t1}, t2={t2})")
 
@@ -193,7 +213,7 @@ def t_tombstone():
         fake = _make_fake(env.state_file, env.tomb_file)
         # TC23: 墓碑只拦本批次——另一批次 save 正常
         env.write_state({SYMBOL: {'batch_c': _batch()}})
-        fake.clear_batch_state(SYMBOL, 'batch_c')
+        fake.clear_batch_state(SYMBOL, 'batch_c', proof=_proof_for('batch_c'))
         fake.save_batch_state(SYMBOL, 'batch_d', _batch(batch_id='batch_d'))
         st = env.load_state().get(SYMBOL, {})
         report("TC23/墓碑只拦本批次", 'batch_d' in st and 'batch_c' not in st,

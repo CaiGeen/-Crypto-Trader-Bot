@@ -102,6 +102,13 @@ def make_fake(states):
     if hasattr(CryptoTrader, '_update_registry'):
         fake._update_registry = (
             lambda s, b, i, **k: CryptoTrader._update_registry(fake, s, b, i, **k))
+    # P0 Batch B（2026-08-29）：clear_batch_state proof 门依赖的 helper 必须绑定
+    # （未绑定 → _verify_clear_proof 返回 MagicMock 恒非 None → proof 恒被拒）
+    for _n in ('_verify_clear_proof', '_batch_has_active_exposure', '_converge_alert'):
+        if hasattr(CryptoTrader, _n):
+            setattr(fake, _n, (lambda _n=_n: lambda *a, **k:
+                               getattr(CryptoTrader, _n)(fake, *a, **k))())
+    fake._converge_alert_counts = {}   # 真实 dict（MagicMock → 告警静默丢失）
     return fake
 
 
@@ -307,7 +314,15 @@ def scenario_t5_breaker_cleanup():
             ('batch_other_xyz', 0): 300.0,
         }
         # 直接调真实 clear_batch_state（fake 已绑内存 states；_state_lock 为 MagicMock 支持 with）
-        CryptoTrader.clear_batch_state(fake, SYMBOL, BATCH)
+        # P0 Batch B：proof 门适配——T5 关注熔断键清理语义，交易所侧收敛由
+        # test_b_batch.py 覆盖，此处提交最小合法 proof（无敞口批次 → PRE_ENTRY）
+        _proof = {
+            'batch_id': BATCH, 'symbol': SYMBOL, 'checked_at': time.time(),
+            'scope': 'PRE_ENTRY', 'position_zero': True,
+            'state_ids_resolved': [], 'exchange_scan': 'zero',
+            'l1_canceled': [], 'l2_canceled': [], 'l3_orphans': [],
+        }
+        CryptoTrader.clear_batch_state(fake, SYMBOL, BATCH, proof=_proof)
         left = fake._tp_breaker_alerted
         ok_self = all(k[0] != BATCH for k in left)
         ok_other = ('batch_other_xyz', 0) in left

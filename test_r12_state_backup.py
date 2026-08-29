@@ -39,6 +39,7 @@ class PersistFake:
 
     def __init__(self):
         self._state_lock = threading.Lock()
+        self._converge_alert_counts = {}   # Batch B：真实 dict（MagicMock 坑防御）
         self.tombstone_file = os.path.join(
             tempfile.gettempdir(), f"r12_tomb_{os.getpid()}_{id(self)}.json")
 
@@ -56,6 +57,23 @@ class PersistFake:
 
     def _collect_batch_order_ids(self, b_data):
         return CryptoTrader._collect_batch_order_ids(self, b_data)
+
+    # P0 Batch B（2026-08-29）：clear_batch_state 加 proof 门后新增依赖——补委托 +
+    # _converge_alert_counts 真实 dict（MagicMock 坑第 8 次实证防御：getattr 拿到
+    # MagicMock 恒非 dict → 告警静默丢失）。proof 门语义由 test_b_batch.py 23 项覆盖，
+    # 本测试专注 .bak 契约。send_tg_notification 为拒绝路径兜底 no-op（本场景走成功
+    # 路径不会触发）。
+    def _verify_clear_proof(self, symbol, batch_id, proof, b_data):
+        return CryptoTrader._verify_clear_proof(self, symbol, batch_id, proof, b_data)
+
+    def _batch_has_active_exposure(self, b_data):
+        return CryptoTrader._batch_has_active_exposure(self, b_data)
+
+    def _converge_alert(self, key, msg, level='critical'):
+        return CryptoTrader._converge_alert(self, key, msg, level=level)
+
+    def send_tg_notification(self, msg, level='info'):
+        pass
 
 
 def read_json(path):
@@ -98,7 +116,13 @@ def scenario_3():
         with open(state, 'w', encoding='utf-8') as f:
             json.dump(old, f)
         with mock.patch.object(trader_260725, 'STATE_FILE', state):
-            CryptoTrader.clear_batch_state(PersistFake(), SYMBOL, 'b_del')
+            # Batch B：clear 走 proof 门。批次 {'is_active': True, 'current_sl_id':
+            # 'sl1'} 无成交/无限价平仓单/无 pending_close → 无活跃敞口 → PRE_ENTRY
+            # proof 合法（修正1：scope 校验看当前敞口）。
+            _proof = {'batch_id': 'b_del', 'symbol': SYMBOL, 'scope': 'PRE_ENTRY',
+                      'position_zero': True, 'state_ids_resolved': [],
+                      'exchange_scan': 'zero', 'l1_canceled': [], 'l2_canceled': []}
+            CryptoTrader.clear_batch_state(PersistFake(), SYMBOL, 'b_del', proof=_proof)
         ok = (os.path.exists(state + '.bak')
               and read_json(state + '.bak') == old          # 被清批次完整保留在 .bak
               and read_json(state) == {})                    # 主文件已清

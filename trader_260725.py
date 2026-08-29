@@ -1335,32 +1335,55 @@ class CryptoTrader:
             else:
                 print(f"🪦 [C2] 墓碑拦截 save（批次 {batch_id}，复活告警已去重）")
 
-    def clear_batch_state(self, symbol: str, batch_id: str):
-        """P0 Batch C（v2 §3）：清理即写墓碑（converged_order_ids = registry 已终态
-        条目的 order_id 近似集；Batch B 接 proof 门后升级为 L1/L2 撤销成功全集）。
+    def clear_batch_state(self, symbol: str, batch_id: str, proof=None) -> bool:
+        """P0 Batch B（proof 门，ChatGPT APPROVED 2026-08-29）：close 清理从
+        「状态删除动作」升级为「经过证明的状态迁移」。唯一入口
+        clear_batch_state(symbol, batch_id, proof=<converge 返回的 proof dict>)；
+        禁止任何 force/skip_verify/proof_required 布尔逃生门（G-B9 签名守卫）。
+        Fail-Closed：proof 缺失/非法 → 拒绝（不删 state、不写墓碑、不发
+        close_phase=3，锁外 critical 告警后 return False，批次保留待下轮 converge）。
+        close_phase=3（CLOSED）唯一写入点在本函数墓碑落盘内（G-B9 正则锚定）。
+        批次已不存在 → 幂等 return True（无状态可保护）。
+        Batch C（v2 §3）：清理即写墓碑；converged_order_ids = registry 已终态条目
+        的 order_id ∪ proof.l1_canceled ∪ proof.l2_canceled（Batch B 升级）；
         幂等：墓碑已存在（重复 clear）不覆盖 cleared_at。"""
         if getattr(self, '_tp_breaker_alerted', None):  # 终态清理熔断告警键（ChatGPT 终审 2026-08-20，长期运行内存管理）
             self._tp_breaker_alerted = {k: v for k, v in self._tp_breaker_alerted.items() if k[0] != batch_id}
+        # converge 告警计数随批次清理一并修剪（镜像 _tp_breaker_alerted 惯例，防长期运行内存增长）
+        _counts = getattr(self, '_converge_alert_counts', None)
+        if isinstance(_counts, dict):
+            self._converge_alert_counts = {k: v for k, v in _counts.items()
+                                           if not (isinstance(k, tuple) and batch_id in k)}
+        _reject = None
         with self._state_lock:
             all_states = self.load_all_states()
-            if symbol in all_states and batch_id in all_states[symbol]:
-                b_data = all_states[symbol][batch_id]
+            b_data = (all_states.get(symbol) or {}).get(batch_id)
+            if b_data is None:
+                return True  # 已清理/不存在 → 幂等成功（无状态可保护）
+            _reject = self._verify_clear_proof(symbol, batch_id, proof, b_data)
+            if _reject is None:
                 # C2：先落墓碑再删 state（删记忆后墓碑是唯一防线，顺序不可倒）
                 try:
                     tombstones = self._load_tombstones()
                     if not isinstance(tombstones.get(batch_id), dict):
-                        _converged = sorted({
-                            str(ent.get('order_id'))
-                            for ent in (b_data.get('protection_registry') or {}).values()
-                            if isinstance(ent, dict) and ent.get('order_id')
-                            and ent.get('state') in _REGISTRY_TERMINAL_STATES})
-                        tombstones[batch_id] = {
+                        _converged = sorted(
+                            {str(ent.get('order_id'))
+                             for ent in (b_data.get('protection_registry') or {}).values()
+                             if isinstance(ent, dict) and ent.get('order_id')
+                             and ent.get('state') in _REGISTRY_TERMINAL_STATES}
+                            | {str(_i) for _i in (proof.get('l1_canceled') or [])}
+                            | {str(_i) for _i in (proof.get('l2_canceled') or [])})
+                        _t_entry = {
                             'symbol': symbol,
                             'side': b_data.get('side'),
                             'cleared_at': time.time(),
                             'converged_order_ids': _converged,
                             'known_order_ids': self._collect_batch_order_ids(b_data),
                         }
+                        # P0 Batch B：close_phase=3（CLOSED）唯一写入点（G-B9 正则锚定，
+                        # 全库仅此一处对 close_phase 赋值 3）
+                        _t_entry['close_phase'] = 3
+                        tombstones[batch_id] = _t_entry
                         self._persist_tombstones(tombstones)
                 except Exception as tomb_e:
                     print(f"⚠️ [C2] 墓碑落盘失败（不阻断清理，但请人工检查）: {tomb_e}")
@@ -1368,7 +1391,15 @@ class CryptoTrader:
                 if not all_states[symbol]:
                     del all_states[symbol]
                 self._persist_states(all_states)
-                print(f"🧹 批次 [{batch_id}] 状态归档/清理完毕（墓碑已登记，7 天防复活）。")
+                print(f"🧹 批次 [{batch_id}] 状态归档/清理完毕（proof 门通过，"
+                      f"墓碑已登记 close_phase=3，7 天防复活）。")
+                return True
+        # 锁外拒绝告警（TG I/O 不进 _state_lock；同键 3 轮去重防刷屏）
+        self._converge_alert(('clear_rejected', symbol, batch_id),
+                             f"🚨【资金安全】批次 `{batch_id}`({symbol}) 清理被 proof 门拒绝"
+                             f"（{_reject}）。状态保留，待下轮 converge 生成收敛证明后重试"
+                             f"（Fail-Closed，无程序侧逃生门）。", level='critical')
+        return False
 
     # ==================== P0 Batch C：墓碑 / 字段级 merge ====================
 
@@ -1784,10 +1815,15 @@ class CryptoTrader:
                     )
                     t.start()
 
-        # 🔥 清理无效的批次
+        # 🔥 清理无效的批次（P0 Batch B：converge 收敛证明后才 clear，Fail-Closed；
+        # G-B7 锁定语义：monitor_error 批次也必须先撤本批次交易所残单才能清理）
         for symbol, batch_id in stale_batches:
-            self.clear_batch_state(symbol, batch_id)
-            print(f"  └─ 🧹 已清理无效批次 [{batch_id}]")
+            _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+            if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+                print(f"  └─ 🧹 已清理无效批次 [{batch_id}]（proof 收敛通过）")
+            else:
+                print(f"  └─ ⚠️ [B] 无效批次 [{batch_id}] 本轮未收敛"
+                      f"（UNKNOWN/撤单失败），保留状态待下轮恢复重试")
 
         print(f"✅ [状态恢复] 恢复流程完成，共接管 {recovered_count} 个历史活跃批次")
         return True  # R3-v2: 返回值表达"流程成功/失败"而非"是否恢复过批次"；唯一失败路径=健康检查不通过(已提前 return False)
@@ -4553,10 +4589,13 @@ class CryptoTrader:
                         # 无成交：全部撤单，终止批次
                         print(f"🚨 [批次终止] 本批次未建仓且开仓挂单被撤销，正在退出...")
                         self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
-                        self.clear_batch_state(symbol, batch_id)
-                        self.send_tg_notification(
-                            f"🧹 **[批次终止]** 批次 `{batch_id}` 在建仓前挂单已全撤，后台监控退出。")
-                        break
+                        # P0 Batch B：converge 证明后才 clear；未收敛不 break，下轮重试
+                        _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+                        if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+                            self.send_tg_notification(
+                                f"🧹 **[批次终止]** 批次 `{batch_id}` 在建仓前挂单已全撤，后台监控退出。")
+                            break
+                        print(f"  └─ ⚠️ [B] 批次 {batch_id} 本轮未收敛（UNKNOWN/撤单失败），保留待下轮重试")
                     else:
                         # 🔥 有已成交层：只取消未成交的挂单，保留已成交层继续监控
                         print(f"⚠️ [手动撤单] 批次 [{batch_id}] 已有 {batch_filled_count} 层成交，仅取消剩余挂单")
@@ -4619,16 +4658,22 @@ class CryptoTrader:
                         if latest_b_data.get('settled_by_limit_close', False):
                             print(f"ℹ️ [限价平仓已处理] 批次 [{batch_id}] 跳过重复结算")
                             self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
-                            self.clear_batch_state(symbol, batch_id)
-                            break
+                            # P0 Batch B：converge 证明后才 clear；未收敛不 break，下轮重试
+                            _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+                            if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+                                break
+                            print(f"  └─ ⚠️ [B] 批次 {batch_id} 本轮未收敛（UNKNOWN/撤单失败），保留待下轮重试")
 
                         # 🔥 如果是程序平仓，跳过结算
                         if latest_b_data.get('pending_close', False) or latest_b_data.get('is_programmatic_cancel',
                                                                                           False):
                             print(f"ℹ️ [程序平仓] 批次 [{batch_id}] 由程序触发平仓，跳过结算")
                             self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
-                            self.clear_batch_state(symbol, batch_id)
-                            break
+                            # P0 Batch B：converge 证明后才 clear；未收敛不 break，下轮重试
+                            _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+                            if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+                                break
+                            print(f"  └─ ⚠️ [B] 批次 {batch_id} 本轮未收敛（UNKNOWN/撤单失败），保留待下轮重试")
 
                         print(f"🛑 [持仓归零检测] 批次 [{batch_id}] 实际持仓已归零，正在安全退出监控...")
 
@@ -4696,8 +4741,11 @@ class CryptoTrader:
                                 pass
                         # 🔥 A1/N8：持仓归零路径同样撤销限价平仓单（补全清理覆盖）
                         self._cancel_limit_close_order(symbol, batch_id)
-                        self.clear_batch_state(symbol, batch_id)
-                        break
+                        # P0 Batch B：converge 证明后才 clear；未收敛不 break，下轮重试
+                        _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+                        if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+                            break
+                        print(f"  └─ ⚠️ [B] 批次 {batch_id} 本轮未收敛（UNKNOWN/撤单失败），保留待下轮重试")
 
                 # ==================== 部分减仓检测（自动更新止盈止损单） ====================
                 _fb_other = 0
@@ -5149,8 +5197,11 @@ class CryptoTrader:
                     # 🔥 A1：撤销限价平仓单，防孤儿单 + 幽灵线程
                     self._cancel_limit_close_order(symbol, batch_id)
 
-                    self.clear_batch_state(symbol, batch_id)
-                    break
+                    # P0 Batch B：converge 证明后才 clear；未收敛不 break，下轮重试
+                    _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+                    if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+                        break
+                    print(f"  └─ ⚠️ [B] 批次 {batch_id} 本轮未收敛（UNKNOWN/撤单失败），保留待下轮重试")
 
                 tp_triggered = False
                 tp_detail = None
@@ -5318,8 +5369,11 @@ class CryptoTrader:
                     # 🔥 A1/N8：TP 结算路径同样撤销限价平仓单（补全清理覆盖）
                     self._cancel_limit_close_order(symbol, batch_id)
 
-                    self.clear_batch_state(symbol, batch_id)
-                    break
+                    # P0 Batch B：converge 证明后才 clear；未收敛不 break，下轮重试
+                    _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+                    if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+                        break
+                    print(f"  └─ ⚠️ [B] 批次 {batch_id} 本轮未收敛（UNKNOWN/撤单失败），保留待下轮重试")
 
                 # ==================== 处理待补挂止损 ====================
                 if pending_sl_orders and has_entered_position and batch_filled_amount > 0:
@@ -6046,8 +6100,14 @@ class CryptoTrader:
                 if b_data:
                     # 如果是程序撤单或 pending_close 标记，清理批次
                     if b_data.get('is_programmatic_cancel') or b_data.get('pending_close'):
-                        self.clear_batch_state(symbol, batch_id)
-                        print(f"  └─ 🧹 程序撤单，批次状态已清理")
+                        # P0 Batch B：converge 证明后才 clear（finally 无循环可重试，
+                        # 未收敛则保留状态 + 告警，交由重启恢复/下轮监控收敛）
+                        _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+                        if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+                            print(f"  └─ 🧹 程序撤单，批次状态已清理（proof 收敛通过）")
+                        else:
+                            print(f"  └─ ⚠️ [B] 程序撤单批次 {batch_id} 本轮未收敛"
+                                  f"（UNKNOWN/撤单失败），保留状态待重启恢复重试")
             except Exception as e:
                 print(f"  └─ ⚠️ 清理程序撤单标记失败: {e}")
 
@@ -6068,8 +6128,14 @@ class CryptoTrader:
                 all_states = self.load_all_states()
                 b_data = all_states.get(symbol, {}).get(batch_id, {})
                 if b_data:
-                    self.clear_batch_state(symbol, batch_id)
-                    print(f"  └─ 🧹 无持仓，已清理批次状态")
+                    # P0 Batch B：converge 证明后才 clear；finally 无循环可重试，
+                    # 未收敛则保留状态 + 告警（持仓已归零，仅剩订单面收敛）
+                    _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+                    if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+                        print(f"  └─ 🧹 无持仓，已清理批次状态（proof 收敛通过）")
+                    else:
+                        print(f"  └─ ⚠️ [B] 无持仓批次 {batch_id} 本轮未收敛"
+                              f"（UNKNOWN/撤单失败），保留状态待重启恢复重试")
             elif current_pos is None:
                 print(f"  └─ ⚠️ 持仓查询失败(UNKNOWN)，保留批次状态不清理")
             else:
@@ -6788,8 +6854,13 @@ class CryptoTrader:
             except Exception:
                 pass
 
-            # 清理批次状态
-            self.clear_batch_state(target_symbol, batch_id)
+            # P0 Batch B（D-B5）：平仓成功照报 + 附残单收敛提示（position=SUCCESS /
+            # cleanup=PENDING 两态分离，平仓结果不因清理未收敛而误报失败）；
+            # clear 须 converge proof（Fail-Closed，无 proof 不 clear）
+            _cleanup_pending = False
+            _proof = self._converge_batch_orders_before_clear(target_symbol, batch_id)
+            if _proof is None or not self.clear_batch_state(target_symbol, batch_id, proof=_proof):
+                _cleanup_pending = True
 
             result_msg = (
                 f"📊 **[市价平仓结算]**\n\n"
@@ -6804,6 +6875,11 @@ class CryptoTrader:
                 f"💸 **总手续费**：`{actual_total_fees:.4f}` USDT\n"
                 f"{pnl_emoji} **最终净盈亏**：`{actual_net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
             )
+            if _cleanup_pending:
+                result_msg += (
+                    f"\n\n⚠️ **[残单收敛提示]** 市价平仓已成交（持仓=SUCCESS），"
+                    f"但批次清理暂未收敛（cleanup=PENDING，proof 未通过，"
+                    f"系统将自动重试收敛后清理，无需人工干预）。")
 
             print(f"\n{result_msg}")
 
@@ -6868,6 +6944,308 @@ class CryptoTrader:
                         print(f"  └─ ⚠️ 撤销限价平仓单失败: {e}（限价单可能残留，持仓归零后将自动失效）")
         except Exception as e:
             print(f"  └─ ⚠️ 清理限价平仓单异常: {e}")
+
+    # ==================== P0 Batch B：converge 收敛证明生产者 + proof 门 ====================
+
+    def _get_amount_precision(self, symbol: str) -> float:
+        """D-B1：position_zero 容差 = 交易所 amount precision（不用裸 epsilon）。
+        precision 为整数（小数位数）→ 10^-n；为浮点（步长）→ 步长本身；
+        市场信息缺失 → 1e-8（保守兜底）。"""
+        try:
+            markets = getattr(self.exchange, 'markets', None)
+            m = markets.get(symbol) if isinstance(markets, dict) else None
+            prec = (m.get('precision') or {}).get('amount') if isinstance(m, dict) else None
+            if isinstance(prec, bool):
+                prec = None
+            if isinstance(prec, int):
+                return float(10 ** -max(int(prec), 0))
+            if isinstance(prec, float) and prec > 0:
+                return float(prec)
+        except Exception:
+            pass
+        return 1e-8
+
+    def _batch_has_active_exposure(self, b_data: dict) -> bool:
+        """修正1（ChatGPT 终审）：proof scope 校验看当前活跃敞口，不看历史痕迹
+        （settled_by_limit_close 等标记不参与）。已成交数量>0 / 限价平仓单在场 /
+        pending_close → 需要 scope=FULL；否则 PRE_ENTRY 即可。纯状态字段判定，零 API。"""
+        if not isinstance(b_data, dict):
+            return False
+        try:
+            ta = b_data.get('target_amounts') or []
+            n = int(b_data.get('last_filled_count') or 0)
+            filled = float(sum(ta[:n])) if n > 0 else 0.0
+        except (TypeError, ValueError):
+            filled = 0.0
+        return bool(filled > 0 or b_data.get('limit_close_order_id')
+                    or b_data.get('pending_close'))
+
+    def _converge_alert(self, key, msg: str, level: str = 'critical') -> None:
+        """B1 告警闸门：同键最多 3 轮后静默（安全不变量：防持续告警触发交易所
+        API 熔断）。⚠️ MagicMock 坑（第 7 次实证防御）：_converge_alert_counts 必须
+        isinstance 校验后兜底真实 dict（getattr MagicMock 非 dict → 告警静默丢失）。"""
+        counts = getattr(self, '_converge_alert_counts', None)
+        if not isinstance(counts, dict):
+            counts = {}
+        try:
+            n = int(counts.get(key, 0)) + 1
+        except (TypeError, ValueError):
+            n = 1
+        counts[key] = n
+        self._converge_alert_counts = counts
+        if n <= 3:
+            self.send_tg_notification(msg, level=level)
+        else:
+            print(f"🔇 [B] converge 告警同键 3 轮已满，静默: {key}")
+
+    def _converge_cancel_order(self, order_id, symbol: str) -> str:
+        """B1 撤单幂等三态返回：'canceled'（撤成功）/ 'absent'（-2011/Unknown order
+        = 已离开交易所 = 事实终态视同成功，同 _cancel_limit_close_order L6865 惯例）/
+        'failed'（其他异常 → 不收敛，下轮重试）。cancel 统一带 stop 参数（项目全库惯例）。"""
+        try:
+            self._safe_api_call(self.exchange.cancel_order, order_id, symbol,
+                                params={'stop': True})
+            return 'canceled'
+        except Exception as e:
+            if isinstance(e, ccxt.OrderNotFound) or '-2011' in str(e) \
+                    or 'Unknown order' in str(e):
+                return 'absent'
+            print(f"  └─ ⚠️ [B1] 撤单失败 {order_id}: {e}")
+            return 'failed'
+
+    def _verify_clear_proof(self, symbol: str, batch_id: str, proof, b_data: dict):
+        """B2 proof 门纯验证（调用方已持 _state_lock，本函数零 I/O 零 API）。
+        合法返回 None；非法返回拒绝原因字符串（调用方锁外发 critical 告警）。
+        Fail-Closed：缺键/类型不符/批次不符/position_zero 非 True/
+        exchange_scan≠zero（CONVERGENCE_UNKNOWN 禁 clear）/scope 与当前敞口
+        不匹配（修正1）全拒绝。"""
+        if not isinstance(proof, dict):
+            return 'proof 缺失或非 dict（需 converge 生成的收敛证明）'
+        for _k in ('batch_id', 'symbol', 'scope', 'position_zero',
+                   'state_ids_resolved', 'exchange_scan'):
+            if _k not in proof:
+                return f'proof 缺键 {_k}'
+        if proof.get('batch_id') != batch_id or str(proof.get('symbol')) != str(symbol):
+            return 'proof 批次/交易对不匹配'
+        if proof.get('position_zero') is not True:
+            return 'position_zero 非 True'
+        if proof.get('exchange_scan') != 'zero':
+            return (f"exchange_scan={proof.get('exchange_scan')} ≠ zero"
+                    f"（CONVERGENCE_UNKNOWN 禁 clear）")
+        _scope = proof.get('scope')
+        if _scope not in ('FULL', 'PRE_ENTRY'):
+            return f'scope={_scope} 非法'
+        if self._batch_has_active_exposure(b_data) and _scope != 'FULL':
+            return '当前存在活跃敞口，PRE_ENTRY proof 不足（修正1）'
+        return None
+
+    def _converge_batch_orders_before_clear(self, symbol: str, batch_id: str):
+        """B1（converge proof 生产者）：clear 前把本批次相关的交易所现实收敛为
+        可证明状态。返回 proof dict（可直接提交 clear_batch_state）或 None
+        （未收敛，调用方下轮重试，绝不半途 clear）。
+        纪律（G-B9 调用栈可审计）：本函数禁止调用 clear_batch_state——收敛与
+        清理职责分离，clear 唯一入口在 proof 门之后。
+        执行序列：
+          ① 两源扫描（normal + params={'stop':True}，任一异常=CONVERGENCE_UNKNOWN→None）
+          ② D-B1 贡献扣减 position 核验（贡献>容差 → 持仓仍在，拒绝清理）
+          ③ L1/L2/L3 分级处置：L1=本批次已知 id 自动撤；L2=无主单匹配本批次
+             registry intent 自动撤；L3=无主单只列示告警不撤不阻塞（D-B4）
+          ④ D-B2 单次复扫（撤后仍见本批次相关单 → None，下轮重试，不做无限重试）
+          ⑤ D-B3 未决条目三条件终态化 ABSENT
+          ⑥ 产出 proof（scope 按当前活跃敞口判定，修正1）"""
+        try:
+            all_states = self.load_all_states()
+        except Exception as e:
+            print(f"⚠️ [B1] 读取状态失败: {e}")
+            return None
+        b_data = (all_states.get(symbol) or {}).get(batch_id)
+        if not isinstance(b_data, dict):
+            return None  # 批次已不存在（可能已被并发 clear），无需收敛
+        # ① 两源扫描
+        try:
+            _normal = self._safe_api_call(self.exchange.fetch_open_orders, symbol) or []
+            _stops = self._safe_api_call(self.exchange.fetch_open_orders, symbol,
+                                         params={'stop': True}) or []
+        except Exception as e:
+            self._converge_alert(('scan_unknown', symbol, batch_id),
+                                  f"🚨【资金安全】批次 `{batch_id}`({symbol}) 收敛扫描失败"
+                                  f"（CONVERGENCE_UNKNOWN），本轮不 clear，下周期重试。\n"
+                                  f"错误: {e}", level='critical')
+            return None
+        _open_map = {}
+        for _o in list(_normal) + list(_stops):
+            if isinstance(_o, dict) and _o.get('id'):
+                _open_map[str(_o['id'])] = _o
+        open_orders = list(_open_map.values())
+        # ② D-B1 贡献扣减：symbol 持仓（绝对值）− 其他活跃批次已成交贡献
+        _side = b_data.get('side') or 'BUY'
+        try:
+            pos_amt = self._get_current_position_amt(
+                symbol, bool(b_data.get('is_hedge_mode')), side=_side)
+        except Exception:
+            pos_amt = None
+        _others_filled = 0.0
+        _owned_ids = set()
+        try:
+            for _bid, _bd in (all_states.get(symbol) or {}).items():
+                if not isinstance(_bd, dict):
+                    continue
+                _owned_ids.update(str(_i) for _i in self._collect_batch_order_ids(_bd) if _i)
+                if _bid != batch_id and _bd.get('is_active'):
+                    _ta = _bd.get('target_amounts') or []
+                    _n = int(_bd.get('last_filled_count') or 0)
+                    if _n > 0:
+                        try:
+                            _others_filled += float(sum(_ta[:_n]))
+                        except (TypeError, ValueError):
+                            pass
+        except Exception as e:
+            print(f"⚠️ [B1] 跨批次预计算异常: {e}")
+            return None
+        try:
+            _contribution = float(pos_amt) - _others_filled
+        except (TypeError, ValueError):
+            _contribution = None
+        if pos_amt is None or _contribution is None:
+            self._converge_alert(('pos_unknown', symbol, batch_id),
+                                  f"🚨【资金安全】批次 `{batch_id}`({symbol}) 持仓查询失败"
+                                  f"（UNKNOWN ≠ EMPTY），本轮不 clear。", level='critical')
+            return None
+        _tolerance = self._get_amount_precision(symbol)
+        _position_zero = (_contribution <= 0) or (abs(_contribution) <= _tolerance)
+        if not _position_zero:
+            self._converge_alert(('position_residual', symbol, batch_id),
+                                  f"🚨【资金安全】批次 `{batch_id}`({symbol}) 清理前持仓核验失败："
+                                  f"本批次持仓贡献 {_contribution} > 容差 {_tolerance}"
+                                  f"（D-B1 贡献扣减法），不 clear。", level='critical')
+            return None
+        # ③ L1/L2/L3 分级处置
+        _my_l1 = {str(_i) for _i in self._collect_batch_order_ids(b_data) if _i}
+        _my_registry = b_data.get('protection_registry') or {}
+        _pending_intents = []
+        for _ident, _ent in _my_registry.items():
+            if not isinstance(_ent, dict) or _ent.get('state') in _REGISTRY_TERMINAL_STATES:
+                continue
+            if isinstance(_ent.get('intent'), dict):
+                _pending_intents.append((_ident, _ent['intent']))
+        _l1_canceled, _l2_canceled, _l3_orphans = [], [], []
+        _l2_matched_idents = set()
+        for _o in open_orders:
+            _oid = str(_o.get('id'))
+            if _oid in _my_l1:
+                _res = self._converge_cancel_order(_oid, symbol)
+                if _res == 'failed':
+                    self._converge_alert(('l1_cancel_fail', symbol, batch_id, _oid),
+                                          f"🚨【资金安全】批次 `{batch_id}`({symbol}) "
+                                          f"L1 撤单失败（{_oid}），不 clear，下轮重试。",
+                                          level='critical')
+                    return None
+                _l1_canceled.append(_oid)
+                try:
+                    _ident = self._find_registry_identity_by_order_id(symbol, batch_id, _oid)
+                    if _ident:
+                        self._update_registry(symbol, batch_id, _ident,
+                                              state='PROGRAMMATIC_CANCELED',
+                                              order_id=_oid, id_known=True,
+                                              terminated_reason='converge_l1_canceled')
+                except Exception as _e:
+                    print(f"⚠️ [B1] L1 registry 终态化失败 {_oid}: {_e}")
+            elif _oid in _owned_ids:
+                continue  # 他批次资产（L1 归属全集内），绝不碰
+            else:
+                _matched = None
+                for _ident, _intent in _pending_intents:
+                    try:
+                        if self._order_matches_intent(_o, _intent, symbol):
+                            _matched = _ident
+                            break
+                    except Exception:
+                        continue
+                if _matched is not None:
+                    _l2_matched_idents.add(_matched)
+                    _res = self._converge_cancel_order(_oid, symbol)
+                    if _res == 'failed':
+                        self._converge_alert(('l2_cancel_fail', symbol, batch_id, _oid),
+                                              f"🚨【资金安全】批次 `{batch_id}`({symbol}) "
+                                              f"L2 撤单失败（{_oid}），不 clear，下轮重试。",
+                                              level='critical')
+                        return None
+                    _l2_canceled.append(_oid)
+                    try:
+                        self._update_registry(symbol, batch_id, _matched,
+                                              state='PROGRAMMATIC_CANCELED',
+                                              order_id=_oid, id_known=True,
+                                              terminated_reason='converge_l2_canceled')
+                    except Exception as _e:
+                        print(f"⚠️ [B1] L2 registry 终态化失败 {_oid}: {_e}")
+                else:
+                    _l3_orphans.append({'id': _oid, 'type': _o.get('type'),
+                                        'side': _o.get('side'), 'amount': _o.get('amount'),
+                                        'stopPrice': _o.get('stopPrice')})
+        # ④ D-B2 单次复扫：撤单后重扫两源，本批次相关单必须清零
+        try:
+            _n2 = self._safe_api_call(self.exchange.fetch_open_orders, symbol) or []
+            _s2 = self._safe_api_call(self.exchange.fetch_open_orders, symbol,
+                                      params={'stop': True}) or []
+        except Exception as e:
+            self._converge_alert(('rescan_unknown', symbol, batch_id),
+                                  f"🚨【资金安全】批次 `{batch_id}`({symbol}) 撤单后复扫失败"
+                                  f"（CONVERGENCE_UNKNOWN），本轮不 clear，下周期重试。\n"
+                                  f"错误: {e}", level='critical')
+            return None
+        _seen2 = {}
+        for _o in list(_n2) + list(_s2):
+            if isinstance(_o, dict) and _o.get('id'):
+                _seen2[str(_o['id'])] = _o
+        _l1_hit = set(_l1_canceled) | set(_l2_canceled)
+        for _o in _seen2.values():
+            _oid = str(_o.get('id'))
+            if _oid in _my_l1 or _oid in _l1_hit:
+                print(f"⚠️ [B1] 复扫仍见本批次单 {_oid}（撤单竞态），"
+                      f"本轮不 clear 下轮重试（D-B2 单次复扫）")
+                return None
+            for _ident, _intent in _pending_intents:
+                try:
+                    if self._order_matches_intent(_o, _intent, symbol):
+                        print(f"⚠️ [B1] 复扫仍见本批次 L2 匹配单 {_oid}，本轮不 clear 下轮重试")
+                        return None
+                except Exception:
+                    continue
+        # L3 告警（D-B4：不阻塞 clear，仅列示人工处置）
+        if _l3_orphans:
+            _l3_ids = ', '.join(str(_x.get('id')) for _x in _l3_orphans)
+            self._converge_alert(('l3_orphans', symbol, batch_id),
+                                  f"🚨【资金安全】批次 `{batch_id}`({symbol}) 收敛时发现 "
+                                  f"{len(_l3_orphans)} 笔无主挂单（L3：不自动撤、不阻塞清理，"
+                                  f"请人工核查处置）：{_l3_ids}", level='critical')
+        # ⑤ D-B3：未决条目三条件终态化 ABSENT
+        #（position_zero ✓ + 复扫本批次清零 ✓ + 该条目无 L2 匹配 ✓）
+        for _ident, _intent in _pending_intents:
+            if _ident in _l2_matched_idents:
+                continue
+            try:
+                self._update_registry(symbol, batch_id, _ident, state='ABSENT',
+                                      terminated_reason='converge_absent')
+            except Exception as _e:
+                print(f"⚠️ [B1] D-B3 ABSENT 终态化失败 {_ident}: {_e}")
+        # ⑥ 产出 proof
+        _scope = 'FULL' if self._batch_has_active_exposure(b_data) else 'PRE_ENTRY'
+        _state_ids_resolved = sorted(
+            _my_l1 | {str(_ent.get('order_id')) for _ent in _my_registry.values()
+                      if isinstance(_ent, dict) and _ent.get('order_id')})
+        proof = {
+            'batch_id': batch_id, 'symbol': symbol, 'checked_at': time.time(),
+            'scope': _scope, 'position_zero': True,
+            'state_ids_resolved': _state_ids_resolved,
+            'exchange_scan': 'zero',
+            'l1_canceled': sorted(set(_l1_canceled)),
+            'l2_canceled': sorted(set(_l2_canceled)),
+            'l3_orphans': _l3_orphans,
+        }
+        print(f"✅ [B1] 批次 {batch_id}({symbol}) 收敛证明生成："
+              f"L1={len(proof['l1_canceled'])} L2={len(proof['l2_canceled'])} "
+              f"L3={len(_l3_orphans)} scope={_scope}")
+        return proof
 
     def close_position_limit(self, batch_id: str, price: float = None) -> tuple[bool, str]:
         """
@@ -7164,6 +7542,34 @@ class CryptoTrader:
                                                       order_id=_sl_id, id_known=True,
                                                       terminated_reason='close_settled_canceled')
                                 print(f"  └─ [N14] SL registry 已终结: {_sl_identity} (close_settled_canceled)")
+                        except Exception:
+                            pass
+
+                    # P0 Batch B（B0/修正2）：结算段撤 TP——8-28 事故根因（结算只撤 SL 不撤 TP，
+                    # 币安遗留孤儿 TP 单 0.002@85000）。reason 固定 close_settled_canceled_tp（审计定位，
+                    # 规格钉死不得改动）。-2011/Unknown order = 已离开交易所 = 事实终态（幂等，
+                    # 同 _cancel_limit_close_order 惯例），registry 照写终态。
+                    _tp_id = b_data.get('tp_order_id') if isinstance(b_data, dict) else None
+                    if _tp_id:
+                        try:
+                            self._safe_api_call(self.exchange.cancel_order, _tp_id, symbol,
+                                                params={'stop': True})
+                            print(f"  └─ [B0] 已撤销止盈单: {_tp_id}")
+                        except Exception as _tp_cancel_e:
+                            if isinstance(_tp_cancel_e, ccxt.OrderNotFound) or \
+                                    '-2011' in str(_tp_cancel_e) or \
+                                    'Unknown order' in str(_tp_cancel_e):
+                                print(f"  └─ [B0] 止盈单 {_tp_id} 已不在交易所（-2011 幂等，事实终态）")
+                            else:
+                                print(f"  └─ ⚠️ [B0] 撤销止盈单失败: {_tp_cancel_e}（交由 converge 收敛）")
+                        try:
+                            _tp_identity = self._find_registry_identity_by_order_id(symbol, batch_id, _tp_id)
+                            if _tp_identity:
+                                self._update_registry(symbol, batch_id, _tp_identity,
+                                                      state='PROGRAMMATIC_CANCELED',
+                                                      order_id=_tp_id, id_known=True,
+                                                      terminated_reason='close_settled_canceled_tp')
+                                print(f"  └─ [B0] TP registry 已终结: {_tp_identity} (close_settled_canceled_tp)")
                         except Exception:
                             pass
 
