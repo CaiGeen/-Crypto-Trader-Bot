@@ -546,6 +546,14 @@ def is_authorized(user_id: int) -> bool:
     return True
 
 
+def _strip_markdown(text: str) -> str:
+    """P0 通知可靠性（2026-08-29）：BadRequest 降级纯文本时，剥离加粗与等宽标记。
+    只剥 ** 和 ` —— 绝不剥下划线：批次号/文件名含 _ 必须原样可读，
+    剥掉会把 batch_20260829_155232_f49f2e 变成 batch20260829155232f49f2e。
+    """
+    return text.replace('**', '').replace('`', '')
+
+
 async def safe_reply(update: Update, text: str, parse_mode=None, reply_markup=None):
     """带网络超时重试保护的回复函数"""
     try:
@@ -557,6 +565,22 @@ async def safe_reply(update: Update, text: str, parse_mode=None, reply_markup=No
     except BadRequest as e:
         # 真错误（Markdown 格式错、消息超长等），必须保留可见性
         logging.error(f"⚠️ 回复消息给 Telegram 失败（BadRequest，请检查消息格式）: {e}")
+        # 🔥 P0 通知可靠性（2026-08-29）：请求级错误（如批次号奇数下划线导致的实体未闭合）
+        # → 同一消息降级纯文本重发一次，保证告警必达（不变量⑧ Fail-not-Silent）。
+        # 与 trader.send_tg_notification 的降级策略对齐；按异常类型判定，不依赖错误文案。
+        if parse_mode is not None:
+            try:
+                plain = _strip_markdown(text)
+                sent = None
+                if update.message:
+                    sent = await update.message.reply_text(plain, reply_markup=reply_markup)
+                elif update.callback_query and update.callback_query.message:
+                    sent = await update.callback_query.message.reply_text(plain, reply_markup=reply_markup)
+                if sent is not None:
+                    logging.info("ℹ️ [TG回复] Markdown 解析失败，已降级纯文本发送")
+                return sent
+            except Exception as e2:
+                logging.error(f"⚠️ [TG回复] 纯文本重发失败: {e2}")
     except RetryAfter as e:
         # Flood control 限流，稍后自动恢复，正常现象
         logging.debug(f"ℹ️ Telegram 回复受限（Flood control，稍后自动恢复）: {e}")
