@@ -2400,7 +2400,13 @@ async def run_trader_recovery_on_startup(trader: CryptoTrader):
                     return
                 else:
                     # R3: 恢复失败不得报告成功，必须显式告警（Phase A: 让失败可见）
-                    trader._not_ready_reason = "恢复失败：交易所健康检查未通过（recover 返回 False）"
+                    # D-009：账本损坏时 recover 已写入精确原因（含读取错误），
+                    # 此处不得用泛化的"健康检查未通过"覆盖，否则运维会误查网络方向。
+                    # ⚠️ 严格 is not True 判定：trader 可能是 MagicMock（测试/降级实例），
+                    # 未绑定属性会返回 MagicMock——它恒 truthy，若用 `not getattr(...)`
+                    # 会误判为"已损坏"而吞掉本条原因更新（SG1 场景4 回归实证）。
+                    if getattr(trader, '_state_corrupted', False) is not True:
+                        trader._not_ready_reason = "恢复失败：交易所健康检查未通过（recover 返回 False）"
                     print("🚨 [启动检测] 历史任务恢复失败！recover_active_batches 返回 False")
                     try:
                         trader.send_tg_notification(

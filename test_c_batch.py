@@ -199,15 +199,36 @@ def t_tombstone():
         t2 = env.load_tomb().get('batch_c', {}).get('cleared_at')
         report("TC5/clear幂等不覆盖墓碑", t1 is not None and t2 == t1, f"(t1={t1}, t2={t2})")
 
-        # TC6: 墓碑文件损坏 → save 放行不抛异常（读取视同空，不阻断主流程）
+        # TC6: 墓碑文件损坏 → DEGRADED 分治（D-009 Q3，ChatGPT R3 批准）
+        #   ⚠️ 旧语义已作废：Batch C 原为"损坏视同空 → save 放行不阻断主流程"。
+        #     D-009 判定该语义危险：它把"不知道墓碑里有什么"解释成"确定没有墓碑"，
+        #     为已清理批次的复活留下通道。新规格按"存在性由谁证明"分治：
+        #       全新 batch_id → 需排除"是已清理批次复活"，墓碑损坏无法排除 → 拒绝
+        #       已存在 batch_id → 存在性由 trade_state 自己证明，墓碑非必要条件 → 放行
+        #   拒绝必须是优雅拒绝（不抛异常）+ critical 告警，绝不静默丢请求。
         with open(env.tomb_file, 'w', encoding='utf-8') as f:
             f.write('{broken json')
+        fake.sent.clear()
         try:
             fake.save_batch_state(SYMBOL, 'other_batch', _batch(batch_id='other_batch'))
-            ok = 'other_batch' in env.load_state().get(SYMBOL, {})
-        except Exception as e:
-            ok = False
-        report("TC6/墓碑损坏不阻断save", ok)
+            new_written = 'other_batch' in env.load_state().get(SYMBOL, {})
+            no_exc = True
+        except Exception:
+            new_written, no_exc = True, False
+        crit6 = [s for s in fake.sent if s[0] == 'critical']
+        report("TC6/墓碑损坏→全新批次拒绝(优雅拒绝+critical)",
+               (not new_written) and no_exc and len(crit6) >= 1,
+               f"(written={new_written}, 无异常={no_exc}, critical={len(crit6)})")
+
+        # TC6b: 墓碑损坏 → 已存在批次仍放行（存在性由 trade_state 证明）
+        env.write_state({SYMBOL: {'keep_batch': _batch(batch_id='keep_batch')}})
+        try:
+            fake.save_batch_state(SYMBOL, 'keep_batch',
+                                  _batch(batch_id='keep_batch', close_phase=1))
+            kept = 'keep_batch' in env.load_state().get(SYMBOL, {})
+        except Exception:
+            kept = False
+        report("TC6b/墓碑损坏→已存在批次放行", kept, f"(kept={kept})")
 
     with _Env() as env:
         fake = _make_fake(env.state_file, env.tomb_file)

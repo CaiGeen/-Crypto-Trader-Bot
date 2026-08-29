@@ -194,8 +194,10 @@ def t_no_repair_semantics_and_source():
     # C4: 源码断言——F2 分支区分 程序撤单/用户修改/外部撤销（is_programmatic / user_modified）
     src = open('trader_260725.py', encoding='utf-8').read()
     lines = src.splitlines()
-    sl_seg = '\n'.join(lines[5077:5116])  # F2 SL terminal 分支（Batch B 插码后 AST/grep 实测重对齐，2026-08-29）
-    tp_seg = '\n'.join(lines[5237:5282])  # F2 TP terminal 分支（同上 +160 平移）
+    # D-009 P0（2026-08-29）：全部插码点位于最早锚点之前 → 三区间统一 +222（AST 实测，
+    # 与 test_sg4 的 14/14 +222 同一次插码，关键字命中已逐段校验）
+    sl_seg = '\n'.join(lines[5299:5338])  # F2 SL terminal 分支（D-009 插码 +222 后实测重对齐）
+    tp_seg = '\n'.join(lines[5459:5504])  # F2 TP terminal 分支（同上 +222 平移）
     report("C4/F2区分程序撤单/用户修改/外部撤销",
            'is_programmatic_cancel' in sl_seg and 'user_modified' in sl_seg
            and 'need_recover_sl = True' in sl_seg
@@ -212,7 +214,7 @@ def t_no_repair_semantics_and_source():
 
     # C6: 行为——用户修改（user_modified=True）撤单后不自动补挂（need_recover 不触发）
     #     即 F2 分支 user_modified → current_sl_id=None 但无 need_recover（修改后实测 L4105-4107 区）
-    seg_user = '\n'.join(lines[5109:5113])  # user_modified 分支（Batch B 插码后实测 L5110）
+    seg_user = '\n'.join(lines[5331:5335])  # user_modified 分支（D-009 插码 +222 后实测 L5332）
     report("C6/用户修改撤单不自动补挂",
            '用户主动修改' in seg_user and '不再自动补挂' in seg_user,
            f"(user_modified分支={'用户主动修改' in seg_user and '不再自动补挂' in seg_user})")

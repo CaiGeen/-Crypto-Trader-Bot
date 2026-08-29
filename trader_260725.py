@@ -93,6 +93,37 @@ def _generate_notify_event_id() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:8]
 
 
+def _fsync_dir(dir_path: str) -> bool:
+    """D-009 P0-A：目录项 fsync（best-effort，降级绝不等于写入失败）——ChatGPT R1 批准。
+
+    作用：os.replace 原子替换后，rename 的目录项本身也需落盘，否则断电可能
+    出现"新文件内容已写入、目录项仍指向旧 inode"的撕裂。
+
+    平台现实（本机实测 2026-08-29）：
+      POSIX   —— os.open(dir, O_DIRECTORY) 可行，真落盘，返回 True
+      Windows —— 三种 os.open 方式全部 PermissionError（无 O_DIRECTORY 语义）
+                 → 捕获后返回 False，由调用方降级
+
+    安全方向（ChatGPT R1 明确裁定）：Windows 下 _fsync_dir 失败**不得**被当作
+    写入失败。否则会出现"状态其实已安全写入，仅因平台不支持目录 fsync 就判定
+    整个保存失败"的错误安全方向。返回值仅用于诊断，绝不参与写入成败判断。
+    """
+    try:
+        fd = os.open(dir_path, getattr(os, 'O_DIRECTORY', os.O_RDONLY))
+    except (PermissionError, OSError, AttributeError):
+        return False          # Windows 常态路径：静默降级，不刷屏
+    try:
+        os.fsync(fd)
+        return True
+    except (PermissionError, OSError):
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
 class CryptoTrader:
     def __init__(self, api_key: str, secret: str, is_demo: bool = False, proxy_url: str = None,
                  tg_bot=None, chat_id=None, loop=None, verbose: bool = True):
@@ -222,6 +253,13 @@ class CryptoTrader:
         # 🔥 每日结算日报线程（daemon，每天 08:05 发送昨日结算）
         self._last_daily_report_date = None
         threading.Thread(target=self._daily_report_loop, daemon=True).start()
+
+        # 🔥 D-009 P0（ChatGPT R2/R3 批准）：账本完整性状态位（默认"可信"，Fail-Closed 起手）
+        # _state_corrupted=True  → 核心账本不可信 → 禁止恢复/接管/新建（SG1 _ready 恒 False）
+        # _tombstones_degraded=True → 历史复活防线不可信 → 已存在批次放行，全新批次拒绝
+        self._state_corrupted = False
+        self._state_corruption_detail = ""
+        self._tombstones_degraded = False
 
         # 🔥 P0 Batch C：墓碑文件路径（测试可重定向）+ 复活告警去重（进程内每批次一次）
         # 启动时 prune 过期墓碑（v2 §3：启动一次 + 日报顺带；文件极小无性能面）
@@ -1266,19 +1304,69 @@ class CryptoTrader:
                 print(f"⚠️ 时间同步微调失败: {e}")
 
     def load_all_states(self) -> dict:
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"⚠️ 读取状态文件失败: {e}")
-        return {}
+        """D-009 P0-A（ChatGPT R2 批准）：读取状态账本——三态分离，杜绝"损坏=空"的致命误读。
 
-    def _persist_states(self, all_states: dict) -> None:
+        三种"空"的安全含义完全不同，旧实现把它们全部塌缩成 {}：
+          ① 文件不存在    → 首次启动，确实没有历史批次        （可正常 READY）
+          ② 合法 {} / dict → 所有批次已清理完毕               （可正常 READY）
+          ③ 读取失败/根非 dict → 账本损坏                     （Fail-Closed，禁止 READY）
+
+        ③ 的正确语义是"不知道有哪些批次"，绝不是"没有批次"。若按 ① 处理，
+        进程会以空账本启动 → 不接管任何历史批次 → 交易所上的真实持仓变成
+        无人监控的孤儿仓；随后新开仓还会把损坏账本覆盖掉，证据彻底灭失。
+
+        损坏时置位 self._state_corrupted=True 并返回 {}（占位，返回值在损坏态
+        下无意义）。调用方读取返回值前必须先判 _state_corrupted。
+        """
+        self._state_corrupted = False
+        self._state_corruption_detail = ""
+        if not os.path.exists(STATE_FILE):
+            return {}
+        try:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            self._state_corrupted = True
+            self._state_corruption_detail = f"{type(e).__name__}: {e}"
+            print(f"🚨 [D-009] trade_state.json 读取失败（账本损坏，Fail-Closed）: {e}")
+            return {}
+        if not isinstance(data, dict):
+            self._state_corrupted = True
+            self._state_corruption_detail = f"根节点类型非法: {type(data).__name__}"
+            print(f"🚨 [D-009] trade_state.json 根节点非 dict（账本损坏，Fail-Closed）")
+            return {}
+        return data
+
+    def _persist_states(self, all_states: dict) -> bool:
         """R12: 状态持久化唯一入口（调用方必须已持有 _state_lock）。
         备份 last-known-good 到 .bak 后原子写入新状态。
         边界：首次保存无文件则跳过备份；备份失败仅警告绝不阻断主保存
-        （C3 是恢复纵深，不改变既有保存契约）。"""
+        （C3 是恢复纵深，不改变既有保存契约）。
+
+        D-009 P0-A（ChatGPT R1 批准）：补全持久化链
+            json.dump → flush → os.fsync(file) → os.replace → _fsync_dir(尽力降级)
+        原子写(os.replace)只保证"不会读到半写文件"，不保证"已落盘"；断电场景下
+        缺 fsync 会产生 0 字节或截断文件（实证：.notify.state.json，2026-08-29）。
+        ⚠️ fsync 是降概率器，不是安全边界——真正的安全边界是下文的损坏 Fail-Closed。
+
+        D-009 P0-B：账本已损坏时拒绝覆盖写入（Fail-Closed）。
+        损坏态下 load_all_states 返回的是 {}，若照常写回，会把磁盘上残留的其余
+        批次一次性抹掉，把"读失败"升级成"证据灭失"。宁可停止写入，不可毁证据。
+        """
+        # D-009 P0-B：损坏账本禁止覆盖（未知 ≠ 空账本）
+        if getattr(self, '_state_corrupted', False) is True:
+            print(f"🚫 [D-009] 拒绝覆盖写入：trade_state.json 已损坏，"
+                  f"账本内容不可信（保护现场待人工恢复）")
+            try:
+                self.send_tg_notification(
+                    f"🚨【资金安全】状态写入被拒绝（账本已损坏）\n"
+                    f"trade_state.json 读取失败，程序拒绝覆盖写入以保护现场。\n"
+                    f"错误: `{self._state_corruption_detail[:150]}`\n"
+                    f"⚠️ 系统已停止交易（READY=False）。请人工修复或重命名该文件后重启。",
+                    level='critical')
+            except Exception:
+                pass
+            return False
         try:
             if os.path.exists(STATE_FILE):
                 shutil.copy2(STATE_FILE, STATE_FILE + '.bak')
@@ -1288,10 +1376,15 @@ class CryptoTrader:
         try:
             with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
                 json.dump(all_states, tf, indent=4, ensure_ascii=False)
+                tf.flush()                 # D-009 P0-A：先刷 Python/ libc 缓冲
+                os.fsync(tf.fileno())      # D-009 P0-A：再落盘，然后才允许 replace
                 temp_name = tf.name
             os.replace(temp_name, STATE_FILE)
+            _fsync_dir(dir_name)           # D-009 P0-A：目录项尽力落盘（Windows 降级返回 False）
+            return True
         except Exception as e:
             print(f"⚠️ 保存状态文件失败: {e}")
+            return False
 
     def save_batch_state(self, symbol: str, batch_id: str, batch_data: dict):
         """P0 Batch C（v2 §5 + v3 §5/§6）：状态落盘单咽喉 = 墓碑检查 + 字段级 merge。
@@ -1302,8 +1395,11 @@ class CryptoTrader:
             旧快照不得降级安全面（B5 陈旧覆盖的语义级修复）。
         merge 后字段集合 = 磁盘 ∪ 快照（快照新增字段正常写入，磁盘独有字段补回）。"""
         _tomb_alert = False
+        _tomb_degraded_reject = False
         with self._state_lock:
             tombstones = self._load_tombstones()
+            # D-009 Q3：墓碑损坏 → DEGRADED（每次 _load_tombstones 重新判定，非粘性）
+            _degraded = getattr(self, '_tombstones_degraded', False) is True
             t_entry = tombstones.get(batch_id)
             if isinstance(t_entry, dict):
                 try:
@@ -1314,13 +1410,38 @@ class CryptoTrader:
                     _tomb_alert = True
             if not _tomb_alert:
                 all_states = self.load_all_states()
-                if symbol not in all_states:
-                    all_states[symbol] = {}
-                existing = all_states[symbol].get(batch_id)
-                if isinstance(existing, dict) and existing:
-                    batch_data = self._merge_batch_state(existing, batch_data)
-                all_states[symbol][batch_id] = batch_data
-                self._persist_states(all_states)
+                # D-009 Q3 分治（ChatGPT R3 批准）：墓碑证明的是"该批次曾存在且已结束，
+                # 不得复活"，不是"该批次存在"。因此存在性由 trade_state 自己证明：
+                #   已存在 batch_id → trade_state 已证明其存在，墓碑非必要条件 → 放行
+                #   全新 batch_id   → 必须排除"是已清理批次复活"；墓碑损坏无法排除 → 拒绝
+                # 准则：未知状态 ≠ 允许。
+                if _degraded and not isinstance((all_states.get(symbol) or {}).get(batch_id), dict):
+                    _tomb_degraded_reject = True
+                else:
+                    if symbol not in all_states:
+                        all_states[symbol] = {}
+                    existing = all_states[symbol].get(batch_id)
+                    if isinstance(existing, dict) and existing:
+                        batch_data = self._merge_batch_state(existing, batch_data)
+                    all_states[symbol][batch_id] = batch_data
+                    self._persist_states(all_states)
+        if _tomb_degraded_reject:
+            _dkey = ('tombstone_degraded', batch_id)
+            if _dkey not in getattr(self, '_tombstone_alerted', set()):
+                try:
+                    self._tombstone_alerted.add(_dkey)
+                except Exception:
+                    pass
+                self.send_tg_notification(
+                    f"🚨【资金安全】墓碑不可信，拒绝创建全新批次\n"
+                    f"批次 `{batch_id}` ({symbol}) 在本地账本中不存在，且墓碑文件 "
+                    f"trade_tombstones.json 读取失败。\n"
+                    f"无法排除该批次是已清理批次的复活（陈旧线程/旧快照回写）。\n"
+                    f"⚠️ 已存在批次的更新不受影响，仅阻断新建。请人工修复墓碑文件。",
+                    level='critical')
+            else:
+                print(f"🪦 [D-009] 墓碑 DEGRADED 拦截新建批次 {batch_id}（告警已去重）")
+            return
         if _tomb_alert:
             if batch_id not in getattr(self, '_tombstone_alerted', set()):
                 try:
@@ -1404,31 +1525,51 @@ class CryptoTrader:
     # ==================== P0 Batch C：墓碑 / 字段级 merge ====================
 
     def _load_tombstones(self) -> dict:
-        """C2：墓碑读取。缺文件/损坏 → 空 dict（读取 Fail-Open：墓碑是 Batch A 冻结
-        之外的第二道防线，缺失最坏退化 = 回到无墓碑现状，不新增风险面；写入侧
-        原子写保证常态正确）。"""
-        path = getattr(self, 'tombstone_file', TOMBSTONE_FILE)
-        if os.path.exists(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    return data if isinstance(data, dict) else {}
-            except Exception as e:
-                print(f"⚠️ [C2] 读取墓碑文件失败（视同空，复活防护降级为仅 Batch A 冻结）: {e}")
-        return {}
+        """C2：墓碑读取。缺文件/损坏 → 空 dict + 置位 _tombstones_degraded（D-009 Q3）。
 
-    def _persist_tombstones(self, tombstones: dict) -> None:
-        """C2：墓碑原子写（调用方必须已持有 _state_lock，与 _persist_states 同范式）。"""
+        与 trade_state 的处理刻意不同，原因是两者的安全角色不同：
+          trade_state 损坏 → 核心账本不可信 → _state_corrupted → _ready=False（全面停摆）
+          墓碑损坏        → 仅"反复活防线"不可信 → _tombstones_degraded → 系统保持 READY，
+                            但**全新批次**因无法排除复活而被拒绝（save_batch_state 闸门）
+
+        损坏态返回 {} 意味着"无法证明任何批次是已清理的"，故绝不可用于放行新建。
+        """
+        path = getattr(self, 'tombstone_file', TOMBSTONE_FILE)
+        self._tombstones_degraded = False
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            self._tombstones_degraded = True
+            print(f"⚠️ [D-009] 墓碑文件读取失败（复活防护降级，禁止新建批次）: {e}")
+            return {}
+        if not isinstance(data, dict):
+            self._tombstones_degraded = True
+            print(f"⚠️ [D-009] 墓碑根节点非 dict（复活防护降级，禁止新建批次）")
+            return {}
+        return data
+
+    def _persist_tombstones(self, tombstones: dict) -> bool:
+        """C2：墓碑原子写（调用方必须已持有 _state_lock，与 _persist_states 同范式）。
+        D-009 P0-A（ChatGPT R1 批准）：json.dump → flush → os.fsync → os.replace
+        → _fsync_dir(尽力降级)。墓碑是"反复活"的唯一防线，其完整性优先于主账本。"""
         path = getattr(self, 'tombstone_file', TOMBSTONE_FILE)
         dir_name = os.path.dirname(path) or "."
         try:
             with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False,
                                              encoding="utf-8") as tf:
                 json.dump(tombstones, tf, indent=4, ensure_ascii=False)
+                tf.flush()                 # D-009 P0-A
+                os.fsync(tf.fileno())      # D-009 P0-A
                 temp_name = tf.name
             os.replace(temp_name, path)
+            _fsync_dir(dir_name)           # D-009 P0-A：Windows 降级返回 False，不阻断
+            return True
         except Exception as e:
             print(f"⚠️ [C2] 保存墓碑文件失败: {e}")
+            return False
 
     def _prune_tombstones(self) -> None:
         """C2：TTL 过期清理（启动 + 日报线程顺带）。持锁 prune，异常不外溢。"""
@@ -1650,6 +1791,39 @@ class CryptoTrader:
 
         return summaries
 
+    def _run_position_census(self) -> list:
+        """D-009 P0-C（ChatGPT Q2 阶段一最小版）：交易所持仓普查（反向对账的只读半边）。
+
+        触发场景：本地账本损坏 → 唯一可信的仓位来源是交易所。此时若不普查，
+        运维只能看到"账本空"，会误判为无持仓。
+
+        严格只读：不撤单、不平仓、不改单、不写任何本地状态。完整的自动
+        reconciliation 属阶段二；本阶段只负责"把真相摆到人类面前"。
+
+        返回 [(symbol, side, contracts), ...]（仅含非零仓位）；
+        查询失败返回 None —— UNKNOWN ≠ EMPTY，绝不可退化成空列表。
+        """
+        try:
+            positions = self._safe_api_call(self.exchange.fetch_positions)
+        except Exception as e:
+            print(f"⚠️ [D-009] 交易所持仓普查失败（UNKNOWN，绝不当作无持仓）: {e}")
+            return None
+        found = []
+        for pos in (positions or []):
+            if not isinstance(pos, dict):
+                continue
+            try:
+                amt = float(pos.get('contracts', 0) or pos.get('positionAmt', 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if abs(amt) <= 0:
+                continue
+            _info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
+            _sym = pos.get('symbol') or _info.get('symbol') or '<unknown>'
+            _side = pos.get('side') or ('long' if amt > 0 else 'short')
+            found.append((str(_sym), str(_side), abs(amt)))
+        return found
+
     def recover_active_batches(self) -> bool:
         # 🔥 健康检查：确认交易所 API 可用
         print("🔍 [恢复前健康检查] 正在验证交易所连接...")
@@ -1664,6 +1838,54 @@ class CryptoTrader:
         all_states = self.load_all_states()
         recovered_count = 0  # R3-v2: 计数器与成败分离，返回值只表达"流程成功/失败"
         stale_batches = []
+
+        # D-009 P0-A/P0-B（ChatGPT R2/R3 批准）：账本损坏 → Fail-Closed。
+        # 损坏读出的 {} 只表示"不知道有哪些批次"，绝不表示"没有批次"。此时接管任何
+        # 批次都可能把交易所上的真实持仓变成无人监控的孤儿仓，因此：
+        # 禁止恢复、禁止接管、禁止置位 READY（SG1 随即封死全部风险增加入口）。
+        # 刻意**不退出进程**：退出 → watchdog 重启 → 账本仍坏 → 再次退出 = 无限重启，
+        # 不增加任何安全性；存活则可保住 TG 告警 / 查询命令 / 人工介入通道。
+        if getattr(self, '_state_corrupted', False) is True:
+            _detail = getattr(self, '_state_corruption_detail', '') or '未知原因'
+            self._not_ready_reason = (f"trade_state.json 损坏，账本不可信"
+                                      f"（{_detail[:80]}），已停止交易待人工恢复")
+            print(f"🚨 [D-009] trade_state.json 损坏（{_detail}）")
+            print(f"   └─ 禁止接管任何历史批次，READY 保持 False，进程存活等待人工介入")
+            # .bak 仅做**存在性诊断**，绝不 open / 装载其内容（ChatGPT R3：
+            # .bak 是 last-state-before-this-write 而非 last-known-good，
+            # 实测其内含 is_active=True 幽灵批次，静默恢复 = 复活已清理批次）。
+            _bak_path = STATE_FILE + '.bak'
+            try:
+                if not os.path.exists(_bak_path):
+                    _bak_note = f"{_bak_path} 不存在，无恢复候选"
+                elif os.path.getsize(_bak_path) > 0:
+                    _bak_note = (f"{_bak_path} 存在（{os.path.getsize(_bak_path)} 字节），"
+                                 f"仅可作为人工恢复候选证据，程序绝不自动装载")
+                else:
+                    _bak_note = f"{_bak_path} 存在但为空，无恢复价值"
+            except OSError:
+                _bak_note = f"{_bak_path} 状态不可读取"
+            # D-009 P0-C：账本不可信 → 唯一可信来源是交易所（只读普查）
+            _census = self._run_position_census()
+            if _census is None:
+                _pos_note = "⚠️ 普查失败（UNKNOWN）——绝不可当作无持仓"
+            elif _census:
+                _pos_note = "\n".join(f"   • {_s} {_sd} {_a}" for _s, _sd, _a in _census)
+            else:
+                _pos_note = "交易所当前无持仓（普查成功，0 个仓位）"
+            print(f"🔍 [D-009] 交易所持仓普查（只读）：{_pos_note}")
+            try:
+                self.send_tg_notification(
+                    f"🚨【资金安全】本地账本损坏，已停止交易\n"
+                    f"trade_state.json 读取失败: `{_detail[:150]}`\n"
+                    f"已禁止接管任何历史批次，READY=False（进程存活，TG 与查询命令可用）。\n"
+                    f"备份诊断: {_bak_note}\n"
+                    f"交易所持仓普查（只读，未执行任何自动操作）:\n{_pos_note}\n"
+                    f"⚠️ 请人工核对后修复或重命名该文件，再重启程序。",
+                    level='critical')
+            except Exception:
+                pass
+            return False
 
         for symbol, symbol_batches in all_states.items():
             for batch_id, b_data in symbol_batches.items():

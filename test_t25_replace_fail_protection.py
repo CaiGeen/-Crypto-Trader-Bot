@@ -180,19 +180,20 @@ def t_b_partial_reduce_keep_old():
     lines = src.splitlines()
     create_at = [i + 1 for i, ln in enumerate(lines) if 'self.exchange.create_order,' in ln]
     cancel_at = [i + 1 for i, ln in enumerate(lines) if 'self.exchange.cancel_order,' in ln]
-    # 部分减仓 SL 段：create 在 L4826、cancel 在 L4848（P0 Batch B 插码 +48 后 AST 重新实测，
-    # 2026-08-29；Batch C 时代为 4778/4800，D-010 Batch2 时代为 4684/4706，与 backups/ 同函数纯插码对应）
-    create_line = 4826 if 4826 in create_at else None
-    cancel_line = 4848 if 4848 in cancel_at else None
-    seg = '\n'.join(lines[4844:4884])  # 部分减仓 SL 段 create→verify→撤旧→except 区间（Batch B 插码 +48 后实测）
+    # 部分减仓 SL 段：create 在 L5048、cancel 在 L5070（D-009 P0 插码 +222 后 AST 重新实测，
+    # 2026-08-29；Batch B 时代为 4826/4848，Batch C 时代为 4778/4800，D-010 Batch2 时代为
+    # 4684/4706，与 backups/ 同函数纯插码对应；D-009 全部插码点均在 L1936 之前 → 14/14 统一 +222）
+    create_line = 5048 if 5048 in create_at else None
+    cancel_line = 5070 if 5070 in cancel_at else None
+    seg = '\n'.join(lines[5066:5106])  # 部分减仓 SL 段 create→verify→撤旧→except 区间（D-009 +222 后实测）
     report("B1/先建后撤+旧单保留注释",
-           create_line == 4826 and cancel_line == 4848 and create_line < cancel_line
+           create_line == 5048 and cancel_line == 5070 and create_line < cancel_line
            and '旧单保留' in seg and '挂新失败' in seg,
            f"(create={create_line}, cancel={cancel_line}, 注释存在={'旧单保留' in seg and '挂新失败' in seg})")
 
     # B2: 源码断言——verify 失败分支"不 Commit/不撤旧"（registry 不写 ABSENT、不调 cancel_order）
     lines2 = src.splitlines()
-    vf_seg = '\n'.join(lines2[4834:4844])  # verify_result != 'success' → 日志+告警（Batch B 插码 +48 后实测 L4837）
+    vf_seg = '\n'.join(lines2[5056:5066])  # verify_result != 'success' → 日志+告警（D-009 +222 后实测 L5059）
     report("B2/verify失败不Commit不撤旧",
            '不 Commit/不撤旧' in vf_seg and 'cancel_order' not in vf_seg,
            f"(不Commit/不撤旧={'不 Commit/不撤旧' in vf_seg}, 无cancel={'cancel_order' not in vf_seg})")
