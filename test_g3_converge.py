@@ -25,7 +25,9 @@ G1/G2/G3b/G3a 的执行路径（create 已发出后的竞态收敛）在回放�
 预期：GREEN——全部 PASS 退出码 0。任何 FAIL = Batch A 实现回退/偏离规格，退出码 1。
 测试基建惯例：unbound-method + fake self；MagicMock 数值比较必炸 → 数值属性绑定真实值。
 """
+import os
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -122,6 +124,15 @@ def make_fake(store, ex):
     fake.load_all_states = lambda: store.load()
     fake._persist_states = lambda all_s: store.persist(all_s)
     fake.save_batch_state = lambda s, b, d: CryptoTrader.save_batch_state(fake, s, b, d)
+    # P0 Batch C（2026-08-29）：save/clear 重写后新增 helper —— 未绑定时
+    # _merge_batch_state 返回 MagicMock 污染 store（batch 落盘为空 dict，registry
+    # 断言全空 = 假回归第 5 次实证）；_load_tombstones 未绑定时返回 MagicMock
+    # 恰好无害（isinstance dict=False）但语义不可靠 → 全量绑定真实实现。
+    fake.tombstone_file = os.path.join(tempfile.gettempdir(),
+                                       f"tomb_g3_{os.getpid()}_{id(fake)}.json")
+    for name in ('_load_tombstones', '_persist_tombstones', '_prune_tombstones',
+                 '_collect_batch_order_ids', '_merge_batch_state'):
+        _bind_real(fake, name)
     for name in ('_update_registry', '_assert_create_allowed', '_final_pre_create_check',
                  '_commit_protection_with_g3', '_g3a_converge_race_order',
                  '_g3_cancel_race_order', '_g3_log_position_recheck',

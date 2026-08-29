@@ -73,9 +73,14 @@ RESULTS = []
 #      一一对应同函数 update_batch_tp/update_batch_sl/_update_sl_no_validation/execute_signal/
 #      _start_monitoring×5/_place_prepared×3/close_position_market/close_position_limit，纯插码）：
 #      create = [1657, 1820, 2040, 2663, 4441, 4521, 5155, 5318, 5496, 5805, 5965, 6130, 6395, 6648]
-A_LINES = {1657, 1820, 2040, 4441, 4521, 5155, 5318, 5496, 5805, 5965, 6130}  # 11 处保护单
-B_LINES = {2663}                                                              # 1 处开仓条件单
-C_LINES = {6395, 6648}                                                        # 2 处平仓单
+# ⚠️ P0 Batch C（2026-08-29）：墓碑/字段级 merge 插在 save/clear（L1296 区，全部调用点之前）→ 14/14 统一 +243。
+# ⚠️ P0 Batch C 选项1（2026-08-29 晚）：_commit_registry_txn helper + 4 收敛函数锁内直写
+#      插在 L3462+ → L2906 之后全部调用点再统一 +94（1900/2063/2283/2906 不受影响）。
+#      AST 重新实测 2026-08-29 晚（同函数纯插码，与上一基线一一对应）：
+#      create = [1900, 2063, 2283, 2906, 4778, 4858, 5492, 5655, 5833, 6142, 6302, 6467, 6732, 6985]
+A_LINES = {1900, 2063, 2283, 4778, 4858, 5492, 5655, 5833, 6142, 6302, 6467}  # 11 处保护单
+B_LINES = {2906}                                                              # 1 处开仓条件单
+C_LINES = {6732, 6985}                                                        # 2 处平仓单
 ALL_LINES = A_LINES | B_LINES | C_LINES                                       # 14 处
 
 

@@ -29,6 +29,24 @@ from telegram.ext import (
 load_dotenv()
 STATE_FILE = "trade_state.json"
 
+# ==================== P0 Batch C（防回退，v2 §3/§5 + v3 §5/§6） ====================
+# C2 墓碑：独立于 trade_state.json（clear 本身从 state 删键，墓碑必须独立持久化
+# 才能抵抗"删记忆"式复活）。TTL=7 天（三轮裁定 D3：覆盖长假/停机重启窗口；
+# parser batch_id 带 uuid4 后缀 → 复用概率≈0，超期后使命完成）。
+TOMBSTONE_FILE = "trade_tombstones.json"
+TOMBSTONE_TTL_SECONDS = 7 * 24 * 3600
+# C1 字段级 merge 分类字段表（v2 §5.1 + v3 §5 七类）：
+#   A 棘轮（close_phase 专列 int max）/ G user_modified OR / B 单调账本 /
+#   C registry 逐 identity / D id 镜像 / E 静态幂等 / F 簿记最新者胜（默认）。
+_MERGE_RATCHET_BOOL_FIELDS = ('pending_close', 'is_programmatic_cancel',
+                              'settled_by_limit_close')
+_MERGE_ID_MIRROR_FIELDS = ('tp_order_id', 'current_sl_id', 'limit_close_order_id')
+# C 类保护集：磁盘条目处于这些 state → 保留磁盘（未决/已锁/终态不许被旧快照降级）
+_MERGE_REGISTRY_PROTECTED_STATES = ('PENDING_CREATE', 'PENDING_VERIFY', 'NOT_CONFIRMED',
+                                    'CONFIRMED', 'MISMATCH', 'HARD_LOCK',
+                                    'PROGRAMMATIC_CANCELED')
+_REGISTRY_TERMINAL_STATES = ('PROGRAMMATIC_CANCELED', 'ABSENT', 'FAILED')
+
 # 北京时间时区（与 watchdog.py 保持一致，日报/盈亏记录统一使用）
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 
@@ -204,6 +222,15 @@ class CryptoTrader:
         # 🔥 每日结算日报线程（daemon，每天 08:05 发送昨日结算）
         self._last_daily_report_date = None
         threading.Thread(target=self._daily_report_loop, daemon=True).start()
+
+        # 🔥 P0 Batch C：墓碑文件路径（测试可重定向）+ 复活告警去重（进程内每批次一次）
+        # 启动时 prune 过期墓碑（v2 §3：启动一次 + 日报顺带；文件极小无性能面）
+        self.tombstone_file = TOMBSTONE_FILE
+        self._tombstone_alerted = set()
+        try:
+            self._prune_tombstones()
+        except Exception as _tomb_e:
+            print(f"⚠️ [C2] 启动墓碑清理异常（不阻断启动）: {_tomb_e}")
 
     # ==================== IP 监控方法 ====================
 
@@ -789,6 +816,8 @@ class CryptoTrader:
     def _send_daily_report(self):
         """发送每日结算报告（昨日已实现盈亏 + 余额 + 持仓快照）"""
         try:
+            # P0 Batch C（v2 §3）：日报顺带 prune 过期墓碑（TTL 7 天）
+            self._prune_tombstones()
             report_date = (datetime.now(BEIJING_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
             base_dir = os.path.dirname(os.path.abspath(__file__))
             stats_file = os.path.join(base_dir, "trade_stats.json")
@@ -1265,24 +1294,238 @@ class CryptoTrader:
             print(f"⚠️ 保存状态文件失败: {e}")
 
     def save_batch_state(self, symbol: str, batch_id: str, batch_data: dict):
+        """P0 Batch C（v2 §5 + v3 §5/§6）：状态落盘单咽喉 = 墓碑检查 + 字段级 merge。
+        C2：见墓碑（TTL 内）→ 拒绝写入（Fail-Closed，已清理批次复活通道封死）+
+            🚨 critical 告警（锁外发送，防持锁 5s TG 超时；进程内每批次一次去重）。
+        C1：磁盘既有批次按七类规则 merge（A 棘轮 / G user_modified OR / B 单调账本 /
+            C registry 逐 identity / D id 镜像 / E 静态 / F 簿记最新者胜），
+            旧快照不得降级安全面（B5 陈旧覆盖的语义级修复）。
+        merge 后字段集合 = 磁盘 ∪ 快照（快照新增字段正常写入，磁盘独有字段补回）。"""
+        _tomb_alert = False
         with self._state_lock:
-            all_states = self.load_all_states()
-            if symbol not in all_states:
-                all_states[symbol] = {}
-            all_states[symbol][batch_id] = batch_data
-            self._persist_states(all_states)
+            tombstones = self._load_tombstones()
+            t_entry = tombstones.get(batch_id)
+            if isinstance(t_entry, dict):
+                try:
+                    _age = time.time() - float(t_entry.get('cleared_at', 0) or 0)
+                except (TypeError, ValueError):
+                    _age = 0.0
+                if _age < TOMBSTONE_TTL_SECONDS:
+                    _tomb_alert = True
+            if not _tomb_alert:
+                all_states = self.load_all_states()
+                if symbol not in all_states:
+                    all_states[symbol] = {}
+                existing = all_states[symbol].get(batch_id)
+                if isinstance(existing, dict) and existing:
+                    batch_data = self._merge_batch_state(existing, batch_data)
+                all_states[symbol][batch_id] = batch_data
+                self._persist_states(all_states)
+        if _tomb_alert:
+            if batch_id not in getattr(self, '_tombstone_alerted', set()):
+                try:
+                    self._tombstone_alerted.add(batch_id)
+                except Exception:
+                    pass
+                self.send_tg_notification(
+                    f"🚨【资金安全】已清理批次复活尝试被阻断\n"
+                    f"批次 `{batch_id}` 已在墓碑登记（7 天 TTL 内），save_batch_state 拒绝写入。\n"
+                    f"疑似陈旧线程/旧快照回写。请人工核查 trade_tombstones.json 与该批次来源。",
+                    level='critical')
+            else:
+                print(f"🪦 [C2] 墓碑拦截 save（批次 {batch_id}，复活告警已去重）")
 
     def clear_batch_state(self, symbol: str, batch_id: str):
+        """P0 Batch C（v2 §3）：清理即写墓碑（converged_order_ids = registry 已终态
+        条目的 order_id 近似集；Batch B 接 proof 门后升级为 L1/L2 撤销成功全集）。
+        幂等：墓碑已存在（重复 clear）不覆盖 cleared_at。"""
         if getattr(self, '_tp_breaker_alerted', None):  # 终态清理熔断告警键（ChatGPT 终审 2026-08-20，长期运行内存管理）
             self._tp_breaker_alerted = {k: v for k, v in self._tp_breaker_alerted.items() if k[0] != batch_id}
         with self._state_lock:
             all_states = self.load_all_states()
             if symbol in all_states and batch_id in all_states[symbol]:
+                b_data = all_states[symbol][batch_id]
+                # C2：先落墓碑再删 state（删记忆后墓碑是唯一防线，顺序不可倒）
+                try:
+                    tombstones = self._load_tombstones()
+                    if not isinstance(tombstones.get(batch_id), dict):
+                        _converged = sorted({
+                            str(ent.get('order_id'))
+                            for ent in (b_data.get('protection_registry') or {}).values()
+                            if isinstance(ent, dict) and ent.get('order_id')
+                            and ent.get('state') in _REGISTRY_TERMINAL_STATES})
+                        tombstones[batch_id] = {
+                            'symbol': symbol,
+                            'side': b_data.get('side'),
+                            'cleared_at': time.time(),
+                            'converged_order_ids': _converged,
+                            'known_order_ids': self._collect_batch_order_ids(b_data),
+                        }
+                        self._persist_tombstones(tombstones)
+                except Exception as tomb_e:
+                    print(f"⚠️ [C2] 墓碑落盘失败（不阻断清理，但请人工检查）: {tomb_e}")
                 del all_states[symbol][batch_id]
                 if not all_states[symbol]:
                     del all_states[symbol]
                 self._persist_states(all_states)
-                print(f"🧹 批次 [{batch_id}] 状态归档/清理完毕。")
+                print(f"🧹 批次 [{batch_id}] 状态归档/清理完毕（墓碑已登记，7 天防复活）。")
+
+    # ==================== P0 Batch C：墓碑 / 字段级 merge ====================
+
+    def _load_tombstones(self) -> dict:
+        """C2：墓碑读取。缺文件/损坏 → 空 dict（读取 Fail-Open：墓碑是 Batch A 冻结
+        之外的第二道防线，缺失最坏退化 = 回到无墓碑现状，不新增风险面；写入侧
+        原子写保证常态正确）。"""
+        path = getattr(self, 'tombstone_file', TOMBSTONE_FILE)
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+            except Exception as e:
+                print(f"⚠️ [C2] 读取墓碑文件失败（视同空，复活防护降级为仅 Batch A 冻结）: {e}")
+        return {}
+
+    def _persist_tombstones(self, tombstones: dict) -> None:
+        """C2：墓碑原子写（调用方必须已持有 _state_lock，与 _persist_states 同范式）。"""
+        path = getattr(self, 'tombstone_file', TOMBSTONE_FILE)
+        dir_name = os.path.dirname(path) or "."
+        try:
+            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False,
+                                             encoding="utf-8") as tf:
+                json.dump(tombstones, tf, indent=4, ensure_ascii=False)
+                temp_name = tf.name
+            os.replace(temp_name, path)
+        except Exception as e:
+            print(f"⚠️ [C2] 保存墓碑文件失败: {e}")
+
+    def _prune_tombstones(self) -> None:
+        """C2：TTL 过期清理（启动 + 日报线程顺带）。持锁 prune，异常不外溢。"""
+        try:
+            with self._state_lock:
+                tombstones = self._load_tombstones()
+                if not tombstones:
+                    return
+                now = time.time()
+                pruned = {}
+                for bid, entry in tombstones.items():
+                    try:
+                        age = now - float((entry or {}).get('cleared_at', 0) or 0)
+                    except (TypeError, ValueError):
+                        age = 0.0
+                    if age < TOMBSTONE_TTL_SECONDS:
+                        pruned[bid] = entry
+                if len(pruned) != len(tombstones):
+                    self._persist_tombstones(pruned)
+                    print(f"🪦 [C2] 墓碑 TTL 清理：{len(tombstones) - len(pruned)} 条过期移除，"
+                          f"剩余 {len(pruned)} 条")
+        except Exception as e:
+            print(f"⚠️ [C2] 墓碑清理异常: {e}")
+
+    def _collect_batch_order_ids(self, b_data: dict) -> list:
+        """C2：收集批次已知订单 id 全集（镜像字段 + registry），供墓碑溯源。"""
+        ids = []
+        for key in _MERGE_ID_MIRROR_FIELDS:
+            v = (b_data or {}).get(key)
+            if v:
+                ids.append(str(v))
+        for ent in ((b_data or {}).get('protection_registry') or {}).values():
+            if isinstance(ent, dict) and ent.get('order_id'):
+                ids.append(str(ent['order_id']))
+        seen, out = set(), []
+        for i in ids:
+            if i not in seen:
+                seen.add(i)
+                out.append(i)
+        return out
+
+    def _merge_batch_state(self, disk: dict, snap: dict) -> dict:
+        """C1 字段级 merge（v2 §5.1 七类 + v3 §5：user_modified 移出棘轮归 G 类）。
+        disk = 磁盘现状（较新事实的载体），snap = 调用方快照（可能陈旧）。
+        返回合并后的新 dict；磁盘独有字段补回（union 语义）。"""
+        merged = dict(snap)  # E/F/未知字段默认最新者胜（快照覆盖）
+        # —— G 类（v3 §5）：user_modified 事实字段取 OR，绝不参与安全判定 ——
+        merged['user_modified'] = bool(disk.get('user_modified')) or bool(snap.get('user_modified'))
+        # —— A 类棘轮：close_phase int max + Boolean False→True 单向 ——
+        try:
+            merged['close_phase'] = max(int(disk.get('close_phase', 0) or 0),
+                                        int(snap.get('close_phase', 0) or 0))
+        except (TypeError, ValueError):
+            pass
+        for f in _MERGE_RATCHET_BOOL_FIELDS:
+            if disk.get(f) and not snap.get(f):
+                merged[f] = disk[f]  # 磁盘 True 快照 False → 保留 True
+        # —— B 类单调账本：结算线程已计的成交/费用不被旧快照抹掉 ——
+        try:
+            merged['last_filled_count'] = max(int(disk.get('last_filled_count', 0) or 0),
+                                              int(snap.get('last_filled_count', 0) or 0))
+        except (TypeError, ValueError):
+            pass
+        try:
+            merged['total_entry_fee'] = max(float(disk.get('total_entry_fee', 0.0) or 0.0),
+                                            float(snap.get('total_entry_fee', 0.0) or 0.0))
+        except (TypeError, ValueError):
+            pass
+        _fd, _fs = disk.get('filled_details') or [], snap.get('filled_details') or []
+        if isinstance(_fd, list) and isinstance(_fs, list):
+            _fd_out = []
+            for i in range(max(len(_fd), len(_fs))):
+                a = _fd[i] if i < len(_fd) else None
+                b = _fs[i] if i < len(_fs) else None
+                if a is None:
+                    _fd_out.append(b)
+                elif b is None:
+                    _fd_out.append(a)
+                else:
+                    try:
+                        _fd_out.append(a if float(a) >= float(b) else b)
+                    except (TypeError, ValueError):
+                        _fd_out.append(b)
+            merged['filled_details'] = _fd_out
+        # —— C 类 registry 逐 identity merge ——
+        _dr = disk.get('protection_registry') or {}
+        _sr = snap.get('protection_registry') or {}
+        if _dr or _sr:
+            merged_reg = dict(_sr)
+            for ident, d_ent in _dr.items():
+                s_ent = _sr.get(ident)
+                if s_ent is None:
+                    merged_reg[ident] = d_ent  # 磁盘独有 identity 补回（防丢更新）
+                    continue
+                if not (isinstance(d_ent, dict) and isinstance(s_ent, dict)):
+                    continue
+                if d_ent.get('state') in _MERGE_REGISTRY_PROTECTED_STATES:
+                    merged_reg[ident] = dict(d_ent)  # 未决/已锁/终态 → 磁盘为准
+                else:
+                    # 磁盘 FAILED/ABSENT → updated_at 新者胜（允许后续重建翻正）
+                    try:
+                        d_newer = (float(d_ent.get('updated_at', 0) or 0)
+                                   >= float(s_ent.get('updated_at', 0) or 0))
+                    except (TypeError, ValueError):
+                        d_newer = False
+                    merged_reg[ident] = dict(d_ent) if d_newer else dict(s_ent)
+            merged['protection_registry'] = merged_reg
+        # —— D 类 id 镜像：磁盘有 id 快照清空 → 仅活单且未进结算才保留 ——
+        _phase = 0
+        try:
+            _phase = int(merged.get('close_phase', 0) or 0)
+        except (TypeError, ValueError):
+            _phase = 0
+        _reg_now = merged.get('protection_registry') or {}
+        for f in _MERGE_ID_MIRROR_FIELDS:
+            d_v, s_v = disk.get(f), snap.get(f)
+            if d_v is not None and s_v is None and _phase < 2:
+                _id_live = any(
+                    isinstance(e, dict) and str(e.get('order_id', '')) == str(d_v)
+                    and e.get('state') not in _REGISTRY_TERMINAL_STATES
+                    for e in _reg_now.values())
+                if _id_live:
+                    merged[f] = d_v
+        # —— 磁盘独有字段补回（union；快照新增字段已在 dict(snap) 中） ——
+        for k, v in disk.items():
+            if k not in merged:
+                merged[k] = v
+        return merged
 
     def get_batch_summary(self, batch_id: str) -> dict | None:
         """
@@ -3160,53 +3403,104 @@ class CryptoTrader:
                          intent=None, fail_count_incr=None, hard_locked=None,
                          terminated_reason=None):
         """B1/P0-2: 保护单 registry 落盘（规格 §5.2）—— protection_registry[identity] 状态条目。
-        每次更新刷新 updated_at；load → modify → save（读最新状态再写，防覆盖并发修改）。
-        调用方必须持有监控线程/写侧锁（仲裁需持锁，§13 推论④）。
+        每次更新刷新 updated_at。
         B2-2: intent 不可变（ChatGPT③）——首次写入后不覆盖，防后期参数漂移
         导致自愈匹配失败/错收编。
         B2-4: fail_count_incr 递增条目级 fail_count 并返回新值（HARD_LOCK 判定源，§5.4）；
         hard_locked 落盘硬锁标记。
         P0 Batch A（§1.4 终态守卫）：PROGRAMMATIC_CANCELED 是订单生命周期终态，
         不可转出（状态机闭环最后防线——防止任何旧路径把它改回 CONFIRMED/ABSENT
-        而复活补挂通道）。同态回写（reason 更新）放行。"""
-        latest_all = self.load_all_states()
-        b = latest_all.get(symbol, {}).get(batch_id)
-        if b is None:
-            return None
-        reg = b.setdefault('protection_registry', {})
-        entry = reg.setdefault(identity, {})
-        if (entry.get('state') == 'PROGRAMMATIC_CANCELED'
-                and state is not None and state != 'PROGRAMMATIC_CANCELED'):
-            print(f"  └─ 🚫 [终态守卫] identity `{identity}` 已 PROGRAMMATIC_CANCELED，"
-                  f"拒绝回写 state={state}（订单终态不可转出）")
-            return None
-        if state is not None:
-            entry['state'] = state
-        if order_id is not None:
-            entry['order_id'] = order_id
-        if id_known is not None:
-            entry['id_known'] = id_known
-        if order_kind is not None:
-            entry['order_kind'] = order_kind
-        if role is not None:
-            entry['role'] = role
-        if layer is not None:
-            entry['layer'] = layer
-        if side is not None:
-            entry['side'] = side
-        if intent is not None:
-            entry.setdefault('intent', intent)
-        new_fail_count = None
-        if fail_count_incr is not None:
-            new_fail_count = entry.get('fail_count', 0) + fail_count_incr
-            entry['fail_count'] = new_fail_count
-        if hard_locked is not None:
-            entry['hard_locked'] = hard_locked
-        if terminated_reason is not None:
-            entry['terminated_reason'] = terminated_reason
-        entry['updated_at'] = time.time()
-        self.save_batch_state(symbol, batch_id, b)
+        而复活补挂通道）。同态回写（reason 更新）放行。
+        P0 Batch C 方案 A（ChatGPT 批准 2026-08-29）：**锁内化事务路径**——
+        with _state_lock: load 最新 → modify → _persist_states 直写。
+        不走普通 save_batch_state 的 C 类 merge：本函数是明确的"读最新→修改→写回"
+        收敛事务（R2c 回滚/R3 收编/G3 终态写），merge 无法区分它与 B5 陈旧快照，
+        会把合法收敛写吞掉（test_b2_restart_semantics 三态复现实证）。锁内直写后
+        与 clear_batch_state/clear 持锁互斥，无 clear 竞态窗口；AST 已排查 62 个
+        调用点零持锁进入，无自嵌死锁。merge/tombstone 语义不变（普通 save 调用面
+        收窄为监控线程快照写——B5 目标不变）。"""
+        with self._state_lock:
+            latest_all = self.load_all_states()
+            b = latest_all.get(symbol, {}).get(batch_id)
+            if b is None:
+                return None
+            reg = b.setdefault('protection_registry', {})
+            entry = reg.setdefault(identity, {})
+            if (entry.get('state') == 'PROGRAMMATIC_CANCELED'
+                    and state is not None and state != 'PROGRAMMATIC_CANCELED'):
+                print(f"  └─ 🚫 [终态守卫] identity `{identity}` 已 PROGRAMMATIC_CANCELED，"
+                      f"拒绝回写 state={state}（订单终态不可转出）")
+                return None
+            if state is not None:
+                entry['state'] = state
+            if order_id is not None:
+                entry['order_id'] = order_id
+            if id_known is not None:
+                entry['id_known'] = id_known
+            if order_kind is not None:
+                entry['order_kind'] = order_kind
+            if role is not None:
+                entry['role'] = role
+            if layer is not None:
+                entry['layer'] = layer
+            if side is not None:
+                entry['side'] = side
+            if intent is not None:
+                entry.setdefault('intent', intent)
+            new_fail_count = None
+            if fail_count_incr is not None:
+                new_fail_count = entry.get('fail_count', 0) + fail_count_incr
+                entry['fail_count'] = new_fail_count
+            if hard_locked is not None:
+                entry['hard_locked'] = hard_locked
+            if terminated_reason is not None:
+                entry['terminated_reason'] = terminated_reason
+            entry['updated_at'] = time.time()
+            # 直写持锁持久化（绕过 C 类 merge；批次被 clear 则上面 b is None 已拦截）
+            self._persist_states(latest_all)
         return new_fail_count
+
+    def _commit_registry_txn(self, symbol, batch_id, reg_entries=None, batch_fields=None):
+        """P0 Batch C 选项1（ChatGPT 批准 2026-08-29，严格限定 4 函数调用面）：
+        读-改-写事务锁内提交——与 _update_registry 方案 A 同范式，专供
+        "决策在锁外计算（含交易所 API / TG 告警）、提交在锁内直写"的收敛路径
+        （启动校验回滚 R2c / 自愈收编 R3 / entry 链重建 R3b）。
+        不走普通 save_batch_state 的 C 类 merge：merge 无法区分 B5 陈旧快照与
+        合法收敛写，磁盘条目 ∈ 保护集时会把回滚/收编吞掉（b2_restart 三态复现实证）。
+        reg_entries: {identity: entry 快照}——逐条应用：
+          终态守卫：磁盘 PROGRAMMATIC_CANCELED 不可被非同态快照覆盖（同 _update_registry）；
+          intent 不可变（B2-2）：磁盘已有 intent 则保留磁盘值（防自愈指纹漂移）。
+        batch_fields: {batch 级字段: 新值}——None 值跳过（id 镜像只补不清）。
+        批次已不存在（被 clear）→ 放弃写入返回 False（不复活，墓碑精神 C-I）。
+        ⚠️ 调用方不得持有 _state_lock（AST 已排查全库调用点零锁内进入，无自嵌死锁）。"""
+        if not reg_entries and not batch_fields:
+            return True
+        with self._state_lock:
+            latest_all = self.load_all_states()
+            latest_b = latest_all.get(symbol, {}).get(batch_id)
+            if latest_b is None:
+                return False
+            if reg_entries:
+                reg = latest_b.setdefault('protection_registry', {})
+                for identity, snap in reg_entries.items():
+                    if not isinstance(snap, dict):
+                        continue
+                    disk = reg.get(identity)
+                    if (isinstance(disk, dict) and disk.get('state') == 'PROGRAMMATIC_CANCELED'
+                            and snap.get('state') != 'PROGRAMMATIC_CANCELED'):
+                        print(f"  └─ 🚫 [终态守卫] identity `{identity}` 已 PROGRAMMATIC_CANCELED，"
+                              f"锁内直写拒绝覆盖（订单终态不可转出）")
+                        continue
+                    if isinstance(disk, dict) and disk.get('intent') is not None:
+                        snap = dict(snap)
+                        snap['intent'] = disk['intent']
+                    reg[identity] = snap
+            for k, v in (batch_fields or {}).items():
+                if v is None:
+                    continue
+                latest_b[k] = v
+            self._persist_states(latest_all)
+        return True
 
     def _assert_create_allowed(self, symbol, batch_id, identity, desc='保护单', replace_order_id=None):
         """B2-3: Create 仲裁闸门（规格 §5.3 + §10.1 最小联动）——
@@ -3302,6 +3596,7 @@ class CryptoTrader:
                 if not reg:
                     continue
                 dirty = False
+                txn_reg = {}  # P0 Batch C 选项1：收集实际改动 identity 快照（锁内直写提交）
                 for identity, entry in reg.items():
                     if not isinstance(entry, dict):
                         continue
@@ -3314,6 +3609,7 @@ class CryptoTrader:
                             # 非法解锁（§5.5）：防"不知道为什么直接改 false"回到不可审计状态
                             entry['hard_locked'] = True
                             entry['updated_at'] = time.time()
+                            txn_reg[identity] = dict(entry)
                             dirty = True
                             rolled_back += 1
                             self.send_tg_notification(
@@ -3334,6 +3630,7 @@ class CryptoTrader:
                         entry['hard_locked'] = True
                         entry['state'] = 'HARD_LOCK'
                         entry['updated_at'] = time.time()
+                        txn_reg[identity] = dict(entry)
                         dirty = True
                         rolled_back += 1
                         self.send_tg_notification(
@@ -3348,7 +3645,11 @@ class CryptoTrader:
                     # state=HARD_LOCK 且 hard_locked=true → 维持锁定（静默，等待人工）
                     # 其他状态 → 不干预
                 if dirty:
-                    self.save_batch_state(symbol, batch_id, b)
+                    # P0 Batch C 选项1（ChatGPT 批准 2026-08-29）：锁内直写——绕过
+                    # save_batch_state 的 C 类 merge（磁盘 ∈ 保护集 → 保留磁盘会吞掉
+                    # 本函数的合法回滚/补锁写，R2c 实证）。TG 告警已在上方锁外发送，
+                    # 持锁区仅做磁盘事务。
+                    self._commit_registry_txn(symbol, batch_id, reg_entries=txn_reg)
         return rolled_back, alerted
 
     def _build_intent(self, symbol, side, qty, order_type, stop_price=None, reduce_only=None):
@@ -3538,6 +3839,8 @@ class CryptoTrader:
         if b is None:
             return
         reg = b.get('protection_registry', {})
+        txn_reg = {}     # P0 Batch C 选项1：实际改动 identity 快照（锁内直写提交）
+        txn_fields = {}  # id 镜像 Commit（只补不清）
         changed = False
         for identity, entry in reg.items():
             if entry.get('state') not in ('PENDING_VERIFY', 'NOT_CONFIRMED'):
@@ -3560,6 +3863,7 @@ class CryptoTrader:
                 if entry.get('state') != 'NOT_CONFIRMED':
                     entry['state'] = 'NOT_CONFIRMED'
                     entry['updated_at'] = time.time()
+                    txn_reg[identity] = dict(entry)
                     changed = True
                 # R-B: 持续未确认升级告警（L1 生命周期不变量：失败状态通知 + 人工接管入口）——
                 # 连续 N 轮仍查不到 → critical 一次（不刷屏；成功/终结后计数自动清零）。
@@ -3594,6 +3898,7 @@ class CryptoTrader:
                 entry['state'] = 'ABSENT'
                 entry['updated_at'] = time.time()
                 entry['terminated_reason'] = f'lifecycle_ended_status_{_status}'
+                txn_reg[identity] = dict(entry)
                 changed = True
                 rounds = getattr(self, '_self_heal_unconfirmed_rounds', None)
                 if isinstance(rounds, dict):
@@ -3612,6 +3917,7 @@ class CryptoTrader:
                 # FOUND 但字段不匹配 → 错误订单/旧订单/其他批次订单：MISMATCH + critical + 不收编
                 entry['state'] = 'MISMATCH'
                 entry['updated_at'] = time.time()
+                txn_reg[identity] = dict(entry)
                 changed = True
                 if is_legacy_entry:
                     # F4b：启动前历史条目的状态同步 ≠ 新资金风险 → 降级为 info，不 TG/邮件
@@ -3628,17 +3934,24 @@ class CryptoTrader:
             role = entry.get('role')
             if role == 'SL' and b.get('current_sl_id') is None:
                 b['current_sl_id'] = order_id
+                txn_fields['current_sl_id'] = order_id
             elif role == 'TP' and b.get('tp_order_id') is None:
                 b['tp_order_id'] = order_id
+                txn_fields['tp_order_id'] = order_id
             entry['state'] = 'CONFIRMED'
             entry['updated_at'] = time.time()
+            txn_reg[identity] = dict(entry)
             changed = True
             # R-B: 确认成功 → 清零持续未确认轮次
             rounds = getattr(self, '_self_heal_unconfirmed_rounds', None)
             if isinstance(rounds, dict):
                 rounds.pop((symbol, batch_id, identity), None)
         if changed:
-            self.save_batch_state(symbol, batch_id, b)
+            # P0 Batch C 选项1（ChatGPT 批准 2026-08-29）：锁内直写——R3 收编
+            # （PENDING_VERIFY→CONFIRMED + id 镜像 Commit）不再被 C 类 merge 吞掉。
+            # API fetch / 告警已在上方锁外完成，持锁区仅做磁盘事务。
+            self._commit_registry_txn(symbol, batch_id, reg_entries=txn_reg,
+                                      batch_fields=txn_fields)
 
     def _reconcile_stale_protection_layers(self, symbol, batch_id, role, keep_order_id=None):
         """R-C（事件3根因C）：滚动撤销链补强 —— 新层汇总保护单已确认后，撤销 registry 中
@@ -3780,12 +4093,15 @@ class CryptoTrader:
             conditional = None
         if normal is None or conditional is None:
             # 快照 INVALID → 全部目标转 PENDING_VERIFY(id_unknown)，静默下轮再试（不误判无单）
-            for _, entry in targets:
+            txn_reg = {}  # P0 Batch C 选项1：锁内直写提交收集
+            for identity, entry in targets:
                 if entry.get('state') != 'PENDING_VERIFY' or entry.get('id_known'):
                     entry['state'] = 'PENDING_VERIFY'
                     entry['id_known'] = False
                     entry['updated_at'] = time.time()
-            self.save_batch_state(symbol, batch_id, b)
+                    txn_reg[identity] = dict(entry)
+            # P0 Batch C 选项1：锁内直写（绕过 C 类 merge，同 _update_registry 方案 A）
+            self._commit_registry_txn(symbol, batch_id, reg_entries=txn_reg)
             return
         # 合并统一视图（双通道按 id 去重，normal 优先保留字段）
         orders_by_id = {}
@@ -3796,6 +4112,7 @@ class CryptoTrader:
             if isinstance(o, dict) and o.get('id'):
                 orders_by_id.setdefault(o['id'], o)
         changed = False
+        txn_reg = {}  # P0 Batch C 选项1：锁内直写提交收集
         for identity, entry in targets:
             intent = entry.get('intent')
             matches = [oid for oid, o in orders_by_id.items()
@@ -3806,11 +4123,13 @@ class CryptoTrader:
                 entry['order_id'] = matches[0]
                 entry['id_known'] = True
                 entry['updated_at'] = time.time()
+                txn_reg[identity] = dict(entry)
                 changed = True
             elif len(matches) > 1:
                 # 命中多条 → NOT_CONFIRMED + critical（人工裁决，禁止自动收编多条）
                 entry['state'] = 'NOT_CONFIRMED'
                 entry['updated_at'] = time.time()
+                txn_reg[identity] = dict(entry)
                 changed = True
                 self.send_tg_notification(
                     f"🚨 **身份签名匹配命中多条订单（禁止自动收编）**\n"
@@ -3823,9 +4142,12 @@ class CryptoTrader:
                 # 快照 VALID 但未命中 → NOT_CONFIRMED（缺席≠从未存在：单可能已触发终结）
                 entry['state'] = 'NOT_CONFIRMED'
                 entry['updated_at'] = time.time()
+                txn_reg[identity] = dict(entry)
                 changed = True
         if changed:
-            self.save_batch_state(symbol, batch_id, b)
+            # P0 Batch C 选项1（ChatGPT 批准 2026-08-29）：锁内直写（绕过 C 类 merge）。
+            # 快照 API / critical 告警已在上方锁外完成，持锁区仅做磁盘事务。
+            self._commit_registry_txn(symbol, batch_id, reg_entries=txn_reg)
 
     def _rebuild_entry_orders_from_registry(self, symbol, batch_id):
         """B2-6（§6.3 + Case F）：从 protection_registry 重建 ENTRY 链——扫描全部
@@ -3921,7 +4243,22 @@ class CryptoTrader:
         if not b.get('last_filled_count'):
             b['pending_sl_orders'] = list(range(len(entry_orders)))
         b['updated_at'] = time.time()
-        self.save_batch_state(symbol, batch_id, b)
+        # P0 Batch C 选项1（ChatGPT 批准 2026-08-29）：锁内直写——R3b entry 链重建
+        # 只提交本函数重建的骨架字段（registry 是重建的输入，保留磁盘最新值不动）；
+        # 绕过 C 类 merge，防止收编后的 CONFIRMED 条目把重建写吞掉。
+        txn_fields = {
+            'entry_orders': entry_orders,
+            'target_amounts': target_amounts,
+            'batch_total_amount': b.get('batch_total_amount'),
+            'layer_sl_params': layer_sl_params,
+            'prepared_tp_params': b.get('prepared_tp_params'),
+            'updated_at': b.get('updated_at'),
+        }
+        if stop_steps:
+            txn_fields['stop_steps'] = stop_steps
+        if not b.get('last_filled_count'):
+            txn_fields['pending_sl_orders'] = list(range(len(entry_orders)))
+        self._commit_registry_txn(symbol, batch_id, batch_fields=txn_fields)
         return entry_orders, True
 
     def _verify_failure_msg(self, desc, order_id, symbol, verify_result):

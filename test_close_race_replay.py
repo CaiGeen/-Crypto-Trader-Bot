@@ -48,6 +48,8 @@ GREEN 正向断言（Batch A 修复行为锁定，防回退）：
   - MagicMock 数值比较必炸教训：所有数值属性绑定真实值
 """
 import io
+import os
+import tempfile
 import threading
 import time
 import traceback
@@ -282,12 +284,19 @@ def make_fake(store, ex):
                  '_clear_tp_param_invalid', '_check_protection_order_validity',
                  '_get_current_position_amt', '_cancel_remaining_entries',
                  '_cancel_limit_close_order',
-                 # P0 Batch A 新 helper 六件套（未绑定 → MagicMock 吸收调用，
-                 # N14 终态会写到 MagicMock key 上，GREEN 断言失效——G4 断言防此坑）
-                 '_final_pre_create_check', '_commit_protection_with_g3',
-                 '_g3a_converge_race_order', '_g3_cancel_race_order',
-                 '_g3_log_position_recheck', '_find_registry_identity_by_order_id'):
+    # P0 Batch A 新 helper 六件套（未绑定 → MagicMock 吸收调用，
+    # N14 终态会写到 MagicMock key 上，GREEN 断言失效——G4 断言防此坑）
+    '_final_pre_create_check', '_commit_protection_with_g3',
+    '_g3a_converge_race_order', '_g3_cancel_race_order',
+    '_g3_log_position_recheck', '_find_registry_identity_by_order_id',
+    # P0 Batch C 墓碑/merge 五件套（未绑定 → _merge_batch_state 返回 MagicMock
+    # 污染 store，批次落盘变空 dict，G1 冻结/G2 终态/G3 相位断言全空——2026-08-29 实证）
+    '_load_tombstones', '_persist_tombstones', '_prune_tombstones',
+    '_collect_batch_order_ids', '_merge_batch_state'):
         _bind_real(fake, name)
+    # C2 墓碑文件重定向 tmp（防 clear 写项目根 trade_tombstones.json）
+    fake.tombstone_file = os.path.join(tempfile.gettempdir(),
+                                       f"tomb_replay_{os.getpid()}_{id(fake)}.json")
     # 数值/容器属性（MagicMock 数值比较必炸教训）
     fake._active_monitors = set()
     fake._active_monitors_lock = threading.Lock()

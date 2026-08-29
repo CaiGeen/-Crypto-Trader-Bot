@@ -107,6 +107,15 @@ def make_fake(create_results=None, open_normal=None, open_conditional=None,
 
     fake.load_all_states = _load
     fake.save_batch_state = _save
+    # P0 Batch C 方案A+选项1（2026-08-29）：_update_registry / _commit_registry_txn 改为
+    # 锁内 load→modify→_persist_states 直写——fake 必须补真实锁 + 持久化映射 + 真实
+    # helper 绑定（MagicMock 吸收 → 收编/回滚写丢失 → B/C/D/E/F 假回归，同既有坑惯例）。
+    import threading as _th
+    fake._state_lock = _th.Lock()          # 生产同款非重入锁
+    fake._persist_states = lambda all_s: fake.states.update(copy.deepcopy(all_s))
+    if hasattr(CryptoTrader, '_commit_registry_txn'):
+        fake._commit_registry_txn = (
+            lambda s, b, **k: CryptoTrader._commit_registry_txn(fake, s, b, **k))
     fake.clear_batch_state = lambda s, b: fake.states.get(s, {}).pop(b, None)
     fake._check_existing_conflicts = lambda s, b, all_states: False
     fake._get_current_position_amt = lambda s, is_hedge_mode=False, side=None: 0.0

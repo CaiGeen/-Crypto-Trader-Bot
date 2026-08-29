@@ -32,16 +32,30 @@ def report(name, passed, detail=""):
 
 
 class PersistFake:
-    """最小 fake：真实 _state_lock + 委托真实 load/_persist（STATE_FILE 已被 patch 到临时目录）"""
+    """最小 fake：真实 _state_lock + 委托真实 load/_persist（STATE_FILE 已被 patch 到临时目录）
+    P0 Batch C（2026-08-29）：save/clear 重写后新增墓碑调用链——补三个委托 +
+    tombstone_file 重定向 tmp（绝不触碰项目根 trade_tombstones.json；墓碑语义
+    由 test_c_batch.py 22 项覆盖，本测试专注 .bak 契约）。"""
 
     def __init__(self):
         self._state_lock = threading.Lock()
+        self.tombstone_file = os.path.join(
+            tempfile.gettempdir(), f"r12_tomb_{os.getpid()}_{id(self)}.json")
 
     def load_all_states(self):
         return CryptoTrader.load_all_states(self)
 
     def _persist_states(self, all_states):
         return CryptoTrader._persist_states(self, all_states)
+
+    def _load_tombstones(self):
+        return CryptoTrader._load_tombstones(self)
+
+    def _persist_tombstones(self, tombstones):
+        return CryptoTrader._persist_tombstones(self, tombstones)
+
+    def _collect_batch_order_ids(self, b_data):
+        return CryptoTrader._collect_batch_order_ids(self, b_data)
 
 
 def read_json(path):
