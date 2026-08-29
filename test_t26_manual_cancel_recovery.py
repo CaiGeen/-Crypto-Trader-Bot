@@ -61,6 +61,18 @@ def _make_fake(states):
     fake._verify_and_update_registry = lambda s, b, i, oid, **kw: CryptoTrader._verify_and_update_registry(
         fake, s, b, i, oid, **kw)
     fake._verify_order_created = lambda oid, sym, order_kind='conditional': 'success'
+    # Batch A（P0 平仓竞态修复）后：_verify_and_update_registry 成功提交改走 G3b 提交链，
+    # 未绑定时 MagicMock ≠ 'committed' → 不写 CONFIRMED（C3 实证：state 停留 PENDING_CREATE，
+    # 同 t25 A4 模式）。G3a 链 + 反查同绑；states 共享引用无需落盘。
+    import threading as _th
+    fake._state_lock = _th.Lock()          # 生产同款非重入锁
+    fake._persist_states = lambda all_s: None
+    for _n in ('_final_pre_create_check', '_commit_protection_with_g3',
+               '_g3a_converge_race_order', '_g3_cancel_race_order',
+               '_g3_log_position_recheck', '_find_registry_identity_by_order_id'):
+        if hasattr(CryptoTrader, _n):
+            setattr(fake, _n,
+                    (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(fake, *a, **k))())
     return fake
 
 
@@ -182,8 +194,8 @@ def t_no_repair_semantics_and_source():
     # C4: 源码断言——F2 分支区分 程序撤单/用户修改/外部撤销（is_programmatic / user_modified）
     src = open('trader_260725.py', encoding='utf-8').read()
     lines = src.splitlines()
-    sl_seg = '\n'.join(lines[4434:4484])  # F2 SL terminal 分支（D-010 Batch2 插码 +235 偏移后实测，2026-08-28）
-    tp_seg = '\n'.join(lines[4569:4619])  # F2 TP terminal 分支
+    sl_seg = '\n'.join(lines[4692:4732])  # F2 SL terminal 分支（Batch A +466 插码后 AST 复核，2026-08-28）
+    tp_seg = '\n'.join(lines[4832:4871])  # F2 TP terminal 分支
     report("C4/F2区分程序撤单/用户修改/外部撤销",
            'is_programmatic_cancel' in sl_seg and 'user_modified' in sl_seg
            and 'need_recover_sl = True' in sl_seg
@@ -200,7 +212,7 @@ def t_no_repair_semantics_and_source():
 
     # C6: 行为——用户修改（user_modified=True）撤单后不自动补挂（need_recover 不触发）
     #     即 F2 分支 user_modified → current_sl_id=None 但无 need_recover（修改后实测 L4105-4107 区）
-    seg_user = '\n'.join(lines[4452:4464])  # user_modified 分支（Batch2 后偏移 +235）
+    seg_user = '\n'.join(lines[4721:4731])  # user_modified 分支（Batch A 后 4724-4727 实测）
     report("C6/用户修改撤单不自动补挂",
            '用户主动修改' in seg_user and '不再自动补挂' in seg_user,
            f"(user_modified分支={'用户主动修改' in seg_user and '不再自动补挂' in seg_user})")

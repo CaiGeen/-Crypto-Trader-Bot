@@ -129,6 +129,19 @@ def scenario_6():
     fake._build_intent = lambda **k: {'stub': True}
     fake._update_registry = lambda *a, **k: None
     fake._verify_order_created = lambda oid, sym, kind: 'success'
+    # P0 Batch A（2026-08-28）：_place_prepared 路径新增 G2 紧前复核（L5774/5934 解包
+    # ` _g2_ok, _g2_reason = self._final_pre_create_check(...)`）+ G3b 原子提交
+    # （L5842/6002）——未绑定时 MagicMock 迭代为空 → "not enough values to unpack"
+    # 被 except 吞 → 下单中断（同 _assert_create_allowed 既有坑，绑定真实语义）
+    import threading as _th
+    fake._state_lock = _th.Lock()          # 生产同款非重入锁
+    fake._persist_states = lambda all_s: None   # states 共享引用，无需落盘
+    for _n in ('_final_pre_create_check', '_commit_protection_with_g3',
+               '_g3a_converge_race_order', '_g3_cancel_race_order',
+               '_g3_log_position_recheck', '_find_registry_identity_by_order_id'):
+        if hasattr(CryptoTrader, _n):
+            setattr(fake, _n,
+                    (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(fake, *a, **k))())
     # R2/R3（ChatGPT 终审 2026-08-20）：预生成挂单段新增 TP 补挂预检 helper
     #（本场景只测 READY Gate 独立性，TP 可行性校验语义由 test_sg4/sg3_p1 覆盖 → 纯桩放行）
     fake._tp_invalid_alerted = {}

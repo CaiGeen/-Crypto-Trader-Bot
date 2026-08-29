@@ -68,9 +68,14 @@ RESULTS = []
 # ⚠️ D-010 Batch 2（2026-08-28）：AUTH_BLOCKED 闸门/恢复链/事件队列插码 → L2415 前 +229，其后 +235。
 #      AST 重新实测 2026-08-28（与改前备份 14/14 一一对应同函数，纯插码零语义变化）：
 #      create = [1651, 1808, 2022, 2644, 4194, 4268, 4885, 5042, 5214, 5517, 5664, 5816, 6071, 6287]
-A_LINES = {1651, 1808, 2022, 4194, 4268, 4885, 5042, 5214, 5517, 5664, 5816}  # 11 处保护单
-B_LINES = {2644}                                                              # 1 处开仓条件单
-C_LINES = {6071, 6287}                                                        # 2 处平仓单
+# ⚠️ P0 Batch A（2026-08-28 晚）：G1/G2/G3/冻结/N14/回滚收紧插码 → 位移（+466/-70）。
+#      AST 重新实测 2026-08-28 晚（与 backups/20260828_p0_batcha_before_/ 14/14
+#      一一对应同函数 update_batch_tp/update_batch_sl/_update_sl_no_validation/execute_signal/
+#      _start_monitoring×5/_place_prepared×3/close_position_market/close_position_limit，纯插码）：
+#      create = [1657, 1820, 2040, 2663, 4441, 4521, 5155, 5318, 5496, 5805, 5965, 6130, 6395, 6648]
+A_LINES = {1657, 1820, 2040, 4441, 4521, 5155, 5318, 5496, 5805, 5965, 6130}  # 11 处保护单
+B_LINES = {2663}                                                              # 1 处开仓条件单
+C_LINES = {6395, 6648}                                                        # 2 处平仓单
 ALL_LINES = A_LINES | B_LINES | C_LINES                                       # 14 处
 
 
@@ -401,6 +406,20 @@ def make_fake(states, open_orders):
     if hasattr(CryptoTrader, '_assert_create_allowed'):
         fake._assert_create_allowed = (
             lambda s, b, i, **k: CryptoTrader._assert_create_allowed(fake, s, b, i, **k))
+    # P0 Batch A（2026-08-28）：恢复链新增 G2 紧前复核（解包 `_g2_ok, _g2_reason =
+    # self._final_pre_create_check(...)`）——未绑定时 MagicMock 迭代为空 → unpack
+    # ValueError 被监控循环 except 吞 → H1/H4 恢复链 create 落空（H4 实证：
+    # "挂出止盈单失败: not enough values to unpack"）。G3b/G3a 链同绑。
+    import threading as _th
+    fake._state_lock = _th.Lock()          # 生产同款非重入锁
+    fake._persist_states = lambda all_s: None
+    for _n in ('_final_pre_create_check', '_commit_protection_with_g3',
+               '_g3a_converge_race_order', '_g3_cancel_race_order',
+               '_g3_log_position_recheck', '_find_registry_identity_by_order_id',
+               '_verify_and_update_registry'):
+        if hasattr(CryptoTrader, _n):
+            setattr(fake, _n,
+                    (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(fake, *a, **k))())
     # R2/R3（ChatGPT 终审 2026-08-20）：补挂止盈预检 helper 真实绑定——
     # MagicMock 未绑定时 `_tp_update_blocked` 返回 truthy mock → `not` → False → H4 TP 恢复链整个被跳过。
     # H4 中 TP=60000 > max(现价100, 成本100) → 真实 R2 判定 valid → 恢复放行。

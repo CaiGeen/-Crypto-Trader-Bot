@@ -65,6 +65,19 @@ def _bind_helpers(fake, states):
     if hasattr(CryptoTrader, '_assert_create_allowed'):
         fake._assert_create_allowed = (
             lambda s, b, i, **k: CryptoTrader._assert_create_allowed(fake, s, b, i, **k))
+    # P0 Batch A（2026-08-28）新 helper：预生成止损单路径含 G2 紧前复核
+    # （`_g2_ok, _g2_reason = self._final_pre_create_check(...)`）——未绑定时 MagicMock
+    # 迭代为空 → "not enough values to unpack (expected 2, got 0)" 被 except 吞 → create 路径中断
+    #（同 _assert_create_allowed 的既有坑，第 5 次实证；G3b/G3a/反查同绑防后续路径触达）。
+    import threading as _th
+    fake._state_lock = _th.Lock()          # 生产同款非重入锁（L153）
+    fake._persist_states = lambda all_s: None   # states 为共享引用，无需落盘
+    for _n in ('_final_pre_create_check', '_commit_protection_with_g3',
+               '_g3a_converge_race_order', '_g3_cancel_race_order',
+               '_g3_log_position_recheck', '_find_registry_identity_by_order_id',
+               '_verify_and_update_registry'):
+        if hasattr(CryptoTrader, _n):
+            setattr(fake, _n, (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(fake, *a, **k))())
     return fake
 
 

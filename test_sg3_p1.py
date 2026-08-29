@@ -230,6 +230,20 @@ def make_fake(states, open_orders):
     if hasattr(CryptoTrader, '_assert_create_allowed'):
         fake._assert_create_allowed = (
             lambda s, b, i, **k: CryptoTrader._assert_create_allowed(fake, s, b, i, **k))
+    # P0 Batch A（2026-08-28）：恢复链（补挂止损/止盈）新增 G2 紧前复核（解包
+    # `_g2_ok, _g2_reason = ...`）——未绑定时 MagicMock 迭代为空 → unpack ValueError
+    # 被监控循环外层 except 吞 → C/E 组恢复链 create 落空（同 _assert_create_allowed 坑）。
+    # G3b/G3a 链同绑（_persist_states 桩 + states 共享引用，registry 语义由 B2 套件覆盖）。
+    import threading as _th
+    fake._state_lock = _th.Lock()          # 生产同款非重入锁
+    fake._persist_states = lambda all_s: None
+    for _n in ('_final_pre_create_check', '_commit_protection_with_g3',
+               '_g3a_converge_race_order', '_g3_cancel_race_order',
+               '_g3_log_position_recheck', '_find_registry_identity_by_order_id',
+               '_verify_and_update_registry'):
+        if hasattr(CryptoTrader, _n):
+            setattr(fake, _n,
+                    (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(fake, *a, **k))())
     fake._check_protection_order_validity = (
         lambda ord, expected_side, is_hedge_mode, position_side, required_amount:
         CryptoTrader._check_protection_order_validity(

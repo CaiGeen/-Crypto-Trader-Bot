@@ -62,6 +62,18 @@ def _make_fake(states):
     fake._protection_identity = lambda b, r, l, s: CryptoTrader._protection_identity(fake, b, r, l, s)
     # verify 结果可控：success（恢复链）/ not_found / unknown
     fake._verify_order_created = lambda oid, sym, order_kind='conditional': 'success'
+    # P0 Batch A（2026-08-28）：_verify_and_update_registry 成功提交改走 G3b
+    # （_commit_protection_with_g3）——未绑定时 MagicMock ≠ 'committed' → 不写 CONFIRMED
+    #（A4 实证：state 停留 PENDING_CREATE）。G3a 链 + 反查同绑；states 共享引用无需落盘。
+    import threading as _th
+    fake._state_lock = _th.Lock()          # 生产同款非重入锁
+    fake._persist_states = lambda all_s: None
+    for _n in ('_final_pre_create_check', '_commit_protection_with_g3',
+               '_g3a_converge_race_order', '_g3_cancel_race_order',
+               '_g3_log_position_recheck', '_find_registry_identity_by_order_id'):
+        if hasattr(CryptoTrader, _n):
+            setattr(fake, _n,
+                    (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(fake, *a, **k))())
     return fake
 
 
@@ -168,18 +180,19 @@ def t_b_partial_reduce_keep_old():
     lines = src.splitlines()
     create_at = [i + 1 for i, ln in enumerate(lines) if 'self.exchange.create_order,' in ln]
     cancel_at = [i + 1 for i, ln in enumerate(lines) if 'self.exchange.cancel_order,' in ln]
-    # 部分减仓 SL 段：create 在 L4194、cancel 在 L4216（D-010 Batch2 插码 +235 偏移后 AST 重新实测，2026-08-28）
-    create_line = 4194 if 4194 in create_at else None
-    cancel_line = 4216 if 4216 in cancel_at else None
-    seg = '\n'.join(lines[4209:4249])  # 部分减仓 SL 段 create→verify→撤旧→except 区间
+    # 部分减仓 SL 段：create 在 L4441、cancel 在 L4463（P0 Batch A 插码位移后 AST 重新实测，2026-08-28 晚；
+    # D-010 Batch2 时代为 4194/4216，与 backups/20260828_p0_batcha_before_/ 同函数纯插码对应）
+    create_line = 4441 if 4441 in create_at else None
+    cancel_line = 4463 if 4463 in cancel_at else None
+    seg = '\n'.join(lines[4456:4496])  # 部分减仓 SL 段 create→verify→撤旧→except 区间（Batch A 偏移后）
     report("B1/先建后撤+旧单保留注释",
-           create_line == 4194 and cancel_line == 4216 and create_line < cancel_line
+           create_line == 4441 and cancel_line == 4463 and create_line < cancel_line
            and '旧单保留' in seg and '挂新失败' in seg,
            f"(create={create_line}, cancel={cancel_line}, 注释存在={'旧单保留' in seg and '挂新失败' in seg})")
 
     # B2: 源码断言——verify 失败分支"不 Commit/不撤旧"（registry 不写 ABSENT、不调 cancel_order）
     lines2 = src.splitlines()
-    vf_seg = '\n'.join(lines2[4202:4212])  # verify_result != 'success' → 日志+告警（Batch2 后偏移 +235）
+    vf_seg = '\n'.join(lines2[4449:4459])  # verify_result != 'success' → 日志+告警（Batch A 偏移后）
     report("B2/verify失败不Commit不撤旧",
            '不 Commit/不撤旧' in vf_seg and 'cancel_order' not in vf_seg,
            f"(不Commit/不撤旧={'不 Commit/不撤旧' in vf_seg}, 无cancel={'cancel_order' not in vf_seg})")
