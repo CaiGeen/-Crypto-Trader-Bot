@@ -1,0 +1,74 @@
+diff --git a/trader_260725.py b/trader_260725.py
+index 9c4ba59..be44aa0 100644
+--- a/trader_260725.py
++++ b/trader_260725.py
+@@ -2733,7 +2733,30 @@ class CryptoTrader:
+             return False, f"批次 {', '.join(missing)} 缺少有效止损单（无 SL 或已被交易所撤除）"
+         return True, ""
+ 
+-    def _check_existing_conflicts(self, symbol: str, batch_id: str, all_states: dict) -> bool:
++    def _compute_signal_fingerprint(self, signal) -> str:
++        """🔥 v6.3（D-005 开仓幂等）：规范化原始信号意图指纹。
++
++        组件 = symbol|side|entries(price,amount)|stop_steps|TP，数值全部过
++        price_to_precision/amount_to_precision（77880/77880.0 不漂移）。
++        描述的是【用户原始交易意图】：与当前市价无关、不使用 post-skip 层集合
++        （重发时价格穿层会改变 skip 集，post-skip 指纹会在最需要拦截时漂移）。
++        stop_steps 直接使用实际列表逐项规范化，不人为补层——幂等层不负责
++        修复/解释缺失 stop step（异常输入由既有合法性校验负责）。
++        不含 batch_id/时间戳/文案/uuid——同一意图必须得到同一指纹。
++        """
++        parts = [f"sym={signal.symbol}", f"side={signal.side.upper()}"]
++        parts.append("entries=" + ";".join(
++            f"{self.exchange.price_to_precision(signal.symbol, p)},"
++            f"{self.exchange.amount_to_precision(signal.symbol, a)}"
++            for p, a in signal.entries))
++        parts.append("stops=" + ";".join(
++            self.exchange.price_to_precision(signal.symbol, s)
++            for s in signal.stop_loss_steps))
++        parts.append(f"tp={self.exchange.price_to_precision(signal.symbol, signal.take_profit)}")
++        return "|".join(parts)
++
++    def _check_existing_conflicts(self, symbol: str, batch_id: str, all_states: dict,
++                                  signal_fingerprint: str = None) -> bool:
+         print(f"\n🔍 正在针对批次 [{batch_id}] 进行防冲突扫描...")
+ 
+         symbol_state = all_states.get(symbol, {})
+@@ -2742,6 +2765,18 @@ class CryptoTrader:
+             print(f"❌ 【批次冲突】批次 [{batch_id}] 目前已在运行中！请勿重复执行。")
+             return True
+ 
++        # 🔥 v6.3（D-005 开仓幂等）：active 同指纹 → 拒绝第二批次。
++        # entry_orders=[] 不豁免——PENDING_CREATE 语义 = create 可能已发出，
++        # 空 skeleton 无法证明未发单；对账/收编由既有恢复机制负责（只 Commit 不 Create）。
++        # 纯本地判据前置 → 拒绝路径零 API 权重。
++        if signal_fingerprint:
++            for _bid, _b in symbol_state.items():
++                if _bid == batch_id or not isinstance(_b, dict) or not _b.get('is_active'):
++                    continue
++                if _b.get('signal_fingerprint') == signal_fingerprint:
++                    print(f"❌ 【开仓幂等】已存在相同交易意图的活跃批次 [{_bid}]，拒绝重复开仓。")
++                    return True
++
+         known_order_ids = set()
+         for b_id, b_data in symbol_state.items():
+             if not b_data.get('is_active'):
+@@ -2938,7 +2973,9 @@ class CryptoTrader:
+                 pass
+             return None
+ 
+-        if self._check_existing_conflicts(symbol, batch_id, all_states):
++        # 🔥 v6.3（D-005）：指纹在冲突扫描前计算——描述原始意图，与市价/跳层无关
++        _signal_fp = self._compute_signal_fingerprint(signal)
++        if self._check_existing_conflicts(symbol, batch_id, all_states, _signal_fp):
+             return None
+ 
+         base_currency = symbol.split('/')[0] if '/' in symbol else symbol.replace('USDT', '')
+@@ -3124,6 +3161,7 @@ class CryptoTrader:
+                 'batch_id': batch_id,
+                 'symbol': symbol,
+                 'side': side,
++                'signal_fingerprint': _signal_fp,  # 🔥 v6.3（D-005）：开仓幂等指纹
+                 'entry_layers': list(skeleton_entry_layers),
+                 'entry_stop_steps': [signal.stop_loss_steps[i] if i < len(signal.stop_loss_steps) else 0.0
+                                      for i in skeleton_entry_layers],

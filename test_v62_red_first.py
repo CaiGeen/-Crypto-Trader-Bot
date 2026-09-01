@@ -50,7 +50,10 @@ import ccxt
 PROJECT_DIR = os.environ.get('V62_PROJECT_DIR', r'G:/my-crypto-bot')
 HELPER_PATH = (os.environ.get('V62_HELPER_OVERRIDE')
                or os.path.join(PROJECT_DIR, '送审附件_v6.1', 'new_helpers_v6.py'))
-PROD_PATH = os.path.join(PROJECT_DIR, 'trader_260725.py')
+# 🔒 v6.2 落产后再基线（2026-09-01）：RED 用例的判别对象是【旧生产】。生产文件已被
+# v6.2 覆盖，继续指向它会让 R1-i/R1-b 等用例转 GREEN_AGAINST_OLD（判别力失效）。
+# 旧生产已固化为存档（= e953d79 工作区原件，7859 行，规范化等价），RED 基线从此恒定。
+PROD_PATH = os.path.join(PROJECT_DIR, '送审附件_v6.1', 'trader_260725_v61_production_archive.py')
 
 SYM = 'BTC/USDT:USDT'
 
