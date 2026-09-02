@@ -1,0 +1,258 @@
+diff --git a/trader_260725.py b/trader_260725.py
+index 6067fbc..39f64db 100644
+--- a/trader_260725.py
++++ b/trader_260725.py
+@@ -39,7 +39,7 @@ TOMBSTONE_TTL_SECONDS = 7 * 24 * 3600
+ #   A 棘轮（close_phase 专列 int max）/ G user_modified OR / B 单调账本 /
+ #   C registry 逐 identity / D id 镜像 / E 静态幂等 / F 簿记最新者胜（默认）。
+ _MERGE_RATCHET_BOOL_FIELDS = ('pending_close', 'is_programmatic_cancel',
+-                              'settled_by_limit_close')
++                              'settled_by_limit_close', 'settlement_reported')
+ 
+ 
+ def _partial_resize_owner_ok(b, owner_op_id):
+@@ -3241,6 +3241,45 @@ class CryptoTrader:
+         with self._resize_inflight_lock:
+             self._resize_inflight.discard(batch_id)
+ 
++    def _monitor_lifecycle_check(self, latest_all, latest_b_data):
++        """🔥 v6.4-P3：monitor 生命周期守卫（每轮/每分支重证生存资格，ChatGPT 冻结规格）。
++
++        三态返回：
++          'ok'      账本可信 + batch 仍 active → 继续本轮工作
++          'exit'    账本可信 + batch 缺失/非 active → 线程必须立即退出
++                    （磁盘生命周期是唯一权威：clear_batch_state 迁移到 CLOSED 后，
++                    任何旧内存线程立即失去产生交易副作用与终端报告的资格）
++          'unknown' 账本损坏（D-009：load_all_states 返回 {} 且 _state_corrupted=True）
++                    → 本轮跳过全部副作用。UNKNOWN ≠ EMPTY——损坏的 {} 绝不解释为
++                    「batch 已被清理」，防止为修僵尸线程重新引入 UNKNOWN→误清 的旧错误。
++        调用方约定：必须在任何交易所 API / 结算 / 补挂 / converge 之前调用。"""
++        if getattr(self, '_state_corrupted', False):
++            return 'unknown'
++        if not isinstance(latest_b_data, dict) or not latest_b_data.get('is_active'):
++            return 'exit'
++        return 'ok'
++
++    def _claim_settlement_reported(self, symbol, batch_id):
++        """🔥 v6.4-P3（Fix④）：terminal 结算报告原子认领（_state_lock 内 CAS）。
++
++        唯一 owner 才允许打印/发送 [平仓结算] 报告（at-most-once）：
++          锁内重读 → batch 仍 active + settlement_reported 非 True
++          → 写 True + durable persist → 当前线程取得 ownership。
++        persist 失败 / 已被认领 / 批次已消失 → False（不发送）。
++        权衡：persist-先于-发送，极端崩溃窗口允许少发一次通知（墓碑仍在），
++        绝不允许重复发送几十次假结算（2026-09-02 18:45 实盘事故）。"""
++        with self._state_lock:
++            latest_all = self.load_all_states()
++            b = (latest_all.get(symbol, {}) or {}).get(batch_id)
++            if not isinstance(b, dict) or not b.get('is_active'):
++                return False
++            if b.get('settlement_reported'):
++                return False
++            b['settlement_reported'] = True
++            if not self._persist_states(latest_all):
++                return False
++            return True
++
+     def _maybe_runtime_resume_partial(self, symbol, batch_id, close_op_id):
+         """🔥 v6.4-P1：monitor 冻结分支的 partial 运行期自愈调度（60s 节流）。
+ 
+@@ -5225,6 +5264,18 @@ class CryptoTrader:
+                     fast_poll_count -= 1
+ 
+                 time.sleep(sleep_interval)
++                # 🔥 v6.4-P3（G1）：生命周期守卫——醒来后先重证生存资格，再允许任何 API。
++                # 磁盘生命周期是唯一权威：批次已被对账/清理（如 /auth_reset）→ 线程立即退出
++                # （零 API/零结算/零补挂）。UNKNOWN ≠ EMPTY：账本损坏绝不解释为「已清理」。
++                _g1_all = self.load_all_states()
++                _g1_state = self._monitor_lifecycle_check(
++                    _g1_all, _g1_all.get(symbol, {}).get(batch_id, {}))
++                if _g1_state == 'exit':
++                    print(f"  └─ 🛬 [生命周期] 批次 {batch_id} 已从账本消失/停用，监控线程正常退出（零 API 零副作用）")
++                    break
++                if _g1_state == 'unknown':
++                    print(f"  └─ ⏸️ [生命周期] 账本 UNKNOWN（损坏），本轮跳过全部轮询副作用")
++                    continue
+                 self._sync_time_if_needed()
+ 
+                 # 🔥 R-B: 运行期周期自愈重查（事件3根因B）——每 ~30s 重查一次 registry 未决条目
+@@ -5495,6 +5546,16 @@ class CryptoTrader:
+                     if current_actual_position == 0:
+                         latest_all = self.load_all_states()
+                         latest_b_data = latest_all.get(symbol, {}).get(batch_id, {})
++                        # 🔥 v6.4-P3（G2）：TOCTOU 二次守卫——G1 通过后本周期内批次可能已被
++                        # /auth_reset 对账清理；结算/撤单/converge 前必须重证生存资格。
++                        # （2026-09-02 18:45 实盘：僵尸监控对已墓碑批次反复发假结算报告）
++                        _lc2 = self._monitor_lifecycle_check(latest_all, latest_b_data)
++                        if _lc2 == 'exit':
++                            print(f"  └─ 🛬 [生命周期] 批次 {batch_id} 已被对账/外部归档，监控线程退出（零结算零副作用）")
++                            break
++                        if _lc2 == 'unknown':
++                            print(f"  └─ ⏸️ [生命周期] 账本 UNKNOWN（损坏），本轮跳过归零结算")
++                            continue
+ 
+                         # 🔥 如果已被限价平仓监控处理，跳过重复结算
+                         if latest_b_data.get('settled_by_limit_close', False):
+@@ -5524,7 +5585,10 @@ class CryptoTrader:
+                         # latest_b_data；finally 区才赋值 b_data → 局部变量未绑定）
+                         # → 外部（app 手动）全平场景监控线程崩溃，批次失去 SL/TP 维护
+                         # （2026-09-02 16:30 实盘事故，ChatGPT 终审 P0 批准修复）
+-                        if batch_filled_amount > 0:
++                        # 🔥 v6.4-P3（Fix④）：结算报告原子认领——_state_lock 内 CAS，
++                        # 唯一 owner 才打印/发送（at-most-once；persist 失败/已认领/批次
++                        # 消失 → 不发送）。converge UNKNOWN 重试轮绝不重复发报告。
++                        if batch_filled_amount > 0 and self._claim_settlement_reported(symbol, batch_id):
+                             # 计算持仓均价（含手续费）
+                             _net_qty, _net_cost = self._batch_net_position(latest_b_data)
+                             _rr_cost = float(latest_b_data.get('realized_reduce_cost', 0.0) or 0.0)
+@@ -5533,6 +5597,10 @@ class CryptoTrader:
+                                 if _gross_cost > 0 else 0.0
+                             total_cost_with_fee = _net_cost + _fee_rem
+                             avg_price_with_fee = total_cost_with_fee / _net_qty if _net_qty > 0 else 0
++                            # 🔥 v6.4-P3（R2 修正）：结算数量统一用 durable 净量——
++                            # partial 后内存 gross（batch_filled_amount）不再是剩余仓位，
++                            # PnL/手续费/报告数量全部按 _net_qty（2026-09-02 实盘「数量也不对」）
++                            settlement_qty = _net_qty
+ 
+                             # 获取当前市价（平仓价格）
+                             try:
+@@ -5543,16 +5611,16 @@ class CryptoTrader:
+ 
+                             # 计算盈亏
+                             if side == 'BUY':
+-                                gross_pnl = (exit_price - avg_price_with_fee) * batch_filled_amount
++                                gross_pnl = (exit_price - avg_price_with_fee) * settlement_qty
+                             else:
+-                                gross_pnl = (avg_price_with_fee - exit_price) * batch_filled_amount
++                                gross_pnl = (avg_price_with_fee - exit_price) * settlement_qty
+ 
+                             # 估算平仓手续费（市价平仓用 TAKER_FEE_RATE）
+-                            exit_fee = exit_price * batch_filled_amount * TAKER_FEE_RATE
++                            exit_fee = exit_price * settlement_qty * TAKER_FEE_RATE
+                             total_fees = total_entry_fee + exit_fee
+                             net_pnl = gross_pnl - total_fees
+ 
+-                            capital_base = avg_price_with_fee * batch_filled_amount if batch_filled_amount > 0 else 1
++                            capital_base = avg_price_with_fee * settlement_qty if settlement_qty > 0 else 1
+                             net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
+ 
+                             # 构建盈亏报告
+@@ -5566,7 +5634,7 @@ class CryptoTrader:
+                                 f"📊 **已成交层数**：`{batch_filled_count}/{len(entry_orders)}`\n"
+                                 f"📈 **持仓均价**：`{avg_price_with_fee:.2f}` USDT\n"
+                                 f"💵 **平仓价格**：`{exit_price:.2f}` USDT\n"
+-                                f"🔢 **平仓数量**：`{batch_filled_amount}`\n"
++                                f"🔢 **平仓数量**：`{settlement_qty}`\n"
+                                 f"📊 **名义盈亏**：`{gross_pnl:+.2f}` USDT\n"
+                                 f"💸 **总手续费**：`{total_fees:.4f}` USDT\n"
+                                 f"{pnl_emoji} **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
+@@ -5851,6 +5919,15 @@ class CryptoTrader:
+ 
+                 latest_all = self.load_all_states()
+                 latest_b_data = latest_all.get(symbol, {}).get(batch_id, {})
++                # 🔥 v6.4-P3（G3）：保护单维护前生命周期守卫——sibling 仍有持仓时僵尸线程
++                # 不会命中归零分支，必须在此重证生存资格（绝不维护/补挂已清理批次的 SL/TP）。
++                _lc3 = self._monitor_lifecycle_check(latest_all, latest_b_data)
++                if _lc3 == 'exit':
++                    print(f"  └─ 🛬 [生命周期] 批次 {batch_id} 已从账本消失/停用，监控线程退出（保护单维护终止）")
++                    break
++                if _lc3 == 'unknown':
++                    print(f"  └─ ⏸️ [生命周期] 账本 UNKNOWN（损坏），本轮保护单维护跳过")
++                    continue
+ 
+                 if latest_b_data and 'pending_sl_orders' in latest_b_data:
+                     pending_sl_orders = latest_b_data.get('pending_sl_orders', [])
+@@ -7009,48 +7086,53 @@ class CryptoTrader:
+                 print(f"  └─ ⚠️ 清理程序撤单标记失败: {e}")
+ 
+             # 检查是否有持仓，如果没有则清理批次状态
+-            try:
+-                positions = self._safe_api_call(self.exchange.fetch_positions, [symbol])
+-                current_pos = 0.0
+-                for pos in positions:
+-                    if pos.get('symbol') == symbol or pos.get('info', {}).get('symbol') == \
+-                            symbol.replace('/', '').split(':')[0]:
+-                        current_pos = abs(float(pos.get('contracts', 0) or pos.get('positionAmt', 0)))
+-                        break
+-            except Exception:
+-                current_pos = None  # R11: UNKNOWN ≠ EMPTY，查询失败不得当作无持仓
++            # 🔥 v6.4-P3（G1 配套）：生命周期守卫——批次已不在账本（G1/G2/G3 exit 路径）
++            # 时，兜底 census 与清理全部无意义 → 直接跳过（零 API 收尾）。
++            _fin_all = self.load_all_states()
++            _fin_b = _fin_all.get(symbol, {}).get(batch_id, {})
++            if isinstance(_fin_b, dict) and _fin_b.get('is_active'):
++                try:
++                    positions = self._safe_api_call(self.exchange.fetch_positions, [symbol])
++                    current_pos = 0.0
++                    for pos in positions:
++                        if pos.get('symbol') == symbol or pos.get('info', {}).get('symbol') == \
++                                symbol.replace('/', '').split(':')[0]:
++                            current_pos = abs(float(pos.get('contracts', 0) or pos.get('positionAmt', 0)))
++                            break
++                except Exception:
++                    current_pos = None  # R11: UNKNOWN ≠ EMPTY，查询失败不得当作无持仓
+ 
+-            # 如果确认无持仓，清理批次
+-            if current_pos is not None and current_pos == 0:
+-                all_states = self.load_all_states()
+-                b_data = all_states.get(symbol, {}).get(batch_id, {})
+-                if b_data:
+-                    # P0 Batch B：converge 证明后才 clear；finally 无循环可重试，
+-                    # 未收敛则保留状态 + 告警（持仓已归零，仅剩订单面收敛）
+-                    _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+-                    if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+-                        print(f"  └─ 🧹 无持仓，已清理批次状态（proof 收敛通过）")
+-                    else:
+-                        print(f"  └─ ⚠️ [B] 无持仓批次 {batch_id} 本轮未收敛"
+-                              f"（UNKNOWN/撤单失败），保留状态待重启恢复重试")
+-            elif current_pos is None:
+-                print(f"  └─ ⚠️ 持仓查询失败(UNKNOWN)，保留批次状态不清理")
+-            else:
+-                # 🔥 v6.2-P0-2（实盘 2026-09-01 17:4x）：symbol 级聚合持仓不能归属本批次——
+-                # 零成交 + 程序撤单收尾的批次自身持仓恒为 0，聚合 > 0 只可能来自其他批次
+-                # （实例：f1e135 被新批次 29ca35 的 0.001 卡成 zombie，进而以 close-in-flight
+-                # 阻塞同方向 single-flight，挡死真实活仓平仓）。此时继续走 converge/clear 收尾。
+-                _zb = (self.load_all_states().get(symbol, {}) or {}).get(batch_id, {}) or {}
+-                if (_zb.get('pending_close') or _zb.get('is_programmatic_cancel')) \
+-                        and int(_zb.get('last_filled_count', 0) or 0) == 0:
+-                    print(f"  └─ ℹ️ 聚合持仓 {current_pos} 属于其他批次（本批次零成交已撤单），继续收敛清理")
+-                    _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+-                    if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+-                        print(f"  └─ 🧹 零成交撤单批次已清理（proof 收敛通过）")
+-                    else:
+-                        print(f"  └─ ⚠️ [B] 零成交撤单批次 {batch_id} 本轮未收敛，保留状态待重启恢复重试")
++                # 如果确认无持仓，清理批次
++                if current_pos is not None and current_pos == 0:
++                    all_states = self.load_all_states()
++                    b_data = all_states.get(symbol, {}).get(batch_id, {})
++                    if b_data:
++                        # P0 Batch B：converge 证明后才 clear；finally 无循环可重试，
++                        # 未收敛则保留状态 + 告警（持仓已归零，仅剩订单面收敛）
++                        _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
++                        if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
++                            print(f"  └─ 🧹 无持仓，已清理批次状态（proof 收敛通过）")
++                        else:
++                            print(f"  └─ ⚠️ [B] 无持仓批次 {batch_id} 本轮未收敛"
++                                  f"（UNKNOWN/撤单失败），保留状态待重启恢复重试")
++                elif current_pos is None:
++                    print(f"  └─ ⚠️ 持仓查询失败(UNKNOWN)，保留批次状态不清理")
+                 else:
+-                    print(f"  └─ 📌 有持仓 {current_pos}，保留批次状态")
++                    # 🔥 v6.2-P0-2（实盘 2026-09-01 17:4x）：symbol 级聚合持仓不能归属本批次——
++                    # 零成交 + 程序撤单收尾的批次自身持仓恒为 0，聚合 > 0 只可能来自其他批次
++                    # （实例：f1e135 被新批次 29ca35 的 0.001 卡成 zombie，进而以 close-in-flight
++                    # 阻塞同方向 single-flight，挡死真实活仓平仓）。此时继续走 converge/clear 收尾。
++                    _zb = (self.load_all_states().get(symbol, {}) or {}).get(batch_id, {}) or {}
++                    if (_zb.get('pending_close') or _zb.get('is_programmatic_cancel')) \
++                            and int(_zb.get('last_filled_count', 0) or 0) == 0:
++                        print(f"  └─ ℹ️ 聚合持仓 {current_pos} 属于其他批次（本批次零成交已撤单），继续收敛清理")
++                        _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
++                        if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
++                            print(f"  └─ 🧹 零成交撤单批次已清理（proof 收敛通过）")
++                        else:
++                            print(f"  └─ ⚠️ [B] 零成交撤单批次 {batch_id} 本轮未收敛，保留状态待重启恢复重试")
++                    else:
++                        print(f"  └─ 📌 有持仓 {current_pos}，保留批次状态")
+ 
+             print(f"🧹 批次 [{batch_id}] 监控线程已退出")
+ 
