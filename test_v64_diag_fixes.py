@@ -94,9 +94,31 @@ def t03_wiring_structural():
     assert "getattr(self.exchange, 'last_response_headers', None)" in SRC
 
 
+def _extract_t(name):
+    """从 trader 提取函数（429 冷却 helper 为 staticmethod，可直调）。"""
+    tree = ast.parse(SRC)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            ns = {}
+            exec(textwrap.dedent(ast.get_source_segment(SRC, node)), ns)
+            return ns[name]
+    return None
+
+
+def t04_429_cooldown_respects_retry_after():
+    ec = _extract_t('_effective_429_cooldown')
+    assert ec is not None, '_effective_429_cooldown 未实现'
+    assert abs(ec(36.6, '221') - 222.0) < 1e-9, 'Retry-After 主导（221+1）'   # 418 事件的真实量级
+    assert abs(ec(36.6, None) - 36.6) < 1e-9, '缺失 → 保持基础值'
+    assert abs(ec(36.6, 'abc') - 36.6) < 1e-9, '非法 → 保持基础值'
+    assert abs(ec(36.6, '-5') - 36.6) < 1e-9, '负数 → 保持基础值'
+    assert abs(ec(50.0, '10') - 50.0) < 1e-9, '基础值更大 → 基础值'
+
+
 TESTS = [t01_snapshot_parse_independent_of_file,
          t02_429_diag_evidence_string,
-         t03_wiring_structural]
+         t03_wiring_structural,
+         t04_429_cooldown_respects_retry_after]
 
 
 def main():

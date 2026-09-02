@@ -1,40 +1,40 @@
 diff --git a/trader_260725.py b/trader_260725.py
-index c8f5e11..0175df3 100644
+index 0175df3..d62d31f 100644
 --- a/trader_260725.py
 +++ b/trader_260725.py
-@@ -1178,6 +1178,24 @@ class CryptoTrader:
-         self._clear_tp_param_invalid(symbol, batch_id)
-         return False
+@@ -1196,6 +1196,20 @@ class CryptoTrader:
+         except Exception as diag_e:
+             return f"🔬 [429诊断] 证据采集失败: {diag_e}"
  
 +    @staticmethod
-+    def _format_429_diagnostics(func, headers, err):
-+        """🔥 v6.4（429 诊断增强）：只采集证据——原始错误 + Retry-After +
-+        X-MBX-USED-WEIGHT-* + X-MBX-ORDER-COUNT-*（429 也可能来自 order rate
-+        limit，缺后者时 order-count 型 429 会查不出真因）+ endpoint。
-+        不改变任何限频/冷却/重试策略。"""
++    def _effective_429_cooldown(base_cooldown, retry_after):
++        """🔥 v6.4（429 协议缺口修复）：普通 429 冷却 = max(基础随机值, Retry-After + 1s)。
++
++        官方语义：429 的 Retry-After 是避免升级 418 封禁的应等时长；无视会累积
++        strike。无有效 Retry-After → 保持原 30-60s 逻辑。不改重试次数/418 逻辑。"""
 +        try:
-+            fname = getattr(func, '__name__', str(func))
-+            h = headers or {}
-+            retry_after = h.get('Retry-After') or h.get('retry-after')
-+            used = {k: v for k, v in h.items() if 'used-weight' in str(k).lower()}
-+            order_count = {k: v for k, v in h.items()
-+                           if 'order-count' in str(k).lower()}
-+            return (f"🔬 [429诊断] endpoint={fname} | Retry-After={retry_after} | "
-+                    f"used-weight={used} | order-count={order_count} | err={err}")
-+        except Exception as diag_e:
-+            return f"🔬 [429诊断] 证据采集失败: {diag_e}"
++            ra = float(retry_after)
++            if ra > 0:
++                return max(base_cooldown, ra + 1.0)
++        except (TypeError, ValueError):
++            pass
++        return base_cooldown
 +
      def _safe_api_call(self, func, *args, retries=5, delay=2, auth_probe=False, **kwargs):
          # 🔥 D-010 Batch 2（ChatGPT 钉死约束 1）：AUTH_BLOCKED 入口闸门——
          # 位于 for retry loop 与 try 之前，raise 于 try 外。锁定期内下方 -1021 分支的
-@@ -1254,6 +1272,10 @@ class CryptoTrader:
-                         "banned" in err_str or "418" in err_str or
-                         "way too many requests" in err_str):
+@@ -1295,7 +1309,13 @@ class CryptoTrader:
+                         continue
  
-+                    # 🔥 v6.4（429 诊断增强）：只采集证据，不改任何限频/冷却/重试策略
-+                    print(self._format_429_diagnostics(
-+                        func, getattr(self.exchange, 'last_response_headers', None), e))
-+
-                     # 🔥 检测到 IP 封禁 → 触发全局熔断
-                     if "banned" in err_str or "418" in err_str or "way too many requests" in err_str:
-                         ban_seconds = self._parse_binance_ban_time(str(e))
+                     # 普通 429：触发全局熔断，所有线程一起降速（P0-2，堵恶化器 C）
+-                    global_cooldown = 30 + random.uniform(0, 30)  # 30-60 秒全局冷却
++                    # 🔥 v6.4（429 协议缺口修复）：冷却 = max(原随机值, Retry-After + 1s)——
++                    # 官方要求 429 后按 Retry-After back off，无视会累积升级 418 封禁。
++                    # 无有效值保持原 30-60s 逻辑；不改重试次数/418 逻辑。
++                    _ra_hdrs = getattr(self.exchange, 'last_response_headers', None) or {}
++                    _ra = _ra_hdrs.get('Retry-After') or _ra_hdrs.get('retry-after')
++                    global_cooldown = self._effective_429_cooldown(
++                        30 + random.uniform(0, 30), _ra)
+                     with self.api_cooldown_lock:
+                         self.api_cooldown_until = max(
+                             self.api_cooldown_until,

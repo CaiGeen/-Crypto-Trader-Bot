@@ -1196,6 +1196,20 @@ class CryptoTrader:
         except Exception as diag_e:
             return f"🔬 [429诊断] 证据采集失败: {diag_e}"
 
+    @staticmethod
+    def _effective_429_cooldown(base_cooldown, retry_after):
+        """🔥 v6.4（429 协议缺口修复）：普通 429 冷却 = max(基础随机值, Retry-After + 1s)。
+
+        官方语义：429 的 Retry-After 是避免升级 418 封禁的应等时长；无视会累积
+        strike。无有效 Retry-After → 保持原 30-60s 逻辑。不改重试次数/418 逻辑。"""
+        try:
+            ra = float(retry_after)
+            if ra > 0:
+                return max(base_cooldown, ra + 1.0)
+        except (TypeError, ValueError):
+            pass
+        return base_cooldown
+
     def _safe_api_call(self, func, *args, retries=5, delay=2, auth_probe=False, **kwargs):
         # 🔥 D-010 Batch 2（ChatGPT 钉死约束 1）：AUTH_BLOCKED 入口闸门——
         # 位于 for retry loop 与 try 之前，raise 于 try 外。锁定期内下方 -1021 分支的
@@ -1295,7 +1309,13 @@ class CryptoTrader:
                         continue
 
                     # 普通 429：触发全局熔断，所有线程一起降速（P0-2，堵恶化器 C）
-                    global_cooldown = 30 + random.uniform(0, 30)  # 30-60 秒全局冷却
+                    # 🔥 v6.4（429 协议缺口修复）：冷却 = max(原随机值, Retry-After + 1s)——
+                    # 官方要求 429 后按 Retry-After back off，无视会累积升级 418 封禁。
+                    # 无有效值保持原 30-60s 逻辑；不改重试次数/418 逻辑。
+                    _ra_hdrs = getattr(self.exchange, 'last_response_headers', None) or {}
+                    _ra = _ra_hdrs.get('Retry-After') or _ra_hdrs.get('retry-after')
+                    global_cooldown = self._effective_429_cooldown(
+                        30 + random.uniform(0, 30), _ra)
                     with self.api_cooldown_lock:
                         self.api_cooldown_until = max(
                             self.api_cooldown_until,
