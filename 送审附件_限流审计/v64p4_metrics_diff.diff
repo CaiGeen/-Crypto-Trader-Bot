@@ -1,0 +1,154 @@
+diff --git a/trader_260725.py b/trader_260725.py
+index 39f64db..54f8c28 100644
+--- a/trader_260725.py
++++ b/trader_260725.py
+@@ -65,6 +65,121 @@ BEIJING_TZ = pytz.timezone('Asia/Shanghai')
+ # QQ 邮箱发送串行锁（限制同时最多 1 个 SMTP 连接）
+ EMAIL_SEND_LOCK = threading.Lock()
+ 
++
++class ApiMetrics:
++    """🔥 v6.4-P4（Phase 2 限流观测层）：_safe_api_call 单点极薄计数。
++
++    只观测、绝不改变任何限频/冷却/重试策略；所有内部异常静默吞掉（观测故障
++    零影响交易）。真实响应头优先（X-MBX-USED-WEIGHT-1M），静态 weight 估值辅助。
++    60s 节流周期汇总；429/418 事发时输出前 window 秒本程序调用面快照——
++    「Bot used-weight 一路飙升」vs「used≈100 却突然拿到 418」两种证据可把
++    归因方向直接分开（2026-09-02 两次 418 归因 UNKNOWN 的工程化收口）。"""
++
++    # 静态 weight 估值（辅助口径；2026-09 官方文档实锤：v3 positionRisk/account=5，
++    # openOrders 带 symbol=1，order 查询=1，ticker(symbol)=1，time=1，下单/撤单=0 weight）
++    WEIGHT_ESTIMATES = {
++        'fetch_open_orders': 1, 'fetch_order': 1, 'fetch_positions': 5,
++        'fetch_balance': 5, 'fetch_ticker': 1, 'fetch_time': 1,
++        'load_time_difference': 1, 'set_leverage': 1,
++        'create_order': 0, 'cancel_order': 0,
++    }
++
++    def __init__(self, window=60.0, time_fn=time.time):
++        self.window = float(window)
++        self._time_fn = time_fn
++        self._lock = threading.Lock()
++        self._events = []            # [(ts, endpoint, 'ok'|'fail')]
++        self._weight_latest = {}     # endpoint -> 最近 used-weight-1m
++        self._weight_peak = {}       # endpoint -> 峰值 used-weight-1m
++        self._last_summary_ts = 0.0
++
++    @staticmethod
++    def _endpoint_of(func):
++        return getattr(func, '__name__', str(func))
++
++    @staticmethod
++    def _used_weight_of(headers):
++        for k, v in (headers or {}).items():
++            if 'used-weight-1m' in str(k).lower():
++                try:
++                    return float(v)
++                except (TypeError, ValueError):
++                    return None
++        return None
++
++    def record(self, func, headers=None, ok=True):
++        """记录一次调用；跨过汇总窗口时返回汇总日志行（由调用方 print），否则 None。"""
++        try:
++            ep = self._endpoint_of(func)
++            now = self._time_fn()
++            uw = self._used_weight_of(headers)
++            line = None
++            with self._lock:
++                self._events.append((now, ep, 'ok' if ok else 'fail'))
++                cutoff = now - self.window * 3   # 事件保留 3 个窗口，够快照+峰值回看
++                while self._events and self._events[0][0] < cutoff:
++                    self._events.pop(0)
++                if uw is not None:
++                    self._weight_latest[ep] = uw
++                    if uw > self._weight_peak.get(ep, -1.0):
++                        self._weight_peak[ep] = uw
++                if now - self._last_summary_ts >= self.window:
++                    self._last_summary_ts = now
++                    counts = {}
++                    for ts, e, _k in self._events:
++                        if ts >= now - self.window:
++                            counts[e] = counts.get(e, 0) + 1
++                    est = sum(self.WEIGHT_ESTIMATES.get(e, 1) * n
++                              for e, n in counts.items())
++                    detail = (', '.join(f'{e}×{n}' for e, n in
++                                        sorted(counts.items(), key=lambda kv: -kv[1]))
++                              or '无')
++                    peak = max(self._weight_peak.values()) if self._weight_peak else None
++                    latest = max(self._weight_latest.values()) if self._weight_latest else None
++                    line = (f"📊 [限流观测] 近{self.window:.0f}s 调用: {detail}"
++                            f" | 估算weight≈{est}"
++                            + (f" | used-weight-1m 最新={latest:.0f} 峰值={peak:.0f}"
++                               if peak is not None else ""))
++            return line
++        except Exception:
++            return None  # 观测故障绝不外泄
++
++    def snapshot_last(self, seconds=None):
++        """窗口内各 endpoint 调用次数（429/418 归因核心证据）。"""
++        try:
++            now = self._time_fn()
++            sec = self.window if seconds is None else float(seconds)
++            with self._lock:
++                counts = {}
++                for ts, e, _k in self._events:
++                    if ts >= now - sec:
++                        counts[e] = counts.get(e, 0) + 1
++            return counts
++        except Exception:
++            return {}
++
++    def format_incident(self, func, headers, err, seconds=None):
++        """429/418 事发快照：前 window 秒本程序调用面 + 本次真实头 + 历史峰值。"""
++        try:
++            ep = self._endpoint_of(func)
++            counts = self.snapshot_last(seconds)
++            detail = (', '.join(f'{k}×{v}' for k, v in
++                                sorted(counts.items(), key=lambda kv: -kv[1]))
++                      or '无')
++            uw = self._used_weight_of(headers)
++            peak = max(self._weight_peak.values()) if self._weight_peak else None
++            return (f"🔬 [限流观测·事发快照] {ep} 触发限流（{str(err)[:120]}）\n"
++                    f"  └─ 前{self.window if seconds is None else seconds:.0f}s "
++                    f"本程序调用面: {detail}"
++                    + (f" | 本次 used-weight-1m={uw:.0f}" if uw is not None else "")
++                    + (f" | 历史峰值={peak:.0f}" if peak is not None else ""))
++        except Exception as e:
++            return f"🔬 [限流观测·事发快照] 采集失败: {e}"
++
++
++# 模块级单例：_safe_api_call 直连（绕开实例初始化顺序问题；观测数据跨实例共享无害）
++_API_METRICS = ApiMetrics()
++
+ TAKER_FEE_RATE = 0.0005
+ MAKER_FEE_RATE = 0.0002
+ SLIPPAGE_BUFFER = 0.0002
+@@ -1243,7 +1358,13 @@ class CryptoTrader:
+                         if wait_time > 0:
+                             time.sleep(wait_time)
+                         self._last_api_call_time = time.time()
+-                    return func(*args, **kwargs)
++                    # 🔥 v6.4-P4：限流观测（极薄单点）——真实响应头优先，内部异常静默
++                    _r = func(*args, **kwargs)
++                    _sum = _API_METRICS.record(
++                        func, getattr(self.exchange, 'last_response_headers', None), ok=True)
++                    if _sum:
++                        print(_sum)
++                    return _r
+ 
+             except Exception as e:
+                 err_str = str(e).lower()
+@@ -1295,6 +1416,12 @@ class CryptoTrader:
+                     # 🔥 v6.4（429 诊断增强）：只采集证据，不改任何限频/冷却/重试策略
+                     print(self._format_429_diagnostics(
+                         func, getattr(self.exchange, 'last_response_headers', None), e))
++                    # 🔥 v6.4-P4：事发快照（先拍快照后入账失败，快照=事前窗口）——
++                    # 下次 418 即有「Bot 自身调用面 + used-weight 峰值」完整归因证据链
++                    print(_API_METRICS.format_incident(
++                        func, getattr(self.exchange, 'last_response_headers', None), e))
++                    _API_METRICS.record(
++                        func, getattr(self.exchange, 'last_response_headers', None), ok=False)
+ 
+                     # 🔥 检测到 IP 封禁 → 触发全局熔断
+                     if "banned" in err_str or "418" in err_str or "way too many requests" in err_str:
