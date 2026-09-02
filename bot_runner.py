@@ -210,21 +210,29 @@ def _load_notify_state(state_file: str | None = None) -> dict:
 
 
 def _save_notify_state(state: dict, state_file: str | None = None) -> None:
-    """原子写 state（tmp → flush → os.replace，与 trade_state.json 同惯例）"""
+    """原子写 state（tmp → flush → **fsync** → os.replace，与 trade_state.json 同惯例）。
+
+    🔥 2026-09-02 23:49 实盘：死机断电后 .notify.state.json 成空文件（char 0 损坏
+    告警）——os.replace 只保证换名原子，数据块未 fsync 落盘时断电得到空内容。
+    补 fsync 对齐 trade_state.json 惯例（Windows 对文件 fsync 可用，仅目录不可用）。"""
     path = state_file or NOTIFY_STATE_FILE
+    tmp_path = None
     try:
         d = os.path.dirname(path) or "."
         fd, tmp_path = tempfile.mkstemp(dir=d, prefix=".tmp_", suffix=".json")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=1)
             f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, path)
+        tmp_path = None
     except Exception as e:
         print(f"⚠️ [D-010] notify state 保存失败: {e}")
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 def _append_notify_audit(event_id: str, status: str, attempts: int,
