@@ -1,0 +1,58 @@
+diff --git a/bot_runner.py b/bot_runner.py
+index e7f4e00..a8d63b4 100644
+--- a/bot_runner.py
++++ b/bot_runner.py
+@@ -1596,6 +1596,40 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
+         )
+ 
+ 
++def _format_partial_candidates(all_states, net_pos_fn):
++    """🔥 v6.4-P1（Fix 3）：/partial 无参时列出可减仓批次——纯本地 durable state，零 API。
++
++    只列 is_active、净持仓 > 0 且未冻结（close_phase==0 且非 pending_close）的批次——
++    冻结批次当前无法 /partial，净 0 ghost（entry 未成交骨架）列出来只会干扰选批。"""
++    lines = []
++    for symbol, symbol_batches in (all_states or {}).items():
++        if not isinstance(symbol_batches, dict):
++            continue
++        for batch_id, b in symbol_batches.items():
++            if not isinstance(b, dict) or not b.get('is_active'):
++                continue
++            if int(b.get('close_phase', 0) or 0) >= 1 or b.get('pending_close'):
++                continue
++            try:
++                net_qty, _net_cost = net_pos_fn(b)
++            except Exception:
++                continue
++            if not net_qty or net_qty <= 0:
++                continue
++            hhmmss = ''
++            parts = str(batch_id).split('_')
++            if len(parts) >= 3 and len(parts[2]) == 6 and parts[2].isdigit():
++                hhmmss = f"{parts[2][0:2]}:{parts[2][2:4]}:{parts[2][4:6]}"
++            lines.append(
++                f"🕒 {hhmmss} | {symbol} | {str(b.get('side') or '?').upper()} | 净持仓 {net_qty}\n"
++                f"`{batch_id}`\n"
++                f"`/partial {batch_id} <数量>`")
++    if not lines:
++        return "📋 当前无可减仓批次（净持仓 > 0 且未冻结的活跃批次为空）。"
++    return ("❌ 格式错误！正确格式：`/partial <BatchID> <数量>`\n"
++            "📋 可减仓批次（净持仓 > 0）：\n\n" + "\n\n".join(lines))
++
++
+ async def partial_close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+     """🔥 v6.4-P0：/partial <BatchID> <amount>——批次指定部分平仓（最小生产入口）。
+ 
+@@ -1611,8 +1645,10 @@ async def partial_close_command(update: Update, context: ContextTypes.DEFAULT_TY
+ 
+     args = context.args
+     if len(args) < 2:
+-        await safe_reply(update, "❌ 格式错误！正确格式：`/partial <BatchID> <数量>`",
+-                         parse_mode='Markdown')
++        # 🔥 v6.4-P1（Fix 3）：不再只回格式错误——列出可减仓批次（开仓时间/方向/净持仓），
++        # 纯本地 durable state 零 API，多批次场景可直接照抄下命令
++        await safe_reply(update, _format_partial_candidates(
++            trader.load_all_states(), trader._batch_net_position), parse_mode='Markdown')
+         return
+ 
+     batch_id = args[0]

@@ -1,0 +1,35 @@
+diff --git a/test_v64_partial_close.py b/test_v64_partial_close.py
+index 8d2c2a2..a3c0d1b 100644
+--- a/test_v64_partial_close.py
++++ b/test_v64_partial_close.py
+@@ -70,7 +70,8 @@ F = {n: ex_t(n) for n in (
+     '_maybe_report_conservation_conflict', '_check_conservation_conflict',
+     '_final_pre_create_check', '_assert_create_allowed', '_commit_protection_with_g3',
+     '_update_registry', '_verify_and_update_registry', '_verify_order_created',
+-    '_build_intent', '_protection_identity', '_close_amount_guard')}
++    '_build_intent', '_protection_identity', '_close_amount_guard',
++    '_try_acquire_resize_inflight', '_release_resize_inflight')}
+ H = {n: ex_h(n) for n in (
+     '_confirm_close_filled', '_fetch_close_order_state', '_set_close_reason_if_current',
+     '_begin_close_request_if_active', '_survey_same_side_batches',
+@@ -182,6 +183,10 @@ def make_trader(states, actual_pos=2.0, lazy_market=False):
+     # 闸门告警簿记桩（真实实现为计数告警，与本测试判据无关）
+     t._gate_alert_counts = {}
+     t._gate_alert_lock = threading.Lock()
++    # 🔥 v6.4-P1：resize 在途互斥簿记（_try/_release_resize_inflight 消费）
++    t._resize_inflight = set()
++    t._resize_inflight_lock = threading.Lock()
++    t._partial_resume_state = {}
+     t._gate_alert_notify = lambda identity, reason, msg, level='warning': print(f'  [gate] {msg}')
+     t._gate_alert_clear = lambda identity: None
+     for name, fn in BINDS.items():
+@@ -195,6 +200,9 @@ def _batch(ta=(1.0,), fd=(100.0,), lfc=1, **extra):
+         'is_hedge_mode': True, 'params_base': {'positionSide': 'LONG', 'leverage': 100},
+         'target_amounts': list(ta), 'filled_details': list(fd),
+         'last_filled_count': lfc, 'total_entry_fee': 0.0,
++        # 🔥 v6.4-P1：durable 取价契约——生产批次必有这两字段（trade_state 实证），
++        # resize 取价只认 durable，拒绝从旧交易所订单恢复
++        'stop_steps': [75001.0], 'take_profit_price': 80000.0,
+         'entry_orders': ['E1'], 'current_sl_id': 'S1', 'tp_order_id': 'T1',
+         'close_phase': 0, 'pending_close': False, 'is_programmatic_cancel': False,
+         'close_reason': '', 'close_op_id': '',

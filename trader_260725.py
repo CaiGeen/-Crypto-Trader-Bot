@@ -241,6 +241,11 @@ class CryptoTrader:
         # 必须在 __init__ 初始化：restart 后新进程对象不会重放 BEGIN，
         # monitor 消费侧需要该 dict 已存在（否则 AttributeError）。
         self._freeze_alerted = {}
+        # 🔥 v6.4-P1：partial resize 并发在途簿记（monitor 自愈线程 vs /partial 事务线程
+        # 防双 create）+ 运行期自愈节流/失败计数簿记
+        self._resize_inflight = set()
+        self._resize_inflight_lock = threading.Lock()
+        self._partial_resume_state = {}
 
         # 🔥 D-010 Batch 2：AUTH_BLOCKED 盲区安全模式（auth_blocked.json 持久化，损坏 Fail-Closed）
         self.auth_blocked_file = AUTH_BLOCKED_FILE        # 测试可重定向
@@ -3001,22 +3006,42 @@ class CryptoTrader:
             b2['realized_reduce_cost'] = float(
                 b2.get('realized_reduce_cost', 0.0) or 0.0) + reduce_cost_delta
             b2['close_reason'] = 'partial_resize_pending'
+            b2['partial_resize_stage'] = 0  # 🔥 v6.4-P1：分腿进度（0=未开始/1=SL 完成/2=TP 完成）
             if not self._persist_states(latest):
                 return False, 'persist_failed'
             # 🔥 resize 必须用 commit 后的净量（旧净量会重开 wrong-close 窗口）
             post_net_qty, _post_net_cost = self._batch_net_position(b2)
         # resize：撤旧挂净量（owner exception 窄放行）。失败 → 保持冻结，恢复续跑。
-        ok_r, msg_r = self._resize_protection_after_partial(
-            symbol, batch_id, close_op_id, post_net_qty)
+        # 🔥 v6.4-P1：in-flight 防护——monitor 运行期自愈与本事务线程互斥（防双 create）
+        if not self._try_acquire_resize_inflight(batch_id):
+            return False, 'resize_inflight（并发续跑防护）'
+        try:
+            ok_r, msg_r = self._resize_protection_after_partial(
+                symbol, batch_id, close_op_id, post_net_qty)
+        finally:
+            self._release_resize_inflight(batch_id)
         if not ok_r:
             return False, msg_r
         return True, 'partial_committed'
 
     def _resize_protection_after_partial(self, symbol, batch_id, close_op_id, net_qty):
-        """🔥 v6.4-P0：partial commit 后按净量重挂 SL/TP（owner exception 窄放行）。
+        """🔥 v6.4-P1：partial commit 后按净量重挂 SL/TP（owner exception 窄放行）。
 
-        旧单先撤、净量后挂 = 极短保护空窗（AGENTS.md ponytail：避免旧 oversized SL
-        在多批次环境错平其他 batch，两害取其轻）。失败 → 保持冻结，恢复续跑。
+        v6.4-P1 实盘事故收敛（2026-09-02 14:27 resize_cancel_unverified_SL 假阴性 +
+        运行期无自愈 + TOCTOU），四轮 ChatGPT 收敛冻结设计：
+        - durable 取价：SL=stop_steps[last_filled_count-1]（缺层回退末位）、
+          TP=take_profit_price——绝不再依赖即将被撤销的旧交易所订单取价
+          （OrderNotFound ≠ 未成交，恢复时旧单可能已查不到）。
+        - 撤旧后有界确认（4×0.5s）：单次查询会被条件单通道传播延迟打假阴性；
+          全败仍 Fail-Closed。OrderNotFound 只证明「不用再撤」，绝不单独视为未成交证明。
+        - partial_resize_stage 0/1/2 分腿 durable：每腿 verify 后同锁提交新 id+stage；
+          resume 按 stage 跳过已完成腿（防「SL 成功后 TP 失败 → 重试撞 CONFIRMED 门」冻结）。
+        - 守恒门双置位：每腿「撤旧终态确认后、create 前」权威复检 _close_amount_guard
+          且返回量 ≈ net_qty（1e-9）——撤单窗口内旧保护单可能触发成交使入口证明过期。
+        - 收编路径：上一轮 verify 成功但 stage 提交前崩溃 → registry CONFIRMED 新 id ≠
+          账本 id → 直接收编（不重发 create）。该 CONFIRMED 只能来自本事务
+          （close_phase=1 期间其他创建者全被 G1/G2 owner 闸门拒绝）。
+        失败 → 保持冻结（stage 已持久化进度），恢复/monitor 60s 续跑，绝不重发 MARKET。
         """
         latest = self.load_all_states()
         b = (latest.get(symbol, {}) or {}).get(batch_id)
@@ -3025,105 +3050,156 @@ class CryptoTrader:
         side = (b.get('side') or 'BUY').upper()
         pos_side = 'LONG' if side == 'BUY' else 'SHORT'
         reduce_side = 'sell' if side == 'BUY' else 'buy'
+        is_hedge = bool(b.get('is_hedge_mode', False))
         lfc = int(b.get('last_filled_count', 0) or 0)
-        new_sl_id = b.get('current_sl_id')
-        new_tp_id = b.get('tp_order_id')
+        stage = int(b.get('partial_resize_stage', 0) or 0)
+        # 🔥 v6.4-P1 durable 目标价（用户改单已同步维护这两处：/sl → stop_steps、/tp → take_profit_price）
+        stops = b.get('stop_steps') or []
+        sl_idx = max(lfc - 1, 0)
+        sl_price = (float(stops[sl_idx]) if sl_idx < len(stops) else float(stops[-1])) if stops else 0.0
+        tp_price = float(b.get('take_profit_price') or 0)
         for kind, old_id in (('SL', b.get('current_sl_id')),
                              ('TP', b.get('tp_order_id'))):
-            if not old_id:
+            if kind == 'SL' and stage >= 1:
+                continue  # 该腿已 durable 完成（stage 幂等，绝不重撤/重挂）
+            if kind == 'TP' and stage >= 2:
                 continue
-            identity = self._protection_identity(batch_id, kind, max(lfc - 1, 0), pos_side)
-            allowed, r = self._assert_create_allowed(
-                symbol, batch_id, identity, desc=f'partial resize {kind}',
-                replace_order_id=old_id, owner_op_id=close_op_id)
-            if allowed:
-                allowed, r = self._final_pre_create_check(
-                    symbol, batch_id, identity, desc=f'partial resize {kind}',
-                    owner_op_id=close_op_id)
-            if not allowed:
-                return False, f'resize_blocked_{kind}（{r}）'
-            try:
-                old_order = self._safe_api_call(self.exchange.fetch_order, old_id, symbol,
-                                                params={'stop': True})
-                price = float(old_order.get('stopPrice') or 0)
-            except Exception:
-                price = 0.0
+            price = sl_price if kind == 'SL' else tp_price
             if price <= 0:
-                # 拿不到旧单价格 → 不猜测，保持冻结（恢复续跑），绝不以劣化参数重挂
-                return False, f'resize_price_unknown_{kind}'
-            # 🔥 v6.4-P0 rework（P0-3）：cancel 必须证明旧单已物理离场，未证明不得继续
-            # （旧 oversized SL + 新净量 SL 同时在场 = 正在修的 wrong-close 本身）
-            try:
-                self._safe_api_call(self.exchange.cancel_order, old_id, symbol,
-                                    params={'stop': True})
-            except Exception as e:
-                if '-2011' not in str(e) and 'Unknown order' not in str(e) \
-                        and 'does not exist' not in str(e):
-                    return False, f'resize_cancel_failed_{kind}（{e}）'
-                # -2011 = 旧单已不存在（幂等，等同撤成功）
+                # durable 目标价缺失 → 不猜测，保持冻结（恢复续跑），绝不以劣化参数重挂
+                return False, f'resize_price_unknown_{kind}（durable 目标价缺失）'
+            identity = self._protection_identity(batch_id, kind, max(lfc - 1, 0), pos_side)
+            # 收编判定：registry CONFIRMED 新 id ≠ 账本 id = 上一轮 verify 后 stage 提交前崩溃
+            reg_entry = (b.get('protection_registry') or {}).get(identity) or {}
+            adopted = (reg_entry.get('state') == 'CONFIRMED'
+                       and reg_entry.get('order_id')
+                       and str(reg_entry.get('order_id')) != str(old_id))
+            if adopted:
+                new_id = str(reg_entry['order_id'])
             else:
+                allowed, r = self._assert_create_allowed(
+                    symbol, batch_id, identity, desc=f'partial resize {kind}',
+                    replace_order_id=old_id, owner_op_id=close_op_id)
+                if allowed:
+                    allowed, r = self._final_pre_create_check(
+                        symbol, batch_id, identity, desc=f'partial resize {kind}',
+                        owner_op_id=close_op_id)
+                if not allowed:
+                    return False, f'resize_blocked_{kind}（{r}）'
+            if old_id:
+                # 🔥 v6.4-P0 rework（P0-3）：cancel 必须证明旧单已物理离场，未证明不得继续
+                # （旧 oversized SL + 新净量 SL 同时在场 = 正在修的 wrong-close 本身）
                 try:
-                    _chk = self._safe_api_call(self.exchange.fetch_order, old_id, symbol,
-                                               params={'stop': True})
-                    _st = str((_chk or {}).get('status') or '').lower()
+                    self._safe_api_call(self.exchange.cancel_order, old_id, symbol,
+                                        params={'stop': True})
+                except Exception as e:
+                    if '-2011' not in str(e) and 'Unknown order' not in str(e) \
+                            and 'does not exist' not in str(e):
+                        return False, f'resize_cancel_failed_{kind}（{e}）'
+                    # -2011 = 旧单已不存在（对「撤单」目标幂等；「未成交」由下方守恒门兜底）
+                else:
+                    # 🔥 v6.4-P1：撤单确认传播延迟假阴性（2026-09-02 实盘 status=open）→ 有界重试
+                    _st = ''
+                    for _i in range(4):
+                        try:
+                            _chk = self._safe_api_call(self.exchange.fetch_order, old_id,
+                                                       symbol, params={'stop': True})
+                            _st = str((_chk or {}).get('status') or '').lower()
+                            if _st in ('canceled', 'expired', 'rejected'):
+                                break
+                        except Exception as e:
+                            if '-2011' in str(e) or 'Unknown order' in str(e):
+                                _st = 'canceled'
+                                break
+                            return False, f'resize_cancel_verify_failed_{kind}（{e}）'
+                        time.sleep(0.5)
                     if _st not in ('canceled', 'expired', 'rejected'):
                         return False, f'resize_cancel_unverified_{kind}（status={_st}）'
+            # 🔥 v6.4-P1 TOCTOU 守恒门：每腿撤旧终态确认后、create/commit 前权威复检——
+            # 撤单窗口内旧保护单可能触发成交使入口守恒证明过期（R3b）；收编路径同门兜底
+            g_qty, g_detail = self._close_amount_guard(symbol, side, is_hedge, net_qty, batch_id)
+            if g_qty is None or abs(float(g_qty) - net_qty) > 1e-9:
+                self.send_tg_notification(
+                    f"🚨【资金安全】partial resize 守恒门拦截（{kind}）批次 `{batch_id}`\n"
+                    f"💡 {g_detail}\n"
+                    f"⚠️ 拒绝按净量 {net_qty} 重挂（撤单窗口内仓位可能已变化）。\n"
+                    f"批次保持冻结并停止自动续跑——请核对交易所实际仓位与挂单后人工处理。",
+                    level='critical')
+                return False, f'resize_guard_rejected_{kind}（{g_detail}）'
+            if not adopted:
+                otype = 'STOP_MARKET' if kind == 'SL' else 'TAKE_PROFIT_MARKET'
+                # 🔥 v6.4-P0 rework（P0-3）：复用 crash-safe Create 链——
+                # B2-2 intent 先落盘（PENDING_CREATE）→ create → verify → registry CONFIRMED；
+                # 禁止「create 返回 ID 就直接 CONFIRMED」的孤儿窗口模式。
+                self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
+                                      id_known=False, order_kind='conditional', role=kind,
+                                      layer=max(int(b.get('last_filled_count', 0) or 0) - 1, 0),
+                                      side=reduce_side,
+                                      intent=self._build_intent(
+                                          symbol=symbol, side=reduce_side, qty=net_qty,
+                                          order_type=otype, stop_price=str(price),
+                                          reduce_only=True))
+                params = dict(b.get('params_base') or {})
+                params['stopPrice'] = price
+                try:
+                    new_order = self._safe_api_call(self.exchange.create_order,
+                                                    symbol, otype, reduce_side, net_qty, None,
+                                                    params)
                 except Exception as e:
-                    if '-2011' not in str(e) and 'Unknown order' not in str(e):
-                        return False, f'resize_cancel_verify_failed_{kind}（{e}）'
-            otype = 'STOP_MARKET' if kind == 'SL' else 'TAKE_PROFIT_MARKET'
-            # 🔥 v6.4-P0 rework（P0-3）：复用 crash-safe Create 链——
-            # B2-2 intent 先落盘（PENDING_CREATE）→ create → verify → registry CONFIRMED；
-            # 禁止「create 返回 ID 就直接 CONFIRMED」的孤儿窗口模式。
-            self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
-                                  id_known=False, order_kind='conditional', role=kind,
-                                  layer=max(int(b.get('last_filled_count', 0) or 0) - 1, 0),
-                                  side=reduce_side,
-                                  intent=self._build_intent(
-                                      symbol=symbol, side=reduce_side, qty=net_qty,
-                                      order_type=otype, stop_price=str(price),
-                                      reduce_only=True))
-            params = dict(b.get('params_base') or {})
-            params['stopPrice'] = price
-            new_order = self._safe_api_call(self.exchange.create_order,
-                                            symbol, otype, reduce_side, net_qty, None,
-                                            params)
-            new_id = str((new_order or {}).get('id') or '')
-            if not new_id:
-                return False, f'resize_create_failed_{kind}'
-            vres = self._verify_and_update_registry(
-                symbol, batch_id, identity, new_id,
-                desc=f'partial resize {kind}', owner_op_id=close_op_id)
-            if vres != 'success':
-                # not_found→NOT_CONFIRMED / unknown→PENDING_VERIFY（registry 已记录真相）；
-                # 保持冻结（恢复/人工接管），绝不把未验证 ID 标 CONFIRMED
-                return False, f'resize_verify_failed_{kind}（{vres}）'
-            if kind == 'SL':
-                new_sl_id = new_id
-            else:
-                new_tp_id = new_id
-        # 最终 CAS → ACTIVE（含新保护单 id 写回）
+                    # create 异常 ≠ 未发出（可能已在途）→ registry 保持 PENDING_CREATE
+                    # Fail-Closed 等人工/裁决，绝不盲目重发（C5 纪律）
+                    return False, f'resize_create_failed_{kind}（{e}）'
+                new_id = str((new_order or {}).get('id') or '')
+                if not new_id:
+                    return False, f'resize_create_failed_{kind}'
+                vres = self._verify_and_update_registry(
+                    symbol, batch_id, identity, new_id,
+                    desc=f'partial resize {kind}', owner_op_id=close_op_id)
+                if vres != 'success':
+                    # not_found→NOT_CONFIRMED / unknown→PENDING_VERIFY（registry 已记录真相）；
+                    # 保持冻结（恢复/人工接管），绝不把未验证 ID 标 CONFIRMED
+                    return False, f'resize_verify_failed_{kind}（{vres}）'
+            # 🔥 v6.4-P1 分腿 durable commit：新 id + stage 同一次锁内持久化
+            with self._state_lock:
+                latest2 = self.load_all_states()
+                b2 = (latest2.get(symbol, {}) or {}).get(batch_id)
+                if not isinstance(b2, dict) \
+                        or (b2.get('close_op_id') or '') != close_op_id \
+                        or b2.get('close_reason') != 'partial_resize_pending':
+                    return False, 'state_changed'
+                if kind == 'SL':
+                    b2['current_sl_id'] = new_id
+                    b2['partial_resize_stage'] = 1
+                else:
+                    b2['tp_order_id'] = new_id
+                    b2['partial_resize_stage'] = 2
+                if not self._persist_states(latest2):
+                    return False, 'persist_failed'
+        # 最终 CAS → ACTIVE（两腿 id 已分腿 durable；此处只切事务态并清 stage）
         with self._state_lock:
             latest = self.load_all_states()
             b3 = (latest.get(symbol, {}) or {}).get(batch_id)
             if not isinstance(b3, dict) or (b3.get('close_op_id') or '') != close_op_id \
                     or b3.get('close_reason') != 'partial_resize_pending':
                 return False, 'state_changed'
+            if int(b3.get('partial_resize_stage', 0) or 0) != 2:
+                return False, 'state_changed（resize stage 未就绪）'
             b3['close_phase'] = 0
             b3['pending_close'] = False
             b3['is_programmatic_cancel'] = False
             b3['close_reason'] = ''
-            b3['current_sl_id'] = new_sl_id
-            b3['tp_order_id'] = new_tp_id
+            b3.pop('partial_resize_stage', None)
             if not self._persist_states(latest):
                 return False, 'persist_failed'
         return True, 'partial_active'
 
     def _resume_partial_resize(self, symbol, batch_id, owner_op_id):
-        """🔥 v6.4-P0：重启分型续跑（崩溃-phase 分型，v4 §0）。
+        """🔥 v6.4-P1：分型续跑（重启恢复 + monitor 运行期自愈共用入口）。
 
-        partial_resize_pending → 只续 resize（按持久化净 qty），绝不重发 MARKET；
-        partial_closing → loud critical + 人工核实（MARKET 副作用未知，不自动续跑）。"""
+        partial_resize_pending → 只续 resize（按持久化净 qty + stage 进度），
+        绝不重发 MARKET；partial_closing → loud critical + 人工核实（副作用未知）。
+        🔥 v6.4-P1：入口快速守恒门——actual 必须覆盖 Σnet 且 guard 返回量 ≈ 本批净量
+        （每腿 create 前还有权威门，见 _resize_protection_after_partial）。"""
         all_states = self.load_all_states()
         b = (all_states.get(symbol, {}) or {}).get(batch_id)
         if not isinstance(b, dict):
@@ -3140,7 +3216,76 @@ class CryptoTrader:
         if (b.get('close_op_id') or '') != (owner_op_id or ''):
             return False, 'op_id_mismatch'
         net_qty, _c = self._batch_net_position(b)
+        side = (b.get('side') or 'BUY').upper()
+        is_hedge = bool(b.get('is_hedge_mode', False))
+        g_qty, g_detail = self._close_amount_guard(symbol, side, is_hedge, net_qty, batch_id)
+        if g_qty is None or abs(float(g_qty) - net_qty) > 1e-9:
+            self.send_tg_notification(
+                f"🚨【资金安全】partial resume 守恒门拦截 批次 `{batch_id}`\n"
+                f"💡 {g_detail}\n"
+                f"⚠️ 账本净量 {net_qty} 与交易所实际已漂移，拒绝自动续跑——请人工核对后处理。",
+                level='critical')
+            return False, f'resume_guard_rejected（{g_detail}）'
         return self._resize_protection_after_partial(symbol, batch_id, owner_op_id, net_qty)
+
+    def _try_acquire_resize_inflight(self, batch_id):
+        """🔥 v6.4-P1：resize 在途互斥（monitor 自愈线程 vs /partial 事务线程防双 create）。"""
+        with self._resize_inflight_lock:
+            if batch_id in self._resize_inflight:
+                return False
+            self._resize_inflight.add(batch_id)
+            return True
+
+    def _release_resize_inflight(self, batch_id):
+        with self._resize_inflight_lock:
+            self._resize_inflight.discard(batch_id)
+
+    def _maybe_runtime_resume_partial(self, symbol, batch_id, close_op_id):
+        """🔥 v6.4-P1：monitor 冻结分支的 partial 运行期自愈调度（60s 节流）。
+
+        - R8：首次看到某 op 的 partial_resize_pending 只登记时间不执行——给 /partial
+          事务线程完整 60s 先自行完成 resize（否则首见立即抢跑 + inflight 撞车 →
+          用户对已成功的减仓收到假失败，可能重发 /partial 造成二次真实减仓）。
+          状态按 close_op_id 绑定：同批次新事务自动重新登记，杜绝陈旧 ts 立即放行。
+        - R7：守恒门拒绝（resume_guard_rejected* / resize_guard_rejected_*）=
+          terminal safety conflict——callee 已 critical 一次，置 halted 停止本进程
+          自动续跑等人工；其余暂态失败静默下轮重试，连续 3 轮一次 critical。"""
+        _prs = dict(self._partial_resume_state.get(batch_id) or {})
+        if _prs.get('op') != (close_op_id or ''):
+            self._partial_resume_state[batch_id] = {'ts': time.time(), 'fails': 0,
+                                                    'op': close_op_id or ''}
+            return
+        if _prs.get('halted') or time.time() - _prs['ts'] < 60:
+            return
+        _prs['ts'] = time.time()
+        if self._try_acquire_resize_inflight(batch_id):
+            try:
+                ok_r, msg_r = self._resume_partial_resize(symbol, batch_id, close_op_id)
+            finally:
+                self._release_resize_inflight(batch_id)
+        else:
+            ok_r, msg_r = False, 'resize_inflight'
+        if ok_r:
+            self._partial_resume_state.pop(batch_id, None)
+            print(f"  └─ ✅ [partial 自愈] 批次 {batch_id}: {msg_r}")
+            self.send_tg_notification(
+                f"✅【partial 自愈】批次 `{batch_id}` 保护单已按净量重挂，恢复 ACTIVE。",
+                level='info')
+            return
+        if msg_r == 'resize_inflight':
+            self._partial_resume_state[batch_id] = _prs  # /partial 事务在途，不计数不告警
+            return
+        _prs['fails'] = int(_prs.get('fails', 0) or 0) + 1
+        print(f"  └─ ⏳ [partial 自愈] 批次 {batch_id} 本轮未续跑: {msg_r}")
+        if msg_r.startswith('resume_guard_rejected') or msg_r.startswith('resize_guard_rejected_'):
+            _prs['halted'] = True  # 守恒冲突 = terminal，等人工（callee 已 critical）
+        elif _prs['fails'] == 3:
+            self.send_tg_notification(
+                f"🚨【资金安全】批次 `{batch_id}` partial resize 连续 3 轮续跑失败\n"
+                f"💡 最近原因: {msg_r}\n"
+                f"批次保持冻结并将继续自动重试；请核对实际仓位与挂单。",
+                level='critical')
+        self._partial_resume_state[batch_id] = _prs
 
     def _check_existing_conflicts(self, symbol: str, batch_id: str, all_states: dict,
                                   signal_fingerprint: str = None) -> bool:
@@ -5746,6 +5891,12 @@ class CryptoTrader:
                                 f"⚠️ 该批次的 SL/TP 不再被补挂 / 换挂 / 降级恢复。\n"
                                 f"💡 请人工核对持仓与挂单，必要时手动平仓。",
                                 level='critical')
+                    # 🔥 v6.4-P1：partial_resize_pending 运行期自愈调度（60s 节流，
+                    # R7 守恒 terminal 停机 / R8 首见只登记——见 _maybe_runtime_resume_partial）
+                    if _b_close_phase == 1 and _close_reason == 'partial_resize_pending':
+                        self._maybe_runtime_resume_partial(
+                            symbol, batch_id,
+                            (latest_b_data or {}).get('close_op_id'))
                     continue
 
                 sl_triggered = False
