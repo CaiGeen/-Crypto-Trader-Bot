@@ -5,7 +5,8 @@
 - 事件模型：(ts, endpoint, status, used_weight_1m, order_count_10s, order_count_1m)
 - USED-WEIGHT / ORDER-COUNT-10S / ORDER-COUNT-1M 三指标：latest=时间序最后有效值，
   peak=60s 窗口内最大值（绝不能用进程生命周期 max 冒充「最新」）
-- 全部真实到达 Binance 的响应入账（含 503/-1021/网络错误等失败；-1021 重同步直连也要入账）
+- 所有 _safe_api_call 调用尝试均入账（含 503/-1021/网络错误等失败；-1021 重同步
+  直连也要入账）；若本次响应提供 header 则同步记录（ChatGPT 终审冻结口径）
 - weight 估值修正：cancel_order IP weight=1（官方实锤），create_order IP=0（order count 由真实 header 记录）
 
 R1 计数 / R2 三指标 header 捕获 / R3 事发快照内容 / R4 汇总 60s 节流 /
