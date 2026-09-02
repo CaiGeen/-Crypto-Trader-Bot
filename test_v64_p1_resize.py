@@ -346,9 +346,12 @@ def t10_p2_freeze_print_throttle():
     i = SRC.find('本轮跳过保护单维护')
     assert i > 0
     j = SRC.find('continue', i)
-    seg = SRC[max(0, i - 600):j]
+    seg = SRC[max(0, i - 700):j]
     assert '_freeze_print_state' in seg, '冻结 print 未接节流簿记'
     assert '300' in seg, '节流窗口应为 300s heartbeat'
+    # ChatGPT P2 边界：签名必须含 close_op_id——同批次新事务（新 op）立即打印，
+    # 且退出冻结后旧缓存不会吞掉新事务首报
+    assert 'close_op_id' in seg, '冻结 print 签名缺 close_op_id（同状态重入会被旧缓存吞掉）'
     assert SRC.count('_freeze_print_state') >= 2, '节流簿记缺失（init + 使用）'
 
 

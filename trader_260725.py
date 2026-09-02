@@ -5879,15 +5879,18 @@ class CryptoTrader:
                                      or 'settlement_stuck')  # 缺失 = 遗留冻结 → fail-noisy
                     # 🔥 v6.4-P2（Fix C）：console 冻结提示节流——状态变化立即打印，
                     # 持续不变每 300s heartbeat 一条（此前每周期无条件 print 实盘刷屏 70+ 行；
-                    # 「3 次后静默」约定只覆盖 TG 通道，console 从未限流）
-                    _fps = self._freeze_print_state.get(batch_id) or ('', 0, 0.0)
+                    # 「3 次后静默」约定只覆盖 TG 通道，console 从未限流）。
+                    # 签名含 close_op_id（ChatGPT P2 边界）：同批次新事务即使 reason/phase
+                    # 相同也视为新事件立即打印，且退出冻结后旧缓存不会吞掉新事务首报。
+                    _close_op = (latest_b_data or {}).get('close_op_id') or ''
+                    _fps = self._freeze_print_state.get(batch_id) or ('', 0, '', 0.0)
                     if _close_reason != _fps[0] or _b_close_phase != _fps[1] \
-                            or time.time() - _fps[2] >= 300:
+                            or _close_op != _fps[2] or time.time() - _fps[3] >= 300:
                         print(f"  └─ 🧊 [P0 冻结] 批次 {batch_id} 处于平仓流程"
                               f"(close_phase={_b_close_phase}, reason={_close_reason})，"
                               f"本轮跳过保护单维护")
                         self._freeze_print_state[batch_id] = (_close_reason, _b_close_phase,
-                                                              time.time())
+                                                              _close_op, time.time())
                     # 🔒 v6.2-r4：FREEZE_QUIET_REASONS（market_confirming /
                     # limit_pending_normal）之外一律周期 critical——
                     # limit_creating 是 transient，crash 重启后必须 loud（M25）。
