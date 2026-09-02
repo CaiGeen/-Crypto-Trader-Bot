@@ -2775,8 +2775,9 @@ class CryptoTrader:
             last_filled = int(b_data.get('last_filled_count', 0) or 0)
             if last_filled <= 0:
                 continue  # 未成交批次无需 SL
-            target_amounts = b_data.get('target_amounts', []) or []
-            program_position += sum(target_amounts[:last_filled])
+            # 🔥 v6.4（consumer 补漏）：SG2 按净仓位累计——partial 后 gross > net，
+            # 会假触发「台账 > 交易所」分支（变量名 last_filled 曾致清单漏网）
+            program_position += self._batch_net_position(b_data)[0]
             filled_batches.append((batch_id, b_data.get('current_sl_id')))
 
         # ② 差额判定（方案 A 严格）：正差=未归属手工仓位，负差=台账与交易所不一致
@@ -2791,12 +2792,20 @@ class CryptoTrader:
                            f"（台账 {program_position:.6f} > 交易所 {current_pos:.6f}），"
                            f"无法确认保护状态，请人工核对")
 
-        # ③ SL 有效性校验：一次 fetch_open_orders，失败 = UNKNOWN = 拒绝
+        # ③ SL 有效性校验：双通道（普通 + stop=True 条件单）——SL 是条件单，
+        # 普通通道看不到（P0-F1 同族：单通道 = 假"缺少有效止损单"，
+        # 2026-09-02 实盘首曝于已成交批次+活 SL+再加仓场景）；
+        # 任一通道失败 = UNKNOWN = 拒绝（Fail-Closed，与 conflict scan 同款）
         try:
             open_orders = self._safe_api_call(self.exchange.fetch_open_orders, symbol)
         except Exception as e:
             return False, f"SL 状态查询失败（{str(e)[:80]}），无法确认保护状态"
-        open_ids = {str(o.get('id')) for o in open_orders}
+        try:
+            stop_orders = self._safe_api_call(self.exchange.fetch_open_orders, symbol,
+                                              params={'stop': True})
+        except Exception as e:
+            return False, f"SL 状态查询失败-条件单通道（{str(e)[:80]}），无法确认保护状态"
+        open_ids = {str(o.get('id')) for o in list(open_orders) + list(stop_orders)}
         missing = [bid for bid, sl_id in filled_batches
                    if not sl_id or str(sl_id) not in open_ids]
         if missing:
@@ -3638,8 +3647,24 @@ class CryptoTrader:
                         raise e
 
             if not entry_orders:
+                # 🔥 v6.4（PROVEN-CLEAN 收口）：到达此处 = 所有层均被本地价格过滤
+                # 或 -2021 确定拒绝（registry 已标 ABSENT，不残留 PENDING_CREATE）——
+                # 0 create_order、0 交易所副作用，数学上可证明干净。空骨架立即终止
+                # active：不再伪装成风险批次参与幂等/统计。不调 clear_batch_state
+                # （其 convergence proof/tombstone 契约不适用于零副作用场景）。
+                try:
+                    with self._state_lock:
+                        latest = self.load_all_states()
+                        _b = (latest.get(symbol, {}) or {}).get(batch_id)
+                        if isinstance(_b, dict) and not _b.get('entry_orders'):
+                            _b['is_active'] = False
+                            self._persist_states(latest)
+                except Exception as _e:
+                    print(f"⚠️ [PROVEN-CLEAN] 空骨架停用失败（不影响拒绝结果）: {_e}")
                 print("❌ 没有成功挂出任何有效开仓条件单（触发价均不符合逻辑），程序安全退出。")
-                return None
+                # 🔥 哨兵（Fix D）：bot_runner 据此释放 D-005 记录，允许立即修正重发；
+                # 其余 None 路径（异常/未知）保持 EXECUTING 10 分钟 Fail-Closed 不变
+                return 'CLEAN_REJECT'
 
             batch_total_amount = float(self.exchange.amount_to_precision(symbol, batch_total_amount))
 

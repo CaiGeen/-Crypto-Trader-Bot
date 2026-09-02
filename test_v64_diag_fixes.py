@@ -95,11 +95,20 @@ def t03_wiring_structural():
 
 
 def _extract_t(name):
-    """从 trader 提取函数（429 冷却 helper 为 staticmethod，可直调）。"""
+    """从 trader 提取函数；注入其引用的模块级常量（EPS 等）。"""
     tree = ast.parse(SRC)
+    consts = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and node.targets and \
+                isinstance(node.targets[0], ast.Name):
+            try:
+                consts[node.targets[0].id] = eval(
+                    compile(ast.Expression(node.value), '<m>', 'eval'))
+            except Exception:
+                pass
+    ns = dict(consts)
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == name:
-            ns = {}
             exec(textwrap.dedent(ast.get_source_segment(SRC, node)), ns)
             return ns[name]
     return None
@@ -115,10 +124,97 @@ def t04_429_cooldown_respects_retry_after():
     assert abs(ec(50.0, '10') - 50.0) < 1e-9, '基础值更大 → 基础值'
 
 
+# ── ⑤ SG2 双通道 + 净仓位（实盘误拒加仓的根因修复）──────────────────────
+def t05_sg2_dual_channel_and_net_position():
+    import types
+    cov = _extract_t('_check_sl_coverage')
+    netpos = _extract_t('_batch_net_position')
+    assert cov is not None and netpos is not None
+
+    class StubEx:
+        def __init__(self, normal, stop):
+            self.normal, self.stop = normal, stop
+
+        def fetch_open_orders(self, symbol, params=None, **k):
+            return list(self.stop) if (params or {}).get('stop') else list(self.normal)
+
+    class T:
+        pass
+
+    t = T()
+    t._batch_net_position = types.MethodType(netpos, t)
+    b = {'is_active': True, 'batch_id': 'batch_A', 'side': 'BUY',
+         'target_amounts': [1.0], 'filled_details': [100.0],
+         'last_filled_count': 1, 'current_sl_id': 'S1',
+         'realized_reduce_amount': 0.5}  # gross 1.0 → net 0.5
+    states = {'BTC/USDT:USDT': {'batch_A': b}}
+
+    # A：SL 只在条件单通道（普通通道看不到——今天实盘误拒的场景本体）
+    t._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
+    t.exchange = StubEx(normal=[], stop=[{'id': 'S1'}])
+    ok, msg = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.5)
+    assert ok is True, f'条件单通道里的 SL 必须被找到: {msg}'
+
+    # 反向对照：两个通道都没有 → 拒绝（判据仍活着）
+    t.exchange = StubEx(normal=[], stop=[])
+    ok, msg = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.5)
+    assert ok is False and '缺少有效止损单' in msg, (ok, msg)
+
+    # B：partial 后净仓位累计——actual 0.5 == Σnet 0.5 → 不得假报台账不一致
+    t.exchange = StubEx(normal=[], stop=[{'id': 'S1'}])
+    ok, msg = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.5)
+    assert ok is True, f'净仓位判据: {msg}'
+    # gross 会得 1.0 > actual 0.5 → 假「台账 > 交易所」（旧实现回归哨兵）
+    ok2, msg2 = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.4)
+    assert ok2 is False and '台账' in msg2, msg2
+
+    # Fail-Closed：任一通道异常 → 拒绝
+    class BoomEx(StubEx):
+        def fetch_open_orders(self, symbol, params=None, **k):
+            if (params or {}).get('stop'):
+                raise Exception('network down')
+            return []
+    t.exchange = BoomEx([], [])
+    ok, msg = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.5)
+    assert ok is False and '条件单通道' in msg, msg
+
+
+# ── ⑥ PROVEN-CLEAN：骨架停用 + D-005 释放（零 create 可证明场景）────────
+def t06_proven_clean_reject_release():
+    import types
+    # D 侧：_release_dedup_clean 从 bot_runner 源提取（桩掉 dedup 依赖）
+    tree = ast.parse(BR)
+    rel = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == '_release_dedup_clean':
+            ns = {'time': __import__('time'), '_load_dedup': None, '_save_dedup': None,
+                  'DedupCorruptedError': Exception, 'print': print}
+            exec(textwrap.dedent(ast.get_source_segment(BR, node)), ns)
+            rel = ns['_release_dedup_clean']
+    assert rel is not None, '_release_dedup_clean 未实现'
+    store = {'fp_77640': {'status': 'EXECUTING', 'batch_id': None}}
+    ns['_load_dedup'] = lambda fp=None, now=None, p=None: dict(store)
+    ns['_save_dedup'] = lambda data, p=None: (store.clear(), store.update(data))
+    rel('fp_77640')
+    assert 'fp_77640' not in store, 'PROVEN-CLEAN 必须删除指纹记录（可立即重发）'
+
+    # C 侧结构：零 create 分支含骨架停用 + CLEAN_REJECT 哨兵
+    assert "return 'CLEAN_REJECT'" in SRC
+    assert "_b['is_active'] = False" in SRC
+    # D 接线：bot_runner 拦截哨兵并释放 + 明确 TG 回执（防「唤起后无下文」），
+    # 其余 None 仍走 mark（Fail-Closed 不变）
+    assert "if batch_id == 'CLEAN_REJECT':" in BR and '_release_dedup_clean(fingerprint)' in BR
+    assert "await safe_reply(" in BR.split("if batch_id == 'CLEAN_REJECT':")[1][:900], \
+        'CLEAN_REJECT 分支必须有 TG 回执'
+    assert "_mark_dedup_result(fingerprint, batch_id)" in BR
+
+
 TESTS = [t01_snapshot_parse_independent_of_file,
          t02_429_diag_evidence_string,
          t03_wiring_structural,
-         t04_429_cooldown_respects_retry_after]
+         t04_429_cooldown_respects_retry_after,
+         t05_sg2_dual_channel_and_net_position,
+         t06_proven_clean_reject_release]
 
 
 def main():

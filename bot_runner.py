@@ -2270,6 +2270,21 @@ def _approve_dedup_force(short_id: str, now=None, path=None):
     return True, matches[0][:8]
 
 
+def _release_dedup_clean(fingerprint: str, now=None, path=None) -> None:
+    """🔥 v6.4（Fix D）：PROVEN-CLEAN 拒绝（trader 已证明零 create/零交易所副作用）
+    → 删除本次指纹记录，允许立即修正重发。best-effort 记账（失败不影响结果）。
+    仅 run_trader_execution 的 CLEAN_REJECT 分支调用；其余 None 路径保持
+    EXECUTING 10 分钟 Fail-Closed（D-005 原始风险理由不变）。"""
+    now = time.time() if now is None else now
+    try:
+        data = _load_dedup(path, now)
+        if fingerprint in data:
+            del data[fingerprint]
+            _save_dedup(data, path)
+    except Exception as e:
+        print(f"⚠️ [D-005] PROVEN-CLEAN 释放记账失败（不影响本次结果）: {e}")
+
+
 async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                signal_snapshot: dict = None):
     async with TRADER_LOCK:
@@ -2358,6 +2373,22 @@ async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
 
             batch_id = await loop.run_in_executor(None, trader.execute_signal, signal)
+            # 🔥 v6.4（Fix D）：trader 返回 CLEAN_REJECT = 已证明零 create/零副作用
+            # → 释放 D-005 记录，允许立即修正重发。其余 None 路径（异常/未知，
+            # 干净失败与部分成交不可分）保持 EXECUTING 10 分钟 Fail-Closed 不变。
+            if batch_id == 'CLEAN_REJECT':
+                _release_dedup_clean(fingerprint)
+                print("✅ [D-005] PROVEN-CLEAN 拒绝已释放去重记录（可立即修正参数重发）")
+                # 🔥 v6.4（landing blocker 修复）：必须有明确 TG 回执——否则用户看到
+                # 「唤起后无下文」，易诱发连续重发（正是刚修过的交互痛点）
+                await safe_reply(
+                    update,
+                    "⚠️ **挂单未执行**：所有入场触发价当前均不符合挂单条件（触发价需在"
+                    "市价正确一侧）。\n✅ 本次未产生任何开仓订单，重复信号锁已释放，"
+                    "可修改参数后立即重发。",
+                    parse_mode='Markdown'
+                )
+                return
             # D-005: 执行结束回写（None 不置 FAILED——干净失败与部分成交不可分，
             # 保持 EXECUTING 由时间窗自解，防部分成交后重发翻倍仓位）
             _mark_dedup_result(fingerprint, batch_id)

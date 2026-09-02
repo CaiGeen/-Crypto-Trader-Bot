@@ -1,99 +1,49 @@
 diff --git a/bot_runner.py b/bot_runner.py
-index 601b22c..f876987 100644
+index f876987..e7f4e00 100644
 --- a/bot_runner.py
 +++ b/bot_runner.py
-@@ -49,7 +49,7 @@ from telegram.request import HTTPXRequest
- from telegram.error import NetworkError, RetryAfter, Conflict, BadRequest
- 
- # 导入交易核心与解析器
--from parser import parse_signal_from_json
-+from parser import parse_signal_from_json, parse_signal_from_dict
- from trader_260725 import CryptoTrader
- 
- # 2. 加载环境变量
-@@ -1812,7 +1812,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-             f"⏳ 正在唤起交易引擎...",
-             parse_mode='Markdown'
-         )
--        asyncio.create_task(run_trader_execution(update, context))
-+        # 🔥 v6.4（signal snapshot 竞态修复）：dispatch 时固化本次信号内容快照，
-+        # 任务永远执行自己的快照——不再重读共享 signal.json（连发覆写竞态根因）
-+        asyncio.create_task(run_trader_execution(update, context,
-+                                                 signal_snapshot=dict(signal_data)))
- 
-     except json.JSONDecodeError as e:
-         await safe_reply(update, f"❌ JSON 解析失败: {e}")
-@@ -1845,7 +1848,10 @@ async def handle_json_or_pending_input(update: Update, context: ContextTypes.DEF
-                     f"📊 {signal_data['symbol']} {signal_data['side']} {signal_data['leverage']}x",
-                     parse_mode='Markdown'
-                 )
--                asyncio.create_task(run_trader_execution(update, context))
-+                # 🔥 v6.4（signal snapshot 竞态修复）：dispatch 时固化本次信号内容快照，
-+                # 任务永远执行自己的快照——不再重读共享 signal.json（连发覆写竞态根因）
-+                asyncio.create_task(run_trader_execution(update, context,
-+                                                         signal_snapshot=dict(signal_data)))
-                 return
-             elif upper_text == "NO":
-                 await safe_reply(update, "❌ 测试挂单已取消。")
-@@ -1870,7 +1876,10 @@ async def handle_json_or_pending_input(update: Update, context: ContextTypes.DEF
-                         signal_file = os.path.join(BASE_DIR, "signal.json")
-                         with open(signal_file, "w", encoding="utf-8") as f:
-                             json.dump(signal_data, f, indent=4, ensure_ascii=False)
--                        asyncio.create_task(run_trader_execution(update, context))
-+                        # 🔥 v6.4（signal snapshot 竞态修复）：dispatch 时固化本次信号内容快照，
-+                        # 任务永远执行自己的快照——不再重读共享 signal.json（连发覆写竞态根因）
-+                        asyncio.create_task(run_trader_execution(
-+                            update, context, signal_snapshot=dict(signal_data)))
-                         return
-                 except (json.JSONDecodeError, KeyError, ValueError):
-                     pass
-@@ -2008,7 +2017,10 @@ async def handle_json_or_pending_input(update: Update, context: ContextTypes.DEF
-             f"⏳ 正在唤起交易引擎...",
-             parse_mode='Markdown'
-         )
--        asyncio.create_task(run_trader_execution(update, context))
-+        # 🔥 v6.4（signal snapshot 竞态修复）：dispatch 时固化本次信号内容快照，
-+        # 任务永远执行自己的快照——不再重读共享 signal.json（连发覆写竞态根因）
-+        asyncio.create_task(run_trader_execution(update, context,
-+                                                 signal_snapshot=dict(signal_data)))
- 
-     except json.JSONDecodeError as e:
-         await safe_reply(update, f"❌ JSON 解析失败: {e}\n\n请检查 JSON 格式。")
-@@ -2088,7 +2100,10 @@ async def handle_quick_signal(update: Update, context: ContextTypes.DEFAULT_TYPE
-             f"🎯 快捷信号生效！已更新 `signal.json` ({symbol} {side} {leverage}x)，唤起交易中...",
-             parse_mode='Markdown'
-         )
--        asyncio.create_task(run_trader_execution(update, context))
-+        # 🔥 v6.4（signal snapshot 竞态修复）：dispatch 时固化本次信号内容快照，
-+        # 任务永远执行自己的快照——不再重读共享 signal.json（连发覆写竞态根因）
-+        asyncio.create_task(run_trader_execution(update, context,
-+                                                 signal_snapshot=dict(signal_data)))
- 
-     except ValueError as e:
-         await safe_reply(update, f"❌ 数字格式错误: {e}")
-@@ -2255,7 +2270,8 @@ def _approve_dedup_force(short_id: str, now=None, path=None):
+@@ -2270,6 +2270,21 @@ def _approve_dedup_force(short_id: str, now=None, path=None):
      return True, matches[0][:8]
  
  
--async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
-+async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYPE,
-+                               signal_snapshot: dict = None):
++def _release_dedup_clean(fingerprint: str, now=None, path=None) -> None:
++    """🔥 v6.4（Fix D）：PROVEN-CLEAN 拒绝（trader 已证明零 create/零交易所副作用）
++    → 删除本次指纹记录，允许立即修正重发。best-effort 记账（失败不影响结果）。
++    仅 run_trader_execution 的 CLEAN_REJECT 分支调用；其余 None 路径保持
++    EXECUTING 10 分钟 Fail-Closed（D-005 原始风险理由不变）。"""
++    now = time.time() if now is None else now
++    try:
++        data = _load_dedup(path, now)
++        if fingerprint in data:
++            del data[fingerprint]
++            _save_dedup(data, path)
++    except Exception as e:
++        print(f"⚠️ [D-005] PROVEN-CLEAN 释放记账失败（不影响本次结果）: {e}")
++
++
+ async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                signal_snapshot: dict = None):
      async with TRADER_LOCK:
-         try:
-             loop = asyncio.get_running_loop()
-@@ -2286,8 +2302,13 @@ async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYP
-                                  parse_mode='Markdown')
+@@ -2358,6 +2373,22 @@ async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYP
                  return
  
--            signal_file = os.path.join(BASE_DIR, "signal.json")
--            signal = parse_signal_from_json(signal_file)
-+            if signal_snapshot is not None:
-+                # 🔥 v6.4（signal snapshot 竞态修复）：本任务永远执行自己 dispatch
-+                # 时的内容快照，不重读共享 signal.json（连发覆写竞态根因）
-+                signal = parse_signal_from_dict(signal_snapshot)
-+            else:
-+                signal_file = os.path.join(BASE_DIR, "signal.json")
-+                signal = parse_signal_from_json(signal_file)
- 
-             print(f"\n📋 信号解析完成:")
-             print(f"   ├─ 标的: {signal.symbol}")
+             batch_id = await loop.run_in_executor(None, trader.execute_signal, signal)
++            # 🔥 v6.4（Fix D）：trader 返回 CLEAN_REJECT = 已证明零 create/零副作用
++            # → 释放 D-005 记录，允许立即修正重发。其余 None 路径（异常/未知，
++            # 干净失败与部分成交不可分）保持 EXECUTING 10 分钟 Fail-Closed 不变。
++            if batch_id == 'CLEAN_REJECT':
++                _release_dedup_clean(fingerprint)
++                print("✅ [D-005] PROVEN-CLEAN 拒绝已释放去重记录（可立即修正参数重发）")
++                # 🔥 v6.4（landing blocker 修复）：必须有明确 TG 回执——否则用户看到
++                # 「唤起后无下文」，易诱发连续重发（正是刚修过的交互痛点）
++                await safe_reply(
++                    update,
++                    "⚠️ **挂单未执行**：所有入场触发价当前均不符合挂单条件（触发价需在"
++                    "市价正确一侧）。\n✅ 本次未产生任何开仓订单，重复信号锁已释放，"
++                    "可修改参数后立即重发。",
++                    parse_mode='Markdown'
++                )
++                return
+             # D-005: 执行结束回写（None 不置 FAILED——干净失败与部分成交不可分，
+             # 保持 EXECUTING 由时间窗自解，防部分成交后重发翻倍仓位）
+             _mark_dedup_result(fingerprint, batch_id)
