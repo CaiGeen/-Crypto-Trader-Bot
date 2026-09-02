@@ -1,0 +1,1 @@
+RED 0/5（未实现: ['_batch_net_position', '_execute_partial_close', '_resize_protection_after_partial', '_resume_partial_resize', '_handle_partial_close_on_recovery', '_maybe_report_conservation_conflict', '_check_conservation_conflict']）

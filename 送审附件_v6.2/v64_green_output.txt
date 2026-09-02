@@ -1,0 +1,9 @@
+✅ t01_partial_commit_full_chain_and_no_fill_rejection
+✅ t02_consumers_use_net_ledger
+  └─ ✅ [partial 恢复] 批次 [batch_A]: partial_active
+  └─ ⚠️ [partial 恢复] 批次 [batch_A]: partial_closing_requires_manual_review
+✅ t03_restart_split_via_production_hook
+✅ t04_partial_new_fill_partial_avg_stable
+✅ t05_detector_via_wiring_with_dedup
+
+GREEN: 5/5

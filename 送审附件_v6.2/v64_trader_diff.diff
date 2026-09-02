@@ -1,0 +1,653 @@
+diff --git a/trader_260725.py b/trader_260725.py
+index be44aa0..c8f5e11 100644
+--- a/trader_260725.py
++++ b/trader_260725.py
+@@ -40,6 +40,18 @@ TOMBSTONE_TTL_SECONDS = 7 * 24 * 3600
+ #   C registry 逐 identity / D id 镜像 / E 静态幂等 / F 簿记最新者胜（默认）。
+ _MERGE_RATCHET_BOOL_FIELDS = ('pending_close', 'is_programmatic_cancel',
+                               'settled_by_limit_close')
++
++
++def _partial_resize_owner_ok(b, owner_op_id):
++    """🔥 v6.4-P0：G1/G2/G3b 极窄 owner exception 判据。
++
++    仅当批次处于 partial_resize_pending（净账本已 durable、只差保护单 resize）
++    且调用方持有匹配的 close_op_id 时，允许在 close_phase>=1 冻结期创建/替换
++    保护单（= partial 事务自身的 resize）。默认 gate 行为零变化，严禁泛化成
++    allow_during_close——否则等于重新打开 close 竞态封印。"""
++    return (owner_op_id is not None
++            and b.get('close_reason') == 'partial_resize_pending'
++            and str(owner_op_id) == str(b.get('close_op_id') or ''))
+ _MERGE_ID_MIRROR_FIELDS = ('tp_order_id', 'current_sl_id', 'limit_close_order_id')
+ # C 类保护集：磁盘条目处于这些 state → 保留磁盘（未决/已锁/终态不许被旧快照降级）
+ _MERGE_REGISTRY_PROTECTED_STATES = ('PENDING_CREATE', 'PENDING_VERIFY', 'NOT_CONFIRMED',
+@@ -836,7 +848,7 @@ class CryptoTrader:
+                     emoji = "📈" if side == 'BUY' else "📉"
+                     last_filled_count = b_data.get('last_filled_count', 0)
+                     target_amounts = b_data.get('target_amounts', [])
+-                    filled_amount = sum(target_amounts[:last_filled_count])
++                    filled_amount, _ = self._batch_net_position(b_data)  # v6.4：净仓位
+                     entry_count = len(b_data.get('entry_orders', []))
+                     sl_txt = "SL✔️" if b_data.get('current_sl_id') else "SL❌"
+                     tp_txt = "TP✔️" if b_data.get('tp_order_id') else "TP❌"
+@@ -1739,12 +1751,17 @@ class CryptoTrader:
+                 filled_details = b_data.get('filled_details', [])
+                 total_entry_fee = b_data.get('total_entry_fee', 0.0)
+ 
+-                filled_amount = sum(target_amounts[:last_filled_count])
++                filled_amount, net_cost = self._batch_net_position(b_data)  # v6.4：净仓位/净成本
+                 if filled_amount <= 0:
+                     return None
+ 
+-                total_cost = sum([target_amounts[i] * filled_details[i] for i in range(last_filled_count)])
+-                avg_price = (total_cost + total_entry_fee) / filled_amount
++                # v6.4：剩余 fee 按 cost 比例分摊（fee 模型 = price×amount×r ∝ 成本 notional，
++                # 非 qty 比例；ChatGPT 反例验算：partial→不同价新层后 qty 比例会低估剩余 fee）
++                _rr_cost = float(b_data.get('realized_reduce_cost', 0.0) or 0.0)
++                _gross_cost = net_cost + _rr_cost
++                fee_rem = float(total_entry_fee or 0.0) * net_cost / _gross_cost \
++                    if _gross_cost > 0 else 0.0
++                avg_price = (net_cost + fee_rem) / filled_amount
+ 
+                 try:
+                     ticker = self._safe_api_call(self.exchange.fetch_ticker, symbol)
+@@ -1977,6 +1994,12 @@ class CryptoTrader:
+                     except Exception as e:
+                         print(f"  └─ ⚠️ 设置杠杆失败: {e}")
+ 
++                    # 🔥 v6.4-P0：partial 崩溃分型续跑（生产调用点——重启看到
++                    # partial_resize_pending 只续 resize；partial_closing loud 拒续跑）
++                    _pc_reason = (b_data.get('close_reason') or '')
++                    if _pc_reason in ('partial_closing', 'partial_resize_pending'):
++                        self._handle_partial_close_on_recovery(symbol, batch_id)
++
+                     # 🔥 验证止损单是否存在
+                     # P0-F2 前置修复（ChatGPT 终审前置问题2）：UNKNOWN ≠ None
+                     #   旧代码 except Exception → current_sl_id=None → 监控线程误判"无SL"
+@@ -2076,7 +2099,7 @@ class CryptoTrader:
+         filled_details = target_b_data.get('filled_details', [])
+         last_filled_count = target_b_data.get('last_filled_count', 0)
+         target_amounts = target_b_data.get('target_amounts', [])
+-        current_filled_amount = sum(target_amounts[:last_filled_count])
++        current_filled_amount, tp_net_cost = self._batch_net_position(target_b_data)  # v6.4：净仓位
+         side = target_b_data.get('side', 'BUY')
+ 
+         formatted_tp_price = float(self.exchange.price_to_precision(target_symbol, new_tp_price))
+@@ -2093,8 +2116,8 @@ class CryptoTrader:
+             )
+             return True, f"✅ 批次 `{batch_id}` 止盈目标已预更新为 `{formatted_tp_price}`（等待首层成交后自动生效）"
+ 
+-        filled_costs = sum([target_amounts[i] * filled_details[i] for i in range(last_filled_count)])
+-        vwap = filled_costs / current_filled_amount if current_filled_amount > 0 else 0.0
++        # v6.4：TP vwap 用净成本（partial 后 gross vwap 会虚高）
++        vwap = tp_net_cost / current_filled_amount if current_filled_amount > 0 else 0.0
+ 
+         if side == 'BUY':
+             min_profit_price = vwap * (1 + TAKER_FEE_RATE + MAKER_FEE_RATE + SLIPPAGE_BUFFER)
+@@ -2242,7 +2265,7 @@ class CryptoTrader:
+ 
+         last_filled_count = target_b_data.get('last_filled_count', 0)
+         target_amounts = target_b_data.get('target_amounts', [])
+-        current_filled_amount = sum(target_amounts[:last_filled_count])
++        current_filled_amount, _ = self._batch_net_position(target_b_data)  # v6.4：净仓位
+         side = target_b_data.get('side', 'BUY')
+ 
+         formatted_sl_price = float(self.exchange.price_to_precision(target_symbol, new_sl_price))
+@@ -2389,17 +2412,22 @@ class CryptoTrader:
+         target_amounts = target_b_data.get('target_amounts', [])
+         filled_details = target_b_data.get('filled_details', [])
+         total_entry_fee = target_b_data.get('total_entry_fee', 0.0)
+-        current_filled_amount = sum(target_amounts[:last_filled_count])
++        current_filled_amount, net_cost = self._batch_net_position(target_b_data)  # v6.4：净仓位/净成本
+ 
+         if current_filled_amount <= 0:
+             return False, f"⚠️ 批次 `{batch_id}` 尚未建仓，无法计算保本价！"
+ 
++        # v6.4：名义/含费均价均基于净仓位/净成本；剩余 fee 按 cost 比例分摊（fee ∝ notional）
++        _rr_cost = float(target_b_data.get('realized_reduce_cost', 0.0) or 0.0)
++        _gross_cost = net_cost + _rr_cost
++        fee_rem = float(total_entry_fee or 0.0) * net_cost / _gross_cost \
++            if _gross_cost > 0 else 0.0
++
+         # 计算名义均价（不含手续费）
+-        filled_costs = sum([target_amounts[i] * filled_details[i] for i in range(last_filled_count)])
+-        nominal_avg = filled_costs / current_filled_amount
++        nominal_avg = net_cost / current_filled_amount
+ 
+         # 计算含费均价（实际保本价）
+-        actual_avg = (filled_costs + total_entry_fee) / current_filled_amount
++        actual_avg = (net_cost + fee_rem) / current_filled_amount
+ 
+         # 获取当前市价
+         try:
+@@ -2497,7 +2525,7 @@ class CryptoTrader:
+ 
+         last_filled_count = b_data.get('last_filled_count', 0)
+         target_amounts = b_data.get('target_amounts', [])
+-        current_filled_amount = sum(target_amounts[:last_filled_count])
++        current_filled_amount, _ = self._batch_net_position(b_data)  # v6.4：净仓位
+ 
+         # B2-8（§5.7 #3）：保本损换挂纳入仲裁——identity = SL/L{主层}/{持仓方向}
+         sl_side_ident = 'LONG' if side == 'BUY' else 'SHORT'
+@@ -2755,6 +2783,314 @@ class CryptoTrader:
+         parts.append(f"tp={self.exchange.price_to_precision(signal.symbol, signal.take_profit)}")
+         return "|".join(parts)
+ 
++    def _batch_net_position(self, b_data):
++        """🔥 v6.4-P0：批次净仓位/净成本二元组（durable partial ledger）。
++
++        净仓位 = Σ target_amounts[:lfc] − realized_reduce_amount
++        净成本 = Σ (target_amounts×filled_details)[:lfc] − realized_reduce_cost
++        realized_reduce_* 唯一写者 = PARTIAL COMMIT（_execute_partial_close）；
++        fill 路径零改动（新层成交只动 target_amounts/lfc，净量随分子自动增长）。
++        旧批次无字段 → get(...,0.0) → 净=gross，向后兼容零迁移。
++        """
++        lfc = int(b_data.get('last_filled_count', 0) or 0)
++        ta = b_data.get('target_amounts') or []
++        fd = b_data.get('filled_details') or []
++        gross_qty = float(sum(ta[:lfc]))
++        gross_cost = float(sum((ta[i] * fd[i]) for i in range(min(lfc, len(fd)))))
++        return (gross_qty - float(b_data.get('realized_reduce_amount', 0.0) or 0.0),
++                gross_cost - float(b_data.get('realized_reduce_cost', 0.0) or 0.0))
++
++    def _check_conservation_conflict(self, symbol, all_states, actual, tol=0.0005):
++        """🔥 v6.4-P0：守恒破坏检测——actual < Σnet − tol ⇒ 归属不可知（ATTRIBUTION_CONFLICT）。
++
++        tol 默认半档 amount 精度（0.0005），防精度抖动误报；真实发散 ≥0.001 必触发。
++        多批次 + App 模糊减仓场景（f1e135 教训的一般化）：检测器，不是修复——
++        触发后由人工 reconcile，不做自动归属猜测。"""
++        symbol_state = all_states.get(symbol, {}) or {}
++        net_sum = 0.0
++        for _b in symbol_state.values():
++            if not isinstance(_b, dict) or not _b.get('is_active'):
++                continue
++            _q, _c = self._batch_net_position(_b)
++            net_sum += max(_q, 0.0)
++        return actual < net_sum - tol
++
++    def _maybe_report_conservation_conflict(self, symbol, batch_id):
++        """🔥 v6.4-P0：monitor 多批次跳过分支的守恒检测接线（真实生产调用点）。
++
++        detector 而非修复——触发后人工 reconcile，不做归属猜测。
++        告警去重：同一 symbol 最多告警 3 次后静默（告警纪律：防刷屏/防 API 风暴）。"""
++        try:
++            all_states = self.load_all_states()
++            _first = next((_bd for _bd in (all_states.get(symbol) or {}).values()
++                           if isinstance(_bd, dict) and _bd.get('is_active')), None)
++            if not isinstance(_first, dict):
++                return
++            is_hedge = bool(_first.get('is_hedge_mode', False))
++            side = (_first.get('side') or 'BUY').upper()
++            actual = self._get_current_position_amt(symbol, is_hedge, side)
++            if actual is None:
++                return
++            if self._check_conservation_conflict(symbol, all_states, actual):
++                alerts = getattr(self, '_conservation_alert_count', None)
++                if alerts is None:
++                    alerts = self._conservation_alert_count = {}
++                n = alerts.get(symbol, 0)
++                if n >= 3:
++                    return
++                alerts[symbol] = n + 1
++                self.send_tg_notification(
++                    f"🚨【资金安全】仓位守恒破坏（ATTRIBUTION_CONFLICT）\n"
++                    f"🆔 检测批次: `{batch_id}`\n"
++                    f"💡 交易所 {symbol} 实际持仓 < Σ批次净仓位——外部减仓归属不可知，\n"
++                    f"各批次保护单数量不可信。请人工核对后修正台账（第 {n + 1}/3 次告警）。",
++                    level='critical')
++        except Exception as e:
++            print(f"  └─ ⚠️ [守恒检测] 异常: {e}")
++
++    def _handle_partial_close_on_recovery(self, symbol, batch_id):
++        """🔥 v6.4-P0：恢复路径的 partial 分型接线（真实生产调用点，重启续跑入口）。
++
++        partial_resize_pending → _resume_partial_resize 只续 resize，绝不重发 MARKET；
++        partial_closing → loud critical（副作用未知），拒绝自动续跑。"""
++        try:
++            b = (self.load_all_states().get(symbol, {}) or {}).get(batch_id) or {}
++            ok, msg = self._resume_partial_resize(symbol, batch_id,
++                                                  b.get('close_op_id'))
++            print(f"  └─ {'✅' if ok else '⚠️'} [partial 恢复] 批次 [{batch_id}]: {msg}")
++        except Exception as e:
++            print(f"  └─ ⚠️ [partial 恢复] 批次 [{batch_id}] 异常: {e}")
++            self.send_tg_notification(
++                f"🚨【资金安全】partial 恢复异常 批次 `{batch_id}`: {e}",
++                level='critical')
++
++    def _execute_partial_close(self, symbol, batch_id, amount):
++        """🔥 v6.4-P0：批次指定部分平仓——intent-before-effect 纪律的平仓侧复用。
++
++        事务：BEGIN(partial_closing, transient) → 市价减单 → exact confirm
++        → CAS 持久化净账本 + reason→partial_resize_pending（同一次原子提交）
++        → 保护单 resize（撤旧挂净量；G1/G2/G3b owner exception 窄放行）
++        → 最终 CAS 回 ACTIVE。pending ENTRY 原样保留。
++        崩溃语义：partial_closing 阶段崩溃 = loud/人工；partial_resize_pending =
++        _resume_partial_resize 续跑，绝不重发 MARKET。
++        """
++        all_states = self.load_all_states()
++        b = (all_states.get(symbol, {}) or {}).get(batch_id)
++        if not isinstance(b, dict) or not b.get('is_active'):
++            return False, 'batch_missing_or_inactive'
++        net_qty, _net_cost = self._batch_net_position(b)
++        # 🔥 v6.4 三审（P0-2）：/partial 必须严格部分平仓——amount == net 全平后
++        # post_net=0 仍进 resize（create amount=0）且 pending ENTRY 保留却无保护维护。
++        # 全量平仓请走 /close（完整 ENTRY 撤除 + 结算 + 归档链）。
++        if amount <= 0 or amount >= net_qty - 1e-12:
++            return False, (f'invalid_amount（净仓位 {net_qty}；/partial 只接受严格小于'
++                           f'净仓位的数量，全量平仓请使用 /close）')
++        ok, close_op_id, reason, snapshot = self._begin_close_request_if_active(
++            symbol, batch_id, 'partial_closing')
++        if not ok:
++            return False, f'begin_failed（{reason}）'
++        side = ((snapshot or b).get('side') or 'BUY').upper()
++        params_base = dict((snapshot or b).get('params_base') or {})
++        # 🔥 v6.4 三审（P0-1）：BEGIN 后先过生产 coverage/守恒 guard——多批次
++        # actual < Σnet（归属冲突）在此 Fail-Closed，绝不带冲突继续减 aggregate
++        # 重演 wrong-close。此时尚无交易所副作用 → 冲突即 CAS 回滚 BEGIN。
++        is_hedge_g = bool((snapshot or b).get('is_hedge_mode', False))
++        guard_amount, guard_detail = self._close_amount_guard(
++            symbol, side, is_hedge_g, amount, batch_id)
++        if guard_amount is None or abs(float(guard_amount) - amount) > 1e-9:
++            self._rollback_close_request_if_current(symbol, batch_id, close_op_id)
++            return False, f'partial_guard_rejected（{guard_detail}）'
++        reduce_side = 'sell' if side == 'BUY' else 'buy'
++        try:
++            order = self._safe_api_call(self.exchange.create_order,
++                                        symbol, 'market', reduce_side, amount, None,
++                                        params_base)
++            order_id = str((order or {}).get('id') or '')
++            if not order_id:
++                raise ValueError('empty order id')
++        except Exception as e:
++            self._set_close_reason_if_current(symbol, batch_id, close_op_id,
++                                              f'partial_error_order（{e}）')
++            return False, f'partial_order_failed（{e}）'
++        # 🔥 v6.4-P0 rework（P0-1）：复用生产六态确认器——订单存在 ≠ 成交。
++        # 只有被 _confirm_close_filled 证明的 filled 才可进 durable COMMIT；
++        # PENDING/UNKNOWN/NOT_CONFIRMED 绝不 COMMIT（防台账凭空减仓 + 保护欠覆盖）。
++        is_hedge = bool((snapshot or b).get('is_hedge_mode', False))
++        verdict, detail, filled = self._confirm_close_filled(
++            symbol, side, is_hedge, order_id, amount, pos_before=None,
++            order_kind='normal')
++        if verdict in ('CONFIRMED_FULL', 'PARTIAL') and filled:
++            confirmed_amount = float(filled)
++        elif verdict == 'TERMINAL_ZERO':
++            # 权威 filled==0 且终态 → 唯一可回滚分支（v5 语义）：安全撤销 BEGIN
++            self._rollback_close_request_if_current(symbol, batch_id, close_op_id)
++            return False, 'partial_zero_fill_rolled_back'
++        else:
++            # PENDING/UNKNOWN/NOT_CONFIRMED → 保持冻结（partial_closing=loud），人工接管
++            self.send_tg_notification(
++                f"🚨【资金安全】partial 确认失败（{verdict}）批次 `{batch_id}`\n"
++                f"💡 {detail}\n请核对交易所实际仓位与挂单后人工处理。",
++                level='critical')
++            return False, f'partial_confirm_{verdict}'
++        # CAS 持久化净账本 + reason→partial_resize_pending（rollback 事务模板：
++        # 锁内重读 → 校验 op_id/phase → 同一锁段写账本 → _persist_states）
++        with self._state_lock:
++            latest = self.load_all_states()
++            b2 = (latest.get(symbol, {}) or {}).get(batch_id)
++            if not isinstance(b2, dict) or (b2.get('close_op_id') or '') != close_op_id \
++                    or int(b2.get('close_phase', 0) or 0) != 1 \
++                    or b2.get('close_reason') != 'partial_closing':
++                return False, 'state_changed（重启恢复路径接管）'
++            pre_net_qty, pre_net_cost = self._batch_net_position(b2)
++            if confirmed_amount > pre_net_qty + 1e-12:
++                return False, f'confirm_exceeds_net（{confirmed_amount} > {pre_net_qty}）'
++            reduce_cost_delta = confirmed_amount * pre_net_cost / pre_net_qty
++            b2['realized_reduce_amount'] = float(
++                b2.get('realized_reduce_amount', 0.0) or 0.0) + confirmed_amount
++            b2['realized_reduce_cost'] = float(
++                b2.get('realized_reduce_cost', 0.0) or 0.0) + reduce_cost_delta
++            b2['close_reason'] = 'partial_resize_pending'
++            if not self._persist_states(latest):
++                return False, 'persist_failed'
++            # 🔥 resize 必须用 commit 后的净量（旧净量会重开 wrong-close 窗口）
++            post_net_qty, _post_net_cost = self._batch_net_position(b2)
++        # resize：撤旧挂净量（owner exception 窄放行）。失败 → 保持冻结，恢复续跑。
++        ok_r, msg_r = self._resize_protection_after_partial(
++            symbol, batch_id, close_op_id, post_net_qty)
++        if not ok_r:
++            return False, msg_r
++        return True, 'partial_committed'
++
++    def _resize_protection_after_partial(self, symbol, batch_id, close_op_id, net_qty):
++        """🔥 v6.4-P0：partial commit 后按净量重挂 SL/TP（owner exception 窄放行）。
++
++        旧单先撤、净量后挂 = 极短保护空窗（AGENTS.md ponytail：避免旧 oversized SL
++        在多批次环境错平其他 batch，两害取其轻）。失败 → 保持冻结，恢复续跑。
++        """
++        latest = self.load_all_states()
++        b = (latest.get(symbol, {}) or {}).get(batch_id)
++        if not isinstance(b, dict):
++            return False, 'batch_missing'
++        side = (b.get('side') or 'BUY').upper()
++        pos_side = 'LONG' if side == 'BUY' else 'SHORT'
++        reduce_side = 'sell' if side == 'BUY' else 'buy'
++        lfc = int(b.get('last_filled_count', 0) or 0)
++        new_sl_id = b.get('current_sl_id')
++        new_tp_id = b.get('tp_order_id')
++        for kind, old_id in (('SL', b.get('current_sl_id')),
++                             ('TP', b.get('tp_order_id'))):
++            if not old_id:
++                continue
++            identity = self._protection_identity(batch_id, kind, max(lfc - 1, 0), pos_side)
++            allowed, r = self._assert_create_allowed(
++                symbol, batch_id, identity, desc=f'partial resize {kind}',
++                replace_order_id=old_id, owner_op_id=close_op_id)
++            if allowed:
++                allowed, r = self._final_pre_create_check(
++                    symbol, batch_id, identity, desc=f'partial resize {kind}',
++                    owner_op_id=close_op_id)
++            if not allowed:
++                return False, f'resize_blocked_{kind}（{r}）'
++            try:
++                old_order = self._safe_api_call(self.exchange.fetch_order, old_id, symbol,
++                                                params={'stop': True})
++                price = float(old_order.get('stopPrice') or 0)
++            except Exception:
++                price = 0.0
++            if price <= 0:
++                # 拿不到旧单价格 → 不猜测，保持冻结（恢复续跑），绝不以劣化参数重挂
++                return False, f'resize_price_unknown_{kind}'
++            # 🔥 v6.4-P0 rework（P0-3）：cancel 必须证明旧单已物理离场，未证明不得继续
++            # （旧 oversized SL + 新净量 SL 同时在场 = 正在修的 wrong-close 本身）
++            try:
++                self._safe_api_call(self.exchange.cancel_order, old_id, symbol,
++                                    params={'stop': True})
++            except Exception as e:
++                if '-2011' not in str(e) and 'Unknown order' not in str(e) \
++                        and 'does not exist' not in str(e):
++                    return False, f'resize_cancel_failed_{kind}（{e}）'
++                # -2011 = 旧单已不存在（幂等，等同撤成功）
++            else:
++                try:
++                    _chk = self._safe_api_call(self.exchange.fetch_order, old_id, symbol,
++                                               params={'stop': True})
++                    _st = str((_chk or {}).get('status') or '').lower()
++                    if _st not in ('canceled', 'expired', 'rejected'):
++                        return False, f'resize_cancel_unverified_{kind}（status={_st}）'
++                except Exception as e:
++                    if '-2011' not in str(e) and 'Unknown order' not in str(e):
++                        return False, f'resize_cancel_verify_failed_{kind}（{e}）'
++            otype = 'STOP_MARKET' if kind == 'SL' else 'TAKE_PROFIT_MARKET'
++            # 🔥 v6.4-P0 rework（P0-3）：复用 crash-safe Create 链——
++            # B2-2 intent 先落盘（PENDING_CREATE）→ create → verify → registry CONFIRMED；
++            # 禁止「create 返回 ID 就直接 CONFIRMED」的孤儿窗口模式。
++            self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
++                                  id_known=False, order_kind='conditional', role=kind,
++                                  layer=max(int(b.get('last_filled_count', 0) or 0) - 1, 0),
++                                  side=reduce_side,
++                                  intent=self._build_intent(
++                                      symbol=symbol, side=reduce_side, qty=net_qty,
++                                      order_type=otype, stop_price=str(price),
++                                      reduce_only=True))
++            params = dict(b.get('params_base') or {})
++            params['stopPrice'] = price
++            new_order = self._safe_api_call(self.exchange.create_order,
++                                            symbol, otype, reduce_side, net_qty, None,
++                                            params)
++            new_id = str((new_order or {}).get('id') or '')
++            if not new_id:
++                return False, f'resize_create_failed_{kind}'
++            vres = self._verify_and_update_registry(
++                symbol, batch_id, identity, new_id,
++                desc=f'partial resize {kind}', owner_op_id=close_op_id)
++            if vres != 'success':
++                # not_found→NOT_CONFIRMED / unknown→PENDING_VERIFY（registry 已记录真相）；
++                # 保持冻结（恢复/人工接管），绝不把未验证 ID 标 CONFIRMED
++                return False, f'resize_verify_failed_{kind}（{vres}）'
++            if kind == 'SL':
++                new_sl_id = new_id
++            else:
++                new_tp_id = new_id
++        # 最终 CAS → ACTIVE（含新保护单 id 写回）
++        with self._state_lock:
++            latest = self.load_all_states()
++            b3 = (latest.get(symbol, {}) or {}).get(batch_id)
++            if not isinstance(b3, dict) or (b3.get('close_op_id') or '') != close_op_id \
++                    or b3.get('close_reason') != 'partial_resize_pending':
++                return False, 'state_changed'
++            b3['close_phase'] = 0
++            b3['pending_close'] = False
++            b3['is_programmatic_cancel'] = False
++            b3['close_reason'] = ''
++            b3['current_sl_id'] = new_sl_id
++            b3['tp_order_id'] = new_tp_id
++            if not self._persist_states(latest):
++                return False, 'persist_failed'
++        return True, 'partial_active'
++
++    def _resume_partial_resize(self, symbol, batch_id, owner_op_id):
++        """🔥 v6.4-P0：重启分型续跑（崩溃-phase 分型，v4 §0）。
++
++        partial_resize_pending → 只续 resize（按持久化净 qty），绝不重发 MARKET；
++        partial_closing → loud critical + 人工核实（MARKET 副作用未知，不自动续跑）。"""
++        all_states = self.load_all_states()
++        b = (all_states.get(symbol, {}) or {}).get(batch_id)
++        if not isinstance(b, dict):
++            return False, 'batch_missing'
++        reason = b.get('close_reason')
++        if reason == 'partial_closing':
++            self.send_tg_notification(
++                f"🚨【资金安全】批次 `{batch_id}` 停留在 partial_closing（部分平仓副作用未知），"
++                f"已拒绝自动续跑——请核对交易所实际仓位与挂单后人工处理。",
++                level='critical')
++            return False, 'partial_closing_requires_manual_review'
++        if reason != 'partial_resize_pending':
++            return False, f'nothing_to_resume（{reason}）'
++        if (b.get('close_op_id') or '') != (owner_op_id or ''):
++            return False, 'op_id_mismatch'
++        net_qty, _c = self._batch_net_position(b)
++        return self._resize_protection_after_partial(symbol, batch_id, owner_op_id, net_qty)
++
+     def _check_existing_conflicts(self, symbol: str, batch_id: str, all_states: dict,
+                                   signal_fingerprint: str = None) -> bool:
+         print(f"\n🔍 正在针对批次 [{batch_id}] 进行防冲突扫描...")
+@@ -3460,7 +3796,7 @@ class CryptoTrader:
+             return 'unknown'
+ 
+     def _verify_and_update_registry(self, symbol, batch_id, identity, order_id, desc='保护单',
+-                                    order_kind='conditional'):
++                                    order_kind='conditional', owner_op_id=None):
+         """B2-0: create 成功后 verify 统一入口——按操作阶段区分异常语义（ChatGPT 评审①）：
+         verify 阶段 OrderNotFound ≠ create 阶段 ExchangeError（可能是查询延迟/路由参数错误/
+         交易所暂时不可见/订单已状态变化），因此：
+@@ -3475,7 +3811,8 @@ class CryptoTrader:
+         verify_result = self._verify_order_created(order_id, symbol, order_kind)
+         if verify_result == 'success':
+             g3 = self._commit_protection_with_g3(symbol, batch_id, identity, order_id,
+-                                                 order_kind=order_kind, desc=desc)
++                                                 order_kind=order_kind, desc=desc,
++                                                 owner_op_id=owner_op_id)
+             if g3 == 'g3_triggered':
+                 # create 已发生但批次已进入平仓/已清理 → G3a 收敛（锁外，可发 API）
+                 self._g3a_converge_race_order(symbol, batch_id, identity, order_id,
+@@ -3491,7 +3828,8 @@ class CryptoTrader:
+ 
+     # ==================== P0 Batch A（2026-08-28 限价平仓竞态）: G2 / G3 / N14 ====================
+ 
+-    def _final_pre_create_check(self, symbol, batch_id, identity, desc='保护单'):
++    def _final_pre_create_check(self, symbol, batch_id, identity, desc='保护单',
++                                owner_op_id=None):
+         """G2（P0 Batch A，规格 v3 §1.1）：create 紧前最终复核——仲裁闸门通过后、
+         PENDING_CREATE 意图落盘前的关闭态复检。与 G1（_assert_create_allowed）分工：
+         G1 = registry 状态机仲裁（含 PROGRAMMATIC_CANCELED 禁建）；G2 = close_phase
+@@ -3507,12 +3845,16 @@ class CryptoTrader:
+                            f"禁止为缺失批次 Create [{desc}]")
+         close_phase = int(b.get('close_phase', 0) or 0)
+         if close_phase >= 1 or b.get('pending_close'):
+-            return False, (f"批次 {batch_id} 已进入平仓流程(close_phase={close_phase})，"
+-                           f"G2 禁止创建/替换保护单 [{desc}]")
++            if _partial_resize_owner_ok(b, owner_op_id):
++                pass  # 🔥 v6.4-P0：partial 事务自身 resize（极窄 owner exception）
++            else:
++                return False, (f"批次 {batch_id} 已进入平仓流程(close_phase={close_phase})，"
++                               f"G2 禁止创建/替换保护单 [{desc}]")
+         return True, ''
+ 
+     def _commit_protection_with_g3(self, symbol, batch_id, identity, order_id,
+-                                   order_kind='conditional', desc='保护单'):
++                                   order_kind='conditional', desc='保护单',
++                                   owner_op_id=None):
+         """G3b（P0-3 + 终审硬约束①）：保护单 Commit 原子提交边界。
+         持 _state_lock 且锁内 load_all_states() 重新读取最新磁盘（禁用 G3a/verify
+         阶段任何旧快照）；同一持锁段内完成"关闭态复核 + CONFIRMED Commit"——
+@@ -3531,7 +3873,10 @@ class CryptoTrader:
+                 return 'g3_triggered'
+             _close_phase = int(b.get('close_phase', 0) or 0)
+             if _close_phase >= 1 or b.get('pending_close'):
+-                return 'g3_triggered'
++                if _partial_resize_owner_ok(b, owner_op_id):
++                    pass  # 🔥 v6.4-P0：partial 事务自身 resize（极窄 owner exception）
++                else:
++                    return 'g3_triggered'
+             entry = b.setdefault('protection_registry', {}).setdefault(identity, {})
+             entry['state'] = 'CONFIRMED'
+             entry['order_id'] = order_id
+@@ -3810,7 +4155,8 @@ class CryptoTrader:
+             self._persist_states(latest_all)
+         return True
+ 
+-    def _assert_create_allowed(self, symbol, batch_id, identity, desc='保护单', replace_order_id=None):
++    def _assert_create_allowed(self, symbol, batch_id, identity, desc='保护单', replace_order_id=None,
++                               owner_op_id=None):
+         """B2-3: Create 仲裁闸门（规格 §5.3 + §10.1 最小联动）——
+         同 identity 存在未终结/已确认状态时禁止新 create（C5 重挂变体最后防线）：
+           禁止 = {PENDING_CREATE, PENDING_VERIFY, NOT_CONFIRMED, CONFIRMED, MISMATCH}
+@@ -3844,8 +4190,11 @@ class CryptoTrader:
+         # pending_close 作保守兼容 belt；Boolean 不参与判定表达式（v3 §2.2 硬规则 1/2）
+         _close_phase = int(b.get('close_phase', 0) or 0)
+         if _close_phase >= 1 or b.get('pending_close'):
+-            return False, (f"批次 {batch_id} 已进入平仓流程(close_phase={_close_phase})，"
+-                           f"禁止创建/替换保护单 [{desc}]")
++            if _partial_resize_owner_ok(b, owner_op_id):
++                pass  # 🔥 v6.4-P0：partial 事务自身 resize（极窄 owner exception）
++            else:
++                return False, (f"批次 {batch_id} 已进入平仓流程(close_phase={_close_phase})，"
++                               f"禁止创建/替换保护单 [{desc}]")
+         entry = b.get('protection_registry', {}).get(identity)
+         if entry is None:
+             self._gate_alert_clear(identity)
+@@ -4957,13 +5306,16 @@ class CryptoTrader:
+ 
+                         print(f"🛑 [持仓归零检测] 批次 [{batch_id}] 实际持仓已归零，正在安全退出监控...")
+ 
+-                        # 🔥 计算实际盈亏
++                        # 🔥 计算实际盈亏（v6.4：净仓位/净成本基准；剩余 fee 按 cost 比例分摊）
+                         if batch_filled_amount > 0:
+                             # 计算持仓均价（含手续费）
+-                            filled_costs = sum(
+-                                [target_amounts[i] * filled_details[i] for i in range(batch_filled_count)])
+-                            total_cost_with_fee = filled_costs + total_entry_fee
+-                            avg_price_with_fee = total_cost_with_fee / batch_filled_amount if batch_filled_amount > 0 else 0
++                            _net_qty, _net_cost = self._batch_net_position(b_data)
++                            _rr_cost = float(b_data.get('realized_reduce_cost', 0.0) or 0.0)
++                            _gross_cost = _net_cost + _rr_cost
++                            _fee_rem = float(total_entry_fee or 0.0) * _net_cost / _gross_cost \
++                                if _gross_cost > 0 else 0.0
++                            total_cost_with_fee = _net_cost + _fee_rem
++                            avg_price_with_fee = total_cost_with_fee / _net_qty if _net_qty > 0 else 0
+ 
+                             # 获取当前市价（平仓价格）
+                             try:
+@@ -5035,6 +5387,8 @@ class CryptoTrader:
+                     _fb_other = sum(1 for b, d in _fb_sym.items() if d.get('is_active', False) and b != batch_id)
+                     if _fb_other > 0:
+                         print(f"  ┏━ ⏭️ [多批次] 跳过部分减仓检测 (同symbol活跃批次: {_fb_other + 1})")
++                        # 🔥 v6.4-P0：跳过≠静默——守恒破坏检测接线（f1e135 一般化）
++                        self._maybe_report_conservation_conflict(symbol, batch_id)
+ 
+                 if _fb_other == 0 and current_actual_position is not None and has_entered_position and 0 < current_actual_position < batch_filled_amount:
+                     # 🔥 v6.2（实盘 2026-09-01 17:2x）：持仓归零（0.0）不是「部分减仓」，
+@@ -5312,7 +5666,10 @@ class CryptoTrader:
+                     # 🔒 v6.2-r4：FREEZE_QUIET_REASONS（market_confirming /
+                     # limit_pending_normal）之外一律周期 critical——
+                     # limit_creating 是 transient，crash 重启后必须 loud（M25）。
+-                    if _close_reason not in ('market_confirming', 'limit_pending_normal'):
++                    # v6.4：partial_resize_pending 进 quiet（可自动续跑的确定性中间态）；
++                    # partial_closing 不进 quiet（transient，重启必须 loud）
++                    if _close_reason not in ('market_confirming', 'limit_pending_normal',
++                                             'partial_resize_pending'):
+                         if time.time() - self._freeze_alerted.get(batch_id, 0) >= 3600:
+                             self._freeze_alerted[batch_id] = time.time()
+                             self.send_tg_notification(
+@@ -7112,7 +7469,9 @@ class CryptoTrader:
+                 last_filled_count = int(snapshot.get('last_filled_count', 0) or 0)
+                 target_amounts = snapshot.get('target_amounts', []) or []
+                 filled_details = snapshot.get('filled_details', []) or []
+-                current_filled_amount = float(sum(target_amounts[:last_filled_count]))
++                # v6.4：全量平仓按净仓位执行（partial 后 gross 含已减部分，reduce-only 会被截断）
++                current_filled_amount = float(sum(target_amounts[:last_filled_count])) \
++                    - float(snapshot.get('realized_reduce_amount', 0.0) or 0.0)
+                 total_entry_fee = float(snapshot.get('total_entry_fee', 0.0) or 0.0)
+             except (TypeError, ValueError) as e:
+                 return False, None, f'ledger_broken（{e}）'
+@@ -7301,7 +7660,8 @@ class CryptoTrader:
+                 # settlement_error 不得覆盖第一现场。返回 True：磁盘已 abnormal，
+                 # 本次切换目标已达成。（授权看 state/组，解释看 reason。）
+                 transition_sources = ('market_confirming', 'limit_pending_normal',
+-                                      'limit_creating')
++                                      'limit_creating',
++                                      'partial_closing', 'partial_resize_pending')  # v6.4：成对注册
+                 cur_reason = b.get('close_reason')
+                 if cur_reason not in transition_sources:
+                     return True, f'reason_already_abnormal（{cur_reason}）'
+@@ -7629,7 +7989,9 @@ class CryptoTrader:
+                           f"coverage 不可证明（Fail-Closed，人工 reconcile）")
+                     return -1, -1, -1
+                 try:
+-                    filled = float(sum(_ta[:_n]))
++                    # v6.4：coverage 按净仓位计算（partial 后 gross 高估 tracked → 误判 conflict）
++                    filled = max(0.0, float(sum(_ta[:_n]))
++                                 - float(b.get('realized_reduce_amount', 0.0) or 0.0))
+                 except (TypeError, ValueError):
+                     # 🔒 v6.2-r6（R3-h3）：其他批次 target_amounts 含字符串等
+                     # 非法值 → 按 helper 契约返回不可判定，而不是向上抛异常
+@@ -8274,11 +8636,17 @@ class CryptoTrader:
+         target_amounts = _txn_vars['target_amounts']
+         current_filled_amount = _txn_vars['current_filled_amount']
+         side = _txn_vars['side']
+-        # 计算均价和预估盈亏（以 claimed 快照为准）
++        # 计算均价和预估盈亏（以 claimed 快照为准；v6.4 净成本/剩余 fee 分摊）
+         filled_details = target_b_data.get('filled_details', [])
+         total_cost = sum([target_amounts[i] * filled_details[i] for i in range(last_filled_count)])
+         total_entry_fee = target_b_data.get('total_entry_fee', 0.0)
+-        avg_price = (total_cost + total_entry_fee) / current_filled_amount if current_filled_amount > 0 else 0
++        _net_cost_m = total_cost - float(target_b_data.get('realized_reduce_cost', 0.0) or 0.0)
++        _gross_cost_m = _net_cost_m + float(target_b_data.get('realized_reduce_cost', 0.0) or 0.0)
++        # v6.4：剩余 fee 按 cost 比例分摊（fee ∝ notional，非 qty）
++        _fee_rem = float(total_entry_fee or 0.0) * _net_cost_m / _gross_cost_m \
++            if _gross_cost_m > 0 else 0.0
++        avg_price = (_net_cost_m + _fee_rem) / current_filled_amount \
++            if current_filled_amount > 0 else 0
+ 
+         if side == 'BUY':
+             gross_pnl = (current_price - avg_price) * current_filled_amount
+@@ -8728,7 +9096,9 @@ class CryptoTrader:
+                     _n = int(_bd.get('last_filled_count') or 0)
+                     if _n > 0:
+                         try:
+-                            _others_filled += float(sum(_ta[:_n]))
++                            # v6.4：其他批次按净仓位计入（partial 后 gross 高估 → 本批次贡献被低估）
++                            _others_filled += max(0.0, float(sum(_ta[:_n]))
++                                                  - float(_bd.get('realized_reduce_amount', 0.0) or 0.0))
+                         except (TypeError, ValueError):
+                             pass
+         except Exception as e:
+@@ -8961,7 +9331,14 @@ class CryptoTrader:
+         filled_details = target_b_data.get('filled_details', [])
+         total_cost = sum([target_amounts[i] * filled_details[i] for i in range(last_filled_count)])
+         total_entry_fee = target_b_data.get('total_entry_fee', 0.0)
+-        avg_price = (total_cost + total_entry_fee) / current_filled_amount if current_filled_amount > 0 else 0
++        # v6.4：净成本/剩余 fee 按 cost 比例分摊（partial 后 gross 均价虚高会误报亏损警告）
++        _rr_cost_l = float(target_b_data.get('realized_reduce_cost', 0.0) or 0.0)
++        _net_cost_l = total_cost - _rr_cost_l
++        _gross_cost_l = total_cost
++        _fee_rem_l = float(total_entry_fee or 0.0) * _net_cost_l / _gross_cost_l \
++            if _gross_cost_l > 0 else 0.0
++        avg_price = (_net_cost_l + _fee_rem_l) / current_filled_amount \
++            if current_filled_amount > 0 else 0
+ 
+         if side == 'BUY' and limit_price <= avg_price:
+             print(f"⚠️ 警告：平仓价 {limit_price} 不高于均价 {avg_price}，可能亏损")

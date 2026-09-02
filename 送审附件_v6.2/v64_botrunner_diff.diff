@@ -1,0 +1,160 @@
+diff --git a/bot_runner.py b/bot_runner.py
+index ad1b4b2..601b22c 100644
+--- a/bot_runner.py
++++ b/bot_runner.py
+@@ -1125,7 +1125,7 @@ async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+ 
+         last_filled_count = target_b_data.get('last_filled_count', 0)
+         target_amounts = target_b_data.get('target_amounts', [])
+-        current_filled_amount = sum(target_amounts[:last_filled_count])
++        current_filled_amount, _ = trader._batch_net_position(target_b_data)  # v6.4：净仓位
+ 
+         if current_filled_amount <= 0:
+             await safe_reply(update, f"⚠️ 批次 `{batch_id}` 尚未建仓，无需平仓。", parse_mode='Markdown')
+@@ -1137,10 +1137,15 @@ async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+         except Exception:
+             current_price = 0.0
+ 
+-        filled_details = target_b_data.get('filled_details', [])
+-        total_cost = sum([target_amounts[i] * filled_details[i] for i in range(last_filled_count)])
++        # 🔥 v6.4 rework：净成本 + cost 比例剩余 fee（与 trader 唯一口径一致，partial 后不再失真）
++        _nq, net_cost = trader._batch_net_position(target_b_data)
+         total_entry_fee = target_b_data.get('total_entry_fee', 0.0)
+-        avg_price = (total_cost + total_entry_fee) / current_filled_amount if current_filled_amount > 0 else 0
++        _rr_cost = float(target_b_data.get('realized_reduce_cost', 0.0) or 0.0)
++        _gross_cost = net_cost + _rr_cost
++        _fee_rem = float(total_entry_fee or 0.0) * net_cost / _gross_cost \
++            if _gross_cost > 0 else 0.0
++        avg_price = (net_cost + _fee_rem) / current_filled_amount \
++            if current_filled_amount > 0 else 0
+ 
+         side = target_b_data.get('side', 'BUY')
+         if side == 'BUY':
+@@ -1309,7 +1314,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
+         target_amounts = target_b_data.get('target_amounts', [])
+         filled_details = target_b_data.get('filled_details', [])
+         total_entry_fee = target_b_data.get('total_entry_fee', 0.0)
+-        current_filled_amount = sum(target_amounts[:last_filled_count])
++        current_filled_amount, _ = trader._batch_net_position(target_b_data)  # v6.4：净仓位
+ 
+         if current_filled_amount <= 0:
+             await update.callback_query.message.reply_text(
+@@ -1318,9 +1323,15 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
+             )
+             return
+ 
+-        filled_costs = sum([target_amounts[i] * filled_details[i] for i in range(last_filled_count)])
+-        nominal_avg = filled_costs / current_filled_amount
+-        actual_avg = (filled_costs + total_entry_fee) / current_filled_amount
++        # 🔥 v6.4 rework（Blocker 2）：net_qty + net_cost 成对使用（分母 net 分子 gross = 均价失真，
++        # 会直接驱动 BE 止损价格）；剩余 fee 按 cost 比例分摊（与 trader 唯一口径一致）
++        net_qty, net_cost = trader._batch_net_position(target_b_data)
++        _rr_cost = float(target_b_data.get('realized_reduce_cost', 0.0) or 0.0)
++        _gross_cost = net_cost + _rr_cost
++        _fee_rem = float(total_entry_fee or 0.0) * net_cost / _gross_cost \
++            if _gross_cost > 0 else 0.0
++        nominal_avg = net_cost / net_qty
++        actual_avg = (net_cost + _fee_rem) / net_qty
+ 
+         try:
+             ticker = trader._safe_api_call(trader.exchange.fetch_ticker, target_symbol)
+@@ -1482,7 +1493,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
+ 
+         last_filled_count = target_b_data.get('last_filled_count', 0)
+         target_amounts = target_b_data.get('target_amounts', [])
+-        current_filled_amount = sum(target_amounts[:last_filled_count])
++        current_filled_amount, _ = trader._batch_net_position(target_b_data)  # v6.4：净仓位
+ 
+         if current_filled_amount <= 0:
+             await update.callback_query.message.reply_text(f"⚠️ 批次 `{batch_id}` 尚未建仓，无需平仓。")
+@@ -1585,6 +1596,54 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
+         )
+ 
+ 
++async def partial_close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
++    """🔥 v6.4-P0：/partial <BatchID> <amount>——批次指定部分平仓（最小生产入口）。
++
++    多批次场景下的减仓必须走 bot 指定 batch（App 模糊减 aggregate 无法归属）。"""
++    if not is_authorized(update.effective_user.id):
++        await safe_reply(update, "🚫 未授权的访问！")
++        return
++
++    trader = context.bot_data.get('global_trader')
++    if trader is None:
++        await safe_reply(update, "❌ 交易引擎尚未初始化，请稍后再试。")
++        return
++
++    args = context.args
++    if len(args) < 2:
++        await safe_reply(update, "❌ 格式错误！正确格式：`/partial <BatchID> <数量>`",
++                         parse_mode='Markdown')
++        return
++
++    batch_id = args[0]
++    try:
++        amount = float(args[1])
++    except ValueError:
++        await safe_reply(update, "❌ 数量必须为数字。")
++        return
++
++    all_states = trader.load_all_states()
++    target_symbol = None
++    for symbol, symbol_batches in all_states.items():
++        if batch_id in symbol_batches and symbol_batches[batch_id].get('is_active'):
++            target_symbol = symbol
++            break
++
++    if target_symbol is None:
++        await safe_reply(update, f"❌ 未找到活跃批次 `{batch_id}`", parse_mode='Markdown')
++        return
++
++    loop = asyncio.get_running_loop()  # 🔥 v6.4 rework（Blocker 1）：与其他 handler 同款取得 running loop
++    result = await loop.run_in_executor(
++        None,
++        trader._execute_partial_close,
++        target_symbol,
++        batch_id,
++        amount
++    )
++    await safe_reply(update, result[1], parse_mode='Markdown')
++
++
+ async def _show_close_options(update: Update, context: ContextTypes.DEFAULT_TYPE, batch_id: str):
+     trader = context.bot_data.get('global_trader')
+     if trader is None:
+@@ -1606,7 +1665,7 @@ async def _show_close_options(update: Update, context: ContextTypes.DEFAULT_TYPE
+ 
+     last_filled_count = target_b_data.get('last_filled_count', 0)
+     target_amounts = target_b_data.get('target_amounts', [])
+-    current_filled_amount = sum(target_amounts[:last_filled_count])
++    current_filled_amount, _ = trader._batch_net_position(target_b_data)  # v6.4：净仓位
+ 
+     if current_filled_amount <= 0:
+         await update.callback_query.message.reply_text(f"⚠️ 批次 `{batch_id}` 尚未建仓，无需平仓。")
+@@ -1618,10 +1677,15 @@ async def _show_close_options(update: Update, context: ContextTypes.DEFAULT_TYPE
+     except Exception:
+         current_price = 0.0
+ 
+-    filled_details = target_b_data.get('filled_details', [])
+-    total_cost = sum([target_amounts[i] * filled_details[i] for i in range(last_filled_count)])
++    # 🔥 v6.4 rework：净成本 + cost 比例剩余 fee（与 trader 唯一口径一致）
++    _nq, net_cost = trader._batch_net_position(target_b_data)
+     total_entry_fee = target_b_data.get('total_entry_fee', 0.0)
+-    avg_price = (total_cost + total_entry_fee) / current_filled_amount if current_filled_amount > 0 else 0
++    _rr_cost = float(target_b_data.get('realized_reduce_cost', 0.0) or 0.0)
++    _gross_cost = net_cost + _rr_cost
++    _fee_rem = float(total_entry_fee or 0.0) * net_cost / _gross_cost \
++        if _gross_cost > 0 else 0.0
++    avg_price = (net_cost + _fee_rem) / current_filled_amount \
++        if current_filled_amount > 0 else 0
+ 
+     side = target_b_data.get('side', 'BUY')
+     if side == 'BUY':
+@@ -2643,6 +2707,7 @@ def main():
+ 
+     app.add_handler(CommandHandler("be", be_command))
+     app.add_handler(CommandHandler("close", close_command))
++    app.add_handler(CommandHandler("partial", partial_close_command))  # 🔥 v6.4-P0
+     app.add_handler(CommandHandler("cancel", cancel_command))
+     app.add_handler(CommandHandler("force", force_command))
+     # 🔥 D-010 B1：AUTH_BLOCKED 人工解除命令（BLIND-SAFE 恢复链唯一命令入口）

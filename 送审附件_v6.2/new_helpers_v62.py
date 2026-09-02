@@ -250,7 +250,9 @@ class _Holder:
             last_filled_count = int(snapshot.get('last_filled_count', 0) or 0)
             target_amounts = snapshot.get('target_amounts', []) or []
             filled_details = snapshot.get('filled_details', []) or []
-            current_filled_amount = float(sum(target_amounts[:last_filled_count]))
+            # v6.4：全量平仓按净仓位执行（partial 后 gross 含已减部分）
+            current_filled_amount = float(sum(target_amounts[:last_filled_count])) \
+                - float(snapshot.get('realized_reduce_amount', 0.0) or 0.0)
             total_entry_fee = float(snapshot.get('total_entry_fee', 0.0) or 0.0)
         except (TypeError, ValueError) as e:
             return False, None, f'ledger_broken（{e}）'
@@ -443,7 +445,8 @@ class _Holder:
             # settlement_error 不得覆盖第一现场。返回 True：磁盘已 abnormal，
             # 本次切换目标已达成。（授权看 state/组，解释看 reason。）
             transition_sources = ('market_confirming', 'limit_pending_normal',
-                                  'limit_creating')
+                                  'limit_creating',
+                                  'partial_closing', 'partial_resize_pending')  # v6.4：成对注册
             cur_reason = b.get('close_reason')
             if cur_reason not in transition_sources:
                 return True, f'reason_already_abnormal（{cur_reason}）'
@@ -777,7 +780,9 @@ class _Holder:
                       f"coverage 不可证明（Fail-Closed，人工 reconcile）")
                 return -1, -1, -1
             try:
-                filled = float(sum(_ta[:_n]))
+                # v6.4：coverage 按净仓位计算（partial 后 gross 高估 tracked）
+                filled = max(0.0, float(sum(_ta[:_n]))
+                             - float(b.get('realized_reduce_amount', 0.0) or 0.0))
             except (TypeError, ValueError):
                 # 🔒 v6.2-r6（R3-h3）：其他批次 target_amounts 含字符串等
                 # 非法值 → 按 helper 契约返回不可判定，而不是向上抛异常
