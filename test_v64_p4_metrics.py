@@ -305,6 +305,81 @@ def r12_weight_map():
     assert '估算weight≈2' in line, f'cancel_order×2 必须估 2 weight: {line}'
 
 
+class _RaceSemaphore:
+    """A 的 with 退出时（semaphore 释放前一刻）同步执行 on_release——
+    确定性模拟「A 请求已结束、B 覆盖共享 header 栏、A 才去记录」的并发竞态。"""
+
+    def __init__(self, on_release):
+        self._inner = threading.BoundedSemaphore(1)
+        self._on_release = on_release
+
+    def __enter__(self):
+        self._inner.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._on_release()
+        self._inner.release()
+        return False
+
+
+def _race_setup(m):
+    """A=fetch_positions 失败(900)；on_release 模拟 B=fetch_ticker 成功(50) 覆盖共享栏。"""
+    ex = types.SimpleNamespace()
+    ex.last_response_headers = {}
+
+    def fetch_positions(*a, **k):
+        ex.last_response_headers = {'X-MBX-USED-WEIGHT-1M': '900'}
+        raise Exception('binanceusdm 429 rate limit exceeded')
+    ex.fetch_positions = fetch_positions
+    t = _wire_trader(ex)
+
+    def on_release():
+        ex.last_response_headers = {'X-MBX-USED-WEIGHT-1M': '50'}
+        m.record(_named('fetch_ticker'), {'X-MBX-USED-WEIGHT-1M': '50'}, ok=True)
+    t._api_semaphore = _RaceSemaphore(on_release)
+    return t
+
+
+def r13_concurrent_header_ownership():
+    """R13：失败事件的 header 必须属于本次尝试——A 失败(900)不能被 B 成功(50)覆盖；
+    429 事发行「本次错误 header」也必须=900。"""
+    m = trader_260725.ApiMetrics()
+    t = _race_setup(m)
+    buf = io.StringIO()
+    raised = False
+    with _MetricsKeeper(m):
+        with contextlib.redirect_stdout(buf):
+            try:
+                t._safe_api_call(t.exchange.fetch_positions, SYM, retries=1)
+            except Exception:
+                raised = True
+    assert raised
+    fails = [e for e in m._events if e[1] == 'fetch_positions' and e[2] == 'fail']
+    assert fails and fails[-1][3] == 900.0, \
+        f'失败事件 header 归属错误（被并发成功覆盖）: {fails}'
+    oks = [e for e in m._events if e[1] == 'fetch_ticker' and e[2] == 'ok']
+    assert oks and oks[-1][3] == 50.0, oks
+    out = buf.getvalue()
+    assert '本次错误 header: USED-WEIGHT=900' in out, \
+        f'429 事发行必须消费 frozen headers:\n{out[-600:]}'
+
+
+def r14_event_ordering():
+    """R14：响应完成顺序 = 事件记录顺序——A 响应先完成、B 后完成（A 线程
+    在记录前被调度暂停），_events 仍必须 [A, B]，latest 语义不被线程调度破坏。"""
+    m = trader_260725.ApiMetrics()
+    t = _race_setup(m)
+    with _MetricsKeeper(m):
+        try:
+            t._safe_api_call(t.exchange.fetch_positions, SYM, retries=1)
+        except Exception:
+            pass
+    eps = [(e[1], e[2]) for e in m._events]
+    assert eps == [('fetch_positions', 'fail'), ('fetch_ticker', 'ok')], \
+        f'事件顺序必须与响应完成顺序一致: {eps}'
+
+
 TESTS = [r1_endpoint_counting,
          r2_header_capture_all_three,
          r3_incident_snapshot_content,
@@ -316,7 +391,9 @@ TESTS = [r1_endpoint_counting,
          r9_order_count_lifecycle,
          r10_window_semantics,
          r11_failed_response_recorded,
-         r12_weight_map]
+         r12_weight_map,
+         r13_concurrent_header_ownership,
+         r14_event_ordering]
 
 
 def main():

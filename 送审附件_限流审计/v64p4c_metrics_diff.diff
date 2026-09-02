@@ -1,0 +1,112 @@
+diff --git a/trader_260725.py b/trader_260725.py
+index e6983d1..65520cb 100644
+--- a/trader_260725.py
++++ b/trader_260725.py
+@@ -73,7 +73,9 @@ class ApiMetrics:
+     零影响交易）。事件模型 (ts, endpoint, ok/fail, used_weight_1m,
+     order_count_10s, order_count_1m)——三指标 latest=时间序最后有效 header、
+     peak=60s 窗口内最大值（绝不用进程生命周期 max 冒充「最新」，ChatGPT 复审
+-    Blocker 2）；全部真实到达 Binance 的响应入账（含失败，Blocker 3）。
++    Blocker 2）。所有 _safe_api_call 调用尝试均入账（成功与失败），若本次响应
++    提供 header 则同步记录（header 由 _api_semaphore 临界区内 dict copy 快照，
++    ownership 与产生它的事务绑定，P4c）。
+     429/418 事发时输出前 window 秒调用面 + 三指标窗口轨迹 + 本次错误 header——
+     「IP weight 飙升」vs「order-count 爆了」vs「两者都低却拿到 418（外部嫌疑
+     大幅上升）」三种归因方向当场分开。"""
+@@ -1401,6 +1403,10 @@ class CryptoTrader:
+         for i in range(retries):
+             # 🔥 每次重试都检查全局熔断（感知其他线程设置的冷却）
+             self._wait_for_api_cooldown()
++            # 🔥 v6.4-P4c：本次尝试的 frozen headers（在 semaphore 临界区内快照；
++            # 请求未达 Binance/本地抛错时为空 dict——口径：所有 _safe_api_call 调用
++            # 尝试均入账，若本次响应提供 header 则同步记录）
++            _attempt_headers = {}
+             try:
+                 # 🔥 单次 API 请求才占用信号量
+                 with self._api_semaphore:
+@@ -1410,21 +1416,27 @@ class CryptoTrader:
+                         if wait_time > 0:
+                             time.sleep(wait_time)
+                         self._last_api_call_time = time.time()
+-                    # 🔥 v6.4-P4：限流观测（极薄单点）——真实响应头优先，内部异常静默
+-                    _r = func(*args, **kwargs)
+-                    _sum = _API_METRICS.record(
+-                        func, getattr(self.exchange, 'last_response_headers', None), ok=True)
++                    # 🔥 v6.4-P4c（ChatGPT PROVEN race 收口）：request → header
++                    # snapshot(dict copy) → metrics record 三件事为同一观测临界区——
++                    # 必须在持有 _api_semaphore 生命周期内完成，否则 semaphore 释放后
++                    # 共享 exchange.last_response_headers 会被并发请求覆盖，失败证据
++                    # 归属错误（A 的 900 被记成 B 的 50）。成功/失败都在此入账。
++                    try:
++                        _r = func(*args, **kwargs)
++                    except Exception:
++                        _attempt_headers = dict(getattr(self.exchange, 'last_response_headers',
++                                                        None) or {})
++                        _API_METRICS.record(func, _attempt_headers, ok=False)
++                        raise
++                    _attempt_headers = dict(getattr(self.exchange, 'last_response_headers',
++                                                    None) or {})
++                    _sum = _API_METRICS.record(func, _attempt_headers, ok=True)
+                     if _sum:
+                         print(_sum)
+                     return _r
+ 
+             except Exception as e:
+                 err_str = str(e).lower()
+-                # 🔥 v6.4-P4b：失败响应同样入账（ChatGPT Blocker 3）——503/-1021/网络错误等
+-                # 真实到达 Binance 的失败也带 header 证据（官方：503 unknown 是否计费以
+-                # 响应 header 为准，只记录不判断）。429/418 分支的快照在此之后拍摄。
+-                _API_METRICS.record(func, getattr(self.exchange, 'last_response_headers', None),
+-                                    ok=False)
+ 
+                 # 🔥 D-010 Batch 2：明确鉴权失败白名单分流（ChatGPT 终审：白名单式分类，
+                 # 不做模糊关键词猜测——普通业务参数错误/订单状态错误/余额不足不进 AUTH_BLOCKED，
+@@ -1449,19 +1461,21 @@ class CryptoTrader:
+                         try:
+                             # R6: 收编信号量限速保护。不套 _safe_api_call——此处位于其 except 分支内，
+                             # 嵌套调用在 sync 自身再抛 -1021 时有递归风险；重试职责由外层循环 continue 承担
++                            # 🔥 v6.4-P4c：snapshot+record 同样收进 semaphore 临界区（同一 ownership 不变量）
+                             with self._api_semaphore:
+                                 self.exchange.load_time_difference()
+-                            self.last_time_sync = time.time()
+-                            # 🔥 v6.4-P4b：重同步直连绕过 _safe_api_call → 单独入账
+-                            _API_METRICS.record(self.exchange.load_time_difference,
+-                                                getattr(self.exchange, 'last_response_headers',
+-                                                        None), ok=True)
++                                self.last_time_sync = time.time()
++                                _API_METRICS.record(self.exchange.load_time_difference,
++                                                    dict(getattr(self.exchange,
++                                                                 'last_response_headers',
++                                                                 None) or {}), ok=True)
+                             print(f"🔄 [时间同步] 已重新同步服务器时间")
+                             time.sleep(2)  # 等待同步生效
+                         except Exception as sync_e:
+                             _API_METRICS.record(self.exchange.load_time_difference,
+-                                                getattr(self.exchange, 'last_response_headers',
+-                                                        None), ok=False)
++                                                dict(getattr(self.exchange,
++                                                             'last_response_headers',
++                                                             None) or {}), ok=False)
+                             print(f"⚠️ 时间同步失败: {sync_e}")
+                     else:
+                         print(f"🔄 [时间同步] 冷却期内跳过重同步（上次同步 {time.time() - self.last_time_sync:.0f} 秒前）")
+@@ -1478,12 +1492,13 @@ class CryptoTrader:
+                         "way too many requests" in err_str):
+ 
+                     # 🔥 v6.4（429 诊断增强）：只采集证据，不改任何限频/冷却/重试策略
+-                    print(self._format_429_diagnostics(
+-                        func, getattr(self.exchange, 'last_response_headers', None), e))
+-                    # 🔥 v6.4-P4b：事发快照（失败调用已由 except 顶部统一入账，
+-                    # 快照含本次失败）——三指标窗口轨迹 + 本次错误 header 归因证据链
+-                    print(_API_METRICS.format_incident(
+-                        func, getattr(self.exchange, 'last_response_headers', None), e))
++                    # 🔥 v6.4-P4c：只消费本次尝试的 frozen _attempt_headers——
++                    # 绝不重读共享 exchange.last_response_headers（可能已被并发请求覆盖，
++                    # 429 归因会得出相反结论）
++                    print(self._format_429_diagnostics(func, _attempt_headers, e))
++                    # 🔥 v6.4-P4/P4b：事发快照（失败调用已在 semaphore 临界区内入账）——
++                    # 三指标窗口轨迹 + 本次错误 header 归因证据链
++                    print(_API_METRICS.format_incident(func, _attempt_headers, e))
+ 
+                     # 🔥 检测到 IP 封禁 → 触发全局熔断
+                     if "banned" in err_str or "418" in err_str or "way too many requests" in err_str:

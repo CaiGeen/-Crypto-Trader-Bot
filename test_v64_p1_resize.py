@@ -235,7 +235,7 @@ def t06_r6_partial_listing_and_runtime_resume_wiring():
     assert '无可减仓批次' in empty, empty
 
     # monitor 冻结分支必须接线运行期自愈（结构断言：freeze 段 → continue 之间含调度调用）
-    i = SRC.find('本轮跳过保护单维护')
+    i = SRC.find('🧊 [P0 冻结] 批次')
     assert i > 0
     j = SRC.find('continue', i)
     seg = SRC[i:j]
@@ -343,7 +343,7 @@ def t10_p2_freeze_print_throttle():
     """2026-09-02 14:27-16:25 实盘：🧊[P0 冻结] 行每监控周期无条件 print 刷屏 70+ 行。
     「3 次后静默」约定只覆盖 TG 通道；console 从未限流。断言：冻结分支 print 已节流
     （_freeze_print_state 簿记：状态变化立即打，持续不变 300s 一条 heartbeat）。"""
-    i = SRC.find('本轮跳过保护单维护')
+    i = SRC.find('🧊 [P0 冻结] 批次')
     assert i > 0
     j = SRC.find('continue', i)
     seg = SRC[max(0, i - 700):j]
