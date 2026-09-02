@@ -67,30 +67,32 @@ EMAIL_SEND_LOCK = threading.Lock()
 
 
 class ApiMetrics:
-    """🔥 v6.4-P4（Phase 2 限流观测层）：_safe_api_call 单点极薄计数。
+    """🔥 v6.4-P4b（Phase 2 观测层数据模型修正）：_safe_api_call 单点极薄计数。
 
     只观测、绝不改变任何限频/冷却/重试策略；所有内部异常静默吞掉（观测故障
-    零影响交易）。真实响应头优先（X-MBX-USED-WEIGHT-1M），静态 weight 估值辅助。
-    60s 节流周期汇总；429/418 事发时输出前 window 秒本程序调用面快照——
-    「Bot used-weight 一路飙升」vs「used≈100 却突然拿到 418」两种证据可把
-    归因方向直接分开（2026-09-02 两次 418 归因 UNKNOWN 的工程化收口）。"""
+    零影响交易）。事件模型 (ts, endpoint, ok/fail, used_weight_1m,
+    order_count_10s, order_count_1m)——三指标 latest=时间序最后有效 header、
+    peak=60s 窗口内最大值（绝不用进程生命周期 max 冒充「最新」，ChatGPT 复审
+    Blocker 2）；全部真实到达 Binance 的响应入账（含失败，Blocker 3）。
+    429/418 事发时输出前 window 秒调用面 + 三指标窗口轨迹 + 本次错误 header——
+    「IP weight 飙升」vs「order-count 爆了」vs「两者都低却拿到 418（外部嫌疑
+    大幅上升）」三种归因方向当场分开。"""
 
     # 静态 weight 估值（辅助口径；2026-09 官方文档实锤：v3 positionRisk/account=5，
-    # openOrders 带 symbol=1，order 查询=1，ticker(symbol)=1，time=1，下单/撤单=0 weight）
+    # openOrders 带 symbol=1，order 查询=1，ticker(symbol)=1，time=1，
+    # DELETE order=1（P4b 修正，原误写 0），New Order IP=0（order 计数由真实 header 记录））
     WEIGHT_ESTIMATES = {
         'fetch_open_orders': 1, 'fetch_order': 1, 'fetch_positions': 5,
         'fetch_balance': 5, 'fetch_ticker': 1, 'fetch_time': 1,
         'load_time_difference': 1, 'set_leverage': 1,
-        'create_order': 0, 'cancel_order': 0,
+        'create_order': 0, 'cancel_order': 1,
     }
 
     def __init__(self, window=60.0, time_fn=time.time):
         self.window = float(window)
         self._time_fn = time_fn
         self._lock = threading.Lock()
-        self._events = []            # [(ts, endpoint, 'ok'|'fail')]
-        self._weight_latest = {}     # endpoint -> 最近 used-weight-1m
-        self._weight_peak = {}       # endpoint -> 峰值 used-weight-1m
+        self._events = []            # [ts, endpoint, ok/fail, uw, oc10, oc1]（缺 header 为 None）
         self._last_summary_ts = 0.0
 
     @staticmethod
@@ -98,48 +100,86 @@ class ApiMetrics:
         return getattr(func, '__name__', str(func))
 
     @staticmethod
-    def _used_weight_of(headers):
+    def _hdr_val(headers, key):
         for k, v in (headers or {}).items():
-            if 'used-weight-1m' in str(k).lower():
+            if key in str(k).lower():
                 try:
                     return float(v)
                 except (TypeError, ValueError):
                     return None
         return None
 
+    def _window_stats(self, now, seconds=None):
+        """窗口内 (counts, est_weight, 各指标 latest/peak60s)。事件按时间序追加，
+        「最新」= 窗口内最后一个有效 header 值。"""
+        sec = self.window if seconds is None else float(seconds)
+        counts = {}
+        uw_l = uw_p = o10_l = o10_p = o1_l = o1_p = None
+        for ts, ep, _st, uw, oc10, oc1 in self._events:
+            if ts < now - sec:
+                continue
+            counts[ep] = counts.get(ep, 0) + 1
+            if uw is not None:
+                uw_l = uw
+                uw_p = uw if uw_p is None else max(uw_p, uw)
+            if oc10 is not None:
+                o10_l = oc10
+                o10_p = oc10 if o10_p is None else max(o10_p, oc10)
+            if oc1 is not None:
+                o1_l = oc1
+                o1_p = oc1 if o1_p is None else max(o1_p, oc1)
+        est = sum(self.WEIGHT_ESTIMATES.get(e, 1) * n for e, n in counts.items())
+        return counts, est, uw_l, uw_p, o10_l, o10_p, o1_l, o1_p
+
+    @staticmethod
+    def _seg(label, latest, peak):
+        if latest is None:
+            return ''
+        return f" {label} 最新={latest:.0f} 峰值60s={peak:.0f}"
+
+    def format_summary(self):
+        """当前窗口汇总行（无节流；record() 内部按 60s 节流打印同一内容）。"""
+        try:
+            now = self._time_fn()
+            with self._lock:
+                counts, est, uw_l, uw_p, o10_l, o10_p, o1_l, o1_p = self._window_stats(now)
+            detail = (', '.join(f'{e}×{n}' for e, n in
+                                sorted(counts.items(), key=lambda kv: -kv[1]))
+                      or '无')
+            return (f"📊 [限流观测] 近{self.window:.0f}s 调用: {detail} | 估算weight≈{est}"
+                    + self._seg('USED-WEIGHT', uw_l, uw_p)
+                    + self._seg('ORDER-10S', o10_l, o10_p)
+                    + self._seg('ORDER-1M', o1_l, o1_p))
+        except Exception:
+            return None  # 观测故障绝不外泄
+
     def record(self, func, headers=None, ok=True):
-        """记录一次调用；跨过汇总窗口时返回汇总日志行（由调用方 print），否则 None。"""
+        """入账一次响应（成功或失败均可，header 缺失记 None）；
+        跨过汇总窗口时返回汇总日志行（由调用方 print），否则 None。"""
         try:
             ep = self._endpoint_of(func)
             now = self._time_fn()
-            uw = self._used_weight_of(headers)
             line = None
             with self._lock:
-                self._events.append((now, ep, 'ok' if ok else 'fail'))
-                cutoff = now - self.window * 3   # 事件保留 3 个窗口，够快照+峰值回看
+                self._events.append((now, ep, 'ok' if ok else 'fail',
+                                     self._hdr_val(headers, 'used-weight-1m'),
+                                     self._hdr_val(headers, 'order-count-10s'),
+                                     self._hdr_val(headers, 'order-count-1m')))
+                cutoff = now - self.window * 3   # 事件保留 3 个窗口
                 while self._events and self._events[0][0] < cutoff:
                     self._events.pop(0)
-                if uw is not None:
-                    self._weight_latest[ep] = uw
-                    if uw > self._weight_peak.get(ep, -1.0):
-                        self._weight_peak[ep] = uw
                 if now - self._last_summary_ts >= self.window:
                     self._last_summary_ts = now
-                    counts = {}
-                    for ts, e, _k in self._events:
-                        if ts >= now - self.window:
-                            counts[e] = counts.get(e, 0) + 1
-                    est = sum(self.WEIGHT_ESTIMATES.get(e, 1) * n
-                              for e, n in counts.items())
+                    counts, est, uw_l, uw_p, o10_l, o10_p, o1_l, o1_p = \
+                        self._window_stats(now)
                     detail = (', '.join(f'{e}×{n}' for e, n in
                                         sorted(counts.items(), key=lambda kv: -kv[1]))
                               or '无')
-                    peak = max(self._weight_peak.values()) if self._weight_peak else None
-                    latest = max(self._weight_latest.values()) if self._weight_latest else None
                     line = (f"📊 [限流观测] 近{self.window:.0f}s 调用: {detail}"
                             f" | 估算weight≈{est}"
-                            + (f" | used-weight-1m 最新={latest:.0f} 峰值={peak:.0f}"
-                               if peak is not None else ""))
+                            + self._seg('USED-WEIGHT', uw_l, uw_p)
+                            + self._seg('ORDER-10S', o10_l, o10_p)
+                            + self._seg('ORDER-1M', o1_l, o1_p))
             return line
         except Exception:
             return None  # 观测故障绝不外泄
@@ -151,7 +191,7 @@ class ApiMetrics:
             sec = self.window if seconds is None else float(seconds)
             with self._lock:
                 counts = {}
-                for ts, e, _k in self._events:
+                for ts, e, _st, _uw, _o10, _o1 in self._events:
                     if ts >= now - sec:
                         counts[e] = counts.get(e, 0) + 1
             return counts
@@ -159,20 +199,32 @@ class ApiMetrics:
             return {}
 
     def format_incident(self, func, headers, err, seconds=None):
-        """429/418 事发快照：前 window 秒本程序调用面 + 本次真实头 + 历史峰值。"""
+        """429/418 事发快照：前 window 秒调用面 + 三指标窗口轨迹 + 本次错误 header。"""
         try:
             ep = self._endpoint_of(func)
-            counts = self.snapshot_last(seconds)
+            now = self._time_fn()
+            sec = self.window if seconds is None else float(seconds)
+            with self._lock:
+                counts, est, uw_l, uw_p, o10_l, o10_p, o1_l, o1_p = \
+                    self._window_stats(now, seconds)
             detail = (', '.join(f'{k}×{v}' for k, v in
                                 sorted(counts.items(), key=lambda kv: -kv[1]))
                       or '无')
-            uw = self._used_weight_of(headers)
-            peak = max(self._weight_peak.values()) if self._weight_peak else None
-            return (f"🔬 [限流观测·事发快照] {ep} 触发限流（{str(err)[:120]}）\n"
-                    f"  └─ 前{self.window if seconds is None else seconds:.0f}s "
-                    f"本程序调用面: {detail}"
-                    + (f" | 本次 used-weight-1m={uw:.0f}" if uw is not None else "")
-                    + (f" | 历史峰值={peak:.0f}" if peak is not None else ""))
+
+            def _v(x):
+                return 'N/A' if x is None else f'{x:.0f}'
+            parts = [f"🔬 [限流观测·事发快照] {ep} 触发限流（{str(err)[:120]}）",
+                     f"前{sec:.0f}s 本程序调用面: {detail} | 估算weight≈{est}"]
+            if uw_l is not None:
+                parts.append(f"USED-WEIGHT 窗口最新={uw_l:.0f} 峰值60s={uw_p:.0f}")
+            if o10_l is not None:
+                parts.append(f"ORDER-10S 窗口最新={o10_l:.0f} 峰值60s={o10_p:.0f}")
+            if o1_l is not None:
+                parts.append(f"ORDER-1M 窗口最新={o1_l:.0f} 峰值60s={o1_p:.0f}")
+            parts.append(f"本次错误 header: USED-WEIGHT={_v(self._hdr_val(headers, 'used-weight-1m'))}"
+                         f" | ORDER-10S={_v(self._hdr_val(headers, 'order-count-10s'))}"
+                         f" | ORDER-1M={_v(self._hdr_val(headers, 'order-count-1m'))}")
+            return parts[0] + '\n  └─ ' + '\n  └─ '.join(parts[1:])
         except Exception as e:
             return f"🔬 [限流观测·事发快照] 采集失败: {e}"
 
@@ -1368,6 +1420,11 @@ class CryptoTrader:
 
             except Exception as e:
                 err_str = str(e).lower()
+                # 🔥 v6.4-P4b：失败响应同样入账（ChatGPT Blocker 3）——503/-1021/网络错误等
+                # 真实到达 Binance 的失败也带 header 证据（官方：503 unknown 是否计费以
+                # 响应 header 为准，只记录不判断）。429/418 分支的快照在此之后拍摄。
+                _API_METRICS.record(func, getattr(self.exchange, 'last_response_headers', None),
+                                    ok=False)
 
                 # 🔥 D-010 Batch 2：明确鉴权失败白名单分流（ChatGPT 终审：白名单式分类，
                 # 不做模糊关键词猜测——普通业务参数错误/订单状态错误/余额不足不进 AUTH_BLOCKED，
@@ -1395,9 +1452,16 @@ class CryptoTrader:
                             with self._api_semaphore:
                                 self.exchange.load_time_difference()
                             self.last_time_sync = time.time()
+                            # 🔥 v6.4-P4b：重同步直连绕过 _safe_api_call → 单独入账
+                            _API_METRICS.record(self.exchange.load_time_difference,
+                                                getattr(self.exchange, 'last_response_headers',
+                                                        None), ok=True)
                             print(f"🔄 [时间同步] 已重新同步服务器时间")
                             time.sleep(2)  # 等待同步生效
                         except Exception as sync_e:
+                            _API_METRICS.record(self.exchange.load_time_difference,
+                                                getattr(self.exchange, 'last_response_headers',
+                                                        None), ok=False)
                             print(f"⚠️ 时间同步失败: {sync_e}")
                     else:
                         print(f"🔄 [时间同步] 冷却期内跳过重同步（上次同步 {time.time() - self.last_time_sync:.0f} 秒前）")
@@ -1416,12 +1480,10 @@ class CryptoTrader:
                     # 🔥 v6.4（429 诊断增强）：只采集证据，不改任何限频/冷却/重试策略
                     print(self._format_429_diagnostics(
                         func, getattr(self.exchange, 'last_response_headers', None), e))
-                    # 🔥 v6.4-P4：事发快照（先拍快照后入账失败，快照=事前窗口）——
-                    # 下次 418 即有「Bot 自身调用面 + used-weight 峰值」完整归因证据链
+                    # 🔥 v6.4-P4b：事发快照（失败调用已由 except 顶部统一入账，
+                    # 快照含本次失败）——三指标窗口轨迹 + 本次错误 header 归因证据链
                     print(_API_METRICS.format_incident(
                         func, getattr(self.exchange, 'last_response_headers', None), e))
-                    _API_METRICS.record(
-                        func, getattr(self.exchange, 'last_response_headers', None), ok=False)
 
                     # 🔥 检测到 IP 封禁 → 触发全局熔断
                     if "banned" in err_str or "418" in err_str or "way too many requests" in err_str:
