@@ -1,0 +1,17 @@
+diff --git a/parser.py b/parser.py
+index d6f770e..d87c1d1 100644
+--- a/parser.py
++++ b/parser.py
+@@ -21,7 +21,12 @@ def parse_signal_from_json(file_path: str) -> TradeSignal:
+     """从 JSON 文件解析交易信号（支持大小写不敏感）"""
+     with open(file_path, 'r', encoding='utf-8') as f:
+         data = json.load(f)
++    return parse_signal_from_dict(data)
+ 
++
++def parse_signal_from_dict(data: dict) -> TradeSignal:
++    """从 JSON dict 解析交易信号（v6.4 竞态修复：handler 快照直接解析，
++    不再重读共享 signal.json——两信号连发覆写竞态根因）。"""
+     # 🔥 大小写不敏感的字段获取函数
+     def get_field(key: str, default=None):
+         if key in data:

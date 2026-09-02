@@ -1178,6 +1178,24 @@ class CryptoTrader:
         self._clear_tp_param_invalid(symbol, batch_id)
         return False
 
+    @staticmethod
+    def _format_429_diagnostics(func, headers, err):
+        """🔥 v6.4（429 诊断增强）：只采集证据——原始错误 + Retry-After +
+        X-MBX-USED-WEIGHT-* + X-MBX-ORDER-COUNT-*（429 也可能来自 order rate
+        limit，缺后者时 order-count 型 429 会查不出真因）+ endpoint。
+        不改变任何限频/冷却/重试策略。"""
+        try:
+            fname = getattr(func, '__name__', str(func))
+            h = headers or {}
+            retry_after = h.get('Retry-After') or h.get('retry-after')
+            used = {k: v for k, v in h.items() if 'used-weight' in str(k).lower()}
+            order_count = {k: v for k, v in h.items()
+                           if 'order-count' in str(k).lower()}
+            return (f"🔬 [429诊断] endpoint={fname} | Retry-After={retry_after} | "
+                    f"used-weight={used} | order-count={order_count} | err={err}")
+        except Exception as diag_e:
+            return f"🔬 [429诊断] 证据采集失败: {diag_e}"
+
     def _safe_api_call(self, func, *args, retries=5, delay=2, auth_probe=False, **kwargs):
         # 🔥 D-010 Batch 2（ChatGPT 钉死约束 1）：AUTH_BLOCKED 入口闸门——
         # 位于 for retry loop 与 try 之前，raise 于 try 外。锁定期内下方 -1021 分支的
@@ -1253,6 +1271,10 @@ class CryptoTrader:
                         "too many requests" in err_str or
                         "banned" in err_str or "418" in err_str or
                         "way too many requests" in err_str):
+
+                    # 🔥 v6.4（429 诊断增强）：只采集证据，不改任何限频/冷却/重试策略
+                    print(self._format_429_diagnostics(
+                        func, getattr(self.exchange, 'last_response_headers', None), e))
 
                     # 🔥 检测到 IP 封禁 → 触发全局熔断
                     if "banned" in err_str or "418" in err_str or "way too many requests" in err_str:

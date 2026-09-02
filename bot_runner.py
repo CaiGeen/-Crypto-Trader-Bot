@@ -49,7 +49,7 @@ from telegram.request import HTTPXRequest
 from telegram.error import NetworkError, RetryAfter, Conflict, BadRequest
 
 # 导入交易核心与解析器
-from parser import parse_signal_from_json
+from parser import parse_signal_from_json, parse_signal_from_dict
 from trader_260725 import CryptoTrader
 
 # 2. 加载环境变量
@@ -1812,7 +1812,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ 正在唤起交易引擎...",
             parse_mode='Markdown'
         )
-        asyncio.create_task(run_trader_execution(update, context))
+        # 🔥 v6.4（signal snapshot 竞态修复）：dispatch 时固化本次信号内容快照，
+        # 任务永远执行自己的快照——不再重读共享 signal.json（连发覆写竞态根因）
+        asyncio.create_task(run_trader_execution(update, context,
+                                                 signal_snapshot=dict(signal_data)))
 
     except json.JSONDecodeError as e:
         await safe_reply(update, f"❌ JSON 解析失败: {e}")
@@ -1845,7 +1848,10 @@ async def handle_json_or_pending_input(update: Update, context: ContextTypes.DEF
                     f"📊 {signal_data['symbol']} {signal_data['side']} {signal_data['leverage']}x",
                     parse_mode='Markdown'
                 )
-                asyncio.create_task(run_trader_execution(update, context))
+                # 🔥 v6.4（signal snapshot 竞态修复）：dispatch 时固化本次信号内容快照，
+                # 任务永远执行自己的快照——不再重读共享 signal.json（连发覆写竞态根因）
+                asyncio.create_task(run_trader_execution(update, context,
+                                                         signal_snapshot=dict(signal_data)))
                 return
             elif upper_text == "NO":
                 await safe_reply(update, "❌ 测试挂单已取消。")
@@ -1870,7 +1876,10 @@ async def handle_json_or_pending_input(update: Update, context: ContextTypes.DEF
                         signal_file = os.path.join(BASE_DIR, "signal.json")
                         with open(signal_file, "w", encoding="utf-8") as f:
                             json.dump(signal_data, f, indent=4, ensure_ascii=False)
-                        asyncio.create_task(run_trader_execution(update, context))
+                        # 🔥 v6.4（signal snapshot 竞态修复）：dispatch 时固化本次信号内容快照，
+                        # 任务永远执行自己的快照——不再重读共享 signal.json（连发覆写竞态根因）
+                        asyncio.create_task(run_trader_execution(
+                            update, context, signal_snapshot=dict(signal_data)))
                         return
                 except (json.JSONDecodeError, KeyError, ValueError):
                     pass
@@ -2008,7 +2017,10 @@ async def handle_json_or_pending_input(update: Update, context: ContextTypes.DEF
             f"⏳ 正在唤起交易引擎...",
             parse_mode='Markdown'
         )
-        asyncio.create_task(run_trader_execution(update, context))
+        # 🔥 v6.4（signal snapshot 竞态修复）：dispatch 时固化本次信号内容快照，
+        # 任务永远执行自己的快照——不再重读共享 signal.json（连发覆写竞态根因）
+        asyncio.create_task(run_trader_execution(update, context,
+                                                 signal_snapshot=dict(signal_data)))
 
     except json.JSONDecodeError as e:
         await safe_reply(update, f"❌ JSON 解析失败: {e}\n\n请检查 JSON 格式。")
@@ -2088,7 +2100,10 @@ async def handle_quick_signal(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"🎯 快捷信号生效！已更新 `signal.json` ({symbol} {side} {leverage}x)，唤起交易中...",
             parse_mode='Markdown'
         )
-        asyncio.create_task(run_trader_execution(update, context))
+        # 🔥 v6.4（signal snapshot 竞态修复）：dispatch 时固化本次信号内容快照，
+        # 任务永远执行自己的快照——不再重读共享 signal.json（连发覆写竞态根因）
+        asyncio.create_task(run_trader_execution(update, context,
+                                                 signal_snapshot=dict(signal_data)))
 
     except ValueError as e:
         await safe_reply(update, f"❌ 数字格式错误: {e}")
@@ -2255,7 +2270,8 @@ def _approve_dedup_force(short_id: str, now=None, path=None):
     return True, matches[0][:8]
 
 
-async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                               signal_snapshot: dict = None):
     async with TRADER_LOCK:
         try:
             loop = asyncio.get_running_loop()
@@ -2286,8 +2302,13 @@ async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYP
                                  parse_mode='Markdown')
                 return
 
-            signal_file = os.path.join(BASE_DIR, "signal.json")
-            signal = parse_signal_from_json(signal_file)
+            if signal_snapshot is not None:
+                # 🔥 v6.4（signal snapshot 竞态修复）：本任务永远执行自己 dispatch
+                # 时的内容快照，不重读共享 signal.json（连发覆写竞态根因）
+                signal = parse_signal_from_dict(signal_snapshot)
+            else:
+                signal_file = os.path.join(BASE_DIR, "signal.json")
+                signal = parse_signal_from_json(signal_file)
 
             print(f"\n📋 信号解析完成:")
             print(f"   ├─ 标的: {signal.symbol}")
