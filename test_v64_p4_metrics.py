@@ -144,9 +144,11 @@ class _MetricsKeeper:
 
 def r6_success_path_wiring():
     ex = types.SimpleNamespace()
-    ex.last_response_headers = {'X-MBX-USED-WEIGHT-1M': '42'}
+    ex.last_response_headers = {}
 
     def fetch_positions(*a, **k):
+        # ccxt 契约：响应 header 在请求调用内部写入（P4d 清栏后桩必须建模此行为）
+        ex.last_response_headers = {'X-MBX-USED-WEIGHT-1M': '42'}
         return [{'symbol': SYM}]
     ex.fetch_positions = fetch_positions
     t = _wire_trader(ex)
@@ -161,9 +163,10 @@ def r6_success_path_wiring():
 
 def r7_429_path_emits_incident_snapshot():
     ex = types.SimpleNamespace()
-    ex.last_response_headers = {'Retry-After': '5', 'X-MBX-USED-WEIGHT-1M': '900'}
+    ex.last_response_headers = {}
 
     def fetch_open_orders(*a, **k):
+        ex.last_response_headers = {'Retry-After': '5', 'X-MBX-USED-WEIGHT-1M': '900'}
         raise Exception('binanceusdm 429 rate limit exceeded; please slow down')
     ex.fetch_open_orders = fetch_open_orders
     t = _wire_trader(ex)
@@ -245,11 +248,12 @@ def r10_window_semantics():
 def r11_failed_response_recorded():
     """R11：503 等带 header 的失败响应也必须留下调用+weight 证据；
     -1021 重同步的直连 load_time_difference 也必须入账。"""
-    # 场景 A：503 带头失败
+    # 场景 A：503 带头失败（ccxt 契约：header 在调用内部写入）
     ex = types.SimpleNamespace()
-    ex.last_response_headers = {'X-MBX-USED-WEIGHT-1M': '500'}
+    ex.last_response_headers = {}
 
     def fetch_positions(*a, **k):
+        ex.last_response_headers = {'X-MBX-USED-WEIGHT-1M': '500'}
         raise Exception('503 Service Unavailable')
     ex.fetch_positions = fetch_positions
     t = _wire_trader(ex)
@@ -380,6 +384,65 @@ def r14_event_ordering():
         f'事件顺序必须与响应完成顺序一致: {eps}'
 
 
+def r15_sync_failure_ownership():
+    """R15：-1021 重同步 load_time_difference 自身失败时，其 header 快照+record
+    必须同样在 semaphore 临界区内完成——A 同步产生 900 后失败 + sibling 覆盖 50
+    → sync fail event 必须=900，绝不能是 50。"""
+    m = trader_260725.ApiMetrics()
+    ex = types.SimpleNamespace()
+    ex.last_response_headers = {}
+
+    def fetch_balance(*a, **k):
+        ex.last_response_headers = {'X-MBX-USED-WEIGHT-1M': '100'}
+        raise Exception('binance -1021 Timestamp for this request is outside of the recvWindow.')
+
+    def load_time_difference():
+        ex.last_response_headers = {'X-MBX-USED-WEIGHT-1M': '900'}
+        raise Exception('sync network error')
+    ex.fetch_balance = fetch_balance
+    ex.load_time_difference = load_time_difference
+    t = _wire_trader(ex)
+
+    def on_release():
+        ex.last_response_headers = {'X-MBX-USED-WEIGHT-1M': '50'}
+        m.record(_named('fetch_ticker'), {'X-MBX-USED-WEIGHT-1M': '50'}, ok=True)
+    t._api_semaphore = _RaceSemaphore(on_release)
+    with _MetricsKeeper(m):
+        raised = False
+        try:
+            t._safe_api_call(ex.fetch_balance, SYM, retries=1)
+        except Exception:
+            raised = True
+    assert raised
+    sync_fails = [e for e in m._events if e[1] == 'load_time_difference' and e[2] == 'fail']
+    assert sync_fails and sync_fails[-1][3] == 900.0, \
+        f'重同步失败 header 归属错误（被 sibling 覆盖）: {sync_fails}'
+
+
+def r16_stale_header_rejection():
+    """R16：线程安全读取共享 header ≠ 证明 header 属于本次 attempt——
+    上一笔遗留 777 + 本地 pre-network 抛错（未产生新响应）→ 本次 event
+    header 必须 None/N/A，绝不能把 777 重新归属为新的窗口事件。"""
+    m = trader_260725.ApiMetrics()
+    ex = types.SimpleNamespace()
+    ex.last_response_headers = {'X-MBX-USED-WEIGHT-1M': '777'}  # 上一笔遗留
+
+    def fetch_balance(*a, **k):
+        raise ValueError('local pre-network error')  # 本地抛错，不碰 Binance
+    ex.fetch_balance = fetch_balance
+    t = _wire_trader(ex)
+    with _MetricsKeeper(m):
+        raised = False
+        try:
+            t._safe_api_call(ex.fetch_balance, SYM, retries=1)
+        except Exception:
+            raised = True
+    assert raised
+    fails = [e for e in m._events if e[1] == 'fetch_balance' and e[2] == 'fail']
+    assert fails and fails[-1][3] is None, \
+        f'遗留 header 777 不得归属本次 attempt: {fails}'
+
+
 TESTS = [r1_endpoint_counting,
          r2_header_capture_all_three,
          r3_incident_snapshot_content,
@@ -393,7 +456,9 @@ TESTS = [r1_endpoint_counting,
          r11_failed_response_recorded,
          r12_weight_map,
          r13_concurrent_header_ownership,
-         r14_event_ordering]
+         r14_event_ordering,
+         r15_sync_failure_ownership,
+         r16_stale_header_rejection]
 
 
 def main():

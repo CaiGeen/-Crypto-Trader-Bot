@@ -1,0 +1,47 @@
+diff --git a/trader_260725.py b/trader_260725.py
+index 65520cb..166d41a 100644
+--- a/trader_260725.py
++++ b/trader_260725.py
+@@ -1421,6 +1421,10 @@ class CryptoTrader:
+                     # 必须在持有 _api_semaphore 生命周期内完成，否则 semaphore 释放后
+                     # 共享 exchange.last_response_headers 会被并发请求覆盖，失败证据
+                     # 归属错误（A 的 900 被记成 B 的 50）。成功/失败都在此入账。
++                    # 🔥 v6.4-P4d：调用前清空共享 header 栏——「线程安全读取共享 header」
++                    # ≠「header 属于本次 attempt」；本地 pre-network 抛错未产生新响应时，
++                    # 上一笔遗留值绝不归属本次（R16）。有响应时 ccxt 会重写该栏。
++                    self.exchange.last_response_headers = {}
+                     try:
+                         _r = func(*args, **kwargs)
+                     except Exception:
+@@ -1462,8 +1466,19 @@ class CryptoTrader:
+                             # R6: 收编信号量限速保护。不套 _safe_api_call——此处位于其 except 分支内，
+                             # 嵌套调用在 sync 自身再抛 -1021 时有递归风险；重试职责由外层循环 continue 承担
+                             # 🔥 v6.4-P4c：snapshot+record 同样收进 semaphore 临界区（同一 ownership 不变量）
++                            # 🔥 v6.4-P4d：成功与失败都必须在临界区内完成 snapshot+record
++                            # （失败路径原先在 semaphore 释放后才 record——同一 race）；
++                            # 调用前清空共享 header 栏（同 R16 语义）
+                             with self._api_semaphore:
+-                                self.exchange.load_time_difference()
++                                self.exchange.last_response_headers = {}
++                                try:
++                                    self.exchange.load_time_difference()
++                                except Exception:
++                                    _API_METRICS.record(
++                                        self.exchange.load_time_difference,
++                                        dict(getattr(self.exchange, 'last_response_headers',
++                                                     None) or {}), ok=False)
++                                    raise
+                                 self.last_time_sync = time.time()
+                                 _API_METRICS.record(self.exchange.load_time_difference,
+                                                     dict(getattr(self.exchange,
+@@ -1472,10 +1487,6 @@ class CryptoTrader:
+                             print(f"🔄 [时间同步] 已重新同步服务器时间")
+                             time.sleep(2)  # 等待同步生效
+                         except Exception as sync_e:
+-                            _API_METRICS.record(self.exchange.load_time_difference,
+-                                                dict(getattr(self.exchange,
+-                                                             'last_response_headers',
+-                                                             None) or {}), ok=False)
+                             print(f"⚠️ 时间同步失败: {sync_e}")
+                     else:
+                         print(f"🔄 [时间同步] 冷却期内跳过重同步（上次同步 {time.time() - self.last_time_sync:.0f} 秒前）")
