@@ -16,6 +16,7 @@
 - Fix3 /partial 无参：纯本地列出净持仓>0 且未冻结批次（零 API，排除 ghost）。
 """
 import ast
+import re
 import textwrap
 
 import test_v64_partial_close as H
@@ -313,6 +314,44 @@ def t08_r8_first_sight_registers_only():
     assert st.get('op') == 'OPY' and 'ts' in st
 
 
+# ── R9（v6.4-P2 Fix A）：外部全平结算分支不得引用未绑定 b_data（实盘监控线程崩溃）──
+def t09_p2_external_close_settlement_no_crash():
+    """2026-09-02 16:30 实盘：app 手动全平 → 持仓归零结算分支引用 b_data
+    （变量早已改名 latest_b_data，L5496 加载；函数 finally 区才赋值 b_data
+    → Python 判定局部变量 → UnboundLocalError → 监控线程死亡，批次失去 SL/TP 维护）。
+    结构断言：结算分支必须使用 latest_b_data；机制存证 finally 区 b_data 赋值仍在
+    （它正是「局部变量未绑定」崩溃机制的来源，ChatGPT 核实）。"""
+    seg = ''
+    for node in ast.walk(H.TREE):
+        if isinstance(node, ast.FunctionDef) and node.name == '_start_monitoring':
+            seg = ast.get_source_segment(H.SRC, node) or ''
+            break
+    assert seg, '未找到 _start_monitoring'
+    # 注意：'b_data.get(...)' 是 'latest_b_data.get(...)' 的后缀子串 → 必须用词边界正则
+    pat = r"(?<![A-Za-z0-9_])b_data\."
+    assert not re.search(pat + r"get\('realized_reduce_cost'", seg), \
+        '持仓归零结算分支仍引用未绑定的 b_data（实盘崩溃点 L5525）'
+    assert 'self._batch_net_position(b_data)' not in seg, \
+        '持仓归零结算分支仍引用未绑定的 b_data（实盘崩溃点 L5524）'
+    assert 'self._batch_net_position(latest_b_data)' in seg, '结算必须使用已加载的 latest_b_data'
+    assert 'b_data = all_states.get(symbol, {}).get(batch_id, {})' in seg, \
+        'finally 区 b_data 赋值（崩溃机制存证）应仍存在'
+
+
+# ── R10（v6.4-P2 Fix C）：freeze console 提示节流（状态变化即打 / 不变 5min heartbeat）──
+def t10_p2_freeze_print_throttle():
+    """2026-09-02 14:27-16:25 实盘：🧊[P0 冻结] 行每监控周期无条件 print 刷屏 70+ 行。
+    「3 次后静默」约定只覆盖 TG 通道；console 从未限流。断言：冻结分支 print 已节流
+    （_freeze_print_state 簿记：状态变化立即打，持续不变 300s 一条 heartbeat）。"""
+    i = SRC.find('本轮跳过保护单维护')
+    assert i > 0
+    j = SRC.find('continue', i)
+    seg = SRC[max(0, i - 600):j]
+    assert '_freeze_print_state' in seg, '冻结 print 未接节流簿记'
+    assert '300' in seg, '节流窗口应为 300s heartbeat'
+    assert SRC.count('_freeze_print_state') >= 2, '节流簿记缺失（init + 使用）'
+
+
 TESTS = [t01_r1_cancel_verify_bounded_retry,
          t02_r2_stage_skip_completed_leg,
          t03_r3_toctou_conservation_gate,
@@ -320,7 +359,9 @@ TESTS = [t01_r1_cancel_verify_bounded_retry,
          t05_r5_per_leg_durable_commit,
          t06_r6_partial_listing_and_runtime_resume_wiring,
          t07_r7_guard_terminal_halts_runtime_resume,
-         t08_r8_first_sight_registers_only]
+         t08_r8_first_sight_registers_only,
+         t09_p2_external_close_settlement_no_crash,
+         t10_p2_freeze_print_throttle]
 
 
 def main():

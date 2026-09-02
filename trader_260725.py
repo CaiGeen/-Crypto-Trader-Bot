@@ -246,6 +246,7 @@ class CryptoTrader:
         self._resize_inflight = set()
         self._resize_inflight_lock = threading.Lock()
         self._partial_resume_state = {}
+        self._freeze_print_state = {}  # 🔥 v6.4-P2（Fix C）：冻结 console 提示节流簿记
 
         # 🔥 D-010 Batch 2：AUTH_BLOCKED 盲区安全模式（auth_blocked.json 持久化，损坏 Fail-Closed）
         self.auth_blocked_file = AUTH_BLOCKED_FILE        # 测试可重定向
@@ -5519,10 +5520,14 @@ class CryptoTrader:
                         print(f"🛑 [持仓归零检测] 批次 [{batch_id}] 实际持仓已归零，正在安全退出监控...")
 
                         # 🔥 计算实际盈亏（v6.4：净仓位/净成本基准；剩余 fee 按 cost 比例分摊）
+                        # 🔥 v6.4-P2（Fix A）：此处曾引用未绑定的 b_data（变量早已改名
+                        # latest_b_data；finally 区才赋值 b_data → 局部变量未绑定）
+                        # → 外部（app 手动）全平场景监控线程崩溃，批次失去 SL/TP 维护
+                        # （2026-09-02 16:30 实盘事故，ChatGPT 终审 P0 批准修复）
                         if batch_filled_amount > 0:
                             # 计算持仓均价（含手续费）
-                            _net_qty, _net_cost = self._batch_net_position(b_data)
-                            _rr_cost = float(b_data.get('realized_reduce_cost', 0.0) or 0.0)
+                            _net_qty, _net_cost = self._batch_net_position(latest_b_data)
+                            _rr_cost = float(latest_b_data.get('realized_reduce_cost', 0.0) or 0.0)
                             _gross_cost = _net_cost + _rr_cost
                             _fee_rem = float(total_entry_fee or 0.0) * _net_cost / _gross_cost \
                                 if _gross_cost > 0 else 0.0
@@ -5872,9 +5877,17 @@ class CryptoTrader:
                 if _b_close_phase >= 1 or (latest_b_data or {}).get('pending_close'):
                     _close_reason = ((latest_b_data or {}).get('close_reason')
                                      or 'settlement_stuck')  # 缺失 = 遗留冻结 → fail-noisy
-                    print(f"  └─ 🧊 [P0 冻结] 批次 {batch_id} 处于平仓流程"
-                          f"(close_phase={_b_close_phase}, reason={_close_reason})，"
-                          f"本轮跳过保护单维护")
+                    # 🔥 v6.4-P2（Fix C）：console 冻结提示节流——状态变化立即打印，
+                    # 持续不变每 300s heartbeat 一条（此前每周期无条件 print 实盘刷屏 70+ 行；
+                    # 「3 次后静默」约定只覆盖 TG 通道，console 从未限流）
+                    _fps = self._freeze_print_state.get(batch_id) or ('', 0, 0.0)
+                    if _close_reason != _fps[0] or _b_close_phase != _fps[1] \
+                            or time.time() - _fps[2] >= 300:
+                        print(f"  └─ 🧊 [P0 冻结] 批次 {batch_id} 处于平仓流程"
+                              f"(close_phase={_b_close_phase}, reason={_close_reason})，"
+                              f"本轮跳过保护单维护")
+                        self._freeze_print_state[batch_id] = (_close_reason, _b_close_phase,
+                                                              time.time())
                     # 🔒 v6.2-r4：FREEZE_QUIET_REASONS（market_confirming /
                     # limit_pending_normal）之外一律周期 critical——
                     # limit_creating 是 transient，crash 重启后必须 loud（M25）。
