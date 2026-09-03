@@ -6324,9 +6324,17 @@ class CryptoTrader:
 
                         # 🔥 P5c（同 Blocker 2）：限价平仓事务在途（未 settled）而仓位
                         # 已归零（如 SL 窗口触发）——在途限价单若不撤，价格回落可能
-                        # 对零仓位开反向仓。撤单（-2011 幂等）→ 共享四态裁决
-                        # （FULL_FILL→finalizer / 取消→恢复），禁止自行 clear。
-                        if (latest_b_data.get('close_reason') == 'limit_pending_normal'
+                        # 对零仓位开反向仓。撤单（-2011 幂等）后按成交量分型。
+                        # 🔥 P5d（ChatGPT 三复审 P0）：仓位已归零时恢复 ACTIVE 无意义
+                        # （守恒门必拒）且 restore_pending 会落回 generic 分支被静默
+                        # clear——SL 成交在聚合层归属不可知（多批次环境），故除
+                        # FULL_FILL（走 finalizer 正确结算）外一律保持可见冻结 +
+                        # 节流 critical，绝不恢复、绝不静默 clear（R18a/R18b）。
+                        # limit_cancel_restore_pending 同样纳入（/closecancel 恢复中
+                        # SL 归零的组合竞态——ChatGPT 场景步骤 3-5 的命令路径变体）。
+                        if (latest_b_data.get('close_reason') in (
+                                'limit_pending_normal',
+                                'limit_cancel_restore_pending')
                                 and latest_b_data.get('limit_close_order_id')):
                             _fid2 = latest_b_data['limit_close_order_id']
                             try:
@@ -6338,12 +6346,36 @@ class CryptoTrader:
                                     print(f"  └─ ⚠️ [P5] 撤在途限价单失败: {_ce}，下轮重试")
                                     continue
                             try:
-                                _ok_a2, _msg_a2 = self._adjudicate_closed_limit_close(
-                                    symbol, batch_id, _fid2)
-                                print(f"  └─ {'✅' if _ok_a2 else '⚠️'} "
-                                      f"[P5 裁决] 批次 {batch_id}: {_msg_a2}")
-                            except Exception as _ae:
-                                print(f"  └─ ⚠️ [P5 裁决] 异常: {_ae}")
+                                _ord2 = self._safe_api_call(self.exchange.fetch_order,
+                                                            _fid2, symbol)
+                            except Exception:
+                                _ord2 = None
+                            _filled2 = float((_ord2 or {}).get('filled') or 0.0)
+                            _st2 = str((_ord2 or {}).get('status') or '').lower()
+                            _pre_net2, _ = self._batch_net_position(latest_b_data)
+                            if _st2 in ('closed', 'filled') \
+                                    and _filled2 >= _pre_net2 - max(1e-8, _pre_net2 * 1e-6):
+                                # 全量成交（撤单竞态：cancel 时已成交）→ finalizer 正确结算
+                                _ok_f2, _msg_f2 = self._finalize_limit_full_fill(
+                                    symbol, batch_id, _fid2, order=_ord2)
+                                if _ok_f2:
+                                    break
+                                print(f"  └─ ⚠️ [P5 finalizer] 批次 {batch_id} "
+                                      f"本轮未完成（{_msg_f2}），下轮重试")
+                                continue
+                            # 零成交/部分成交撤销 + 仓位已被 SL 归零：SL 成交归属在
+                            # 聚合层不可知 → PnL/归属未明确，保持可见冻结待人工
+                            if time.time() - self._freeze_alerted.get(batch_id, 0) >= 3600:
+                                self._freeze_alerted[batch_id] = time.time()
+                                self.send_tg_notification(
+                                    f"🚨【资金安全】批次 `{batch_id}` 限价平仓单已撤销"
+                                    f"（成交量 {_filled2}），但仓位已被止损归零——余量平仓"
+                                    f"归属未明确，已保持冻结待人工核对。\n"
+                                    f"💡 请核对交易所成交记录后人工处理"
+                                    f"（本批次不会被自动清理/恢复）。",
+                                    level='critical')
+                            print(f"  └─ 🧊 [P5] 批次 {batch_id} 限价单撤零/部分成交"
+                                  f"（filled={_filled2}）+ 仓位归零，保持冻结待人工")
                             continue
 
                         # 🔥 如果是程序平仓，跳过结算
@@ -7898,7 +7930,14 @@ class CryptoTrader:
                 if current_pos is not None and current_pos == 0:
                     all_states = self.load_all_states()
                     b_data = all_states.get(symbol, {}).get(batch_id, {})
-                    if b_data:
+                    # 🔥 P5d（ChatGPT 三复审 Blocker 2 端到端）：settled 批次清理的
+                    # 唯一守卫是共享 finalizer（PnL 落盘门）——线程异常退出也不得
+                    # 经 finally 旁路 converge+clear（否则成交记录永久丢失）
+                    if b_data.get('settled_by_limit_close') \
+                            and b_data.get('limit_close_order_id'):
+                        self._finalize_limit_full_fill(
+                            symbol, batch_id, b_data['limit_close_order_id'])
+                    elif b_data:
                         # P0 Batch B：converge 证明后才 clear；finally 无循环可重试，
                         # 未收敛则保留状态 + 告警（持仓已归零，仅剩订单面收敛）
                         _proof = self._converge_batch_orders_before_clear(symbol, batch_id)

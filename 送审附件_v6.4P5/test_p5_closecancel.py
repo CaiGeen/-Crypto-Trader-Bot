@@ -61,6 +61,12 @@ class Ex:
         o['status'] = 'canceled'
         return {'id': oid}
 
+    def amount_to_precision(self, symbol, amount):
+        return amount
+
+    def price_to_precision(self, symbol, price):
+        return price
+
     def create_order(self, symbol, otype, side, amount, price=None, params=None, **k):
         nid = f'N{len(self.create_calls) + 1}'
         self.create_calls.append((otype, side, round(float(amount), 6)))
@@ -607,24 +613,34 @@ def r16_pnl_gate_monitor_no_bypass_clear():
         cleared.append(bid)
         return True
     t.clear_batch_state = _clear
-    th = threading.Thread(target=t._start_monitoring,
-                          args=(SYM, BID),
-                          kwargs=dict(entry_orders=['E1'], stop_steps=[75001.0],
-                                      take_profit_price=80000.0, current_sl_id='S1',
-                                      tp_order_id='T1', batch_total_amount=0.002,
-                                      target_amounts=[0.002], params_base={},
-                                      is_hedge_mode=True, side='BUY',
-                                      last_filled_count=1, filled_details=[76620.0],
-                                      total_entry_fee=0.15),
-                          daemon=True)
-    th.start()
-    dl = time.time() + 4
-    while time.time() < dl and len(cleared) == 0 and th.is_alive():
-        time.sleep(0.05)
+    # 真实节流 10~15s/轮 → 压缩 sleep 使行为测试在秒级跑多轮（确定性）
+    _real_sleep = time.sleep  # 先捕获真实现（lambda 闭包内 time.sleep 已被 patch 会递归）
+    with mock.patch.object(trader_260725.time, 'sleep',
+                           lambda s: _real_sleep(min(s, 0.02))):
+        th = threading.Thread(target=t._start_monitoring,
+                              args=(SYM, BID),
+                              kwargs=dict(entry_orders=['E1'], stop_steps=[75001.0],
+                                          take_profit_price=80000.0, current_sl_id='S1',
+                                          tp_order_id='T1', batch_total_amount=0.002,
+                                          target_amounts=[0.002], params_base={},
+                                          is_hedge_mode=True, side='BUY',
+                                          last_filled_count=1, filled_details=[76620.0],
+                                          total_entry_fee=0.15),
+                              daemon=True)
+        th.start()
+        dl = time.time() + 4
+        while time.time() < dl and len(cleared) == 0 and th.is_alive():
+            time.sleep(0.05)
+        # 测试卫生（ChatGPT P5d）：显式终止线程——批次消失 → G1 exit → join，
+        # 杜绝 daemon 残留跨用例串扰后续测试的全局 STATE_FILE 切换
+        b_snap = _state_read(t).get(SYM, {}).get(BID)  # 先取快照再抹账本
+        _state_write(t, {SYM: {}})
+        th.join(timeout=5)
+        assert not th.is_alive(), 'R16 monitor 线程必须可干净终止'
     assert not cleared, f'PnL 门生效期间主监控绝不得 clear 批次: {cleared}'
-    b2 = _state_read(t)[SYM][BID]
-    assert b2['close_phase'] == 2 and b2.get('settled_by_limit_close'), \
-        '批次必须保持 phase=2 等待续跑'
+    assert b_snap is not None and b_snap['close_phase'] == 2 \
+        and b_snap.get('settled_by_limit_close'), \
+        f'批次必须保持 phase=2 等待续跑: {b_snap}'
     # 结构断言：settled 分支路由 finalizer，禁止直连 converge/clear
     src = open(r'G:\my-crypto-bot\trader_260725.py', encoding='utf-8').read()
     i = src.find("latest_b_data.get('settled_by_limit_close', False)")
@@ -666,6 +682,78 @@ def r17_monitor_fail_command_takeover():
         '运行期自愈必须调度 phase=2 finalizer 接管'
 
 
+# ────────────────── P5d：ChatGPT 三复审 P0（SL 归零 × 限价撤单 组合竞态） ──────────────────
+
+def _run_sl_zeroed_monitor(t, ex, filled):
+    """R18 共用驱动：仓位已被 SL 归零 + 限价单已撤销（成交量 filled）。
+    真线程跑数个周期后显式终止；返回 (cleared, 磁盘批次, criticals)。"""
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    _state_write(t, _single(b))
+    ex._mk('S1', otype='STOP_MARKET', amount=0.002, stop=75001.0,
+           status='canceled', filled=0.002, avg=75000.0)   # SL 已全平（外部事实）
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='canceled', filled=filled,
+           avg=76500.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    cleared = []
+
+    def _clear(s, bid, proof=None):
+        cleared.append(bid)
+        return True
+    t.clear_batch_state = _clear
+    th = threading.Thread(target=t._start_monitoring,
+                          args=(SYM, BID),
+                          kwargs=dict(entry_orders=['E1'], stop_steps=[75001.0],
+                                      take_profit_price=80000.0, current_sl_id='S1',
+                                      tp_order_id='T1', batch_total_amount=0.002,
+                                      target_amounts=[0.002], params_base={},
+                                      is_hedge_mode=True, side='BUY',
+                                      last_filled_count=1, filled_details=[76620.0],
+                                      total_entry_fee=0.15),
+                          daemon=True)
+    _real_sleep = time.sleep  # 先捕获真实现（lambda 闭包内 time.sleep 已被 patch 会递归）
+    with mock.patch.object(trader_260725.time, 'sleep',
+                           lambda s: _real_sleep(min(s, 0.02))):
+        th.start()
+        dl = time.time() + 4
+        while time.time() < dl and not cleared and th.is_alive():
+            time.sleep(0.05)
+        # 测试卫生：显式终止（先取快照再抹账本 → 批次消失 → G1 exit → join）
+        b_snap = _state_read(t).get(SYM, {}).get(BID)
+        _state_write(t, {SYM: {}})
+        th.join(timeout=5)
+        assert not th.is_alive(), 'R18 monitor 线程必须可干净终止'
+    return cleared, b_snap, t.sent_tg
+
+
+def r18a_sl_zeroed_zero_fill_no_silent_clear():
+    """R18a：限价零成交撤销 + SL 全平——绝不恢复 ACTIVE、绝不静默 clear，
+    保持可见冻结（节流 critical）。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    cleared, b2, crits = _run_sl_zeroed_monitor(t, ex, filled=0.0)
+    assert not cleared, f'归属未明确时绝不得静默 clear: {cleared}'
+    assert b2 is not None, '批次必须保持可见（不得被清出账本）'
+    assert b2.get('close_phase') == 1, f'绝不恢复 ACTIVE: {b2}'
+    assert b2.get('close_reason') == 'limit_pending_normal', \
+        f'不得写入恢复态（仓位已归零，恢复无意义）: {b2.get("close_reason")}'
+    assert any('资金安全' in c for c in crits), '必须有可见 critical 告警'
+
+
+def r18b_sl_zeroed_partial_fill_no_silent_clear():
+    """R18b：限价部分成交 + SL 平掉余量——同 R18a：不恢复、不静默 clear、
+    保持可见冻结；且不提交归属（PnL/归属未明确）。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    cleared, b2, crits = _run_sl_zeroed_monitor(t, ex, filled=0.001)
+    assert not cleared, f'归属未明确时绝不得静默 clear: {cleared}'
+    assert b2 is not None, '批次必须保持可见（不得被清出账本）'
+    assert b2.get('close_phase') == 1, f'绝不恢复 ACTIVE: {b2}'
+    assert b2.get('close_reason') == 'limit_pending_normal', \
+        f'不得写入恢复态: {b2.get("close_reason")}'
+    assert float(b2.get('realized_reduce_amount') or 0.0) == 0.0, \
+        '归属未明确时不得提交 partial 归属'
+    assert any('资金安全' in c for c in crits), '必须有可见 critical 告警'
+
+
 TESTS = [r1_eligibility_matrix,
          r2_pure_cancel_full_restore,
          r3_partial_fill_attribution_and_restore,
@@ -683,7 +771,9 @@ TESTS = [r1_eligibility_matrix,
          r14_pnl_persist_failure_keeps_phase2,
          r15_tp_confirmed_stage_crash_resume,
          r16_pnl_gate_monitor_no_bypass_clear,
-         r17_monitor_fail_command_takeover]
+         r17_monitor_fail_command_takeover,
+         r18a_sl_zeroed_zero_fill_no_silent_clear,
+         r18b_sl_zeroed_partial_fill_no_silent_clear]
 
 
 def main():
