@@ -396,6 +396,11 @@ class CryptoTrader:
         self._active_monitors = set()
         self._active_monitors_lock = threading.Lock()
 
+        # 🔥 P5j：重启恢复重生的限价监控所有权登记（键=(symbol, batch_id, close_op_id)
+        # → thread）。只在线程成功启动前登记、线程退出（finally）释放——登记前的
+        # 任何失败都保持「可续跑」，绝不把「尝试过」当成「已接管」。
+        self._limit_close_monitor_threads = {}
+
         # 🔥 SG3-P1: 保护单无效告警节流（键=(batch_id, order_id, reason)，防告警风暴）
         self._sg3_alerted = set()
 
@@ -3240,19 +3245,6 @@ class CryptoTrader:
           不可证明 → 保持冻结 + loud。"""
         try:
             b = (self.load_all_states().get(symbol, {}) or {}).get(batch_id) or {}
-            # 🔥 P5i（ChatGPT 八复审 P1）：进程内单次守卫——monitor_error 分支与
-            # 正常接管流程都会调用本 handler；PENDING 分支每次都会新建
-            # _monitor_limit_close 线程。无守卫会产生两个并发限价监控线程
-            # （重复轮询/重复裁决/重复告警）。同一 (batch, close_op) 只执行一次；
-            # 新事务（新 op_id）可再次进入。
-            _done = getattr(self, '_limit_recovery_done', None)
-            if _done is None:
-                _done = set()
-                self._limit_recovery_done = _done
-            _guard_key = (symbol, batch_id, b.get('close_op_id') or '')
-            if _guard_key in _done:
-                return
-            _done.add(_guard_key)
             op = b.get('close_op_id') or ''
             oid = b.get('limit_close_order_id') or ''
             reason = b.get('close_reason') or ''
@@ -3321,6 +3313,16 @@ class CryptoTrader:
                 return
             if verdict == 'PENDING':
                 # 限价单仍 live → 重拉监控线程（durable 派生 monitor 入参）
+                # 🔥 P5j（ChatGPT 九复审 P0）：所有权守卫只登记「已接管」——
+                # 查询/finalizer/恢复/start 任一步失败都不得留下痕迹，下次调用
+                # 必须能续跑（失败保持可接管）。登记在 start() 之前完成（防止
+                # 线程先结束释放所有权后又被登记成死线程），start 失败即撤销登记。
+                _guard_key = (symbol, batch_id, op)
+                _live = self._limit_close_monitor_threads.get(_guard_key)
+                if _live is not None and _live.is_alive():
+                    print(f"  └─ 👁️ [限价平仓恢复] 批次 [{batch_id}] "
+                          f"限价监控已在运行，跳过重复启动")
+                    return
                 lfc = int(b.get('last_filled_count', 0) or 0)
                 ta = list(b.get('target_amounts') or [])
                 fd = list(b.get('filled_details') or [])
@@ -3328,11 +3330,16 @@ class CryptoTrader:
                 gross_cost = float(sum(ta[i] * fd[i] for i in range(min(lfc, len(fd)))))
                 avg = (gross_cost / gross) if gross > 0 else 0.0
                 th = threading.Thread(
-                    target=self._monitor_limit_close,
-                    args=(symbol, batch_id, oid, gross, avg,
+                    target=self._monitor_limit_close_owned,
+                    args=(_guard_key, symbol, batch_id, oid, gross, avg,
                           float(b.get('total_entry_fee', 0.0) or 0.0),
                           b.get('side') or 'BUY', lfc, ta, fd), daemon=True)
-                th.start()
+                self._limit_close_monitor_threads[_guard_key] = th
+                try:
+                    th.start()
+                except Exception:
+                    self._limit_close_monitor_threads.pop(_guard_key, None)
+                    raise
                 print(f"  └─ 👁️ [限价平仓恢复] 批次 [{batch_id}] 限价单在途，监控线程已重生")
                 return
             self.send_tg_notification(
@@ -3343,6 +3350,14 @@ class CryptoTrader:
             print(f"  └─ ⚠️ [限价平仓恢复] 批次 [{batch_id}]: {verdict}（{detail[:120]}）")
         except Exception as e:
             print(f"  └─ ⚠️ [限价平仓恢复] 批次 [{batch_id}] 异常: {e}")
+
+    def _monitor_limit_close_owned(self, guard_key, *args, **kwargs):
+        """🔥 P5j：限价监控所有权包裹——线程退出（正常成交收敛 / 异常）时释放
+        `_limit_close_monitor_threads` 登记，使下一次恢复可重新接管。"""
+        try:
+            self._monitor_limit_close(*args, **kwargs)
+        finally:
+            self._limit_close_monitor_threads.pop(guard_key, None)
 
     def _execute_partial_close(self, symbol, batch_id, amount):
         """🔥 v6.4-P0：批次指定部分平仓——intent-before-effect 纪律的平仓侧复用。
@@ -10996,13 +11011,22 @@ class CryptoTrader:
             print(f"\n{result_msg}")
 
             # 🔥 启动一个后台线程监控限价单成交
+            # 🔥 P5j：与恢复路径共用同一所有权登记（防止 auth 恢复 reconcile
+            # 在监控仍在运行时重复启动第二个限价监控）
+            _guard_key = (target_symbol, batch_id, close_op_id)
             monitor_thread = threading.Thread(
-                target=self._monitor_limit_close,
-                args=(target_symbol, batch_id, order_id, current_filled_amount, avg_price, total_entry_fee, side,
+                target=self._monitor_limit_close_owned,
+                args=(_guard_key, target_symbol, batch_id, order_id, current_filled_amount,
+                      avg_price, total_entry_fee, side,
                       last_filled_count, target_amounts, filled_details),
                 daemon=True
             )
-            monitor_thread.start()
+            self._limit_close_monitor_threads[_guard_key] = monitor_thread
+            try:
+                monitor_thread.start()
+            except Exception:
+                self._limit_close_monitor_threads.pop(_guard_key, None)
+                raise
 
             return True, result_msg
 

@@ -1236,27 +1236,92 @@ def r31_monitor_error_pending_keeps_main_monitor():
                     {'symbol': SYM, 'contracts': 0.002, 'side': 'long',
                      'positionSide': 'LONG'}]
     counts = {'main': 0, 'limit': 0}
-    _real_main = t._start_monitoring
-    _real_limit = t._monitor_limit_close
+    gate = threading.Event()
 
-    def _main(*a, **k):
+    def _main(**k):      # 阻塞桩：记录调用后挂起，测试末尾统一放行 + join（不依赖调度时序）
         counts['main'] += 1
-        return _real_main(*a, **k)
+        gate.wait(timeout=15)
 
     def _limit(*a, **k):
         counts['limit'] += 1
-        return _real_limit(*a, **k)
+        gate.wait(timeout=15)
     t._start_monitoring = _main
     t._monitor_limit_close = _limit
+    _before = set(threading.enumerate())
     t.recover_active_batches()
-    b2 = _state_read(t).get(SYM, {}).get(BID)
-    assert b2 is not None, 'PENDING 限价在途批次不得被清理'
-    assert BID in t._active_monitors, \
-        f'必须有主监控所有权（限价监控退出后仍需维护批次）: {t._active_monitors}'
-    assert counts['main'] == 1, f'主监控必须恰好一个（Hedge 双记录不得误判）: {counts}'
-    assert counts['limit'] == 1, f'限价监控必须恰好一个（不得重复启动）: {counts}'
+    _new = [x for x in threading.enumerate() if x not in _before]
+    try:
+        b2 = _state_read(t).get(SYM, {}).get(BID)
+        assert b2 is not None, 'PENDING 限价在途批次不得被清理'
+        assert BID in t._active_monitors, \
+            f'必须有主监控所有权（限价监控退出后仍需维护批次）: {t._active_monitors}'
+        # 计数稳定：等待新线程全部进入桩体后再断言（避免依赖线程调度及时性）
+        _deadline = time.time() + 5
+        while time.time() < _deadline and (counts['main'] < 1 or counts['limit'] < 1):
+            time.sleep(0.01)
+        assert counts['main'] == 1, f'主监控必须恰好一个（Hedge 双记录不得误判）: {counts}'
+        assert counts['limit'] == 1, f'限价监控必须恰好一个（不得重复启动）: {counts}'
+    finally:
+        gate.set()
+        for _x in _new:
+            _x.join(timeout=5)
+        assert not any(_x.is_alive() for _x in _new), '测试结束前线程必须全部收尾'
     # monitor_error 保留为崩溃证据；关键不变量是「不再因该标记被无条件清理」
     # 且已重新获得主监控所有权（下轮重启幂等重复接管，不影响正确性）
+
+
+def r32_guard_must_not_mean_attempt():
+    """R32（ChatGPT 九复审 P0 负向）：守卫不得把「尝试过」当成「已接管」。
+
+    第一次处理同一 (batch, close_op) 时在启动监控之前失败 → 不得留下任何
+    所有权痕迹；故障修复后再次调用必须能续跑，且最终只存在一个限价监控；
+    监控线程退出后所有权必须释放（可再次接管）。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='open', filled=0.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.002, 'side': 'long',
+                     'positionSide': 'LONG'}]
+
+    # 1) 第一次调用：在启动监控之前注入失败（裁决查询阶段）
+    calls = {'n': 0}
+    _real_bnp = t._batch_net_position
+
+    def _flaky(*a, **k):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise RuntimeError('injected pre-monitor failure')
+        return _real_bnp(*a, **k)
+    t._batch_net_position = _flaky
+
+    started = []
+    stop = threading.Event()
+
+    def _spy_monitor(*a, **k):
+        started.append(threading.current_thread())
+        stop.wait(timeout=10)
+    t._monitor_limit_close = _spy_monitor
+
+    t._handle_limit_close_on_recovery(SYM, BID)
+    assert len(started) == 0, '第一次调用在启动监控前失败，不得启动任何监控线程'
+    assert not getattr(t, '_limit_close_monitor_threads', None), \
+        '失败的尝试绝不得登记所有权（尝试 ≠ 接管）'
+
+    # 2) 故障修复后第二次调用：必须能续跑并恰好启动一个限价监控
+    t._batch_net_position = _real_bnp
+    t._handle_limit_close_on_recovery(SYM, BID)
+    assert len(started) == 1, f'故障修复后必须能续跑并启动限价监控，实际 {len(started)}'
+    assert len(t._limit_close_monitor_threads) == 1, '所有权登记恰好 1 条'
+
+    # 3) 同一事务再次调用：live 监控在途 → 不得重复启动
+    t._handle_limit_close_on_recovery(SYM, BID)
+    assert len(started) == 1, f'live 监控在途时不得重复启动，实际 {len(started)}'
+
+    # 4) 监控线程退出 → 所有权释放（后续可再次接管）
+    stop.set()
+    for _th in list(t._limit_close_monitor_threads.values()):
+        _th.join(timeout=5)
+    assert not t._limit_close_monitor_threads, '监控线程退出后必须释放所有权登记'
 
 
 TESTS = [r1_eligibility_matrix,
@@ -1291,7 +1356,8 @@ TESTS = [r1_eligibility_matrix,
          r28_startup_recovery_settled_beats_manual_review,
          r29_nonzero_position_crash_no_zero_route,
          r30_clear_authorization_atomic,
-         r31_monitor_error_pending_keeps_main_monitor]
+         r31_monitor_error_pending_keeps_main_monitor,
+         r32_guard_must_not_mean_attempt]
 
 
 def main():
