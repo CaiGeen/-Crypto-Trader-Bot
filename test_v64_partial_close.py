@@ -51,7 +51,7 @@ def _module_assigns(tree, src, prefixes):
 
 # 共享命名空间：函数间经 global 名互相解析（与生产模块语义一致）
 NS = {'uuid': __import__('uuid'), 'time': __import__('time'), 'math': __import__('math')}
-NS.update(_module_assigns(TREE, SRC, ('_MERGE', '_PARTIAL', '_partial_resize', 'TAKER', 'MAKER')))
+NS.update(_module_assigns(TREE, SRC, ('_MERGE', '_PARTIAL', '_partial_resize', 'TAKER', 'MAKER', 'CONSERVATION')))
 OWNER_FN = _extract(TREE, SRC, '_partial_resize_owner_ok', NS)
 NS['_partial_resize_owner_ok'] = OWNER_FN
 
@@ -68,6 +68,7 @@ F = {n: ex_t(n) for n in (
     '_batch_net_position', '_execute_partial_close', '_resize_protection_after_partial',
     '_resume_partial_resize', '_handle_partial_close_on_recovery',
     '_maybe_report_conservation_conflict', '_check_conservation_conflict',
+    '_is_valid_inflight_close_txn',
     '_final_pre_create_check', '_assert_create_allowed', '_commit_protection_with_g3',
     '_update_registry', '_verify_and_update_registry', '_verify_order_created',
     '_build_intent', '_protection_identity', '_close_amount_guard',
@@ -149,6 +150,9 @@ def make_trader(states, actual_pos=2.0, lazy_market=False):
     t._lock = threading.RLock()
     t._state_lock = t._lock
     t._criticals = []
+    # 🔥 v6.4-P6：守恒分级观察器事件存储（v1.3 契约）
+    t._conservation_events = {}
+    t._conservation_event_lock = threading.Lock()
     t._persist_ok = True
     t._stub_actual = actual_pos
 
@@ -363,20 +367,21 @@ def t04_partial_new_fill_partial_avg_stable():
     assert abs(nc2 / nq2 - 166.6666667) < 1e-3, f'二次 partial 净均价必须仍 166.67: {nc2 / nq2}'
 
 
-# ── ⑤ detector 经真实生产调用点（含 3 次告警去重）────────────────────────
+# ── ⑤ detector 经真实生产调用点（v6.4-P6 分级语义：事件内 ≤3 critical 上限）──
 def t05_detector_via_wiring_with_dedup():
     t = make_trader({
         SYM: {'batch_A': _batch(), 'batch_B': _batch(batch_id='batch_B')}},
-        actual_pos=1.5)  # Σnet 2.0 > actual 1.5 → conflict
+        actual_pos=1.5)  # 同方向 Σnet 2.0 > actual 1.5 → conflict（无有效在途 → 立即 critical）
     for i in range(5):
-        F['_maybe_report_conservation_conflict'](t, SYM, 'batch_A')
-    assert len(t._criticals) == 3, f'告警必须存在且 3 次封顶: {len(t._criticals)}'
-    # 守恒恢复 → 静默
+        F['_maybe_report_conservation_conflict'](t, SYM, 'BUY', 1.5)
+    assert len(t._criticals) == 3, f'告警必须存在且单事件 3 次封顶: {len(t._criticals)}'
+    # 守恒恢复 → 静默 + 事件记录整份删除
     t2 = make_trader({
         SYM: {'batch_A': _batch(), 'batch_B': _batch(batch_id='batch_B')}},
         actual_pos=2.0)
-    F['_maybe_report_conservation_conflict'](t2, SYM, 'batch_A')
+    F['_maybe_report_conservation_conflict'](t2, SYM, 'BUY', 2.0)
     assert t2._criticals == []
+    assert t2._conservation_events == {}, f'收敛必须删除事件记录: {t2._conservation_events}'
 
 
 TESTS = [t01_partial_commit_full_chain_and_no_fill_rejection,

@@ -238,6 +238,10 @@ _API_METRICS = ApiMetrics()
 
 TAKER_FEE_RATE = 0.0005
 MAKER_FEE_RATE = 0.0002
+# 🔥 v6.4-P6（设计 v1.3，ChatGPT FULLY ALIGNED）：守恒分级观察器宽限窗——
+# 仅当存在「有效在途平仓事务」（五条件合取）时，瞬时归档滞后豁免 300s；
+# 无可解释事务的守恒冲突立即 critical（f1e135 场景零延迟）。
+CONSERVATION_GRACE_S = 300
 SLIPPAGE_BUFFER = 0.0002
 
 # -1021 时间戳错误重同步冷却（秒）：窗口内不重复调 load_time_difference（P0-1，堵放大器 A）
@@ -395,6 +399,11 @@ class CryptoTrader:
         # 🔥 监控线程去重
         self._active_monitors = set()
         self._active_monitors_lock = threading.Lock()
+        # 🔥 v6.4-P6：守恒分级观察器事件存储（键=(symbol, side_upper) →
+        # {'first_seen','warning_sent','critical_count'}）。事件随收敛/批次<2
+        # 整份删除（≤3 critical 为单事件上限）；内存态，重启清零。
+        self._conservation_events = {}
+        self._conservation_event_lock = threading.Lock()
 
         # 🔥 P5j/P5k：限价监控所有权登记（键=(symbol, batch_id, close_op_id)
         # → thread）。判据「已预留/已运行」，检查+登记在锁内原子完成，线程退出
@@ -3172,51 +3181,124 @@ class CryptoTrader:
         return (gross_qty - float(b_data.get('realized_reduce_amount', 0.0) or 0.0),
                 gross_cost - float(b_data.get('realized_reduce_cost', 0.0) or 0.0))
 
-    def _check_conservation_conflict(self, symbol, all_states, actual, tol=0.0005):
+    def _check_conservation_conflict(self, symbol, all_states, actual, side='', tol=0.0005):
         """🔥 v6.4-P0：守恒破坏检测——actual < Σnet − tol ⇒ 归属不可知（ATTRIBUTION_CONFLICT）。
 
         tol 默认半档 amount 精度（0.0005），防精度抖动误报；真实发散 ≥0.001 必触发。
         多批次 + App 模糊减仓场景（f1e135 教训的一般化）：检测器，不是修复——
-        触发后由人工 reconcile，不做自动归属猜测。"""
+        触发后由人工 reconcile，不做自动归属猜测。
+        🔥 v6.4-P6（设计 v1.3）：计量边界收窄为 (symbol, side)——Hedge 模式下
+        LONG/SHORT 批次可并存（same_side_close_inflight 只禁同方向并行 close），
+        Σnet 只累加同方向批次，杜绝「单方向 actual vs 双方向台账」误判。"""
         symbol_state = all_states.get(symbol, {}) or {}
+        side_u = str(side or '').upper()
         net_sum = 0.0
         for _b in symbol_state.values():
             if not isinstance(_b, dict) or not _b.get('is_active'):
+                continue
+            if side_u and str(_b.get('side') or '').upper() != side_u:
                 continue
             _q, _c = self._batch_net_position(_b)
             net_sum += max(_q, 0.0)
         return actual < net_sum - tol
 
-    def _maybe_report_conservation_conflict(self, symbol, batch_id):
-        """🔥 v6.4-P0：monitor 多批次跳过分支的守恒检测接线（真实生产调用点）。
+    def _is_valid_inflight_close_txn(self, b):
+        """🔥 v6.4-P6（v1.2 阻断 1 收口）：「有效在途平仓事务」五条件合取。
 
-        detector 而非修复——触发后人工 reconcile，不做归属猜测。
-        告警去重：同一 symbol 最多告警 3 次后静默（告警纪律：防刷屏/防 API 风暴）。"""
+        回滚（L9117-9119 同型）只复位 close_phase/pending_close，保留
+        close_reason/close_op_id 作审计——单看 reason 会把已回滚批次的陈旧
+        标记当成在途事务，给真实外部减仓错误宽限。五条件合取下陈旧 reason
+        被结构性排除（回滚后 close_phase>=1 ∧ pending_close=True 必不成立）。"""
+        if not isinstance(b, dict) or not b.get('is_active'):
+            return False
+        if int(b.get('close_phase', 0) or 0) < 1:
+            return False
+        if b.get('pending_close') is not True:
+            return False
+        if not (b.get('close_op_id') or ''):
+            return False
+        reason = b.get('close_reason') or ''
+        if reason not in ('market_confirming', 'limit_pending_normal',
+                          'partial_closing'):
+            return False
+        if reason == 'limit_pending_normal' and not (b.get('limit_close_order_id') or ''):
+            return False
+        return True
+
+    def _maybe_report_conservation_conflict(self, symbol, side, actual_position):
+        """🔥 v6.4-P6（设计 v1.3，ChatGPT FULLY ALIGNED）：守恒分级观察器——每轮无条件调用。
+
+        - 计量边界 (symbol, side)：Σnet 只累加同方向 active 批次；
+        - 同方向活跃批次 <2 → 删除整份事件记录并 return（单批次无归属歧义，
+          观察器只负责清理历史事件，绝不产生守恒告警）；
+        - 事件模型：每 (symbol, side) 至多一份
+          {'first_seen', 'warning_sent', 'critical_count'}；
+          守恒恢复（本轮无冲突，显式收敛）或批次<2 → 整份删除；
+          ≤3 次 critical 为单事件上限（取代旧 _conservation_alert_count 的
+          进程生命周期上限——旧语义达 3 后未来真实事故永久静默）；
+        - 分级：无「有效在途平仓事务」（五条件合取，见
+          _is_valid_inflight_close_txn）→ 立即 critical（外部减仓零延迟）；
+          有 → 首见 warning + CONSERVATION_GRACE_S 后升级 critical；
+        - 事件内单调棘轮：critical_count>0 后不得降级回 warning、不得重新
+          获得宽限；
+        - 零新增 API（actual_position 由调用方传入）；锁内认领、锁外通知。"""
         try:
             all_states = self.load_all_states()
-            _first = next((_bd for _bd in (all_states.get(symbol) or {}).values()
-                           if isinstance(_bd, dict) and _bd.get('is_active')), None)
-            if not isinstance(_first, dict):
-                return
-            is_hedge = bool(_first.get('is_hedge_mode', False))
-            side = (_first.get('side') or 'BUY').upper()
-            actual = self._get_current_position_amt(symbol, is_hedge, side)
-            if actual is None:
-                return
-            if self._check_conservation_conflict(symbol, all_states, actual):
-                alerts = getattr(self, '_conservation_alert_count', None)
-                if alerts is None:
-                    alerts = self._conservation_alert_count = {}
-                n = alerts.get(symbol, 0)
-                if n >= 3:
+            side_u = str(side or '').upper()
+            key = (symbol, side_u)
+            same_side = [b for b in ((all_states.get(symbol) or {}).values())
+                         if isinstance(b, dict) and b.get('is_active')
+                         and str(b.get('side') or '').upper() == side_u]
+            with self._conservation_event_lock:
+                if len(same_side) < 2:
+                    self._conservation_events.pop(key, None)
                     return
-                alerts[symbol] = n + 1
-                self.send_tg_notification(
-                    f"🚨【资金安全】仓位守恒破坏（ATTRIBUTION_CONFLICT）\n"
-                    f"🆔 检测批次: `{batch_id}`\n"
-                    f"💡 交易所 {symbol} 实际持仓 < Σ批次净仓位——外部减仓归属不可知，\n"
-                    f"各批次保护单数量不可信。请人工核对后修正台账（第 {n + 1}/3 次告警）。",
-                    level='critical')
+                if actual_position is None:
+                    return                      # 仓位不可判定 → 不观察不改状态
+                conflict = self._check_conservation_conflict(
+                    symbol, all_states, actual_position, side=side_u)
+                if not conflict:
+                    self._conservation_events.pop(key, None)   # 显式收敛
+                    return
+                ev = self._conservation_events.get(key)
+                if ev is None:
+                    ev = self._conservation_events[key] = {
+                        'first_seen': time.time(), 'warning_sent': False,
+                        'critical_count': 0}
+                has_inflight = any(self._is_valid_inflight_close_txn(b)
+                                   for b in same_side)
+                escalate = ((not has_inflight) or ev['critical_count'] > 0
+                            or (time.time() - ev['first_seen']) >= CONSERVATION_GRACE_S)
+                critical_msg = None
+                warning_msg = None
+                if escalate:
+                    if ev['critical_count'] < 3:
+                        ev['critical_count'] += 1
+                        _ctx = ' | '.join(
+                            f"{b.get('batch_id')}/net{self._batch_net_position(b)[0]:.4f}"
+                            f"/ph{int(b.get('close_phase', 0) or 0)}"
+                            f"/{b.get('close_reason') or '-'}" for b in same_side)
+                        critical_msg = (
+                            f"🚨【资金安全】仓位守恒破坏（ATTRIBUTION_CONFLICT）\n"
+                            f"🧭 {symbol} {side_u}：交易所实际持仓 {actual_position} "
+                            f"< Σ批次净仓位\n"
+                            f"📊 同方向批次: {_ctx}\n"
+                            f"💡 外部减仓归属不可知，各批次保护单数量不可信。"
+                            f"请人工核对后修正台账（本事件第 {ev['critical_count']}/3 次告警）。")
+                elif not ev['warning_sent']:
+                    ev['warning_sent'] = True
+                    warning_msg = (
+                        f"⚠️【守恒观测】{symbol} {side_u} 实际持仓 < Σ批次净仓位，"
+                        f"但存在在途平仓事务（归档滞后豁免窗 {CONSERVATION_GRACE_S}s）。\n"
+                        f"💡 若 {CONSERVATION_GRACE_S}s 后仍发散将升级 critical；"
+                        f"若为程序平仓滞后可忽略本条。")
+            # 锁外通知（防持锁 I/O）
+            if critical_msg:
+                print(f"  └─ 🚨 [守恒检测] {symbol} {side_u} ATTRIBUTION_CONFLICT")
+                self.send_tg_notification(critical_msg, level='critical')
+            elif warning_msg:
+                print(f"  └─ ⚠️ [守恒观测] {symbol} {side_u} 在途平仓豁免窗内（warning）")
+                self.send_tg_notification(warning_msg, level='warning')
         except Exception as e:
             print(f"  └─ ⚠️ [守恒检测] 异常: {e}")
 
@@ -6610,6 +6692,12 @@ class CryptoTrader:
 
                 current_actual_position = self._get_current_position_amt(symbol, is_hedge_mode, side=side)
 
+                # 🔥 v6.4-P6（v1.3 契约）：守恒观察器每轮无条件调用——收敛与
+                # 「同方向批次<2」的清理依赖持续观察；观察器内部按 (symbol, side)
+                # 认领事件（锁内）+ 幂等去重，多批次监控线程并发安全；复用本轮
+                # 已取得的方向仓位，零新增 API。
+                self._maybe_report_conservation_conflict(symbol, side, current_actual_position)
+
                 # ==================== 持仓归零检测 ====================
                 if current_actual_position is not None and has_entered_position and batch_filled_amount > 0:
                     if current_actual_position == 0:
@@ -6781,8 +6869,8 @@ class CryptoTrader:
                     _fb_other = sum(1 for b, d in _fb_sym.items() if d.get('is_active', False) and b != batch_id)
                     if _fb_other > 0:
                         print(f"  ┏━ ⏭️ [多批次] 跳过部分减仓检测 (同symbol活跃批次: {_fb_other + 1})")
-                        # 🔥 v6.4-P0：跳过≠静默——守恒破坏检测接线（f1e135 一般化）
-                        self._maybe_report_conservation_conflict(symbol, batch_id)
+                        # 🔥 v6.4-P6：守恒检测已外提为每轮无条件观察器（本分支
+                        # 不再调用）——v1.3 契约：收敛/批次<2 清理依赖持续观察。
 
                 if _fb_other == 0 and current_actual_position is not None and has_entered_position and 0 < current_actual_position < batch_filled_amount:
                     # 🔥 v6.2（实盘 2026-09-01 17:2x）：持仓归零（0.0）不是「部分减仓」，
