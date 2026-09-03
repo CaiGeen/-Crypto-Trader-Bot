@@ -1,753 +1,198 @@
 diff --git a/trader_260725.py b/trader_260725.py
-index 166d41a..cc76de2 100644
+index cc76de2..ed9addb 100644
 --- a/trader_260725.py
 +++ b/trader_260725.py
-@@ -43,14 +43,16 @@ _MERGE_RATCHET_BOOL_FIELDS = ('pending_close', 'is_programmatic_cancel',
- 
- 
- def _partial_resize_owner_ok(b, owner_op_id):
--    """🔥 v6.4-P0：G1/G2/G3b 极窄 owner exception 判据。
-+    """🔥 v6.4-P0 + P5：G1/G2/G3b 极窄 owner exception 判据。
- 
-     仅当批次处于 partial_resize_pending（净账本已 durable、只差保护单 resize）
--    且调用方持有匹配的 close_op_id 时，允许在 close_phase>=1 冻结期创建/替换
--    保护单（= partial 事务自身的 resize）。默认 gate 行为零变化，严禁泛化成
--    allow_during_close——否则等于重新打开 close 竞态封印。"""
-+    或 limit_cancel_restore_pending（P5：closecancel 归属已 durable、只差保护单
-+    恢复）且调用方持有匹配的 close_op_id 时，允许在 close_phase>=1 冻结期
-+    创建/替换保护单（= 事务自身的 resize/re-arm）。默认 gate 行为零变化，
-+    严禁泛化成 allow_during_close——否则等于重新打开 close 竞态封印。"""
-     return (owner_op_id is not None
--            and b.get('close_reason') == 'partial_resize_pending'
-+            and b.get('close_reason') in ('partial_resize_pending',
-+                                          'limit_cancel_restore_pending')
-             and str(owner_op_id) == str(b.get('close_op_id') or ''))
- _MERGE_ID_MIRROR_FIELDS = ('tp_order_id', 'current_sl_id', 'limit_close_order_id')
- # C 类保护集：磁盘条目处于这些 state → 保留磁盘（未决/已锁/终态不许被旧快照降级）
-@@ -868,16 +870,20 @@ class CryptoTrader:
- 
-     def _record_realized_pnl(self, batch_id: str, symbol: str, side: str, amount: float,
-                              avg_price: float, exit_price: float, net_pnl: float,
--                             mode: str, pnl_partial: bool = False) -> None:
-+                             mode: str, pnl_partial: bool = False,
-+                             dedup_key: str | None = None,
-+                             stats_file: str | None = None) -> None:
-         """记录一笔已实现盈亏到 trade_stats.json（原子写入，失败静默）
- 
-+        dedup_key —— P5：同一 close 订单的 PnL 幂等记录（/closecancel 与
-+        _monitor_limit_close 共享 finalizer，双线程/崩溃重试只记一次）。
+@@ -880,7 +880,9 @@ class CryptoTrader:
          pnl_partial=True —— 本次实际成交**小于台账**（此前存在未被跟踪的减仓：
          手动减仓 / ADL / 他方平仓）。此时 net_pnl 仅覆盖本次成交部分，**不是该
          批次的完整已实现盈亏**；落 `prior_reduction_unknown` 标记供日报/汇总识别。
-         """
+-        """
++        返回 bool：True=已记录（含 dedup 命中=幂等成功），False=写盘失败
++        （P5 finalizer 依赖此返回值：失败必须保持 phase=2，绝不 clear——否则
++        成交记录永久丢失）。"""
          try:
              base_dir = os.path.dirname(os.path.abspath(__file__))
--            stats_file = os.path.join(base_dir, "trade_stats.json")
-+            stats_file = stats_file or os.path.join(base_dir, "trade_stats.json")
-             with self._state_lock:
-                 stats = {}
-                 if os.path.exists(stats_file):
-@@ -886,6 +892,9 @@ class CryptoTrader:
-                             stats = json.load(f)
-                     except Exception:
+             stats_file = stats_file or os.path.join(base_dir, "trade_stats.json")
+@@ -894,7 +896,7 @@ class CryptoTrader:
                          stats = {}
-+                if dedup_key and any(r.get('dedup_key') == dedup_key
-+                                     for r in stats.get('trades', []) or []):
-+                    return  # 幂等：同订单 PnL 已记录（finalizer 接管/重试语义）
+                 if dedup_key and any(r.get('dedup_key') == dedup_key
+                                      for r in stats.get('trades', []) or []):
+-                    return  # 幂等：同订单 PnL 已记录（finalizer 接管/重试语义）
++                    return True  # 幂等：同订单 PnL 已记录（finalizer 接管/重试语义）
                  record = {
                      "time": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S"),
                      "batch_id": batch_id,
-@@ -897,8 +906,10 @@ class CryptoTrader:
-                     "net_pnl": round(float(net_pnl), 4),
-                     "mode": mode,
-                 }
-+                if dedup_key:
-+                    record['dedup_key'] = dedup_key
-                 stats.setdefault("trades", []).append(record)
--                with tempfile.NamedTemporaryFile("w", dir=base_dir, delete=False, encoding="utf-8") as tf:
-+                with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(stats_file), delete=False, encoding="utf-8") as tf:
+@@ -913,8 +915,10 @@ class CryptoTrader:
                      json.dump(stats, tf, ensure_ascii=False, indent=2)
                      temp_name = tf.name
                  os.replace(temp_name, stats_file)
-@@ -2262,6 +2273,11 @@ class CryptoTrader:
-                     _pc_reason = (b_data.get('close_reason') or '')
-                     if _pc_reason in ('partial_closing', 'partial_resize_pending'):
-                         self._handle_partial_close_on_recovery(symbol, batch_id)
-+                    # 🔥 P5：限价平仓分型（restore_pending 自动续跑 / limit_pending_normal
-+                    # 重拉监控或终态裁决）——重启后限价监控不自动重生的既有缺口闭环
-+                    if _pc_reason in ('limit_pending_normal',
-+                                      'limit_cancel_restore_pending'):
-+                        self._handle_limit_close_on_recovery(symbol, batch_id)
++            return True
+         except Exception as e:
+             print(f"⚠️ [盈亏记录] 写入失败: {e}")
++            return False
  
-                     # 🔥 验证止损单是否存在
-                     # P0-F2 前置修复（ChatGPT 终审前置问题2）：UNKNOWN ≠ None
-@@ -3136,6 +3152,59 @@ class CryptoTrader:
-                 f"🚨【资金安全】partial 恢复异常 批次 `{batch_id}`: {e}",
-                 level='critical')
- 
-+    def _handle_limit_close_on_recovery(self, symbol, batch_id):
-+        """🔥 P5：重启后限价平仓分型（接线契约①/⑦）。
-+
-+        limit_cancel_restore_pending → 自动续跑保护恢复（绝不再发 close order）；
-+        limit_pending_normal → 权威裁决：
-+          终态（TERMINAL_ZERO/PARTIAL/CONFIRMED_FULL）→ 四态分型（含 finalizer）；
-+          仍 live（PENDING）→ 重拉 _monitor_limit_close 线程——重启后限价监控
-+          不自动重生的既有缺口（否则成交只剩「持仓归零兜底结算」，Maker 口径丢失）；
-+          不可证明 → 保持冻结 + loud。"""
-+        try:
-+            b = (self.load_all_states().get(symbol, {}) or {}).get(batch_id) or {}
-+            op = b.get('close_op_id') or ''
-+            oid = b.get('limit_close_order_id') or ''
-+            reason = b.get('close_reason') or ''
-+            if reason == 'limit_cancel_restore_pending':
-+                ok, msg = self._resume_closecancel_restore(symbol, batch_id, op)
-+                print(f"  └─ {'✅' if ok else '⚠️'} [限价平仓恢复] 批次 [{batch_id}]: {msg}")
-+                return
-+            if not oid:
-+                return
-+            pre_net, _c = self._batch_net_position(b)
-+            verdict, detail, _filled = self._confirm_close_filled(
-+                symbol, b.get('side') or 'BUY', bool(b.get('is_hedge_mode', False)),
-+                oid, expected=pre_net, attempts=2, delay=0.5, order_kind='normal')
-+            if verdict in ('TERMINAL_ZERO', 'PARTIAL', 'CONFIRMED_FULL'):
-+                ok, msg = self._adjudicate_closed_limit_close(symbol, batch_id, oid)
-+                print(f"  └─ {'✅' if ok else '⚠️'} [限价平仓恢复] 批次 [{batch_id}]: {msg}")
-+                return
-+            if verdict == 'PENDING':
-+                # 限价单仍 live → 重拉监控线程（durable 派生 monitor 入参）
-+                lfc = int(b.get('last_filled_count', 0) or 0)
-+                ta = list(b.get('target_amounts') or [])
-+                fd = list(b.get('filled_details') or [])
-+                gross = float(sum(ta[:lfc]))
-+                gross_cost = float(sum(ta[i] * fd[i] for i in range(min(lfc, len(fd)))))
-+                avg = (gross_cost / gross) if gross > 0 else 0.0
-+                th = threading.Thread(
-+                    target=self._monitor_limit_close,
-+                    args=(symbol, batch_id, oid, gross, avg,
-+                          float(b.get('total_entry_fee', 0.0) or 0.0),
-+                          b.get('side') or 'BUY', lfc, ta, fd), daemon=True)
-+                th.start()
-+                print(f"  └─ 👁️ [限价平仓恢复] 批次 [{batch_id}] 限价单在途，监控线程已重生")
-+                return
-+            self.send_tg_notification(
-+                f"🚨【资金安全】限价平仓单状态不可证明 批次 `{batch_id}`\n"
-+                f"💡 {verdict}: {detail[:200]}\n"
-+                f"⚠️ 保持冻结，请人工核对交易所限价单后处理（或 /closecancel）。",
-+                level='critical')
-+            print(f"  └─ ⚠️ [限价平仓恢复] 批次 [{batch_id}]: {verdict}（{detail[:120]}）")
-+        except Exception as e:
-+            print(f"  └─ ⚠️ [限价平仓恢复] 批次 [{batch_id}] 异常: {e}")
-+
-     def _execute_partial_close(self, symbol, batch_id, amount):
-         """🔥 v6.4-P0：批次指定部分平仓——intent-before-effect 纪律的平仓侧复用。
- 
-@@ -3240,7 +3309,8 @@ class CryptoTrader:
-             return False, msg_r
-         return True, 'partial_committed'
- 
--    def _resize_protection_after_partial(self, symbol, batch_id, close_op_id, net_qty):
-+    def _resize_protection_after_partial(self, symbol, batch_id, close_op_id, net_qty,
-+                                         adopt_matching_sl=False):
-         """🔥 v6.4-P1：partial commit 后按净量重挂 SL/TP（owner exception 窄放行）。
- 
-         v6.4-P1 实盘事故收敛（2026-09-02 14:27 resize_cancel_unverified_SL 假阴性 +
-@@ -3257,6 +3327,10 @@ class CryptoTrader:
-         - 收编路径：上一轮 verify 成功但 stage 提交前崩溃 → registry CONFIRMED 新 id ≠
-           账本 id → 直接收编（不重发 create）。该 CONFIRMED 只能来自本事务
-           （close_phase=1 期间其他创建者全被 G1/G2 owner 闸门拒绝）。
-+        - 🔥 P5（adopt_matching_sl=True）：limit_cancel_restore_pending 恢复时 SL 未被
-+          撤——live 且数量/目标价与当前净量匹配则收编（stage=1，不重建）；不匹配
-+          （PARTIAL 净量已变/丢失/已触发）才走 resize。TP 已撤 → 专用窄 re-arm
-+          （_rearm_tp_registry_for_closecancel 五条件）后按净量重建。
-         失败 → 保持冻结（stage 已持久化进度），恢复/monitor 60s 续跑，绝不重发 MARKET。
-         """
-         latest = self.load_all_states()
-@@ -3269,6 +3343,7 @@ class CryptoTrader:
-         is_hedge = bool(b.get('is_hedge_mode', False))
-         lfc = int(b.get('last_filled_count', 0) or 0)
-         stage = int(b.get('partial_resize_stage', 0) or 0)
-+        is_p5_restore = b.get('close_reason') == 'limit_cancel_restore_pending'
-         # 🔥 v6.4-P1 durable 目标价（用户改单已同步维护这两处：/sl → stop_steps、/tp → take_profit_price）
-         stops = b.get('stop_steps') or []
-         sl_idx = max(lfc - 1, 0)
-@@ -3284,7 +3359,33 @@ class CryptoTrader:
-             if price <= 0:
-                 # durable 目标价缺失 → 不猜测，保持冻结（恢复续跑），绝不以劣化参数重挂
-                 return False, f'resize_price_unknown_{kind}（durable 目标价缺失）'
-+            # 🔥 P5：PURE_CANCEL/PARTIAL 恢复时 TP 已被 close 启动撤掉（registry
-+            # PROGRAMMATIC_CANCELED/close_requested_canceled）→ 专用窄 re-arm 开启
-+            # 新一代订单生命周期（五条件，generic 终态守卫零改动）
-+            if kind == 'TP' and is_p5_restore:
-+                ok_rm, why_rm = self._rearm_tp_registry_for_closecancel(
-+                    symbol, batch_id, close_op_id)
-+                if not ok_rm:
-+                    return False, f'tp_rearm_failed（{why_rm}）'
-             identity = self._protection_identity(batch_id, kind, max(lfc - 1, 0), pos_side)
-+            # 🔥 P5：SL 收编判定——live 且数量/目标价与当前净量匹配 → 不重建
-+            if adopt_matching_sl and kind == 'SL' and old_id:
-+                _ad, _adopt_id = self._try_adopt_live_sl(symbol, batch_id, old_id,
-+                                                         net_qty, price)
-+                if _ad == 'adopted':
-+                    with self._state_lock:
-+                        latest_a = self.load_all_states()
-+                        b_a = (latest_a.get(symbol, {}) or {}).get(batch_id)
-+                        if not isinstance(b_a, dict) \
-+                                or (b_a.get('close_op_id') or '') != close_op_id \
-+                                or b_a.get('close_reason') not in (
-+                                    'partial_resize_pending', 'limit_cancel_restore_pending'):
-+                            return False, 'state_changed'
-+                        b_a['current_sl_id'] = _adopt_id
-+                        b_a['partial_resize_stage'] = 1
-+                        if not self._persist_states(latest_a):
-+                            return False, 'persist_failed'
-+                    continue
-             # 收编判定：registry CONFIRMED 新 id ≠ 账本 id = 上一轮 verify 后 stage 提交前崩溃
-             reg_entry = (b.get('protection_registry') or {}).get(identity) or {}
-             adopted = (reg_entry.get('state') == 'CONFIRMED'
-@@ -3376,12 +3477,14 @@ class CryptoTrader:
-                     # 保持冻结（恢复/人工接管），绝不把未验证 ID 标 CONFIRMED
-                     return False, f'resize_verify_failed_{kind}（{vres}）'
-             # 🔥 v6.4-P1 分腿 durable commit：新 id + stage 同一次锁内持久化
-+            # 🔥 P5：reason 校验统一接受 limit_cancel_restore_pending（接线契约①）
-             with self._state_lock:
-                 latest2 = self.load_all_states()
-                 b2 = (latest2.get(symbol, {}) or {}).get(batch_id)
-                 if not isinstance(b2, dict) \
-                         or (b2.get('close_op_id') or '') != close_op_id \
--                        or b2.get('close_reason') != 'partial_resize_pending':
-+                        or b2.get('close_reason') not in (
-+                            'partial_resize_pending', 'limit_cancel_restore_pending'):
-                     return False, 'state_changed'
-                 if kind == 'SL':
-                     b2['current_sl_id'] = new_id
-@@ -3392,11 +3495,14 @@ class CryptoTrader:
-                 if not self._persist_states(latest2):
-                     return False, 'persist_failed'
-         # 最终 CAS → ACTIVE（两腿 id 已分腿 durable；此处只切事务态并清 stage）
-+        # 🔥 P5（接线契约③）：restore_pending 时原子清理 limit_close_* 三字段——
-+        # 绝不让 ACTIVE 批次携带一张已终态的「活跃限价平仓单」镜像
+     def _count_active_batches(self, all_states):
+         """D-006: 统计全账户活跃批次数与带活跃批次的交易对集合（零 API，只读本地状态文件）"""
+@@ -3590,7 +3594,10 @@ class CryptoTrader:
+           terminated_reason==close_requested_canceled
+         旧条目快照入 rearm_audit 后移除（新代由 fresh create 建立全新 intent，
+         按当前 durable net_qty）；generic _update_registry 终态守卫零改动；
+-        普通 PROGRAMMATIC_CANCELED 不获得任何复活能力。"""
++        普通 PROGRAMMATIC_CANCELED 不获得任何复活能力。
++        🔥 复审 Blocker 3（P0）：crash 幂等——re-arm pop 后、create 前崩溃重启，
++        registry 条目已缺 + rearm_audit 已有本 op 记录 → 幂等放行（返回
++        already_rearmed），绝不 tp_rearm_failed 冻结。"""
          with self._state_lock:
-             latest = self.load_all_states()
-             b3 = (latest.get(symbol, {}) or {}).get(batch_id)
-             if not isinstance(b3, dict) or (b3.get('close_op_id') or '') != close_op_id \
--                    or b3.get('close_reason') != 'partial_resize_pending':
-+                    or b3.get('close_reason') not in (
-+                        'partial_resize_pending', 'limit_cancel_restore_pending'):
-                 return False, 'state_changed'
-             if int(b3.get('partial_resize_stage', 0) or 0) != 2:
-                 return False, 'state_changed（resize stage 未就绪）'
-@@ -3405,6 +3511,10 @@ class CryptoTrader:
-             b3['is_programmatic_cancel'] = False
-             b3['close_reason'] = ''
-             b3.pop('partial_resize_stage', None)
-+            if b3.get('close_op_id') == close_op_id and \
-+                    b3.pop('limit_close_order_id', None) is not None:
-+                b3.pop('limit_close_price', None)
-+                b3.pop('limit_close_mode', None)
-             if not self._persist_states(latest):
-                 return False, 'persist_failed'
-         return True, 'partial_active'
-@@ -3428,6 +3538,9 @@ class CryptoTrader:
-                 level='critical')
-             return False, 'partial_closing_requires_manual_review'
-         if reason != 'partial_resize_pending':
-+            if reason == 'limit_cancel_restore_pending':
-+                # 🔥 P5：closecancel 归属已 durable 的确定性恢复态 → 续保护单恢复
-+                return self._resume_closecancel_restore(symbol, batch_id, owner_op_id)
-             return False, f'nothing_to_resume（{reason}）'
-         if (b.get('close_op_id') or '') != (owner_op_id or ''):
-             return False, 'op_id_mismatch'
-@@ -3444,6 +3557,324 @@ class CryptoTrader:
-             return False, f'resume_guard_rejected（{g_detail}）'
-         return self._resize_protection_after_partial(symbol, batch_id, owner_op_id, net_qty)
- 
-+    # ==================== P5：/closecancel（限价平仓撤销与恢复） ====================
-+
-+    def _try_adopt_live_sl(self, symbol, batch_id, sl_id, net_qty, target_price):
-+        """🔥 P5：SL 收编判定——旧 SL 未被 close 撤（限价路径全程不撤 SL），
-+        live 且数量≈当前净量、目标价≈durable stop_steps → 收编（不重建）。
-+        返回 ('adopted', sl_id) / ('resize', None)。查询异常按 resize 处理
-+        （cancel 对已消失订单 -2011 幂等，守恒门兜底）。"""
-+        try:
-+            o = self._safe_api_call(self.exchange.fetch_order, sl_id, symbol,
-+                                    params={'stop': True})
-+            if not isinstance(o, dict):
-+                return 'resize', None
-+            status = str(o.get('status') or '').lower()
-+            filled = float(o.get('filled') or 0.0)
-+            amount = float(o.get('amount') or 0.0)
-+            stop = float(o.get('stopPrice') or 0.0)
-+            if status in ('open', 'new', 'active', 'partially_filled') and filled <= 1e-12 \
-+                    and abs(amount - net_qty) <= max(1e-8, net_qty * 1e-6) \
-+                    and abs(stop - target_price) <= 1e-6:
-+                return 'adopted', sl_id
-+        except Exception:
-+            pass
-+        return 'resize', None
-+
-+    def _rearm_tp_registry_for_closecancel(self, symbol, batch_id, close_op_id):
-+        """🔥 P5：TP registry 专用窄 re-arm 事务（ChatGPT v2 §5.1 裁定）。
-+
-+        五条件全满足才允许该 TP slot 开启新一代订单生命周期：
-+          close_reason==limit_cancel_restore_pending / close_phase==1 /
-+          close_op_id==owner / 旧 TP registry state==PROGRAMMATIC_CANCELED /
-+          terminated_reason==close_requested_canceled
-+        旧条目快照入 rearm_audit 后移除（新代由 fresh create 建立全新 intent，
-+        按当前 durable net_qty）；generic _update_registry 终态守卫零改动；
-+        普通 PROGRAMMATIC_CANCELED 不获得任何复活能力。"""
-+        with self._state_lock:
-+            try:
-+                latest = self.load_all_states()
-+            except Exception as e:
-+                return False, f'state_unreadable（{e}）'
-+            b = (latest.get(symbol, {}) or {}).get(batch_id)
-+            if not isinstance(b, dict):
-+                return False, 'batch_missing'
-+            if b.get('close_reason') != 'limit_cancel_restore_pending' \
-+                    or int(b.get('close_phase', 0) or 0) != 1 \
-+                    or (b.get('close_op_id') or '') != (close_op_id or ''):
-+                return False, 'not_in_restore'
-+            side = (b.get('side') or 'BUY').upper()
-+            pos_side = 'LONG' if side == 'BUY' else 'SHORT'
-+            lfc = int(b.get('last_filled_count', 0) or 0)
-+            identity = self._protection_identity(batch_id, 'TP', max(lfc - 1, 0), pos_side)
-+            entry = (b.get('protection_registry') or {}).get(identity) or {}
-+            if entry.get('state') != 'PROGRAMMATIC_CANCELED' \
-+                    or entry.get('terminated_reason') != 'close_requested_canceled':
-+                return False, f'rearm_conditions_not_met（state={entry.get("state")}）'
-+            b.setdefault('rearm_audit', []).append({
-+                'time': time.time(), 'identity': identity,
-+                'prev_state': entry.get('state'),
-+                'prev_order_id': entry.get('order_id'),
-+                'prev_terminated_reason': entry.get('terminated_reason'),
-+                'op': close_op_id})
-+            b['protection_registry'].pop(identity, None)
-+            if not self._persist_states(latest):
-+                return False, 'persist_failed'
-+            return True, 'rearmed'
-+
-+    def _commit_closecancel_attribution(self, symbol, batch_id, close_op_id,
-+                                        confirmed_filled):
-+        """🔥 P5：PARTIAL_FILL_CANCEL 成交量归属——原子 CAS（防双计用状态单向迁移）。
-+
-+        只有 close_reason==limit_pending_normal 才能提交；首提改变 close_reason →
-+        并发线程/崩溃重试的 CAS 立即失败（替代 accounted 字段，ChatGPT v3 裁定）。
-+        成本口径与 /partial L3219 完全一致：净成本比例分摊。"""
-+        with self._state_lock:
-+            try:
-+                latest = self.load_all_states()
-+            except Exception as e:
-+                return False, f'state_unreadable（{e}）'
-+            b = (latest.get(symbol, {}) or {}).get(batch_id)
-+            if not isinstance(b, dict):
-+                return False, 'batch_missing'
-+            if (b.get('close_op_id') or '') != (close_op_id or '') \
-+                    or int(b.get('close_phase', 0) or 0) != 1 \
-+                    or b.get('close_reason') != 'limit_pending_normal':
-+                return False, 'state_changed（已归属/已迁移，绝不双计）'
-+            pre_net_qty, pre_net_cost = self._batch_net_position(b)
-+            if confirmed_filled > pre_net_qty + 1e-12:
-+                return False, f'confirm_exceeds_net（{confirmed_filled} > {pre_net_qty}）'
-+            reduce_cost_delta = (confirmed_filled * pre_net_cost / pre_net_qty
-+                                 if pre_net_qty > 0 else 0.0)
-+            b['realized_reduce_amount'] = float(
-+                b.get('realized_reduce_amount', 0.0) or 0.0) + confirmed_filled
-+            b['realized_reduce_cost'] = float(
-+                b.get('realized_reduce_cost', 0.0) or 0.0) + reduce_cost_delta
-+            b['close_reason'] = 'limit_cancel_restore_pending'
-+            if not self._persist_states(latest):
-+                return False, 'persist_failed'
-+            return True, 'attributed'
-+
-+    def _resume_closecancel_restore(self, symbol, batch_id, owner_op_id):
-+        """🔥 P5：limit_cancel_restore_pending 确定态恢复——只续保护单恢复，
-+        绝不再发 close order（与 partial_resume 分型对称：副作用已知→自动续跑）。"""
-+        all_states = self.load_all_states()
-+        b = (all_states.get(symbol, {}) or {}).get(batch_id)
-+        if not isinstance(b, dict):
-+            return False, 'batch_missing'
-+        if b.get('close_reason') != 'limit_cancel_restore_pending':
-+            return False, f'nothing_to_resume（{b.get("close_reason")}）'
-+        if (b.get('close_op_id') or '') != (owner_op_id or ''):
-+            return False, 'op_id_mismatch'
-+        net_qty, _c = self._batch_net_position(b)
-+        side = (b.get('side') or 'BUY').upper()
-+        is_hedge = bool(b.get('is_hedge_mode', False))
-+        g_qty, g_detail = self._close_amount_guard(symbol, side, is_hedge, net_qty, batch_id)
-+        if g_qty is None or abs(float(g_qty) - net_qty) > 1e-9:
-+            self.send_tg_notification(
-+                f"🚨【资金安全】closecancel 恢复守恒门拦截 批次 `{batch_id}`\n"
-+                f"💡 {g_detail}\n"
-+                f"⚠️ 账本净量 {net_qty} 与交易所实际已漂移，拒绝恢复——请人工核对后处理。",
-+                level='critical')
-+            return False, f'resume_guard_rejected（{g_detail}）'
-+        return self._resize_protection_after_partial(symbol, batch_id, owner_op_id,
-+                                                     net_qty, adopt_matching_sl=True)
-+
-+    def _adjudicate_closed_limit_close(self, symbol, batch_id, order_id):
-+        """🔥 P5：终态限价平仓单的四态裁决（命令与 monitor canceled 分支共用）。
-+
-+        按成交量分型（v3.1 冻结）：TERMINAL_ZERO→PURE_CANCEL 恢复原净仓；
-+        PARTIAL→durable 归属已成交部分→恢复剩余净量；CONFIRMED_FULL→共享幂等
-+        finalizer（绝不恢复 ACTIVE）；PENDING/UNKNOWN/NOT_CONFIRMED→Fail-Closed。"""
-+        all_states = self.load_all_states()
-+        b = (all_states.get(symbol, {}) or {}).get(batch_id)
-+        if not isinstance(b, dict) or not b.get('is_active'):
-+            return False, 'batch_missing'
-+        close_op_id = b.get('close_op_id') or ''
-+        if not close_op_id:
-+            return False, 'no_close_inflight'
-+        if b.get('close_reason') not in ('limit_pending_normal',
-+                                         'limit_cancel_restore_pending'):
-+            return False, f'not_cancellable（reason={b.get("close_reason")}）'
-+        if b.get('settled_by_limit_close'):
-+            return False, 'already_settled'
-+        pre_net_qty, _c = self._batch_net_position(b)
-+        verdict, detail, filled = self._confirm_close_filled(
-+            symbol, b.get('side') or 'BUY', bool(b.get('is_hedge_mode', False)),
-+            order_id, expected=pre_net_qty, attempts=3, delay=0.4,
-+            order_kind='normal')
-+        if verdict == 'TERMINAL_ZERO':
-+            ok_a, msg_a = self._commit_closecancel_attribution(
-+                symbol, batch_id, close_op_id, 0.0)
-+            if not ok_a:
-+                return False, msg_a
-+            return self._resume_closecancel_restore(symbol, batch_id, close_op_id)
-+        if verdict == 'PARTIAL':
-+            if not filled or filled <= 0:
-+                return False, f'partial_fill_unknown（{detail}）'
-+            # 🔥 覆盖度兜底：已全量成交后再撤（status 退化为 canceled + filled==全量）
-+            # → 本质是 FULL_FILL，绝不按「部分成交」恢复（恢复会让净量归零并撞守恒门）
-+            if filled >= pre_net_qty - max(1e-8, pre_net_qty * 1e-6):
-+                return self._finalize_limit_full_fill(symbol, batch_id, order_id)
-+            ok_a, msg_a = self._commit_closecancel_attribution(
-+                symbol, batch_id, close_op_id, float(filled))
-+            if not ok_a:
-+                return False, msg_a
-+            return self._resume_closecancel_restore(symbol, batch_id, close_op_id)
-+        if verdict == 'CONFIRMED_FULL':
-+            return self._finalize_limit_full_fill(symbol, batch_id, order_id)
-+        # PENDING / UNKNOWN / NOT_CONFIRMED → Fail-Closed
-+        self.send_tg_notification(
-+            f"🚨【资金安全】限价平仓单终态无法证明 批次 `{batch_id}`\n"
-+            f"💡 {verdict}: {detail[:200]}\n"
-+            f"⚠️ 保持冻结（单飞占用中）。请核对交易所限价单实际状态后重试 /closecancel 或人工处理。",
-+            level='critical')
-+        return False, f'closecancel_{verdict}（{detail[:120]}）'
-+
-+    def _submit_closecancel(self, symbol, batch_id):
-+        """🔥 P5：/closecancel 命令入口——撤销在途限价平仓并恢复批次控制权。
-+
-+        资格 → cancel → 四态裁决（TERMINAL_ZERO/PARTIAL→恢复；CONFIRMED_FULL→
-+        共享 finalizer；其余→Fail-Closed）。inflight 与恢复调度互斥。"""
-+        all_states = self.load_all_states()
-+        b = (all_states.get(symbol, {}) or {}).get(batch_id)
-+        if not isinstance(b, dict) or not b.get('is_active'):
-+            return False, f'batch_missing（{batch_id}）'
-+        if not b.get('close_op_id'):
-+            return False, 'no_close_inflight（该批次没有在途平仓事务）'
-+        if b.get('settled_by_limit_close'):
-+            return False, 'already_settled（限价平仓已成交结算，不可撤销）'
-+        if int(b.get('close_phase', 0) or 0) == 0 and not b.get('pending_close'):
-+            return False, 'no_close_inflight（批次处于 ACTIVE，无在途平仓事务）'
-+        if b.get('close_reason') != 'limit_pending_normal':
-+            return False, (f'not_cancellable（reason={b.get("close_reason")}——'
-+                           f'仅 limit_pending_normal 可撤销）')
-+        order_id = b.get('limit_close_order_id')
-+        if not order_id:
-+            return False, 'no_limit_order（限价平仓单 ID 缺失，请人工核对）'
-+        if not self._try_acquire_resize_inflight(batch_id):
-+            return False, 'closecancel_inflight（已有撤销/恢复在途）'
-+        try:
-+            try:
-+                self._safe_api_call(self.exchange.cancel_order, order_id, symbol)
-+            except Exception as e:
-+                if '-2011' not in str(e) and 'Unknown order' not in str(e) \
-+                        and 'does not exist' not in str(e):
-+                    return False, f'cancel_failed（{e}）'
-+                # -2011：订单已离场 → 进入裁决（ filled 事实由 fetch_order 权威判定）
-+            return self._adjudicate_closed_limit_close(symbol, batch_id, order_id)
-+        finally:
-+            self._release_resize_inflight(batch_id)
-+
-+    def _finalize_limit_full_fill(self, symbol, batch_id, order_id, order=None):
-+        """🔥 P5：FULL_FILL 共享幂等 finalizer（/closecancel 与 _monitor_limit_close
-+        共用；ChatGPT v3 裁定）。CAS 认领只确认事实、不授独占权——任何看到
-+        settled_by_limit_close=True 的调用方都必须继续执行幂等收敛；
-+        PnL 以 (symbol, order_id) 去重（崩溃/接管/重试只记一次）。"""
-+        # ① CAS 认领（幂等：重复调用看到已认领 → 继续收敛但跳过 PnL）
-+        claimed = False
-+        avg_price = 0.0
-+        if order is None:
-+            try:
-+                order = self._safe_api_call(self.exchange.fetch_order, order_id, symbol)
-+            except Exception as e:
-+                order = None
-+                print(f"⚠️ [finalizer] fetch_order 失败（按已确认 FULL_FILL 继续）: {e}")
-+        if isinstance(order, dict):
-+            info = order.get('info', {}) or {}
-+            avg_price = float(order.get('average') or order.get('price') or 0.0)
-+            if avg_price == 0.0:
-+                cum_quote = float(info.get('cumQuote', 0.0))
-+                executed_qty = float(info.get('executedQty', 0.0))
-+                if cum_quote > 0 and executed_qty > 0:
-+                    avg_price = cum_quote / executed_qty
-+        with self._state_lock:
-+            latest = self.load_all_states()
-+            b = (latest.get(symbol, {}) or {}).get(batch_id)
-+            if not isinstance(b, dict) or not b.get('is_active'):
-+                return True, 'already_cleared'
-+            if not b.get('settled_by_limit_close'):
-+                b['settled_by_limit_close'] = True
-+                b['is_programmatic_cancel'] = True
-+                b['close_phase'] = 2
+             try:
+                 latest = self.load_all_states()
+@@ -3608,19 +3615,25 @@ class CryptoTrader:
+             lfc = int(b.get('last_filled_count', 0) or 0)
+             identity = self._protection_identity(batch_id, 'TP', max(lfc - 1, 0), pos_side)
+             entry = (b.get('protection_registry') or {}).get(identity) or {}
+-            if entry.get('state') != 'PROGRAMMATIC_CANCELED' \
+-                    or entry.get('terminated_reason') != 'close_requested_canceled':
+-                return False, f'rearm_conditions_not_met（state={entry.get("state")}）'
+-            b.setdefault('rearm_audit', []).append({
+-                'time': time.time(), 'identity': identity,
+-                'prev_state': entry.get('state'),
+-                'prev_order_id': entry.get('order_id'),
+-                'prev_terminated_reason': entry.get('terminated_reason'),
+-                'op': close_op_id})
+-            b['protection_registry'].pop(identity, None)
+-            if not self._persist_states(latest):
+-                return False, 'persist_failed'
+-            return True, 'rearmed'
++            if entry.get('state') == 'PROGRAMMATIC_CANCELED' \
++                    and entry.get('terminated_reason') == 'close_requested_canceled':
++                b.setdefault('rearm_audit', []).append({
++                    'time': time.time(), 'identity': identity,
++                    'prev_state': entry.get('state'),
++                    'prev_order_id': entry.get('order_id'),
++                    'prev_terminated_reason': entry.get('terminated_reason'),
++                    'op': close_op_id})
++                b['protection_registry'].pop(identity, None)
 +                if not self._persist_states(latest):
 +                    return False, 'persist_failed'
-+                claimed = True
-+        # ② 结算数据（从 durable ledger 取，与 monitor 快照口径一致）
-+        b = (self.load_all_states().get(symbol, {}) or {}).get(batch_id) or {}
-+        side = (b.get('side') or 'BUY').upper()
-+        net_qty, net_cost = self._batch_net_position(b)
-+        gross = float(sum((b.get('target_amounts') or [])[:int(b.get('last_filled_count', 0) or 0)]))
-+        total_entry_fee = float(b.get('total_entry_fee', 0.0) or 0.0)
-+        fee_rem = total_entry_fee * (net_qty / gross) if gross > 0 else 0.0
-+        total_cost_with_fee = net_cost + fee_rem
-+        avg_entry = total_cost_with_fee / net_qty if net_qty > 0 else 0.0
-+        exit_price = avg_price
-+        if side == 'BUY':
-+            gross_pnl = (exit_price - avg_entry) * net_qty
-+        else:
-+            gross_pnl = (avg_entry - exit_price) * net_qty
-+        exit_fee = exit_price * net_qty * MAKER_FEE_RATE
-+        total_fees = fee_rem + exit_fee
-+        net_pnl = gross_pnl - total_fees
-+        # ③ PnL 幂等记录（dedup 键 = symbol:order_id）
-+        self._record_realized_pnl(batch_id, symbol, side, net_qty, avg_entry,
-+                                  exit_price, net_pnl, '限价平仓',
-+                                  dedup_key=f'{symbol}:{order_id}')
-+        # ④ 撤 SL（N14）+ 残余 TP（B0）——同 monitor 结算惯例
-+        if b.get('current_sl_id'):
-+            _sl_id = b['current_sl_id']
-+            try:
-+                self._safe_api_call(self.exchange.cancel_order, _sl_id, symbol,
-+                                    params={'stop': True})
-+                _sl_identity = self._find_registry_identity_by_order_id(symbol, batch_id, _sl_id)
-+                if _sl_identity:
-+                    self._update_registry(symbol, batch_id, _sl_identity,
-+                                          state='PROGRAMMATIC_CANCELED',
-+                                          order_id=_sl_id, id_known=True,
-+                                          terminated_reason='close_settled_canceled')
-+            except Exception:
-+                pass
-+        _tp_id = b.get('tp_order_id')
-+        if _tp_id:
-+            try:
-+                self._safe_api_call(self.exchange.cancel_order, _tp_id, symbol,
-+                                    params={'stop': True})
-+            except Exception:
-+                pass  # -2011 幂等 / 其余交由 converge 收敛
-+            try:
-+                _tp_identity = self._find_registry_identity_by_order_id(symbol, batch_id, _tp_id)
-+                if _tp_identity:
-+                    self._update_registry(symbol, batch_id, _tp_identity,
-+                                          state='PROGRAMMATIC_CANCELED',
-+                                          order_id=_tp_id, id_known=True,
-+                                          terminated_reason='close_settled_canceled_tp')
-+            except Exception:
-+                pass
-+        # ⑤ 结算 TG（一次）+ 记录
-+        if claimed and self._claim_settlement_reported(symbol, batch_id):
-+            capital_base = avg_entry * net_qty if net_qty > 0 else 1
-+            net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
-+            self.send_tg_notification(
-+                f"🎉 **[限价平仓结算]**\n\n"
-+                f"🆔 **批次号**：`{batch_id}`\n"
-+                f"🪙 **标的**：`{symbol}`\n"
-+                f"📊 **方向**：`{side}`\n"
-+                f"📊 **平仓模式**：限价单 (Maker {MAKER_FEE_RATE * 100:.2f}%)\n"
-+                f"📊 **持仓**：`{net_qty}`\n"
-+                f"📈 **持仓均价**：`{avg_entry:.2f}` USDT\n"
-+                f"💵 **平仓均价**：`{exit_price:.2f}` USDT\n"
-+                f"📊 **名义盈亏**：`{gross_pnl:+.2f}` USDT\n"
-+                f"💸 **总手续费**：`{total_fees:.4f}` USDT\n"
-+                f"{'🟢' if net_pnl >= 0 else '🔴'} **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
-+            )
-+            self._notify_snapshot(batch_id)
-+        # ⑥ converge + clear（幂等：proof 门未过则保留，重启续跑）
-+        _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
-+        if _proof is not None:
-+            self.clear_batch_state(symbol, batch_id, proof=_proof)
-+        return True, ('finalized' if claimed else 'finalized_takeover')
-+
++                return True, 'rearmed'
++            # crash 幂等：本 op 已 re-arm（条目已移除）→ 审计留痕为证，放行续跑
++            if not entry:
++                for _aud in b.get('rearm_audit') or []:
++                    if _aud.get('op') == (close_op_id or '') \
++                            and _aud.get('identity') == identity:
++                        return True, 'already_rearmed'
++            return False, f'rearm_conditions_not_met（state={entry.get("state")}）'
+ 
+     def _commit_closecancel_attribution(self, symbol, batch_id, close_op_id,
+                                         confirmed_filled):
+@@ -3693,11 +3706,19 @@ class CryptoTrader:
+         close_op_id = b.get('close_op_id') or ''
+         if not close_op_id:
+             return False, 'no_close_inflight'
++        # 🔥 P5 复审 Blocker 1（P0）：代际隔离——旧事务的监控/命令不得裁决当前
++        # 新一代事务的订单（旧 L1/OP1 绝不能把新 L2/OP2 标 settled 并触发 clear）
++        if str(b.get('limit_close_order_id') or '') != str(order_id):
++            return False, ('order_generation_mismatch（裁决订单 %s ≠ 当前事务订单 %s，'
++                           '旧事务线程已失效）' % (order_id, b.get('limit_close_order_id')))
+         if b.get('close_reason') not in ('limit_pending_normal',
+                                          'limit_cancel_restore_pending'):
+             return False, f'not_cancellable（reason={b.get("close_reason")}）'
+         if b.get('settled_by_limit_close'):
+-            return False, 'already_settled'
++            # 🔥 P5 复审 Blocker 2（P0）：phase=2 接管契约——已认领结算的批次
++            # 必须由任何看到 settled 的调用方续跑幂等 finalizer（PnL 去重 +
++            # converge+clear），绝不直接退回（否则 CAS 后崩溃无人续跑）
++            return self._finalize_limit_full_fill(symbol, batch_id, order_id)
+         pre_net_qty, _c = self._batch_net_position(b)
+         verdict, detail, filled = self._confirm_close_filled(
+             symbol, b.get('side') or 'BUY', bool(b.get('is_hedge_mode', False)),
+@@ -3770,29 +3791,46 @@ class CryptoTrader:
+         """🔥 P5：FULL_FILL 共享幂等 finalizer（/closecancel 与 _monitor_limit_close
+         共用；ChatGPT v3 裁定）。CAS 认领只确认事实、不授独占权——任何看到
+         settled_by_limit_close=True 的调用方都必须继续执行幂等收敛；
+-        PnL 以 (symbol, order_id) 去重（崩溃/接管/重试只记一次）。"""
+-        # ① CAS 认领（幂等：重复调用看到已认领 → 继续收敛但跳过 PnL）
++        PnL 以 (symbol, order_id) 去重（崩溃/接管/重试只记一次）。
++        🔥 复审 4 Blocker 收口：
++          B1(P0) CAS 校验 close_op_id + limit_close_order_id==order_id（代际隔离）；
++          B2(P0) settled=True 由裁决器路由至此 → 接管续跑；
++          B4(P0) PnL 落盘失败 → 保持 close_phase=2 等待续跑，绝不 clear；
++          fetch_order 失败无成交价 → 保持 phase=2 重试，绝不 exit_price=0 结算；
++          converge None / clear 失败 → 如实返回（不谎报成功）。"""
++        # ① 成交价：调用方已持有 order（monitor）直接复用；否则 fetch，失败保持
++        # phase=2 等待续跑（exit_price=0 结算会把 PnL 算成 -100%，属数据污染）
+         claimed = False
+         avg_price = 0.0
+         if order is None:
+             try:
+                 order = self._safe_api_call(self.exchange.fetch_order, order_id, symbol)
+             except Exception as e:
+-                order = None
+-                print(f"⚠️ [finalizer] fetch_order 失败（按已确认 FULL_FILL 继续）: {e}")
+-        if isinstance(order, dict):
+-            info = order.get('info', {}) or {}
+-            avg_price = float(order.get('average') or order.get('price') or 0.0)
+-            if avg_price == 0.0:
+-                cum_quote = float(info.get('cumQuote', 0.0))
+-                executed_qty = float(info.get('executedQty', 0.0))
+-                if cum_quote > 0 and executed_qty > 0:
+-                    avg_price = cum_quote / executed_qty
++                print(f"⚠️ [finalizer] fetch_order 失败，保持 phase=2 待重试: {e}")
++                return False, f'order_unavailable（{str(e)[:120]}）'
++        if not isinstance(order, dict):
++            return False, 'order_structure_unknown（保持 phase=2）'
++        info = order.get('info', {}) or {}
++        avg_price = float(order.get('average') or order.get('price') or 0.0)
++        if avg_price == 0.0:
++            cum_quote = float(info.get('cumQuote', 0.0))
++            executed_qty = float(info.get('executedQty', 0.0))
++            if cum_quote > 0 and executed_qty > 0:
++                avg_price = cum_quote / executed_qty
++        if avg_price <= 0.0:
++            return False, 'fill_price_unavailable（保持 phase=2）'
+         with self._state_lock:
+             latest = self.load_all_states()
+             b = (latest.get(symbol, {}) or {}).get(batch_id)
+             if not isinstance(b, dict) or not b.get('is_active'):
+                 return True, 'already_cleared'
++            # 🔥 Blocker 1（P0）：代际隔离——只允许当前事务（close_op 在册且
++            # durable limit_close_order_id == 本订单）触发结算；旧线程的 L1
++            # 绝不能结算新一代 L2/OP2
++            if not b.get('close_op_id') \
++                    or str(b.get('limit_close_order_id') or '') != str(order_id):
++                return False, ('order_generation_mismatch（结算订单 %s ≠ 当前事务'
++                               '订单 %s）' % (order_id, b.get('limit_close_order_id')))
+             if not b.get('settled_by_limit_close'):
+                 b['settled_by_limit_close'] = True
+                 b['is_programmatic_cancel'] = True
+@@ -3818,9 +3856,12 @@ class CryptoTrader:
+         total_fees = fee_rem + exit_fee
+         net_pnl = gross_pnl - total_fees
+         # ③ PnL 幂等记录（dedup 键 = symbol:order_id）
+-        self._record_realized_pnl(batch_id, symbol, side, net_qty, avg_entry,
+-                                  exit_price, net_pnl, '限价平仓',
+-                                  dedup_key=f'{symbol}:{order_id}')
++        # 🔥 Blocker 4（P0）：PnL 必须 durable 成功才允许继续收敛/清理——落盘失败
++        # 保持 close_phase=2（claim 已完成），由恢复/接管续跑重试（dedup 防双记）
++        if not self._record_realized_pnl(batch_id, symbol, side, net_qty, avg_entry,
++                                         exit_price, net_pnl, '限价平仓',
++                                         dedup_key=f'{symbol}:{order_id}'):
++            return False, 'pnl_persist_failed（保持 close_phase=2 待续跑重试）'
+         # ④ 撤 SL（N14）+ 残余 TP（B0）——同 monitor 结算惯例
+         if b.get('current_sl_id'):
+             _sl_id = b['current_sl_id']
+@@ -3869,10 +3910,12 @@ class CryptoTrader:
+                 f"{'🟢' if net_pnl >= 0 else '🔴'} **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
+             )
+             self._notify_snapshot(batch_id)
+-        # ⑥ converge + clear（幂等：proof 门未过则保留，重启续跑）
++        # ⑥ converge + clear（幂等；如实返回：proof 未过 / clear 失败不得谎报成功）
+         _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+-        if _proof is not None:
+-            self.clear_batch_state(symbol, batch_id, proof=_proof)
++        if _proof is None:
++            return False, 'converge_pending（保持 close_phase=2，重启/接管续跑）'
++        if not self.clear_batch_state(symbol, batch_id, proof=_proof):
++            return False, 'clear_failed（保持 close_phase=2，重启/接管续跑）'
+         return True, ('finalized' if claimed else 'finalized_takeover')
+ 
      def _try_acquire_resize_inflight(self, batch_id):
-         """🔥 v6.4-P1：resize 在途互斥（monitor 自愈线程 vs /partial 事务线程防双 create）。"""
-         with self._resize_inflight_lock:
-@@ -6188,8 +6619,11 @@ class CryptoTrader:
-                     # limit_creating 是 transient，crash 重启后必须 loud（M25）。
-                     # v6.4：partial_resize_pending 进 quiet（可自动续跑的确定性中间态）；
-                     # partial_closing 不进 quiet（transient，重启必须 loud）
-+                    # P5：limit_cancel_restore_pending 同属「可自动续跑的确定性
-+                    # 中间态」（归属已 durable，恢复由 _resume_closecancel_restore 续跑）
-                     if _close_reason not in ('market_confirming', 'limit_pending_normal',
--                                             'partial_resize_pending'):
-+                                             'partial_resize_pending',
-+                                             'limit_cancel_restore_pending'):
-                         if time.time() - self._freeze_alerted.get(batch_id, 0) >= 3600:
-                             self._freeze_alerted[batch_id] = time.time()
-                             self.send_tg_notification(
-@@ -6199,9 +6633,11 @@ class CryptoTrader:
-                                 f"⚠️ 该批次的 SL/TP 不再被补挂 / 换挂 / 降级恢复。\n"
-                                 f"💡 请人工核对持仓与挂单，必要时手动平仓。",
-                                 level='critical')
--                    # 🔥 v6.4-P1：partial_resize_pending 运行期自愈调度（60s 节流，
--                    # R7 守恒 terminal 停机 / R8 首见只登记——见 _maybe_runtime_resume_partial）
--                    if _b_close_phase == 1 and _close_reason == 'partial_resize_pending':
-+                    # 🔥 v6.4-P1 + P5：partial_resize_pending / limit_cancel_restore_pending
-+                    # 运行期自愈调度（60s 节流，R7 守恒 terminal 停机 / R8 首见只登记——
-+                    # 见 _maybe_runtime_resume_partial；路由在 _resume_partial_resize 内）
-+                    if _b_close_phase == 1 and _close_reason in (
-+                            'partial_resize_pending', 'limit_cancel_restore_pending'):
-                         self._maybe_runtime_resume_partial(
-                             symbol, batch_id,
-                             (latest_b_data or {}).get('close_op_id'))
-@@ -10148,123 +10584,26 @@ class CryptoTrader:
-                     continue
- 
-                 if status == 'closed' or status == 'filled':
--                    actual_price = float(order.get('average') or order.get('price') or 0.0)
--                    if actual_price == 0.0:
--                        info = order.get('info', {})
--                        cum_quote = float(info.get('cumQuote', 0.0))
--                        executed_qty = float(info.get('executedQty', 0.0))
--                        if cum_quote > 0 and executed_qty > 0:
--                            actual_price = cum_quote / executed_qty
--                        else:
--                            actual_price = float(order.get('price') or 0.0)
--
--                    print(f"✅ [限价平仓监控] 批次 {batch_id} 限价单已成交，价格: {actual_price}")
--
--                    # 计算盈亏
--                    if side == 'BUY':
--                        gross_pnl = (actual_price - avg_price) * current_filled_amount
--                    else:
--                        gross_pnl = (avg_price - actual_price) * current_filled_amount
--
--                    exit_fee = actual_price * current_filled_amount * MAKER_FEE_RATE
--                    total_fees = total_entry_fee + exit_fee
--                    net_pnl = gross_pnl - total_fees
--
--                    capital_base = avg_price * current_filled_amount if current_filled_amount > 0 else 1
--                    net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
--                    pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
--
--                    # 🔥 先设置标记，防止主循环重复结算
--                    all_states = self.load_all_states()
--                    b_data = all_states.get(symbol, {}).get(batch_id, {})
--                    if b_data:
--                        b_data['settled_by_limit_close'] = True
--                        # 🔥 保留 is_programmatic_cancel，防止撤单提醒
--                        b_data['is_programmatic_cancel'] = True
--                        # P0 Batch A（§2.1）：结算开始 → close_phase=2（CLOSE_SETTLING，
--                        # 唯一权威）——冻结语义与 phase=1 等价，直至主循环 finally 清理
--                        b_data['close_phase'] = 2
--                        self.save_batch_state(symbol, batch_id, b_data)
--
--                    # 🔥 撤销止损单（N14 语义：程序主动终结 → registry 终态，撤成功才写）
--                    if b_data.get('current_sl_id'):
--                        _sl_id = b_data['current_sl_id']
--                        try:
--                            self._safe_api_call(self.exchange.cancel_order, _sl_id, symbol,
--                                                params={'stop': True})
--                            print(f"  └─ 已撤销止损单: {_sl_id}")
--                            _sl_identity = self._find_registry_identity_by_order_id(symbol, batch_id, _sl_id)
--                            if _sl_identity:
--                                self._update_registry(symbol, batch_id, _sl_identity,
--                                                      state='PROGRAMMATIC_CANCELED',
--                                                      order_id=_sl_id, id_known=True,
--                                                      terminated_reason='close_settled_canceled')
--                                print(f"  └─ [N14] SL registry 已终结: {_sl_identity} (close_settled_canceled)")
--                        except Exception:
--                            pass
--
--                    # P0 Batch B（B0/修正2）：结算段撤 TP——8-28 事故根因（结算只撤 SL 不撤 TP，
--                    # 币安遗留孤儿 TP 单 0.002@85000）。reason 固定 close_settled_canceled_tp（审计定位，
--                    # 规格钉死不得改动）。-2011/Unknown order = 已离开交易所 = 事实终态（幂等，
--                    # 同 _cancel_limit_close_order 惯例），registry 照写终态。
--                    _tp_id = b_data.get('tp_order_id') if isinstance(b_data, dict) else None
--                    if _tp_id:
--                        try:
--                            self._safe_api_call(self.exchange.cancel_order, _tp_id, symbol,
--                                                params={'stop': True})
--                            print(f"  └─ [B0] 已撤销止盈单: {_tp_id}")
--                        except Exception as _tp_cancel_e:
--                            if isinstance(_tp_cancel_e, ccxt.OrderNotFound) or \
--                                    '-2011' in str(_tp_cancel_e) or \
--                                    'Unknown order' in str(_tp_cancel_e):
--                                print(f"  └─ [B0] 止盈单 {_tp_id} 已不在交易所（-2011 幂等，事实终态）")
--                            else:
--                                print(f"  └─ ⚠️ [B0] 撤销止盈单失败: {_tp_cancel_e}（交由 converge 收敛）")
--                        try:
--                            _tp_identity = self._find_registry_identity_by_order_id(symbol, batch_id, _tp_id)
--                            if _tp_identity:
--                                self._update_registry(symbol, batch_id, _tp_identity,
--                                                      state='PROGRAMMATIC_CANCELED',
--                                                      order_id=_tp_id, id_known=True,
--                                                      terminated_reason='close_settled_canceled_tp')
--                                print(f"  └─ [B0] TP registry 已终结: {_tp_identity} (close_settled_canceled_tp)")
--                        except Exception:
--                            pass
--
--                    # 🔥 不调用 clear_batch_state，让主循环的 finally 块清理
--
--                    result_msg = (
--                        f"🎉 **[限价平仓结算]**\n\n"
--                        f"🆔 **批次号**：`{batch_id}`\n"
--                        f"🪙 **标的**：`{symbol}`\n"
--                        f"📊 **方向**：`{side}`\n"
--                        f"📊 **平仓模式**：限价单 (Maker {MAKER_FEE_RATE * 100:.2f}%)\n"
--                        f"📊 **持仓**：`{current_filled_amount}` ({last_filled_count}层)\n"
--                        f"📈 **持仓均价**：`{avg_price:.2f}` USDT\n"
--                        f"💵 **平仓均价**：`{actual_price:.2f}` USDT\n"
--                        f"📊 **名义盈亏**：`{gross_pnl:+.2f}` USDT\n"
--                        f"💸 **总手续费**：`{total_fees:.4f}` USDT\n"
--                        f"{pnl_emoji} **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
--                    )
--
--                    print(f"\n{result_msg}")
--                    self.send_tg_notification(result_msg)
--
--                    # 🔥 记录已实现盈亏 + 附带剩余持仓快照
--                    self._record_realized_pnl(batch_id, symbol, side, current_filled_amount,
--                                              avg_price, actual_price, net_pnl, "限价平仓")
--                    self._notify_snapshot(batch_id)
-+                    # 🔥 P5：FULL_FILL 共享幂等 finalizer（与 /closecancel 命令共用；
-+                    # CAS 认领 + PnL 按订单去重 + converge + clear，接管语义见函数 docstring）
-+                    self._finalize_limit_full_fill(symbol, batch_id, order_id, order=order)
-                     break
- 
-                 elif status == 'canceled' or status == 'expired':
--                    print(f"⚠️ [限价平仓监控] 批次 {batch_id} 限价单已取消/过期")
--                    all_states = self.load_all_states()
--                    b_data = all_states.get(symbol, {}).get(batch_id, {})
--                    if b_data:
--                        b_data.pop('limit_close_order_id', None)
--                        b_data.pop('limit_close_price', None)
--                        b_data.pop('limit_close_mode', None)
--                        self.save_batch_state(symbol, batch_id, b_data)
-+                    # 🔥 P5（R8 本源缺陷闭环）：外部取消不再只清字段——进入共享
-+                    # 四态裁决（含部分成交归属 + 恢复 ACTIVE），与 /closecancel 同路径
-+                    print(f"⚠️ [限价平仓监控] 批次 {batch_id} 限价单已取消/过期，进入终态裁决...")
-+                    try:
-+                        _ok_a, _msg_a = self._adjudicate_closed_limit_close(
-+                            symbol, batch_id, order_id)
-+                        print(f"  └─ {'✅' if _ok_a else '⚠️'} [限价裁决] 批次 {batch_id}: {_msg_a}")
-+                        if not _ok_a:
-+                            self.send_tg_notification(
-+                                f"🚨【资金安全】限价平仓单已取消但批次未恢复 批次 `{batch_id}`\n"
-+                                f"💡 原因: {_msg_a}\n请人工核对，或重试 /closecancel。",
-+                                level='critical')
-+                    except Exception as _adj_e:
-+                        print(f"  └─ ⚠️ [限价裁决] 异常: {_adj_e}")
-                     break
- 
-         except Exception as e:

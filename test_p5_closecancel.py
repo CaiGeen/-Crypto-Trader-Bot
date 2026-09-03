@@ -267,8 +267,9 @@ def r4_full_fill_finalizer_monitor_dead():
     def _rec(*a, **k):  # 模拟真函数的 dedup 契约（真行为由 R12 单测）
         if k.get('dedup_key') and any(r.get('dedup_key') == k['dedup_key']
                                       for _, r in pnl):
-            return
+            return True
         pnl.append((a, k))
+        return True
     t._record_realized_pnl = _rec
     ok, msg = t._submit_closecancel(SYM, BID)
     assert ok, msg
@@ -277,6 +278,29 @@ def r4_full_fill_finalizer_monitor_dead():
     # monitor 死亡场景：直接再调 finalizer（接管语义）→ PnL 不重记、不崩溃
     ok2, msg2 = t._finalize_limit_full_fill(SYM, BID, 'L1')
     assert len(pnl) == 1, f'PnL 幂等: {len(pnl)}'
+
+
+def r4b_phase2_takeover_after_crash():
+    """R4b（ChatGPT 复审 Blocker 2）：CAS 认领（settled=True, phase=2）后崩溃 →
+    重启恢复经裁决器必须续跑 finalizer（PnL 去重 + converge+clear），绝不
+    already_settled 拒绝后无人接管。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, settled=True)  # CAS 已认领、崩溃于 finalizer 中途
+    b['close_phase'] = 2
+    _state_write(t, _single(b))
+    ex._mk('S1', otype='STOP_MARKET', amount=0.002, stop=75001.0)
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    cleared = []
+    t._converge_batch_orders_before_clear = lambda s, bid: {'proof': 'FULL'}
+    t.clear_batch_state = lambda s, bid, proof=None: cleared.append(bid) or True
+    pnl = []
+    t._record_realized_pnl = lambda *a, **k: pnl.append((a, k)) or True
+    # 恢复路径：经裁决器（settled 分支）→ 接管 finalizer
+    ok, msg = t._adjudicate_closed_limit_close(SYM, BID, 'L1')
+    assert ok, msg
+    assert cleared == [BID], 'phase=2 接管必须续跑 converge+clear'
+    assert len(pnl) == 1, f'PnL 接管只记一次: {pnl}'
 
 
 # ────────────────── R5 守恒门失败 ──────────────────
@@ -347,9 +371,77 @@ def r8_monitor_canceled_self_heal():
     assert "pop('limit_close_order_id'" not in seg, '旧的只清字段不恢复缺陷不得回归'
 
 
+def r13_generation_isolation():
+    """R13（ChatGPT 复审 Blocker 1）：旧事务线程的订单 L1（OP1）绝不得结算当前
+    新一代事务（L2/OP2）——裁决与 finalizer 都必须拒绝 order_generation_mismatch。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, op='OP2', lfo='L2')  # 当前新一代事务
+    _state_write(t, _single(b))
+    ex._mk('L2', otype='LIMIT', amount=0.002, status='open', filled=0.0)
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    cleared = []
+    t._converge_batch_orders_before_clear = lambda s, bid: {'proof': 'FULL'}
+    t.clear_batch_state = lambda s, bid, proof=None: cleared.append(bid) or True
+    # 旧 monitor 拿 L1 来裁决/结算 → 必须拒绝且零副作用
+    ok1, msg1 = t._adjudicate_closed_limit_close(SYM, BID, 'L1')
+    assert not ok1 and 'order_generation_mismatch' in msg1, (ok1, msg1)
+    ok2, msg2 = t._finalize_limit_full_fill(SYM, BID, 'L1')
+    assert not ok2 and 'order_generation_mismatch' in msg2, (ok2, msg2)
+    b2 = _state_read(t)[SYM][BID]
+    assert b2['close_phase'] == 1 and not b2.get('settled_by_limit_close'), b2
+    assert cleared == [], '旧订单绝不得触发 clear'
+    assert not ex.cancel_calls, f'旧订单绝不得触发撤单: {ex.cancel_calls}'
+
+
+def r14_pnl_persist_failure_keeps_phase2():
+    """R14（ChatGPT 复审 Blocker 4）：PnL 落盘失败（disk full 等价注入）→
+    finalizer 必须保持 close_phase=2、绝不 clear/谎报成功。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002)
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    cleared = []
+    t._converge_batch_orders_before_clear = lambda s, bid: {'proof': 'FULL'}
+    t.clear_batch_state = lambda s, bid, proof=None: cleared.append(bid) or True
+    t._record_realized_pnl = lambda *a, **k: False  # 落盘失败注入
+    ok, msg = t._finalize_limit_full_fill(SYM, BID, 'L1')
+    assert not ok and 'pnl_persist_failed' in msg, (ok, msg)
+    b2 = _state_read(t)[SYM][BID]
+    assert b2.get('close_phase') == 2, 'PnL 未 durable 绝不回 phase<2'
+    assert cleared == [], 'PnL 写失败绝不 clear（成交记录会永久丢失）'
+
+
+def r7b_rearm_crash_idempotent():
+    """R7b（ChatGPT 复审 Blocker 3）：re-arm pop 后、create 前崩溃 → 重启续跑，
+    registry 条目已缺 + rearm_audit 在册 → 幂等放行，绝不 tp_rearm_failed 冻结。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(reason='limit_cancel_restore_pending', net=0.002)
+    # 崩溃现场：TP registry 条目已被 pop，但 rearm_audit 有本 op 记录
+    b['protection_registry'].pop(f'{BID}|TP|L0|LONG', None)
+    b.setdefault('rearm_audit', []).append({'identity': f'{BID}|TP|L0|LONG',
+                                            'op': OP, 'prev_state': 'PROGRAMMATIC_CANCELED',
+                                            'prev_order_id': 'T1'})
+    _state_write(t, _single(b))
+    ex._mk('S1', otype='STOP_MARKET', amount=0.002, stop=75001.0)
+    ex._mk('T1', otype='TAKE_PROFIT_MARKET', amount=0.002, stop=80000.0,
+           status='canceled', _gone=True)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.002, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    ok, msg = t._resume_closecancel_restore(SYM, BID, OP)
+    assert ok, f're-arm 断点续跑必须幂等放行: {msg}'
+    b2 = _state_read(t)[SYM][BID]
+    assert b2['close_phase'] == 0 and b2['tp_order_id'] == 'N1', b2
+    assert b2['protection_registry'][f'{BID}|TP|L0|LONG']['state'] == 'CONFIRMED'
+
+
 # ────────────────── R9 并发单一提交单一 PnL ──────────────────
 
 def r9_concurrent_single_commit_and_pnl():
+    """R9（ChatGPT 复审）：命令线程（_submit_closecancel，经 inflight）与
+    monitor 线程（直调 _finalize_limit_full_fill，不经 inflight）真并发——
+    只有一个状态提交 + 一条 PnL（CAS + dedup 定终局）。"""
     t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
     b = _lp_batch(net=0.002)
     _state_write(t, _single(b))
@@ -361,33 +453,58 @@ def r9_concurrent_single_commit_and_pnl():
     ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
                      'positionSide': 'LONG'}]
     cleared = []
-    t._converge_batch_orders_before_clear = lambda s, bid: {'proof': 'FULL'}
-    t.clear_batch_state = lambda s, bid, proof=None: cleared.append(bid) or True
+
+    def _converge(s, bid):  # 建模真实 proof 门：批次已清 → None（后续 clear 不再触发）
+        if bid not in (dict(_state_read(t).get(SYM) or {}) or {}):
+            return None
+        return {'proof': 'FULL'}
+
+    def _clear(s, bid, proof=None):
+        with t._state_lock:  # 建模真实 clear：串行移除批次（存在性幂等）
+            st = _state_read(t)
+            if bid in (dict(st.get(SYM) or {}) or {}):
+                st.get(SYM, {}).pop(bid, None)
+                _state_write(t, st)
+                cleared.append(bid)
+                return True
+            return False
+    t._converge_batch_orders_before_clear = _converge
+    t.clear_batch_state = _clear
     pnl = []
 
     def _rec(*a, **k):  # dedup 契约（真行为由 R12 单测）
         if k.get('dedup_key') and any(r.get('dedup_key') == k['dedup_key']
                                       for _, r in pnl):
-            return
+            return True
         pnl.append((a, k))
+        return True
     t._record_realized_pnl = _rec
     barrier = threading.Barrier(2)
     results = []
 
-    def run():
+    def monitor_path():
+        barrier.wait()
+        try:
+            results.append(t._finalize_limit_full_fill(SYM, BID, 'L1'))
+        except Exception as e:
+            results.append((False, f'exc:{e}'))
+
+    def command_path():
         barrier.wait()
         try:
             results.append(t._submit_closecancel(SYM, BID))
         except Exception as e:
             results.append((False, f'exc:{e}'))
-    ths = [threading.Thread(target=run) for _ in range(2)]
+    ths = [threading.Thread(target=monitor_path), threading.Thread(target=command_path)]
     for th in ths:
         th.start()
     for th in ths:
         th.join()
-    assert len(pnl) <= 1, f'PnL 绝不双记: {pnl}'
-    assert cleared.count(BID) <= 1, f'clear 幂等: {cleared}'
-    assert any(r[0] for r in results if isinstance(r, tuple)), results
+    assert len(pnl) == 1, f'PnL 恰好一次（CAS+dedup 定终局）: {pnl}'
+    assert len(cleared) <= 1, f'clear 幂等: {cleared}'
+    b2 = _state_read(t).get(SYM, {}).get(BID)
+    assert b2 is None or b2.get('close_phase') == 2 or not b2.get('is_active'), \
+        f'终态必须一致收敛: {b2}'
 
 
 # ────────────────── R10 归属不双计 ──────────────────
@@ -444,13 +561,17 @@ TESTS = [r1_eligibility_matrix,
          r2_pure_cancel_full_restore,
          r3_partial_fill_attribution_and_restore,
          r4_full_fill_finalizer_monitor_dead,
+         r4b_phase2_takeover_after_crash,
          r5_guard_fail_no_restore,
          r7_crash_restart_auto_resume,
+         r7b_rearm_crash_idempotent,
          r8_monitor_canceled_self_heal,
          r9_concurrent_single_commit_and_pnl,
          r10_no_double_accounting,
          r11_flags_clean_after_restore,
-         r12_pnl_dedup_unit]
+         r12_pnl_dedup_unit,
+         r13_generation_isolation,
+         r14_pnl_persist_failure_keeps_phase2]
 
 
 def main():

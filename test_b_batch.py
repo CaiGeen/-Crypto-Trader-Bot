@@ -235,6 +235,8 @@ def _batch(**over):
         'is_active': True, 'batch_id': BATCH, 'symbol': SYMBOL, 'side': 'BUY',
         'is_hedge_mode': False, 'entry_orders': [], 'stop_steps': [55000.0],
         'take_profit_price': 60000.0, 'current_sl_id': 'sl1', 'tp_order_id': 'tp1',
+        # 🔥 P5：限价平仓事务必有 close_op_id（finalizer 代际隔离依赖，生产契约）
+        'close_op_id': 'OP1',
         'close_phase': 2, 'settled_by_limit_close': True,
         'batch_total_amount': 0.002, 'target_amounts': [0.002],
         'last_filled_count': 1, 'filled_details': [85000.0], 'total_entry_fee': 0.5,

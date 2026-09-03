@@ -1730,12 +1730,22 @@ async def closecancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     ok, msg = await loop.run_in_executor(
         None, trader._submit_closecancel, target_symbol, batch_id)
     if ok:
-        await safe_reply(
-            update,
-            f"✅ **限价平仓已撤销，批次恢复 ACTIVE**\n"
-            f"🆔 批次：`{batch_id}`\n"
-            f"💡 {msg}",
-            parse_mode='Markdown')
+        if 'finalized' in str(msg):
+            # FULL_FILL：订单已成交 → 走共享 finalizer 结算（批次已归档，非恢复 ACTIVE）
+            await safe_reply(
+                update,
+                f"✅ **限价平仓单已确认成交，结算完成**\n"
+                f"🆔 批次：`{batch_id}`\n"
+                f"💡 {msg}",
+                parse_mode='Markdown')
+        else:
+            await safe_reply(
+                update,
+                f"✅ **限价平仓已撤销，批次恢复 ACTIVE**\n"
+                f"🆔 批次：`{batch_id}`\n"
+                f"💡 {msg}\n"
+                f"可以重新选择退出方式（再次平仓 / 继续持有）。",
+                parse_mode='Markdown')
     else:
         await safe_reply(
             update,
