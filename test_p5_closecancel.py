@@ -1455,8 +1455,8 @@ def r33_monitor_start_once_is_atomic():
     t._release_limit_monitor_ownership(_key, _sentinel)            # owner
     assert _key not in t._limit_close_monitor_threads, 'owner 退出必须释放所有权'
 
-    # c) 结构断言：入口不得直接写表
-    src = open(r'G:\my-crypto-bot\trader_260725.py', encoding='utf-8').read()
+    # c) 结构断言：入口不得直接写表（路径取自模块 __file__，不依赖工作目录/机器）
+    src = open(os.path.abspath(trader_260725.__file__), encoding='utf-8').read()
     assert src.count('_start_limit_close_monitor_once(') >= 3, \
         '正常挂单与重启恢复两个入口必须共用同一 helper'
     _i = src.find('def _start_limit_close_monitor_once')
@@ -1466,6 +1466,83 @@ def r33_monitor_start_once_is_atomic():
     assert '_limit_close_monitor_lock' in _helpers, 'helper 必须加锁'
     assert '_limit_close_monitor_threads[' not in src.replace(_helpers, ''), \
         '所有权表写入只允许发生在共用 helper 内'
+
+
+def r33b_reserved_must_guarantee_started():
+    """R33b（ChatGPT 十一复审 P0）：预留 ≠ 保证启动。
+
+    必要不变量：helper 返回 False ⇒ key 对应线程必然已成功 start()。
+    攻击链（旧代码确定复现）：A 锁内登记 → 锁外卡在 start()；B 拿到 False
+    （误以为已有存活 owner）；放行后 A 的 start() 失败清表 → 双调用方均返回，
+    但零 owner 零监控。修复契约：A 的启动失败原样上抛（零登记），B 续跑
+    成功启动唯一监控。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    gate = threading.Event()       # 卡住 A 的 start()（放大预留窗口）
+    stop = threading.Event()
+    attempts = {'n': 0}
+    started = []
+
+    def _spy_monitor(*a, **k):
+        started.append(threading.current_thread())
+        stop.wait(timeout=10)
+    t._monitor_limit_close = _spy_monitor
+
+    _real_threading = trader_260725.threading
+
+    class _FailFirstStartThread(threading.Thread):
+        """第一次 start()：先等 gate 再注入失败；后续 start() 正常。"""
+
+        def start(self):
+            attempts['n'] += 1
+            if attempts['n'] == 1:
+                gate.wait(timeout=10)
+                raise RuntimeError('injected start failure')
+            super().start()
+
+    class _Shim:
+        Thread = _FailFirstStartThread
+
+        def __getattr__(self, name):
+            return getattr(_real_threading, name)
+
+    outcomes = {}
+    _key = (SYM, BID, 'OP1')
+
+    def _caller(tag):
+        try:
+            outcomes[tag] = t._start_limit_close_monitor_once(
+                _key, (SYM, BID, 'L1', 0.002, 100.0, 0.0, 'BUY', 0, [], []))
+        except Exception as e:
+            outcomes[tag] = ('raised', type(e).__name__)
+
+    trader_260725.threading = _Shim()
+    try:
+        _a = threading.Thread(target=_caller, args=('A',))
+        _a.start()
+        _dl = time.time() + 5
+        while time.time() < _dl and attempts['n'] < 1:
+            time.sleep(0.02)       # 等 A 进入 start()（新代码此时仍持锁未登记）
+        _b = threading.Thread(target=_caller, args=('B',))
+        _b.start()
+        time.sleep(0.3)            # 旧代码：B 已拿到 False；新代码：B 阻塞在锁上
+        gate.set()
+        _a.join(timeout=10)
+        _b.join(timeout=10)
+    finally:
+        trader_260725.threading = _real_threading
+
+    a_res, b_res = outcomes.get('A'), outcomes.get('B')
+    # 🔒 必要不变量：任何调用方拿到 False 时，必须存在已成功启动的监控线程
+    if b_res is False:
+        assert started, ('预留≠保证启动：B 拿到 False 但实际零监控线程', a_res, b_res)
+    assert a_res == ('raised', 'RuntimeError'), f'A 的启动失败必须原样上抛: {a_res}'
+    assert b_res is True, f'B 必须在 A 失败后续跑并成功启动: {b_res}'
+    assert len(started) == 1, f'最终恰好 1 个限价监控，实际 {len(started)}'
+    assert len(t._limit_close_monitor_threads) == 1, '所有权登记恰好 1 条'
+    stop.set()
+    for _th in list(t._limit_close_monitor_threads.values()):
+        _th.join(timeout=10)
+    assert not t._limit_close_monitor_threads, '监控退出后所有权必须释放'
 
 
 def r99_production_files_untouched():
@@ -1515,6 +1592,7 @@ TESTS = [r1_eligibility_matrix,
          r31_monitor_error_pending_keeps_main_monitor,
          r32_guard_must_not_mean_attempt,
          r33_monitor_start_once_is_atomic,
+         r33b_reserved_must_guarantee_started,
          r99_production_files_untouched]
 
 

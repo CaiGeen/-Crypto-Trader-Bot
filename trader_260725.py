@@ -3347,23 +3347,26 @@ class CryptoTrader:
     def _start_limit_close_monitor_once(self, guard_key, monitor_args):
         """🔥 P5k：限价监控「启动一次」——正常挂单与重启恢复两个入口**共用**。
 
-        判据：`guard_key` 已存在 = 已预留/已运行（不再用 is_alive()，避免
-        「已登记未 start」被误判为空位）。检查 + 登记在同一锁内完成，杜绝并发
-        check-then-act。start() 不在锁内（线程体可能反查本表，且避免持锁等待
-        调度）；start 失败仅条件撤销自己的登记。
-        返回 True=本次启动；False=已有 owner，本次跳过。"""
+        判据：`guard_key` 已存在 = 线程已成功启动（见下方不变量）。
+        🔒 P5l（ChatGPT 十一复审 P0）：「预留」≠「保证启动」——旧版先登记后
+        锁外 start()，并发方在窗口内拿到 False（误以为已有存活 owner），随后
+        start() 失败清表 → 双方均返回但零 owner 零监控（R33b 确定复现）。
+        必要不变量：**本 helper 返回 False 时，key 对应线程必然已成功 start()**。
+        实现：start() + 登记全部在锁内完成，且仅在 start() 成功后登记：
+        - 并发方在锁上排队，要么看到已登记（=已成功启动），要么自己启动；
+        - start() 失败 → 零登记零留痕，异常原样上抛（调用方走既有失败路径）；
+        - 锁内 start() 无死锁：新线程仅在退出时才回调
+          _release_limit_monitor_ownership 抢同一把锁，而 start() 的返回只依赖
+          bootstrap 的 _started 事件（先于线程体执行），不依赖该回调。
+        返回 True=本次启动；False=已有已启动的 owner，本次跳过。"""
         with self._limit_close_monitor_lock:
             if guard_key in self._limit_close_monitor_threads:
                 return False
             th = threading.Thread(target=self._monitor_limit_close_owned,
                                   args=(guard_key,) + tuple(monitor_args),
                                   daemon=True)
-            self._limit_close_monitor_threads[guard_key] = th
-        try:
             th.start()
-        except Exception:
-            self._release_limit_monitor_ownership(guard_key, th)
-            raise
+            self._limit_close_monitor_threads[guard_key] = th
         return True
 
     def _release_limit_monitor_ownership(self, guard_key, owner):
