@@ -734,8 +734,9 @@ def r18a_sl_zeroed_zero_fill_no_silent_clear():
     assert not cleared, f'归属未明确时绝不得静默 clear: {cleared}'
     assert b2 is not None, '批次必须保持可见（不得被清出账本）'
     assert b2.get('close_phase') == 1, f'绝不恢复 ACTIVE: {b2}'
-    assert b2.get('close_reason') == 'limit_pending_normal', \
-        f'不得写入恢复态（仓位已归零，恢复无意义）: {b2.get("close_reason")}'
+    # P5e 契约：原子写入专用 manual_review（不再伪装成普通 limit_pending_normal）
+    assert b2.get('close_reason') == 'limit_cancel_manual_review', \
+        f'必须写入专用人工核对冻结态: {b2.get("close_reason")}'
     assert any('资金安全' in c for c in crits), '必须有可见 critical 告警'
 
 
@@ -747,11 +748,131 @@ def r18b_sl_zeroed_partial_fill_no_silent_clear():
     assert not cleared, f'归属未明确时绝不得静默 clear: {cleared}'
     assert b2 is not None, '批次必须保持可见（不得被清出账本）'
     assert b2.get('close_phase') == 1, f'绝不恢复 ACTIVE: {b2}'
-    assert b2.get('close_reason') == 'limit_pending_normal', \
-        f'不得写入恢复态: {b2.get("close_reason")}'
+    assert b2.get('close_reason') == 'limit_cancel_manual_review', \
+        f'必须写入专用人工核对冻结态: {b2.get("close_reason")}'
     assert float(b2.get('realized_reduce_amount') or 0.0) == 0.0, \
         '归属未明确时不得提交 partial 归属'
     assert any('资金安全' in c for c in crits), '必须有可见 critical 告警'
+
+
+# ────────────────── P5e：ChatGPT 四复审 P0（冻结态必须持久化可恢复） ──────────────────
+
+def r19_monitor_crash_freeze_survives_finally():
+    """R19：monitor 异常退出但账本仍在——finally 两段清理（pending_close 段 +
+    持仓归零段）都绝不得清掉 manual_review 冻结批次。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    _state_write(t, _single(b))
+    ex._mk('S1', otype='STOP_MARKET', amount=0.002, stop=75001.0,
+           status='canceled', filled=0.002, avg=75000.0)
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='canceled', filled=0.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    cleared = []
+
+    def _clear(s, bid, proof=None):
+        cleared.append(bid)
+        return True
+    t.clear_batch_state = _clear
+    calls = {'n': 0}
+    _real_sleep = time.sleep
+
+    def _sleep(s):  # 前 2 周期正常（第 1 周期写入 manual_review），第 3 次注入崩溃
+        calls['n'] += 1
+        if calls['n'] >= 3:
+            raise RuntimeError('injected monitor crash')
+        _real_sleep(min(s, 0.02))
+    with mock.patch.object(trader_260725.time, 'sleep', _sleep):
+        th = threading.Thread(target=t._start_monitoring,
+                              args=(SYM, BID),
+                              kwargs=dict(entry_orders=['E1'], stop_steps=[75001.0],
+                                          take_profit_price=80000.0, current_sl_id='S1',
+                                          tp_order_id='T1', batch_total_amount=0.002,
+                                          target_amounts=[0.002], params_base={},
+                                          is_hedge_mode=True, side='BUY',
+                                          last_filled_count=1, filled_details=[76620.0],
+                                          total_entry_fee=0.15),
+                              daemon=True)
+        th.start()
+        th.join(timeout=10)
+    assert not th.is_alive(), '注入崩溃后线程应已退出'
+    b2 = _state_read(t).get(SYM, {}).get(BID)
+    assert b2 is not None, '异常退出后冻结批次必须仍在账本（不得被 finally 清理）'
+    assert b2.get('close_reason') == 'limit_cancel_manual_review', b2.get('close_reason')
+    assert not cleared, f'finally 绝不得清理 manual_review 冻结批次: {cleared}'
+    assert any('资金安全' in c for c in t.sent_tg), '必须有可见 critical 告警'
+
+
+def r20_manual_review_recovery_no_clear():
+    """R20：冻结态重启恢复——manual_review 批次只告警不清理不恢复；
+    crash-before-marker（limit_pending_normal + 仓位已归零）经恢复分发
+    原子写入 manual_review，绝不走 ZERO/PARTIAL→恢复复活原缺陷。"""
+    # a) manual_review 批次 → 恢复分发只告警
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_cancel_manual_review')
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='canceled', filled=0.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    t._handle_limit_close_on_recovery(SYM, BID)
+    b2 = _state_read(t).get(SYM, {}).get(BID)
+    assert b2 is not None and b2.get('close_reason') == 'limit_cancel_manual_review', b2
+    assert not ex.create_calls, '冻结态恢复绝不得 create'
+    # b) crash-before-marker → 恢复分发原子写 manual_review（绝不恢复/清理）
+    t2, ex2 = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b3 = _lp_batch(net=0.002, reason='limit_pending_normal')
+    _state_write(t2, _single(b3))
+    ex2._mk('L1', otype='LIMIT', amount=0.002, status='canceled', filled=0.0)
+    ex2.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                      'positionSide': 'LONG'}]
+    t2._handle_limit_close_on_recovery(SYM, BID)
+    b4 = _state_read(t2).get(SYM, {}).get(BID)
+    assert b4 is not None, '不得被恢复路径清理'
+    assert b4.get('close_reason') == 'limit_cancel_manual_review', b4.get('close_reason')
+    assert b4.get('close_phase') == 1, '绝不恢复 ACTIVE'
+    # c) 结构断言：启动 stale 清理必须先经限价理由守卫（不 stale-clear）
+    src = open(r'G:\my-crypto-bot\trader_260725.py', encoding='utf-8').read()
+    i = src.find('交恢复分型（不清理）')
+    assert i > 0, 'stale 清理分支未接线限价理由守卫'
+    j = src.find('无挂单且无持仓，自动清理', i)
+    assert j > 0 and j - i < 4000, '限价理由守卫必须位于 stale 清理之前'
+
+
+def r21_canceled_full_fill_routes_finalizer():
+    """R21：生产退化形态 status=canceled + filled=全量 → 必须进 finalizer
+    正确结算，绝不得永久冻结。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='canceled', filled=0.002,
+           avg=76500.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    _real_sleep = time.sleep
+    with mock.patch.object(trader_260725.time, 'sleep',
+                           lambda s: _real_sleep(min(s, 0.02))):
+        th = threading.Thread(target=t._start_monitoring,
+                              args=(SYM, BID),
+                              kwargs=dict(entry_orders=['E1'], stop_steps=[75001.0],
+                                          take_profit_price=80000.0, current_sl_id='S1',
+                                          tp_order_id='T1', batch_total_amount=0.002,
+                                          target_amounts=[0.002], params_base={},
+                                          is_hedge_mode=True, side='BUY',
+                                          last_filled_count=1, filled_details=[76620.0],
+                                          total_entry_fee=0.15),
+                              daemon=True)
+        th.start()
+        dl = time.time() + 6
+        while time.time() < dl and th.is_alive():
+            time.sleep(0.05)
+    b2 = _state_read(t)
+    assert BID not in b2.get(SYM, {}), \
+        f'canceled+filled=全量必须经 finalizer 结算归档: {b2.get(SYM, {}).keys()}'
+    stats_file = os.path.join(os.path.dirname(trader_260725.STATE_FILE),
+                              'trade_stats.json')
+    if os.path.exists(stats_file):
+        stats = json.load(open(stats_file, encoding='utf-8'))
+        assert len(stats.get('trades', [])) == 1, stats
 
 
 TESTS = [r1_eligibility_matrix,
@@ -773,7 +894,10 @@ TESTS = [r1_eligibility_matrix,
          r16_pnl_gate_monitor_no_bypass_clear,
          r17_monitor_fail_command_takeover,
          r18a_sl_zeroed_zero_fill_no_silent_clear,
-         r18b_sl_zeroed_partial_fill_no_silent_clear]
+         r18b_sl_zeroed_partial_fill_no_silent_clear,
+         r19_monitor_crash_freeze_survives_finally,
+         r20_manual_review_recovery_no_clear,
+         r21_canceled_full_fill_routes_finalizer]
 
 
 def main():
