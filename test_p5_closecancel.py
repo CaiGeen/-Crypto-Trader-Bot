@@ -1296,25 +1296,38 @@ def r32_guard_must_not_mean_attempt():
 
     started = []
     stop = threading.Event()
+    entered = threading.Event()
 
     def _spy_monitor(*a, **k):
         started.append(threading.current_thread())
+        entered.set()
         stop.wait(timeout=10)
     t._monitor_limit_close = _spy_monitor
 
+    def _wait_started(n, what):
+        _dl = time.time() + 5
+        while time.time() < _dl and len(started) < n:
+            entered.wait(timeout=0.05)
+        assert len(started) == n, f'{what}：实际启动 {len(started)} 个限价监控'
+
+    # 1) 第一次调用：在启动监控之前注入失败（裁决查询阶段）
     t._handle_limit_close_on_recovery(SYM, BID)
-    assert len(started) == 0, '第一次调用在启动监控前失败，不得启动任何监控线程'
+    entered.wait(timeout=0.5)      # 给「若误启动」留出调度窗口
+    assert not started, '第一次调用在启动监控前失败，不得启动任何监控线程'
     assert not getattr(t, '_limit_close_monitor_threads', None), \
         '失败的尝试绝不得登记所有权（尝试 ≠ 接管）'
 
     # 2) 故障修复后第二次调用：必须能续跑并恰好启动一个限价监控
     t._batch_net_position = _real_bnp
+    entered.clear()
     t._handle_limit_close_on_recovery(SYM, BID)
-    assert len(started) == 1, f'故障修复后必须能续跑并启动限价监控，实际 {len(started)}'
+    _wait_started(1, '故障修复后必须能续跑并启动限价监控')
     assert len(t._limit_close_monitor_threads) == 1, '所有权登记恰好 1 条'
 
     # 3) 同一事务再次调用：live 监控在途 → 不得重复启动
+    entered.clear()
     t._handle_limit_close_on_recovery(SYM, BID)
+    entered.wait(timeout=0.5)
     assert len(started) == 1, f'live 监控在途时不得重复启动，实际 {len(started)}'
 
     # 4) 监控线程退出 → 所有权释放（后续可再次接管）
@@ -1322,6 +1335,15 @@ def r32_guard_must_not_mean_attempt():
     for _th in list(t._limit_close_monitor_threads.values()):
         _th.join(timeout=5)
     assert not t._limit_close_monitor_threads, '监控线程退出后必须释放所有权登记'
+
+    # 5) 释放后必须能重新接管（释放 ≠ 永久拒绝）
+    entered.clear()
+    stop.clear()
+    t._handle_limit_close_on_recovery(SYM, BID)
+    _wait_started(2, '所有权释放后必须能重新接管')
+    stop.set()
+    for _th in list(t._limit_close_monitor_threads.values()):
+        _th.join(timeout=5)
 
 
 TESTS = [r1_eligibility_matrix,
