@@ -271,6 +271,27 @@ def r44_partial_overlap_keeps_event():
     assert _ev(t)['critical_count'] == 2, _ev(t)
 
 
+# ── R45：生产接线结构锁（防「helper 建好没人用」/ 接线回退的空转通过）─────
+def r45_production_wiring_locked():
+    """R34-R44 直调观察器，不证明监控循环真的在调用——本测试锁死生产接线：
+    ①观察器调用点恰好 1 处（除定义外），且为无条件每轮契约的新签名；
+    ②旧 (symbol, batch_id) 签名调用零残留；
+    ③调用位于方向仓位取得（L6611 同型）之后。"""
+    import os
+    src = open(os.path.abspath(trader_260725.__file__), encoding='utf-8').read()
+    n_calls = src.count('self._maybe_report_conservation_conflict(')
+    assert n_calls == 1, \
+        f'生产接线必须恰好 1 处调用（实际 {n_calls}）：旧分支调用必须已移除'
+    assert src.count('_maybe_report_conservation_conflict(symbol, '
+                     'side, current_actual_position)') == 1, \
+        '必须存在无条件每轮契约调用 (symbol, side, current_actual_position)'
+    assert '_maybe_report_conservation_conflict(symbol, batch_id)' not in src, \
+        '旧 (symbol, batch_id) 签名调用残留'
+    _i_pos = src.find('current_actual_position = self._get_current_position_amt(')
+    _i_call = src.find('self._maybe_report_conservation_conflict(')
+    assert 0 < _i_pos < _i_call, '观察器调用必须位于方向仓位取得之后（复用不重查）'
+
+
 TESTS = [r34_inflight_transient_conflict_warning_only,
          r35_no_inflight_immediate_critical,
          r36_inflight_conflict_escalates_after_grace,
@@ -281,7 +302,8 @@ TESTS = [r34_inflight_transient_conflict_warning_only,
          r41_sibling_disappearance_full_reset,
          r42_monotonic_no_downgrade_after_critical,
          r43_batch_set_change_starts_new_event,
-         r44_partial_overlap_keeps_event]
+         r44_partial_overlap_keeps_event,
+         r45_production_wiring_locked]
 
 
 def main():
