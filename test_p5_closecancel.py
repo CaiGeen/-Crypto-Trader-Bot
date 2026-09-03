@@ -96,16 +96,56 @@ class Ex:
         return 1234567890
 
 
+# 🔥 生产文件免疫快照（模块导入时采集，早于任何用例执行）——r99 收尾比对，
+# 证伪「测试污染生产账本」：trade_state / 墓碑 / 盈亏统计 / 鉴权态必须零变化。
+_PROD_FILES = ['trade_state.json', 'trade_tombstones.json', 'trade_stats.json',
+               'auth_blocked.json', 'signal.json', 'signal_dedup.json']
+_PROD_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _prod_snapshot():
+    """生产文件指纹（hash + size + mtime_ns）。
+
+    必须带 mtime_ns：内容相同的重复写入（如墓碑条目已存在）不会改变 hash/size，
+    但仍是对生产文件的写入——只比对内容会漏判。"""
+    snap = {}
+    for _n in _PROD_FILES:
+        _p = os.path.join(_PROD_DIR, _n)
+        try:
+            with open(_p, 'rb') as _f:
+                _data = _f.read()
+            snap[_n] = (__import__('hashlib').sha256(_data).hexdigest(),
+                        len(_data), os.stat(_p).st_mtime_ns)
+        except FileNotFoundError:
+            snap[_n] = ('<missing>', 0, 0)
+    return snap
+
+
+_PROD_SNAP_AT_IMPORT = _prod_snapshot()
+
+
 def make_trader(tmp):
     state_file = os.path.join(str(tmp), 'trade_state.json')
     trader_260725.STATE_FILE = state_file
     trader_260725.AUTH_BLOCKED_FILE = os.path.join(str(tmp), 'auth_blocked.json')
     trader_260725.NOTIFY_QUEUE_DIR_TRADER = os.path.join(str(tmp), '.notify_queue')
+    # 🔥 P5k（ChatGPT 十复审阻断）：墓碑与盈亏统计此前**未**重定向——
+    # TOMBSTONE_FILE 是相对路径（按 CWD 解析）、_record_realized_pnl 默认写
+    # 源码目录 trade_stats.json → 跑真实 finalizer 的用例会把 batch_A 写进
+    # 生产账本（已实证 2 条污染）。两者一并隔离到临时目录。
+    trader_260725.TOMBSTONE_FILE = os.path.join(str(tmp), 'trade_tombstones.json')
     ex = Ex()
     with mock.patch.object(CryptoTrader, '_daily_report_loop', lambda self: None):
         with mock.patch.object(trader_260725.ccxt, 'binanceusdm') as mk:
             mk.return_value = ex
             t = CryptoTrader('k', 's')
+    _stats_file = os.path.join(str(tmp), 'trade_stats.json')
+    _real_pnl = t._record_realized_pnl
+
+    def _isolated_pnl(*a, **k):
+        k.setdefault('stats_file', _stats_file)
+        return _real_pnl(*a, **k)
+    t._record_realized_pnl = _isolated_pnl
     t._min_api_interval = 0
     t.ip_file = os.path.join(str(tmp), 'last_ip.txt')
     t.sent_tg = []
@@ -1346,6 +1386,100 @@ def r32_guard_must_not_mean_attempt():
         _th.join(timeout=5)
 
 
+def r33_monitor_start_once_is_atomic():
+    """R33（ChatGPT 十复审 P0）：两个入口并发「检查→登记→启动」必须只创建
+    一个限价监控线程；释放所有权必须是条件的（只释放自己的）。
+
+    a) 放大「已登记未 start」窗口（start() 前等 gate），两入口同时进入
+       → 只启动 1 个线程（旧代码：后到者 is_alive()==False → 覆盖登记 → 2 个）；
+    b) 条件释放：非 owner 退出不得抹掉当前 owner 的登记；
+    c) 结构断言：两个入口共用同一加锁 helper，所有权表写入只发生在 helper 内。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='open', filled=0.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.002, 'side': 'long',
+                     'positionSide': 'LONG'}]
+
+    gate = threading.Event()      # 放行 start()（放大「已登记未启动」窗口）
+    stop = threading.Event()      # 放行监控体（使断言期间线程保持存活）
+    started = []
+
+    def _spy_monitor(*a, **k):
+        started.append(threading.current_thread())
+        stop.wait(timeout=10)
+    t._monitor_limit_close = _spy_monitor
+
+    _real_threading = trader_260725.threading
+
+    class _SlowStartThread(threading.Thread):
+        """把「登记 → start」的窗口放大到可复现：start() 前先等 gate。"""
+
+        def start(self):
+            gate.wait(timeout=10)
+            super().start()
+
+    class _Shim:
+        Thread = _SlowStartThread
+
+        def __getattr__(self, name):
+            return getattr(_real_threading, name)
+
+    # a) 并发双入口
+    trader_260725.threading = _Shim()
+    try:
+        _ths = [threading.Thread(target=t._handle_limit_close_on_recovery,
+                                 args=(SYM, BID)) for _ in range(2)]
+        for _x in _ths:
+            _x.start()
+        time.sleep(0.5)          # 两入口都已完成检查/登记，正卡在 start()
+        gate.set()
+        for _x in _ths:
+            _x.join(timeout=10)
+    finally:
+        trader_260725.threading = _real_threading
+    assert len(started) == 1, f'并发双入口必须只创建 1 个限价监控，实际 {len(started)}'
+    assert len(t._limit_close_monitor_threads) == 1, '所有权登记恰好 1 条'
+    stop.set()   # 放行监控体 → 退出并释放所有权后统一收尾
+    for _th in list(t._limit_close_monitor_threads.values()):
+        _th.join(timeout=10)
+    assert not t._limit_close_monitor_threads, '监控退出后所有权必须释放'
+
+    # b) 条件释放：非 owner 不得抹掉当前 owner 的登记
+    _key = (SYM, BID, 'OPX')
+    _sentinel = threading.current_thread()      # 假 owner（主线程）
+    t._limit_close_monitor_threads[_key] = _sentinel
+    t._release_limit_monitor_ownership(_key, threading.Thread())   # 非 owner
+    assert t._limit_close_monitor_threads.get(_key) is _sentinel, \
+        '非 owner 退出绝不得抹掉当前 owner 的所有权'
+    t._release_limit_monitor_ownership(_key, _sentinel)            # owner
+    assert _key not in t._limit_close_monitor_threads, 'owner 退出必须释放所有权'
+
+    # c) 结构断言：入口不得直接写表
+    src = open(r'G:\my-crypto-bot\trader_260725.py', encoding='utf-8').read()
+    assert src.count('_start_limit_close_monitor_once(') >= 3, \
+        '正常挂单与重启恢复两个入口必须共用同一 helper'
+    _i = src.find('def _start_limit_close_monitor_once')
+    _j = src.find('def _execute_partial_close')
+    assert 0 < _i < _j, 'helper 定义未定位'
+    _helpers = src[_i:_j]
+    assert '_limit_close_monitor_lock' in _helpers, 'helper 必须加锁'
+    assert '_limit_close_monitor_threads[' not in src.replace(_helpers, ''), \
+        '所有权表写入只允许发生在共用 helper 内'
+
+
+def r99_production_files_untouched():
+    """r99（ChatGPT 十复审阻断）：整套 P5 跑完，生产账本必须**零变化**
+    ——与模块导入时采集的快照逐文件比对（hash + size）。
+
+    背景：make_trader 此前未重定向 TOMBSTONE_FILE（相对路径，按 CWD 解析）
+    与 _record_realized_pnl 默认的源码目录 trade_stats.json，跑真实 finalizer
+    的用例会把测试批次写进生产账本（已实证 2 条污染）。"""
+    _now = _prod_snapshot()
+    _diff = {k: (v, _now[k]) for k, v in _PROD_SNAP_AT_IMPORT.items() if _now[k] != v}
+    assert not _diff, f'测试污染生产文件（导入前 → 现在）: {_diff}'
+
+
 TESTS = [r1_eligibility_matrix,
          r2_pure_cancel_full_restore,
          r3_partial_fill_attribution_and_restore,
@@ -1379,7 +1513,9 @@ TESTS = [r1_eligibility_matrix,
          r29_nonzero_position_crash_no_zero_route,
          r30_clear_authorization_atomic,
          r31_monitor_error_pending_keeps_main_monitor,
-         r32_guard_must_not_mean_attempt]
+         r32_guard_must_not_mean_attempt,
+         r33_monitor_start_once_is_atomic,
+         r99_production_files_untouched]
 
 
 def main():

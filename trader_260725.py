@@ -396,10 +396,12 @@ class CryptoTrader:
         self._active_monitors = set()
         self._active_monitors_lock = threading.Lock()
 
-        # 🔥 P5j：重启恢复重生的限价监控所有权登记（键=(symbol, batch_id, close_op_id)
-        # → thread）。只在线程成功启动前登记、线程退出（finally）释放——登记前的
-        # 任何失败都保持「可续跑」，绝不把「尝试过」当成「已接管」。
+        # 🔥 P5j/P5k：限价监控所有权登记（键=(symbol, batch_id, close_op_id)
+        # → thread）。判据「已预留/已运行」，检查+登记在锁内原子完成，线程退出
+        # 条件释放；登记前任何失败都保持「可续跑」——绝不把「尝试过」当成
+        # 「已接管」。
         self._limit_close_monitor_threads = {}
+        self._limit_close_monitor_lock = threading.Lock()
 
         # 🔥 SG3-P1: 保护单无效告警节流（键=(batch_id, order_id, reason)，防告警风暴）
         self._sg3_alerted = set()
@@ -3313,33 +3315,24 @@ class CryptoTrader:
                 return
             if verdict == 'PENDING':
                 # 限价单仍 live → 重拉监控线程（durable 派生 monitor 入参）
-                # 🔥 P5j（ChatGPT 九复审 P0）：所有权守卫只登记「已接管」——
-                # 查询/finalizer/恢复/start 任一步失败都不得留下痕迹，下次调用
-                # 必须能续跑（失败保持可接管）。登记在 start() 之前完成（防止
-                # 线程先结束释放所有权后又被登记成死线程），start 失败即撤销登记。
+                # 🔥 P5k（ChatGPT 十复审 P0）：与正常挂单路径**共用**同一加锁
+                # helper——两个入口各自「检查→登记→启动」在并发下会同时看到空位
+                # （或看到对方已登记但未 start、is_alive()==False 而覆盖），
+                # 导致同订单两个监控；且无条件 pop 会删掉仍存活线程的所有权。
                 _guard_key = (symbol, batch_id, op)
-                _live = self._limit_close_monitor_threads.get(_guard_key)
-                if _live is not None and _live.is_alive():
-                    print(f"  └─ 👁️ [限价平仓恢复] 批次 [{batch_id}] "
-                          f"限价监控已在运行，跳过重复启动")
-                    return
                 lfc = int(b.get('last_filled_count', 0) or 0)
                 ta = list(b.get('target_amounts') or [])
                 fd = list(b.get('filled_details') or [])
                 gross = float(sum(ta[:lfc]))
                 gross_cost = float(sum(ta[i] * fd[i] for i in range(min(lfc, len(fd)))))
                 avg = (gross_cost / gross) if gross > 0 else 0.0
-                th = threading.Thread(
-                    target=self._monitor_limit_close_owned,
-                    args=(_guard_key, symbol, batch_id, oid, gross, avg,
-                          float(b.get('total_entry_fee', 0.0) or 0.0),
-                          b.get('side') or 'BUY', lfc, ta, fd), daemon=True)
-                self._limit_close_monitor_threads[_guard_key] = th
-                try:
-                    th.start()
-                except Exception:
-                    self._limit_close_monitor_threads.pop(_guard_key, None)
-                    raise
+                if not self._start_limit_close_monitor_once(
+                        _guard_key, (symbol, batch_id, oid, gross, avg,
+                                     float(b.get('total_entry_fee', 0.0) or 0.0),
+                                     b.get('side') or 'BUY', lfc, ta, fd)):
+                    print(f"  └─ 👁️ [限价平仓恢复] 批次 [{batch_id}] "
+                          f"限价监控已预留/在运行，跳过重复启动")
+                    return
                 print(f"  └─ 👁️ [限价平仓恢复] 批次 [{batch_id}] 限价单在途，监控线程已重生")
                 return
             self.send_tg_notification(
@@ -3351,13 +3344,42 @@ class CryptoTrader:
         except Exception as e:
             print(f"  └─ ⚠️ [限价平仓恢复] 批次 [{batch_id}] 异常: {e}")
 
+    def _start_limit_close_monitor_once(self, guard_key, monitor_args):
+        """🔥 P5k：限价监控「启动一次」——正常挂单与重启恢复两个入口**共用**。
+
+        判据：`guard_key` 已存在 = 已预留/已运行（不再用 is_alive()，避免
+        「已登记未 start」被误判为空位）。检查 + 登记在同一锁内完成，杜绝并发
+        check-then-act。start() 不在锁内（线程体可能反查本表，且避免持锁等待
+        调度）；start 失败仅条件撤销自己的登记。
+        返回 True=本次启动；False=已有 owner，本次跳过。"""
+        with self._limit_close_monitor_lock:
+            if guard_key in self._limit_close_monitor_threads:
+                return False
+            th = threading.Thread(target=self._monitor_limit_close_owned,
+                                  args=(guard_key,) + tuple(monitor_args),
+                                  daemon=True)
+            self._limit_close_monitor_threads[guard_key] = th
+        try:
+            th.start()
+        except Exception:
+            self._release_limit_monitor_ownership(guard_key, th)
+            raise
+        return True
+
+    def _release_limit_monitor_ownership(self, guard_key, owner):
+        """仅当登记项确实属于 owner 时才释放——防止旧线程退出抹掉新 owner。"""
+        with self._limit_close_monitor_lock:
+            if self._limit_close_monitor_threads.get(guard_key) is owner:
+                self._limit_close_monitor_threads.pop(guard_key, None)
+
     def _monitor_limit_close_owned(self, guard_key, *args, **kwargs):
         """🔥 P5j：限价监控所有权包裹——线程退出（正常成交收敛 / 异常）时释放
         `_limit_close_monitor_threads` 登记，使下一次恢复可重新接管。"""
         try:
             self._monitor_limit_close(*args, **kwargs)
         finally:
-            self._limit_close_monitor_threads.pop(guard_key, None)
+            self._release_limit_monitor_ownership(guard_key,
+                                                  threading.current_thread())
 
     def _execute_partial_close(self, symbol, batch_id, amount):
         """🔥 v6.4-P0：批次指定部分平仓——intent-before-effect 纪律的平仓侧复用。
@@ -11011,22 +11033,12 @@ class CryptoTrader:
             print(f"\n{result_msg}")
 
             # 🔥 启动一个后台线程监控限价单成交
-            # 🔥 P5j：与恢复路径共用同一所有权登记（防止 auth 恢复 reconcile
-            # 在监控仍在运行时重复启动第二个限价监控）
-            _guard_key = (target_symbol, batch_id, close_op_id)
-            monitor_thread = threading.Thread(
-                target=self._monitor_limit_close_owned,
-                args=(_guard_key, target_symbol, batch_id, order_id, current_filled_amount,
-                      avg_price, total_entry_fee, side,
-                      last_filled_count, target_amounts, filled_details),
-                daemon=True
-            )
-            self._limit_close_monitor_threads[_guard_key] = monitor_thread
-            try:
-                monitor_thread.start()
-            except Exception:
-                self._limit_close_monitor_threads.pop(_guard_key, None)
-                raise
+            # 🔥 P5k：与恢复路径**共用**同一加锁 helper（防 auth 恢复 reconcile
+            # 与本次挂单并发 → 同订单两个监控 / 互相抹掉所有权）
+            self._start_limit_close_monitor_once(
+                (target_symbol, batch_id, close_op_id),
+                (target_symbol, batch_id, order_id, current_filled_amount, avg_price,
+                 total_entry_fee, side, last_filled_count, target_amounts, filled_details))
 
             return True, result_msg
 
