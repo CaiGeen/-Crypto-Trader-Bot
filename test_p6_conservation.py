@@ -221,6 +221,23 @@ def r42_monotonic_no_downgrade_after_critical():
     assert len(t._criticals) == 3, '超过单事件上限后必须静默'
 
 
+# ── R43：批次集变更 = 新事件（防「全监控退出」窗口的跨事件污染）──────────
+def r43_batch_set_change_starts_new_event():
+    # 旧事件（bA+bB 无在途冲突，已 critical 1 次）
+    t = make_trader([_b('bA'), _b('bB')], actual=0.003)
+    _obs(t, 0.003)
+    assert _ev(t)['critical_count'] == 1
+    # 旧批次对全部归档 → 监控线程退出 → 观察器停调（删除路径不可达的窗口）；
+    # 之后新批次对上线并冲突（带有效在途事务）
+    t._states[SYM] = {'bC': _inflight(_b('bC')), 'bD': _b('bD')}
+    _obs(t, 0.003)
+    ev = _ev(t)
+    assert ev['critical_count'] == 0 and ev['warning_sent'] is True, \
+        f'批次集变更=新事件，不得继承旧事件 critical 状态: {ev}'
+    assert len(t._criticals) == 1 and len(t._warnings) == 1, (
+        len(t._criticals), len(t._warnings))
+
+
 TESTS = [r34_inflight_transient_conflict_warning_only,
          r35_no_inflight_immediate_critical,
          r36_inflight_conflict_escalates_after_grace,
@@ -229,7 +246,8 @@ TESTS = [r34_inflight_transient_conflict_warning_only,
          r39_hedge_sides_fully_isolated,
          r40_stale_reason_denies_grace,
          r41_sibling_disappearance_full_reset,
-         r42_monotonic_no_downgrade_after_critical]
+         r42_monotonic_no_downgrade_after_critical,
+         r43_batch_set_change_starts_new_event]
 
 
 def main():

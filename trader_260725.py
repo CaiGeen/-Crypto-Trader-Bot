@@ -3261,10 +3261,19 @@ class CryptoTrader:
                     self._conservation_events.pop(key, None)   # 显式收敛
                     return
                 ev = self._conservation_events.get(key)
+                # 🔥 v1.3 实施自检（R43）：事件绑定其发生时的批次集——不同批次集
+                # 不可能是同一次冲突。防「全部监控线程退出 → 观察器停调 → 删除
+                # 路径不可达」窗口内旧事件滞留，污染新批次集的新事件（旧
+                # critical 状态经单调棘轮使新事件跳过 warning 直接 critical）。
+                _cur_ids = frozenset(b.get('batch_id') or '' for b in same_side)
+                if ev is not None and ev.get('_batch_ids') != _cur_ids:
+                    ev = None
                 if ev is None:
                     ev = self._conservation_events[key] = {
                         'first_seen': time.time(), 'warning_sent': False,
-                        'critical_count': 0}
+                        'critical_count': 0, '_batch_ids': _cur_ids}
+                else:
+                    ev['_batch_ids'] = _cur_ids
                 has_inflight = any(self._is_valid_inflight_close_txn(b)
                                    for b in same_side)
                 escalate = ((not has_inflight) or ev['critical_count'] > 0
