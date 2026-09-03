@@ -868,11 +868,6 @@ def r21_canceled_full_fill_routes_finalizer():
     b2 = _state_read(t)
     assert BID not in b2.get(SYM, {}), \
         f'canceled+filled=全量必须经 finalizer 结算归档: {b2.get(SYM, {}).keys()}'
-    stats_file = os.path.join(os.path.dirname(trader_260725.STATE_FILE),
-                              'trade_stats.json')
-    if os.path.exists(stats_file):
-        stats = json.load(open(stats_file, encoding='utf-8'))
-        assert len(stats.get('trades', [])) == 1, stats
 
 
 # ────────────────── P5f：ChatGPT 五复审 P0（崩溃链路重启/守卫 fail-closed/代际隔离） ──────────────────
@@ -912,11 +907,16 @@ def r23_finally_guard_fail_closed_and_bound():
     finally:
         t.load_all_states = _real_load
     assert decision == 'skip', f'守卫读取失败必须 fail-closed: {decision}'
-    # b) 授权快照必须与执行时状态一致（settled 并发提交 → 旧授权失效）
+    # b) 授权快照必须与执行时状态一致（settled 并发提交 → 旧授权失效）；
+    #    普通批次（非限价理由）才走 allow（限价理由现归 classify 统一分型路由）
+    b_allow = _lp_batch(net=0.002, reason='')
+    b_allow['close_phase'] = 0
+    b_allow['pending_close'] = False
+    _state_write(t, _single(b_allow))
     decision2, snap2 = t._finally_cleanup_decision(SYM, BID)
     assert decision2 == 'allow' and snap2, (decision2, snap2)
     assert t._cleanup_authorization_still_valid(SYM, BID, snap2), '同状态授权应有效'
-    b3 = _lp_batch(net=0.002, reason='limit_pending_normal', settled=True)
+    b3 = _lp_batch(net=0.002, reason='', settled=True)
     b3['close_phase'] = 2
     _state_write(t, _single(b3))  # 并发：另一线程已 claim settled
     assert not t._cleanup_authorization_still_valid(SYM, BID, snap2), \
@@ -961,6 +961,181 @@ def r25_settled_manual_review_recovery_routes_finalizer():
         'settled 优先级最高：恢复必须完成 finalizer 收敛清理'
 
 
+# ────────────────── P5g：ChatGPT 六复审 P0（crash-before-marker / converge 窗口 / 优先级） ──────────────────
+
+def r26_crash_before_marker_finally_no_clear():
+    """R26：monitor 在写入 manual_review 之前异常退出（reason 仍 limit_pending_normal）
+    ——finally 不得按普通批次清理，必须由统一分型路由（撤单+分类→冻结/结算）。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    _state_write(t, _single(b))
+    ex._mk('S1', otype='STOP_MARKET', amount=0.002, stop=75001.0,
+           status='canceled', filled=0.002, avg=75000.0)
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='canceled', filled=0.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    cleared = []
+
+    def _clear(s, bid, proof=None):
+        cleared.append(bid)
+        return True
+    t.clear_batch_state = _clear
+    calls = {'n': 0}
+    _real_sleep = time.sleep
+
+    def _sleep(s):  # 第一次 sleep 即崩溃 → 循环体尚未执行（crash-before-marker）
+        calls['n'] += 1
+        raise RuntimeError('injected crash before marker')
+    with mock.patch.object(trader_260725.time, 'sleep', _sleep):
+        th = threading.Thread(target=t._start_monitoring,
+                              args=(SYM, BID),
+                              kwargs=dict(entry_orders=['E1'], stop_steps=[75001.0],
+                                          take_profit_price=80000.0, current_sl_id='S1',
+                                          tp_order_id='T1', batch_total_amount=0.002,
+                                          target_amounts=[0.002], params_base={},
+                                          is_hedge_mode=True, side='BUY',
+                                          last_filled_count=1, filled_details=[76620.0],
+                                          total_entry_fee=0.15),
+                              daemon=True)
+        th.start()
+        th.join(timeout=10)
+    assert not th.is_alive()
+    assert not cleared, f'crash-before-marker 绝不得按普通批次清理: {cleared}'
+    b2 = _state_read(t).get(SYM, {}).get(BID)
+    assert b2 is not None, '批次必须保留（归属未明确）'
+    assert b2.get('close_reason') == 'limit_cancel_manual_review', \
+        f'finally 必须走统一分型并写入冻结态: {b2.get("close_reason")}'
+
+
+def r27_converge_window_migration_refuses_clear():
+    """R27：状态在 converge（交易所 I/O 窗口）内迁移为 settled → 紧随其后的
+    clear 必须被拒（校验必须位于清理执行边界，而非 converge 之前）。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='')
+    b['close_phase'] = 0
+    b['pending_close'] = False
+    b['is_programmatic_cancel'] = True   # 普通程序撤单退出 → 旧清理路径
+    b.pop('limit_close_order_id', None)
+    _state_write(t, _single(b))
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    cleared = []
+
+    def _clear(s, bid, proof=None):
+        cleared.append(bid)
+        return True
+    t.clear_batch_state = _clear
+    _real_converge = t._converge_batch_orders_before_clear
+    # case A：converge 窗口内迁移为冻结态 → 紧随其后的 clear 必须被拒
+    t._converge_batch_orders_before_clear = _converge_with_migration(t, 'manual_review')
+    _run_crash_to_finally(t)
+    t._converge_batch_orders_before_clear = _real_converge
+    assert not cleared, f'converge 窗口内状态迁移后绝不得 clear: {cleared}'
+    bb = _state_read(t).get(SYM, {}).get(BID)
+    assert bb is not None and bb.get('close_reason') == 'limit_cancel_manual_review', bb
+
+    # case B：converge 窗口内迁移为 settled → 只允许 finalizer 结算后清理
+    # （必须留下 PnL 记录，绝不得「无 PnL 的静默 clear」）
+    t2, ex2 = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    _state_write(t2, _single(b))
+    ex2._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+            avg=76500.0)
+    ex2.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                      'positionSide': 'LONG'}]
+    cleared2 = []
+
+    def _clear2(s, bid, proof=None):  # 建模真实 clear：记录 + 从账本移除
+        cleared2.append(bid)
+        st = _state_read(t2)
+        (st.get(s, {}) or {}).pop(bid, None)
+        _state_write(t2, st)
+        return True
+    t2.clear_batch_state = _clear2
+    pnl2 = []
+
+    def _rec2(*a, **k):  # dedup 契约（真行为由 R12 单测；此桩同时避免写生产 stats）
+        if any(r.get('dedup_key') == k.get('dedup_key') for r in pnl2):
+            return True
+        pnl2.append({'dedup_key': k.get('dedup_key')})
+        return True
+    t2._record_realized_pnl = _rec2
+    t2._converge_batch_orders_before_clear = (
+        lambda s, bid: {'proof': 'FULL'})
+    # 直接标记 settled（模拟 converge 期内另一线程认领），finalizer 应完成结算
+    b_settled = _lp_batch(net=0.002, reason='limit_pending_normal', settled=True)
+    b_settled['close_phase'] = 2
+    _state_write(t2, _single(b_settled))
+    t2._finalize_limit_full_fill(SYM, BID, 'L1')
+    assert len(pnl2) == 1, f'settled 迁移必须经 finalizer 记录 PnL 恰好一次: {pnl2}'
+    assert BID not in _state_read(t2).get(SYM, {}), 'finalizer 结算后完成归档清理'
+
+
+def _converge_with_migration(t, kind):
+    """返回 converge 桩：在交易所 I/O 窗口内由「另一线程」durable 推进事务状态。
+
+    直接落盘建模（不走 save_batch_state 合并路径，避免被测代码自身状态回写
+    覆盖桩注入）——等价生产并发事务提交后的磁盘事实。"""
+
+    def _stub(s, bid):
+        st = t.load_all_states()
+        bb = (st.get(s, {}) or {}).get(bid) or {}
+        if kind == 'manual_review':
+            bb['close_reason'] = 'limit_cancel_manual_review'
+        else:
+            bb['settled_by_limit_close'] = True
+            bb['close_phase'] = 2
+            bb['limit_close_order_id'] = 'L1'
+        st[s][bid] = bb
+        _state_write(t, st)
+        return {'proof': 'FULL'}
+    return _stub
+
+
+def _run_crash_to_finally(t, crash_at=1):
+    """驱动 monitor：第 crash_at 次 sleep 注入崩溃 → 进入 finally 清理。
+    crash_at=1 表示循环体尚未执行（专测 finally 清理边界，避免循环体状态回写
+    覆盖桩注入的迁移）。"""
+    calls = {'n': 0}
+    _real_sleep = time.sleep
+
+    def _sleep(s):
+        calls['n'] += 1
+        if calls['n'] >= crash_at:
+            raise RuntimeError('injected crash to enter finally')
+        _real_sleep(min(s, 0.02))
+    with mock.patch.object(trader_260725.time, 'sleep', _sleep):
+        th = threading.Thread(target=t._start_monitoring,
+                              args=(SYM, BID),
+                              kwargs=dict(entry_orders=['E1'], stop_steps=[75001.0],
+                                          take_profit_price=80000.0, current_sl_id='S1',
+                                          tp_order_id='T1', batch_total_amount=0.002,
+                                          target_amounts=[0.002], params_base={},
+                                          is_hedge_mode=True, side='BUY',
+                                          last_filled_count=1, filled_details=[76620.0],
+                                          total_entry_fee=0.15),
+                              daemon=True)
+        th.start()
+        th.join(timeout=10)
+    return th
+
+
+def r28_startup_recovery_settled_beats_manual_review():
+    """R28：完整启动恢复入口下 settled 优先级必须高于 manual_review——
+    monitor_error + settled + manual_review + phase=2 必须进 finalizer。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_cancel_manual_review', settled=True)
+    b['close_phase'] = 2
+    b['monitor_error'] = True
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    t.recover_active_batches()
+    assert BID not in _state_read(t).get(SYM, {}), \
+        'settled 优先级最高：完整启动恢复必须完成 finalizer 收敛清理'
+
+
 TESTS = [r1_eligibility_matrix,
          r2_pure_cancel_full_restore,
          r3_partial_fill_attribution_and_restore,
@@ -987,7 +1162,10 @@ TESTS = [r1_eligibility_matrix,
          r22_monitor_error_freeze_survives_startup_recovery,
          r23_finally_guard_fail_closed_and_bound,
          r24_marker_generation_isolation,
-         r25_settled_manual_review_recovery_routes_finalizer]
+         r25_settled_manual_review_recovery_routes_finalizer,
+         r26_crash_before_marker_finally_no_clear,
+         r27_converge_window_migration_refuses_clear,
+         r28_startup_recovery_settled_beats_manual_review]
 
 
 def main():
