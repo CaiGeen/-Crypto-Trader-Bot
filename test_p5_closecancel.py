@@ -1136,6 +1136,110 @@ def r28_startup_recovery_settled_beats_manual_review():
         'settled 优先级最高：完整启动恢复必须完成 finalizer 收敛清理'
 
 
+# ────────────────── P5h：ChatGPT 七复审 P0（仓位证据/删除原子绑定/主监控所有权） ──────────────────
+
+def r29_nonzero_position_crash_no_zero_route():
+    """R29：仓位仍存在、限价单仍在途时主监控异常退出——finally 不得按「归零」
+    分型撤单并写入永久冻结（必须有方向感知的归零证据才可路由）。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    _state_write(t, _single(b))
+    ex._mk('S1', otype='STOP_MARKET', amount=0.002, stop=75001.0)
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='open', filled=0.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.002, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    cleared = []
+
+    def _clear(s, bid, proof=None, **k):
+        cleared.append(bid)
+        return True
+    t.clear_batch_state = _clear
+    _real_sleep = time.sleep
+
+    def _sleep(s):  # 首周期即崩溃 → 直接进入 finally
+        raise RuntimeError('injected crash')
+    with mock.patch.object(trader_260725.time, 'sleep', _sleep):
+        th = threading.Thread(target=t._start_monitoring,
+                              args=(SYM, BID),
+                              kwargs=dict(entry_orders=['E1'], stop_steps=[75001.0],
+                                          take_profit_price=80000.0, current_sl_id='S1',
+                                          tp_order_id='T1', batch_total_amount=0.002,
+                                          target_amounts=[0.002], params_base={},
+                                          is_hedge_mode=True, side='BUY',
+                                          last_filled_count=1, filled_details=[76620.0],
+                                          total_entry_fee=0.15),
+                              daemon=True)
+        th.start()
+        th.join(timeout=10)
+    assert not th.is_alive()
+    assert 'L1' not in ex.cancel_calls, f'非零持仓绝不得撤在途限价单: {ex.cancel_calls}'
+    b2 = _state_read(t).get(SYM, {}).get(BID)
+    assert b2 is not None and b2.get('close_reason') == 'limit_pending_normal', \
+        f'绝不得写入归零冻结态: {b2.get("close_reason") if b2 else None}'
+    assert not cleared, f'非零持仓绝不得清批: {cleared}'
+
+
+def r30_clear_authorization_atomic():
+    """R30：删除授权必须与删除在同一锁内原子绑定——校验返回后、删除取锁前
+    若状态迁移为 settled/manual_review，clear_batch_state 必须拒绝。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='')
+    b['close_phase'] = 0
+    b['pending_close'] = False
+    b['is_programmatic_cancel'] = True
+    b.pop('limit_close_order_id', None)
+    _state_write(t, _single(b))
+    snap = ('OP1', '', False, '')
+    # 授权与状态一致 → 允许清理（用真实 converge 取合法 proof）
+    _proof_ok = t._converge_batch_orders_before_clear(SYM, BID)
+    ok1 = t.clear_batch_state(SYM, BID, proof=_proof_ok, authorization=snap)
+    assert ok1 is True, '同状态授权应允许清理'
+    assert BID not in _state_read(t).get(SYM, {})
+
+    # 授权后、删除前状态迁移（settled/manual_review）→ 拒绝删除
+    for mutated, label in ((('OP1', 'limit_cancel_manual_review', False, ''),
+                            'manual_review'),
+                           (('OP1', 'limit_pending_normal', True, 'L1'), 'settled')):
+        t2, _ = make_trader(tempfile.mkdtemp(prefix='p5_'))
+        b2 = _lp_batch(net=0.002, reason='')
+        b2['close_phase'] = 0
+        b2['pending_close'] = False
+        b2['is_programmatic_cancel'] = True
+        b2.pop('limit_close_order_id', None)
+        _state_write(t2, _single(b2))
+        st = _state_read(t2)
+        bb = st[SYM][BID]
+        bb['close_reason'] = mutated[1]
+        bb['settled_by_limit_close'] = mutated[2]
+        bb['limit_close_order_id'] = mutated[3]
+        _state_write(t2, st)
+        _proof_ok2 = t2._converge_batch_orders_before_clear(SYM, BID)
+        ok2 = t2.clear_batch_state(SYM, BID, proof=_proof_ok2,
+                                   authorization=snap)
+        assert ok2 is False, f'{label} 迁移后必须拒绝删除'
+        assert BID in _state_read(t2).get(SYM, {}), f'{label} 迁移后批次必须保留'
+
+
+def r31_monitor_error_pending_keeps_main_monitor():
+    """R31：完整启动恢复 monitor_error + PENDING（限价在途、仓位仍在）→
+    必须重新接管并持有主监控所有权（限价监控退出后不得无人维护）。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    b['monitor_error'] = True
+    _state_write(t, _single(b))
+    ex._mk('S1', otype='STOP_MARKET', amount=0.002, stop=75001.0)
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='open', filled=0.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.002, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    t.recover_active_batches()
+    b2 = _state_read(t).get(SYM, {}).get(BID)
+    assert b2 is not None, 'PENDING 限价在途批次不得被清理'
+    assert BID in t._active_monitors, \
+        f'必须有主监控所有权（限价监控退出后仍需维护批次）: {t._active_monitors}'
+    # monitor_error 保留为崩溃证据；关键不变量是「不再因该标记被无条件清理」
+    # 且已重新获得主监控所有权（下轮重启幂等重复接管，不影响正确性）
+
+
 TESTS = [r1_eligibility_matrix,
          r2_pure_cancel_full_restore,
          r3_partial_fill_attribution_and_restore,
@@ -1165,7 +1269,10 @@ TESTS = [r1_eligibility_matrix,
          r25_settled_manual_review_recovery_routes_finalizer,
          r26_crash_before_marker_finally_no_clear,
          r27_converge_window_migration_refuses_clear,
-         r28_startup_recovery_settled_beats_manual_review]
+         r28_startup_recovery_settled_beats_manual_review,
+         r29_nonzero_position_crash_no_zero_route,
+         r30_clear_authorization_atomic,
+         r31_monitor_error_pending_keeps_main_monitor]
 
 
 def main():
