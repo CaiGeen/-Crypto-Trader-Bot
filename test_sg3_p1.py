@@ -240,7 +240,10 @@ def make_fake(states, open_orders):
     for _n in ('_final_pre_create_check', '_commit_protection_with_g3',
                '_g3a_converge_race_order', '_g3_cancel_race_order',
                '_g3_log_position_recheck', '_find_registry_identity_by_order_id',
-               '_verify_and_update_registry'):
+               '_verify_and_update_registry',
+               # P5f：finally 清理授权（返回二元组）——未绑定时 MagicMock 解包抛
+               # ValueError，驱动用例直接崩（同 _assert_create_allowed 坑）
+               '_finally_cleanup_decision', '_cleanup_authorization_still_valid'):
         if hasattr(CryptoTrader, _n):
             setattr(fake, _n,
                     (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(fake, *a, **k))())

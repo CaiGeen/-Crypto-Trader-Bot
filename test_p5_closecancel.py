@@ -835,7 +835,7 @@ def r20_manual_review_recovery_no_clear():
     i = src.find('交恢复分型（不清理）')
     assert i > 0, 'stale 清理分支未接线限价理由守卫'
     j = src.find('无挂单且无持仓，自动清理', i)
-    assert j > 0 and j - i < 4000, '限价理由守卫必须位于 stale 清理之前'
+    assert j > 0 and j - i < 6000, '限价理由守卫必须位于 stale 清理之前'
 
 
 def r21_canceled_full_fill_routes_finalizer():
@@ -875,6 +875,92 @@ def r21_canceled_full_fill_routes_finalizer():
         assert len(stats.get('trades', [])) == 1, stats
 
 
+# ────────────────── P5f：ChatGPT 五复审 P0（崩溃链路重启/守卫 fail-closed/代际隔离） ──────────────────
+
+def r22_monitor_error_freeze_survives_startup_recovery():
+    """R22：崩溃写入 monitor_error + manual_review 后，执行完整启动恢复
+    （recover_active_batches）——冻结批次绝不得被 monitor_error 分支静默清理。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_cancel_manual_review')
+    b['monitor_error'] = True          # R19 崩溃链路产物
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='canceled', filled=0.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    cleared = []
+
+    def _clear(s, bid, proof=None):
+        cleared.append(bid)
+        return True
+    t.clear_batch_state = _clear
+    t.recover_active_batches()
+    assert not cleared, f'启动恢复绝不得清理 manual_review 冻结批次: {cleared}'
+    b2 = _state_read(t).get(SYM, {}).get(BID)
+    assert b2 is not None and b2.get('close_reason') == 'limit_cancel_manual_review', b2
+
+
+def r23_finally_guard_fail_closed_and_bound():
+    """R23：finally 清理授权必须 fail-closed + 与当前状态绑定（TOCTOU）。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    _state_write(t, _single(b))
+    # a) 守卫读取异常 → 绝不授权清理（fail-closed，不得沿用旧 fail-open 默认）
+    _real_load = t.load_all_states
+    t.load_all_states = lambda: (_ for _ in ()).throw(RuntimeError('disk read fail'))
+    try:
+        decision, snap = t._finally_cleanup_decision(SYM, BID)
+    finally:
+        t.load_all_states = _real_load
+    assert decision == 'skip', f'守卫读取失败必须 fail-closed: {decision}'
+    # b) 授权快照必须与执行时状态一致（settled 并发提交 → 旧授权失效）
+    decision2, snap2 = t._finally_cleanup_decision(SYM, BID)
+    assert decision2 == 'allow' and snap2, (decision2, snap2)
+    assert t._cleanup_authorization_still_valid(SYM, BID, snap2), '同状态授权应有效'
+    b3 = _lp_batch(net=0.002, reason='limit_pending_normal', settled=True)
+    b3['close_phase'] = 2
+    _state_write(t, _single(b3))  # 并发：另一线程已 claim settled
+    assert not t._cleanup_authorization_still_valid(SYM, BID, snap2), \
+        '状态已迁移 → 旧授权必须失效（不得凭陈旧快照清理）'
+
+
+def r24_marker_generation_isolation():
+    """R24：manual-review CAS 必须绑定 op/order 代际并拒绝 settled：
+    OP1/L1 线程不得把 OP2/L2 标成冻结；settled 批次不得被改 reason。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, op='OP2', lfo='L2', reason='limit_pending_normal')
+    _state_write(t, _single(b))
+    ok, msg = t._mark_limit_cancel_manual_review(SYM, BID, close_op_id='OP1',
+                                                 order_id='L1')
+    assert not ok and 'generation' in msg, f'旧代际必须拒绝: {ok}/{msg}'
+    b2 = _state_read(t)[SYM][BID]
+    assert b2['close_reason'] == 'limit_pending_normal', b2['close_reason']
+    # settled 已认领 → 拒绝改 reason（结算优先级高于冻结）
+    b3 = _lp_batch(net=0.002, op='OP2', lfo='L2', reason='limit_pending_normal',
+                   settled=True)
+    b3['close_phase'] = 2
+    _state_write(t, _single(b3))
+    ok3, msg3 = t._mark_limit_cancel_manual_review(SYM, BID, close_op_id='OP2',
+                                                   order_id='L2')
+    assert not ok3, f'settled 批次不得被标记冻结: {ok3}/{msg3}'
+    assert _state_read(t)[SYM][BID]['close_reason'] == 'limit_pending_normal'
+
+
+def r25_settled_manual_review_recovery_routes_finalizer():
+    """R25：settled + manual_review + phase=2 → 恢复分发必须进 finalizer，
+    不得因 manual_review 优先判断而永久冻结（结算优先级）。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_cancel_manual_review', settled=True)
+    b['close_phase'] = 2
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    t._handle_limit_close_on_recovery(SYM, BID)
+    assert BID not in _state_read(t).get(SYM, {}), \
+        'settled 优先级最高：恢复必须完成 finalizer 收敛清理'
+
+
 TESTS = [r1_eligibility_matrix,
          r2_pure_cancel_full_restore,
          r3_partial_fill_attribution_and_restore,
@@ -897,7 +983,11 @@ TESTS = [r1_eligibility_matrix,
          r18b_sl_zeroed_partial_fill_no_silent_clear,
          r19_monitor_crash_freeze_survives_finally,
          r20_manual_review_recovery_no_clear,
-         r21_canceled_full_fill_routes_finalizer]
+         r21_canceled_full_fill_routes_finalizer,
+         r22_monitor_error_freeze_survives_startup_recovery,
+         r23_finally_guard_fail_closed_and_bound,
+         r24_marker_generation_isolation,
+         r25_settled_manual_review_recovery_routes_finalizer]
 
 
 def main():

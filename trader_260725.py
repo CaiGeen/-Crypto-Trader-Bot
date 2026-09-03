@@ -2197,7 +2197,33 @@ class CryptoTrader:
                     print(f"\n🔄 [状态恢复] 识别到未完成的历史活跃任务 [{batch_id}] ({symbol})，正在检查...")
 
                     # 🔥 检查是否有错误标记（之前监控线程崩溃）
+                    # 🔥 P5f（ChatGPT 五复审 P0-1）：monitor_error 分支位于所有守卫
+                    # 之前——冻结态/PnL 守卫批次不得经此被静默清理：
+                    #   manual_review → 保持冻结 + 告警；
+                    #   settled+phase2 → 路由 finalizer（PnL 门是唯一清批守卫）；
+                    #   限价事务在途 → 交恢复分型（FULL_FILL 结算 / 否则冻结）。
                     if b_data.get('monitor_error', False):
+                        _me_reason = (b_data.get('close_reason') or '')
+                        if _me_reason == 'limit_cancel_manual_review':
+                            print(f"  └─ 🧊 批次 [{batch_id}] 有错误标记但处于人工核对"
+                                  f"冻结（归属未明确），保留不清理")
+                            self.send_tg_notification(
+                                f"🚨【资金安全】批次 `{batch_id}` 监控异常退出且处于"
+                                f"人工核对冻结（限价撤单 + 仓位已被止损归零）。\n"
+                                f"💡 请核对交易所成交记录后人工处理（未被自动清理）。",
+                                level='critical')
+                            continue
+                        if b_data.get('settled_by_limit_close') \
+                                and b_data.get('limit_close_order_id'):
+                            self._finalize_limit_full_fill(
+                                symbol, batch_id, b_data['limit_close_order_id'])
+                            continue
+                        if _me_reason in ('limit_pending_normal',
+                                          'limit_cancel_restore_pending'):
+                            print(f"  └─ 🧊 批次 [{batch_id}] 有错误标记但限价平仓事务"
+                                  f"在途，交恢复分型（不清理）")
+                            self._handle_limit_close_on_recovery(symbol, batch_id)
+                            continue
                         print(f"  └─ ⚠️ 批次 [{batch_id}] 有错误标记，跳过恢复并清理")
                         stale_batches.append((symbol, batch_id))
                         continue
@@ -3182,6 +3208,12 @@ class CryptoTrader:
             op = b.get('close_op_id') or ''
             oid = b.get('limit_close_order_id') or ''
             reason = b.get('close_reason') or ''
+            # 🔥 P5f（ChatGPT 五复审 P0-3）：结算优先级最高——settled+phase=2
+            # 必须先走 finalizer 续跑，绝不能因 manual_review 判断在前而永久冻结
+            if b.get('settled_by_limit_close') and oid:
+                ok_s, msg_s = self._finalize_limit_full_fill(symbol, batch_id, oid)
+                print(f"  └─ {'✅' if ok_s else '⚠️'} [限价平仓恢复] 批次 [{batch_id}]: {msg_s}")
+                return
             # 🔥 P5e（ChatGPT 四复审 P0）：人工核对冻结态——只告警，不裁决不恢复
             if reason == 'limit_cancel_manual_review':
                 self.send_tg_notification(
@@ -3196,13 +3228,11 @@ class CryptoTrader:
             # 与主循环同款分型：FULL_FILL→finalizer；零/部分成交→原子写 manual_review
             if reason in ('limit_pending_normal', 'limit_cancel_restore_pending'):
                 try:
-                    _rec_pos = self._safe_api_call(self.exchange.fetch_positions, [symbol])
-                    _cur = 0.0
-                    for _p in _rec_pos or []:
-                        if _p.get('symbol') == symbol or \
-                                _p.get('info', {}).get('symbol') == symbol.replace('/', '').split(':')[0]:
-                            _cur = abs(float(_p.get('contracts', 0) or _p.get('positionAmt', 0)))
-                            break
+                    # 🔥 P5f：Hedge Mode 下同一 symbol 有 LONG/SHORT 双记录——
+                    # 必须按本批次 side 取方向感知净仓，不得取首个匹配（否则归零误判）
+                    _cur = self._get_current_position_amt(
+                        symbol, bool(b.get('is_hedge_mode', False)),
+                        b.get('side') or 'BUY')
                     if _cur == 0.0 and oid:
                         try:
                             self._safe_api_call(self.exchange.cancel_order, oid, symbol)
@@ -3220,7 +3250,8 @@ class CryptoTrader:
                             print(f"  └─ {'✅' if ok_ff else '⚠️'} [限价平仓恢复] "
                                   f"批次 [{batch_id}]: {msg_ff}")
                             return
-                        ok_mr, msg_mr = self._mark_limit_cancel_manual_review(symbol, batch_id)
+                        ok_mr, msg_mr = self._mark_limit_cancel_manual_review(
+                            symbol, batch_id, close_op_id=op, order_id=oid)
                         print(f"  └─ {'🧊' if ok_mr else '⚠️'} [限价平仓恢复] "
                               f"批次 [{batch_id}] 仓位已归零（filled={_fill0}）: {msg_mr}")
                         return
@@ -3751,15 +3782,63 @@ class CryptoTrader:
         return self._resize_protection_after_partial(symbol, batch_id, owner_op_id,
                                                      net_qty, adopt_matching_sl=True)
 
-    def _mark_limit_cancel_manual_review(self, symbol, batch_id):
-        """🔥 P5e（ChatGPT 四复审 P0）：SL 归零 × 限价撤单（零/部分成交）→
-        原子落盘人工核对冻结态。
+    def _finally_cleanup_decision(self, symbol, batch_id):
+        """🔥 P5f（ChatGPT 五复审 P0-2）：finally 清理授权（fail-closed + 状态绑定）。
+
+        返回 (decision, snapshot)：
+          'finalizer' settled（有订单 ID）→ 由 finalizer 独占清理生命周期；
+          'skip'     manual_review 冻结 / 批次已不存在 / **读取异常**——
+                     读失败绝不沿用旧 fail-open 默认（否则异常退出即旁路 PnL 门）；
+          'allow'    普通批次 → 允许旧的两段清理（执行前须二次校验 snapshot）。
+        snapshot=(close_op_id, close_reason, settled, limit_close_order_id)。"""
+        try:
+            with self._state_lock:
+                b = (self.load_all_states().get(symbol, {}) or {}).get(batch_id) or {}
+                if not isinstance(b, dict) or not b.get('is_active'):
+                    return 'skip', None
+                snap = (b.get('close_op_id') or '', b.get('close_reason') or '',
+                        bool(b.get('settled_by_limit_close')),
+                        b.get('limit_close_order_id') or '')
+                if snap[2] and snap[3]:
+                    return 'finalizer', snap
+                if snap[1] == 'limit_cancel_manual_review':
+                    return 'skip', snap
+                return 'allow', snap
+        except Exception as e:
+            print(f"  └─ ⚠️ [P5] finally 清理授权读取失败（fail-closed，不清理）: {e}")
+            return 'skip', None
+
+    def _cleanup_authorization_still_valid(self, symbol, batch_id, snapshot):
+        """清理执行前二次校验：授权快照必须与**当前**账本一致（TOCTOU 收口）。
+
+        授权后、clear 前若另一线程推进了 close 事务（settled/phase=2/reason
+        迁移），旧授权立即失效——清理不得凭陈旧判断执行（R23）。"""
+        if not snapshot:
+            return False
+        try:
+            with self._state_lock:
+                b = (self.load_all_states().get(symbol, {}) or {}).get(batch_id) or {}
+                if not isinstance(b, dict) or not b.get('is_active'):
+                    return False
+                cur = (b.get('close_op_id') or '', b.get('close_reason') or '',
+                       bool(b.get('settled_by_limit_close')),
+                       b.get('limit_close_order_id') or '')
+                return cur == tuple(snapshot)
+        except Exception:
+            return False
+
+    def _mark_limit_cancel_manual_review(self, symbol, batch_id,
+                                         close_op_id=None, order_id=None):
+        """🔥 P5e/P5f：SL 归零 × 限价撤单（零/部分成交）→ 原子落盘人工核对冻结态。
 
         专用 close_reason=limit_cancel_manual_review（不再伪装成普通
-        limit_pending_normal）——主循环、finally 两段清理、启动 stale 清理、
-        恢复分发四处统一识别：不恢复、不清理、只告警。
-        CAS 单向迁移：仅 limit_pending_normal / limit_cancel_restore_pending
-        可写入（防与 /closecancel 恢复链并发覆盖）。"""
+        limit_pending_normal）——主循环、finally 清理、启动 stale/monitor_error
+        清理、恢复分发统一识别：不恢复、不清理、只告警。
+        🔥 P5f（ChatGPT 五复审 P0-3）CAS 收紧：
+          - 代际隔离：close_op_id / limit_close_order_id 必须与调用方预期一致
+            （旧 L1/OP1 线程绝不能把新 L2/OP2 标成冻结）；
+          - 拒绝 settled（settled+phase=2 优先级最高 → finalizer 结算）；
+          - 仅 close_phase==1 可迁移（防与恢复链/新事务并发覆盖）。"""
         with self._state_lock:
             try:
                 latest = self.load_all_states()
@@ -3768,6 +3847,18 @@ class CryptoTrader:
             b = (latest.get(symbol, {}) or {}).get(batch_id)
             if not isinstance(b, dict) or not b.get('is_active'):
                 return False, 'batch_missing'
+            if close_op_id is not None \
+                    and str(b.get('close_op_id') or '') != str(close_op_id):
+                return False, ('generation_mismatch（op %s ≠ 当前事务 %s）'
+                               % (close_op_id, b.get('close_op_id')))
+            if order_id is not None \
+                    and str(b.get('limit_close_order_id') or '') != str(order_id):
+                return False, ('generation_mismatch（order %s ≠ 当前事务 %s）'
+                               % (order_id, b.get('limit_close_order_id')))
+            if b.get('settled_by_limit_close'):
+                return False, 'settled_already（结算优先，不得改冻结）'
+            if int(b.get('close_phase', 0) or 0) != 1:
+                return False, f'phase_mismatch（close_phase={b.get("close_phase")}）'
             if b.get('close_reason') not in ('limit_pending_normal',
                                              'limit_cancel_restore_pending'):
                 return False, f'not_markable（reason={b.get("close_reason")}）'
@@ -6465,7 +6556,9 @@ class CryptoTrader:
                             # 零成交/部分成交撤销 + 仓位已被 SL 归零：SL 成交归属在
                             # 聚合层不可知 → PnL/归属未明确，原子写入持久冻结态
                             _ok_m2, _msg_m2 = self._mark_limit_cancel_manual_review(
-                                symbol, batch_id)
+                                symbol, batch_id,
+                                close_op_id=latest_b_data.get('close_op_id'),
+                                order_id=_fid2)
                             print(f"  └─ {'🧊' if _ok_m2 else '⚠️'} [P5] 批次 {batch_id} "
                                   f"限价单撤零/部分成交（filled={_filled2}）+ 仓位归零: "
                                   f"{_msg_m2}")
@@ -7983,50 +8076,51 @@ class CryptoTrader:
             #      是 settled 批次清理的唯一守卫；无论成败，后续两段旧清理全部短路）；
             #   2) manual_review 冻结 → 不清理只告警（两段旧清理全部短路）。
             # 否则线程异常退出时，下方 pending_close 段会绕过 PnL 门静默 clear。
-            _skip_finally_cleanup = False
-            try:
-                _fin_b0 = (self.load_all_states().get(symbol, {}) or {}).get(batch_id) or {}
-                if _fin_b0.get('is_active'):
-                    if _fin_b0.get('settled_by_limit_close') \
-                            and _fin_b0.get('limit_close_order_id'):
-                        try:
-                            _ok_ff, _msg_ff = self._finalize_limit_full_fill(
-                                symbol, batch_id, _fin_b0['limit_close_order_id'])
-                            print(f"  └─ {'✅' if _ok_ff else '⚠️'} [P5 finalizer] "
-                                  f"finally 接管批次 {batch_id}: {_msg_ff}")
-                        except Exception as _ffe:
-                            print(f"  └─ ⚠️ [P5 finalizer] finally 接管异常: {_ffe}")
-                        _skip_finally_cleanup = True  # settled 生命周期归 finalizer 独占
-                    elif _fin_b0.get('close_reason') == 'limit_cancel_manual_review':
-                        print(f"  └─ 🧊 [P5] 批次 {batch_id} 人工核对冻结"
-                              f"（manual_review），finally 跳过清理")
-                        _skip_finally_cleanup = True
-            except Exception as _fge:
-                print(f"  └─ ⚠️ [P5] finally 前置守卫异常: {_fge}")
+            # 🔥 P5f（ChatGPT 五复审 P0-2）：fail-closed 授权 —— 读取异常/冻结态/
+            # settled 一律不授权旧清理；settled 由 finalizer 独占（成败都不清）。
+            _fin_decision, _fin_snap = self._finally_cleanup_decision(symbol, batch_id)
+            if _fin_decision == 'finalizer':
+                try:
+                    _ok_ff, _msg_ff = self._finalize_limit_full_fill(
+                        symbol, batch_id, _fin_snap[3])
+                    print(f"  └─ {'✅' if _ok_ff else '⚠️'} [P5 finalizer] "
+                          f"finally 接管批次 {batch_id}: {_msg_ff}")
+                except Exception as _ffe:
+                    print(f"  └─ ⚠️ [P5 finalizer] finally 接管异常: {_ffe}")
+            elif _fin_decision == 'skip' and _fin_snap \
+                    and _fin_snap[1] == 'limit_cancel_manual_review':
+                print(f"  └─ 🧊 [P5] 批次 {batch_id} 人工核对冻结"
+                      f"（manual_review），finally 跳过清理")
 
             # 清理程序撤单标记和批次状态（如果是程序撤单导致的退出）
-            if not _skip_finally_cleanup:
+            if _fin_decision == 'allow':
                 try:
                     all_states = self.load_all_states()
                     b_data = all_states.get(symbol, {}).get(batch_id, {})
                     if b_data:
                         # 如果是程序撤单或 pending_close 标记，清理批次
                         if b_data.get('is_programmatic_cancel') or b_data.get('pending_close'):
-                            # P0 Batch B：converge 证明后才 clear。v6.2-P0-2：finally 里加
-                            # 有限重试（3 次 × 2s）——撤单状态在交易所有传播短窗口，
-                            # 单次 UNKNOWN 不应直接把批次留成 close-in-flight。
-                            _proof = None
-                            for _attempt in range(3):
-                                _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
-                                if _proof is not None:
-                                    break
-                                if _attempt < 2:
-                                    time.sleep(2)
-                            if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
-                                print(f"  └─ 🧹 程序撤单，批次状态已清理（proof 收敛通过）")
+                            # 🔥 执行前二次校验：授权快照必须与当前账本一致（TOCTOU）
+                            if not self._cleanup_authorization_still_valid(
+                                    symbol, batch_id, _fin_snap):
+                                print(f"  └─ ⚠️ [P5] 批次 {batch_id} 状态已迁移，"
+                                      f"finally 清理授权失效（跳过清理）")
                             else:
-                                print(f"  └─ ⚠️ [B] 程序撤单批次 {batch_id} 本轮未收敛"
-                                      f"（UNKNOWN/撤单失败），保留状态待重启恢复重试")
+                                # P0 Batch B：converge 证明后才 clear。v6.2-P0-2：finally 里加
+                                # 有限重试（3 次 × 2s）——撤单状态在交易所有传播短窗口，
+                                # 单次 UNKNOWN 不应直接把批次留成 close-in-flight。
+                                _proof = None
+                                for _attempt in range(3):
+                                    _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+                                    if _proof is not None:
+                                        break
+                                    if _attempt < 2:
+                                        time.sleep(2)
+                                if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+                                    print(f"  └─ 🧹 程序撤单，批次状态已清理（proof 收敛通过）")
+                                else:
+                                    print(f"  └─ ⚠️ [B] 程序撤单批次 {batch_id} 本轮未收敛"
+                                          f"（UNKNOWN/撤单失败），保留状态待重启恢复重试")
                 except Exception as e:
                     print(f"  └─ ⚠️ 清理程序撤单标记失败: {e}")
 
@@ -8035,7 +8129,14 @@ class CryptoTrader:
             # 时，兜底 census 与清理全部无意义 → 直接跳过（零 API 收尾）。
             _fin_all = self.load_all_states()
             _fin_b = _fin_all.get(symbol, {}).get(batch_id, {})
-            if not _skip_finally_cleanup and isinstance(_fin_b, dict) and _fin_b.get('is_active'):
+            # 🔥 第二段清理同样二次校验（授权后状态可能已迁移）
+            _fin_authorized = (_fin_decision == 'allow'
+                               and self._cleanup_authorization_still_valid(
+                                   symbol, batch_id, _fin_snap))
+            if _fin_decision == 'allow' and not _fin_authorized:
+                print(f"  └─ ⚠️ [P5] 批次 {batch_id} 状态已迁移，"
+                      f"finally 持仓归零清理授权失效（跳过清理）")
+            if _fin_authorized and isinstance(_fin_b, dict) and _fin_b.get('is_active'):
                 try:
                     positions = self._safe_api_call(self.exchange.fetch_positions, [symbol])
                     current_pos = 0.0
