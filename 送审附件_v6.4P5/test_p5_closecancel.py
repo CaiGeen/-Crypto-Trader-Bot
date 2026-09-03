@@ -557,6 +557,115 @@ def r12_pnl_dedup_unit():
     assert len(stats['trades']) == 1, stats
 
 
+# ────────────────── P5c：ChatGPT 二复审 3 P0（端到端闭环） ──────────────────
+
+def r15_tp_confirmed_stage_crash_resume():
+    """R15：TP 新代已 CONFIRMED、stage=2 未提交时崩溃 → 重启续跑必须
+    already_rearmed + CONFIRMED 收编 → 恢复 ACTIVE，绝不 tp_rearm_failed 冻结。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, reason='limit_cancel_restore_pending')
+    b['partial_resize_stage'] = 1                      # SL 腿已 durable
+    b['current_sl_id'] = 'S2'                          # SL 已收编
+    b['protection_registry'][f'{BID}|SL|L0|LONG'] = {
+        'state': 'CONFIRMED', 'order_id': 'S2',
+        'intent': {'qty': 0.002, 'stop_price': '75001.0'}}
+    # re-arm 已 pop 旧 TP 条目 + 审计在册；新代 TP 已 CONFIRMED（T2），stage 未提交
+    b['protection_registry'].pop(f'{BID}|TP|L0|LONG', None)
+    b['rearm_audit'] = [{'op': OP, 'identity': f'{BID}|TP|L0|LONG',
+                         'prev_state': 'PROGRAMMATIC_CANCELED', 'prev_order_id': 'T1'}]
+    b['protection_registry'][f'{BID}|TP|L0|LONG'] = {
+        'state': 'CONFIRMED', 'order_id': 'T2',
+        'intent': {'qty': 0.002, 'stop_price': '80000.0'}}
+    _state_write(t, _single(b))
+    ex._mk('S2', otype='STOP_MARKET', amount=0.002, stop=75001.0)
+    ex._mk('T2', otype='TAKE_PROFIT_MARKET', amount=0.002, stop=80000.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.002, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    ok, msg = t._resume_partial_resize(SYM, BID, OP)
+    assert ok, f'CONFIRMED→stage 崩溃断点必须续跑成功: {msg}'
+    b2 = _state_read(t)[SYM][BID]
+    assert b2['close_phase'] == 0 and b2.get('tp_order_id') == 'T2', b2
+    assert not any(ct[0] == 'TAKE_PROFIT_MARKET' for ct in ex.create_calls), \
+        'TP 已 CONFIRMED 必须收编，绝不能重发 create'
+
+
+def r16_pnl_gate_monitor_no_bypass_clear():
+    """R16：PnL 落盘失败后，主监控的 settled 归零分支绝不能自行 converge+clear
+    （端到端：整个系统不得绕过 PnL 门清批次）。真线程 + 真 trader 行为测试。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, settled=True, reason='limit_pending_normal')
+    b['close_phase'] = 2
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    t._record_realized_pnl = lambda *a, **k: False  # PnL 持续落盘失败
+    cleared = []
+
+    def _clear(s, bid, proof=None):
+        cleared.append(bid)
+        return True
+    t.clear_batch_state = _clear
+    th = threading.Thread(target=t._start_monitoring,
+                          args=(SYM, BID),
+                          kwargs=dict(entry_orders=['E1'], stop_steps=[75001.0],
+                                      take_profit_price=80000.0, current_sl_id='S1',
+                                      tp_order_id='T1', batch_total_amount=0.002,
+                                      target_amounts=[0.002], params_base={},
+                                      is_hedge_mode=True, side='BUY',
+                                      last_filled_count=1, filled_details=[76620.0],
+                                      total_entry_fee=0.15),
+                          daemon=True)
+    th.start()
+    dl = time.time() + 4
+    while time.time() < dl and len(cleared) == 0 and th.is_alive():
+        time.sleep(0.05)
+    assert not cleared, f'PnL 门生效期间主监控绝不得 clear 批次: {cleared}'
+    b2 = _state_read(t)[SYM][BID]
+    assert b2['close_phase'] == 2 and b2.get('settled_by_limit_close'), \
+        '批次必须保持 phase=2 等待续跑'
+    # 结构断言：settled 分支路由 finalizer，禁止直连 converge/clear
+    src = open(r'G:\my-crypto-bot\trader_260725.py', encoding='utf-8').read()
+    i = src.find("latest_b_data.get('settled_by_limit_close', False)")
+    assert i > 0
+    seg = src[i:i + 900]
+    assert '_finalize_limit_full_fill' in seg, 'settled 分支必须路由共享 finalizer'
+    assert 'clear_batch_state' not in seg, 'settled 分支禁止自行 clear（旁路）'
+
+
+def r17_monitor_fail_command_takeover():
+    """R17：monitor finalizer 失败退出后，/closecancel 在 settled+phase=2 必须
+    接管 finalizer（不得 already_settled 拒绝）；monitor 结构上必须对可重试
+    失败继续轮询（不得无条件 break）；运行期自愈必须调度 phase=2 finalizer。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
+    b = _lp_batch(net=0.002, settled=True, reason='limit_pending_normal')
+    b['close_phase'] = 2
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    ok, msg = t._submit_closecancel(SYM, BID)
+    assert ok, f'settled+phase=2 必须接管 finalizer: {msg}'
+    b2 = _state_read(t)
+    assert BID not in b2.get(SYM, {}), '接管后必须完成 converge+clear'
+    # monitor 结构断言：finalizer 失败继续轮询，不得无条件 break
+    src = open(r'G:\my-crypto-bot\trader_260725.py', encoding='utf-8').read()
+    i = src.find('🔥 P5c（ChatGPT 二复审 Blocker 3）：必须检查返回值')
+    assert i > 0, 'monitor full-fill 分支未接线返回值检查'
+    seg = src[i:i + 500]
+    assert '_ok_f' in seg, 'monitor 必须检查 finalizer 返回值'
+    assert 'continue' in seg, 'monitor 对 finalizer 失败必须继续轮询'
+    # 运行期自愈调度 phase=2 finalizer（结构断言：经 _maybe_runtime_finalize_limit）
+    j = src.find('🧊 [P0 冻结]')
+    assert j > 0
+    k = src.find('continue', j)
+    seg2 = src[j:k]
+    assert 'settled_by_limit_close' in seg2 and '_maybe_runtime_finalize_limit' in seg2, \
+        '运行期自愈必须调度 phase=2 finalizer 接管'
+
+
 TESTS = [r1_eligibility_matrix,
          r2_pure_cancel_full_restore,
          r3_partial_fill_attribution_and_restore,
@@ -571,7 +680,10 @@ TESTS = [r1_eligibility_matrix,
          r11_flags_clean_after_restore,
          r12_pnl_dedup_unit,
          r13_generation_isolation,
-         r14_pnl_persist_failure_keeps_phase2]
+         r14_pnl_persist_failure_keeps_phase2,
+         r15_tp_confirmed_stage_crash_resume,
+         r16_pnl_gate_monitor_no_bypass_clear,
+         r17_monitor_fail_command_takeover]
 
 
 def main():

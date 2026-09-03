@@ -3614,6 +3614,14 @@ class CryptoTrader:
             pos_side = 'LONG' if side == 'BUY' else 'SHORT'
             lfc = int(b.get('last_filled_count', 0) or 0)
             identity = self._protection_identity(batch_id, 'TP', max(lfc - 1, 0), pos_side)
+            # 🔥 P5c（ChatGPT 二复审 Blocker 1，P0）：crash 幂等前置——本 op 已
+            # re-arm（审计在册）→ 无论条目缺失（pop 后崩溃）还是新代已进入
+            # PENDING_CREATE/CONFIRMED（create 后、stage commit 前崩溃），一律幂等
+            # 放行续跑；新代 CONFIRMED 由恢复链的收编路径接管（绝不重发 create）
+            for _aud in b.get('rearm_audit') or []:
+                if _aud.get('op') == (close_op_id or '') \
+                        and _aud.get('identity') == identity:
+                    return True, 'already_rearmed'
             entry = (b.get('protection_registry') or {}).get(identity) or {}
             if entry.get('state') == 'PROGRAMMATIC_CANCELED' \
                     and entry.get('terminated_reason') == 'close_requested_canceled':
@@ -3627,12 +3635,6 @@ class CryptoTrader:
                 if not self._persist_states(latest):
                     return False, 'persist_failed'
                 return True, 'rearmed'
-            # crash 幂等：本 op 已 re-arm（条目已移除）→ 审计留痕为证，放行续跑
-            if not entry:
-                for _aud in b.get('rearm_audit') or []:
-                    if _aud.get('op') == (close_op_id or '') \
-                            and _aud.get('identity') == identity:
-                        return True, 'already_rearmed'
             return False, f'rearm_conditions_not_met（state={entry.get("state")}）'
 
     def _commit_closecancel_attribution(self, symbol, batch_id, close_op_id,
@@ -3764,6 +3766,17 @@ class CryptoTrader:
         if not b.get('close_op_id'):
             return False, 'no_close_inflight（该批次没有在途平仓事务）'
         if b.get('settled_by_limit_close'):
+            # 🔥 P5c（ChatGPT 二复审 Blocker 3）：settled + close_phase=2 = finalizer
+            # 已认领但未完成（PnL 门/converge 断点）→ 命令接管共享 finalizer 续跑
+            # （CAS 只确认事实不授独占权——任何调用方都可幂等续跑，PnL dedup 防双记）
+            if int(b.get('close_phase', 0) or 0) == 2 and b.get('limit_close_order_id'):
+                if not self._try_acquire_resize_inflight(batch_id):
+                    return False, 'closecancel_inflight（已有撤销/恢复在途）'
+                try:
+                    return self._finalize_limit_full_fill(
+                        symbol, batch_id, b['limit_close_order_id'])
+                finally:
+                    self._release_resize_inflight(batch_id)
             return False, 'already_settled（限价平仓已成交结算，不可撤销）'
         if int(b.get('close_phase', 0) or 0) == 0 and not b.get('pending_close'):
             return False, 'no_close_inflight（批次处于 ACTIVE，无在途平仓事务）'
@@ -4013,6 +4026,50 @@ class CryptoTrader:
                 f"🚨【资金安全】批次 `{batch_id}` partial resize 连续 3 轮续跑失败\n"
                 f"💡 最近原因: {msg_r}\n"
                 f"批次保持冻结并将继续自动重试；请核对实际仓位与挂单。",
+                level='critical')
+        self._partial_resume_state[batch_id] = _prs
+
+    def _maybe_runtime_finalize_limit(self, symbol, batch_id, close_op_id):
+        """🔥 P5c（ChatGPT 二复审 Blocker 3）：monitor 冻结分支的 phase=2 finalizer
+        运行期接管调度（60s 节流，与 partial 自愈共用状态簿记）。
+
+        settled_by_limit_close=True + close_phase=2 = finalizer 已认领未完成
+        （PnL 落盘门/converge 断点）→ 定期接管续跑（dedup 防双记）；
+        不再依赖重启才有恢复链。失败静默下轮重试（finalizer 自身幂等）。"""
+        _prs = dict(self._partial_resume_state.get(batch_id) or {})
+        if _prs.get('op') != (close_op_id or ''):
+            self._partial_resume_state[batch_id] = {'ts': time.time(), 'fails': 0,
+                                                    'op': close_op_id or ''}
+            return
+        if _prs.get('halted') or time.time() - _prs['ts'] < 60:
+            return
+        _prs['ts'] = time.time()
+        with self._state_lock:
+            b = (self.load_all_states().get(symbol, {}) or {}).get(batch_id) or {}
+            order_id = str(b.get('limit_close_order_id') or '')
+        if not order_id:
+            return
+        if self._try_acquire_resize_inflight(batch_id):
+            try:
+                ok_r, msg_r = self._finalize_limit_full_fill(symbol, batch_id, order_id)
+            finally:
+                self._release_resize_inflight(batch_id)
+        else:
+            ok_r, msg_r = False, 'resize_inflight'
+        if ok_r:
+            self._partial_resume_state.pop(batch_id, None)
+            print(f"  └─ ✅ [限价结算接管] 批次 {batch_id}: {msg_r}")
+            return
+        if msg_r == 'resize_inflight':
+            self._partial_resume_state[batch_id] = _prs
+            return
+        _prs['fails'] = int(_prs.get('fails', 0) or 0) + 1
+        print(f"  └─ ⏳ [限价结算接管] 批次 {batch_id} 本轮未完成: {msg_r}")
+        if _prs['fails'] == 3:
+            self.send_tg_notification(
+                f"🚨【资金安全】批次 `{batch_id}` 限价平仓结算连续 3 轮接管失败\n"
+                f"💡 最近原因: {msg_r}\n"
+                f"批次保持 phase=2 并将继续自动重试；请核对实际仓位与挂单。",
                 level='critical')
         self._partial_resume_state[batch_id] = _prs
 
@@ -6246,15 +6303,48 @@ class CryptoTrader:
                             print(f"  └─ ⏸️ [生命周期] 账本 UNKNOWN（损坏），本轮跳过归零结算")
                             continue
 
-                        # 🔥 如果已被限价平仓监控处理，跳过重复结算
+                        # 🔥 P5c（ChatGPT 二复审 Blocker 2，P0）：已被限价平仓 finalizer
+                        # 认领（settled=True）→ 统一路由共享 finalizer 接管续跑，
+                        # **禁止本分支自行 converge+clear**——finalizer 的 PnL 落盘门
+                        # 是批次清理的唯一守卫，旁路 clear 会永久丢失成交记录。
+                        # finalizer 可重试失败 → 保持 phase=2 下轮重试（dedup 防双记）。
                         if latest_b_data.get('settled_by_limit_close', False):
-                            print(f"ℹ️ [限价平仓已处理] 批次 [{batch_id}] 跳过重复结算")
-                            self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
-                            # P0 Batch B：converge 证明后才 clear；未收敛不 break，下轮重试
-                            _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
-                            if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
-                                break
-                            print(f"  └─ ⚠️ [B] 批次 {batch_id} 本轮未收敛（UNKNOWN/撤单失败），保留待下轮重试")
+                            _fid = (latest_b_data.get('limit_close_order_id') or '')
+                            if _fid:
+                                _ok_f, _msg_f = self._finalize_limit_full_fill(
+                                    symbol, batch_id, _fid)
+                                if _ok_f:
+                                    break
+                                print(f"  └─ ⚠️ [P5 finalizer] 批次 {batch_id} "
+                                      f"本轮未完成（{_msg_f}），保持 phase=2 下轮重试")
+                                continue
+                            print(f"🚨【资金安全】批次 `{batch_id}` settled=True 但"
+                                  f"限价订单 ID 缺失（异常态），已拒绝自行清理，请人工核对。")
+                            continue
+
+                        # 🔥 P5c（同 Blocker 2）：限价平仓事务在途（未 settled）而仓位
+                        # 已归零（如 SL 窗口触发）——在途限价单若不撤，价格回落可能
+                        # 对零仓位开反向仓。撤单（-2011 幂等）→ 共享四态裁决
+                        # （FULL_FILL→finalizer / 取消→恢复），禁止自行 clear。
+                        if (latest_b_data.get('close_reason') == 'limit_pending_normal'
+                                and latest_b_data.get('limit_close_order_id')):
+                            _fid2 = latest_b_data['limit_close_order_id']
+                            try:
+                                self._safe_api_call(self.exchange.cancel_order, _fid2,
+                                                    symbol)
+                            except Exception as _ce:
+                                if '-2011' not in str(_ce) \
+                                        and 'Unknown order' not in str(_ce):
+                                    print(f"  └─ ⚠️ [P5] 撤在途限价单失败: {_ce}，下轮重试")
+                                    continue
+                            try:
+                                _ok_a2, _msg_a2 = self._adjudicate_closed_limit_close(
+                                    symbol, batch_id, _fid2)
+                                print(f"  └─ {'✅' if _ok_a2 else '⚠️'} "
+                                      f"[P5 裁决] 批次 {batch_id}: {_msg_a2}")
+                            except Exception as _ae:
+                                print(f"  └─ ⚠️ [P5 裁决] 异常: {_ae}")
+                            continue
 
                         # 🔥 如果是程序平仓，跳过结算
                         if latest_b_data.get('pending_close', False) or latest_b_data.get('is_programmatic_cancel',
@@ -6682,6 +6772,14 @@ class CryptoTrader:
                     if _b_close_phase == 1 and _close_reason in (
                             'partial_resize_pending', 'limit_cancel_restore_pending'):
                         self._maybe_runtime_resume_partial(
+                            symbol, batch_id,
+                            (latest_b_data or {}).get('close_op_id'))
+                    # 🔥 P5c（ChatGPT 二复审 Blocker 3）：phase=2 finalizer 运行期接管
+                    # （settled 已认领未完成 → 60s 节流定期续跑，不再依赖重启）
+                    elif _b_close_phase == 2 \
+                            and (latest_b_data or {}).get('settled_by_limit_close') \
+                            and (latest_b_data or {}).get('limit_close_order_id'):
+                        self._maybe_runtime_finalize_limit(
                             symbol, batch_id,
                             (latest_b_data or {}).get('close_op_id'))
                     continue
@@ -10629,8 +10727,15 @@ class CryptoTrader:
                 if status == 'closed' or status == 'filled':
                     # 🔥 P5：FULL_FILL 共享幂等 finalizer（与 /closecancel 命令共用；
                     # CAS 认领 + PnL 按订单去重 + converge + clear，接管语义见函数 docstring）
-                    self._finalize_limit_full_fill(symbol, batch_id, order_id, order=order)
-                    break
+                    # 🔥 P5c（ChatGPT 二复审 Blocker 3）：必须检查返回值——可重试失败
+                    # （PnL 落盘失败/订单查询失败）保持轮询接管，绝不无条件 break
+                    _ok_f, _msg_f = self._finalize_limit_full_fill(
+                        symbol, batch_id, order_id, order=order)
+                    if _ok_f:
+                        break
+                    print(f"  └─ ⚠️ [限价平仓监控] finalizer 未完成（{_msg_f}），"
+                          f"保持轮询接管")
+                    continue
 
                 elif status == 'canceled' or status == 'expired':
                     # 🔥 P5（R8 本源缺陷闭环）：外部取消不再只清字段——进入共享
