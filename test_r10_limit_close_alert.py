@@ -55,6 +55,12 @@ def make_fake(states, tg_raises=False, pnl_raises=False):
         return None
 
     fake._record_realized_pnl = _pnl
+    if pnl_raises:
+        # 🔥 P5：结算段已抽取进共享 finalizer（_finalize_limit_full_fill）——
+        # MagicMock 默认会吞掉该调用，注入点必须显式落到 finalizer 才能验证
+        # 「monitor 异常退出 → critical TG（含 batch/order）」这一不变量。
+        fake._finalize_limit_full_fill = lambda *a, **k: (
+            _ for _ in ()).throw(RuntimeError("模拟结算内部异常"))
     fake._notify_snapshot = lambda *a, **k: None
     return fake
 

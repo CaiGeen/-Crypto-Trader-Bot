@@ -1688,6 +1688,63 @@ async def partial_close_command(update: Update, context: ContextTypes.DEFAULT_TY
     await safe_reply(update, result[1], parse_mode='Markdown')
 
 
+async def closecancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🔥 v6.4-P5：/closecancel <BatchID>——撤销在途限价平仓单并恢复批次控制权。
+
+    解决实盘缺口：限价平仓挂单长期不成交时，same_side_close_inflight 使程序
+    无法再发起任何平仓（含市价）→ 用户失去退出方式，只能 App 手动平（连锁触发
+    守恒告警 + 孤儿单）。撤销后批次恢复 ACTIVE，用户可自由选择再次平仓方式。
+    四态裁决：纯取消/部分成交→恢复保护单；已成交→共享 finalizer 结算；
+    不可证明→Fail-Closed 保持冻结 + critical。"""
+    if not is_authorized(update.effective_user.id):
+        await safe_reply(update, "🚫 未授权的访问！")
+        return
+
+    trader = context.bot_data.get('global_trader')
+    if trader is None:
+        await safe_reply(update, "❌ 交易引擎尚未初始化，请稍后再试。")
+        return
+
+    args = context.args
+    if len(args) < 1:
+        await safe_reply(
+            update,
+            "❌ 格式错误！正确格式：`/closecancel <BatchID>`\n"
+            "💡 用于撤销在途限价平仓单（close_reason=limit_pending_normal 的批次）。",
+            parse_mode='Markdown')
+        return
+
+    batch_id = args[0]
+    all_states = trader.load_all_states()
+    target_symbol = None
+    for symbol, symbol_batches in all_states.items():
+        if batch_id in symbol_batches and symbol_batches[batch_id].get('is_active'):
+            target_symbol = symbol
+            break
+
+    if target_symbol is None:
+        await safe_reply(update, f"❌ 未找到活跃批次 `{batch_id}`", parse_mode='Markdown')
+        return
+
+    loop = asyncio.get_running_loop()
+    ok, msg = await loop.run_in_executor(
+        None, trader._submit_closecancel, target_symbol, batch_id)
+    if ok:
+        await safe_reply(
+            update,
+            f"✅ **限价平仓已撤销，批次恢复 ACTIVE**\n"
+            f"🆔 批次：`{batch_id}`\n"
+            f"💡 {msg}",
+            parse_mode='Markdown')
+    else:
+        await safe_reply(
+            update,
+            f"⚠️ **撤销未生效（未发出任何订单）**\n"
+            f"🆔 批次：`{batch_id}`\n"
+            f"💡 {msg}",
+            parse_mode='Markdown')
+
+
 async def _show_close_options(update: Update, context: ContextTypes.DEFAULT_TYPE, batch_id: str):
     trader = context.bot_data.get('global_trader')
     if trader is None:
@@ -2804,6 +2861,7 @@ def main():
     app.add_handler(CommandHandler("be", be_command))
     app.add_handler(CommandHandler("close", close_command))
     app.add_handler(CommandHandler("partial", partial_close_command))  # 🔥 v6.4-P0
+    app.add_handler(CommandHandler("closecancel", closecancel_command))  # 🔥 v6.4-P5
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("force", force_command))
     # 🔥 D-010 B1：AUTH_BLOCKED 人工解除命令（BLIND-SAFE 恢复链唯一命令入口）

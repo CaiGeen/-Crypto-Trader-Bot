@@ -218,7 +218,11 @@ def make_fake_b(env, ex):
              # P0 Batch B 新 helper（RED 阶段缺失 → MagicMock → FAIL，即 RED 信号）
              '_converge_batch_orders_before_clear', '_converge_cancel_order',
              '_get_amount_precision', '_batch_has_active_exposure',
-             '_verify_clear_proof', '_converge_alert')
+             '_verify_clear_proof', '_converge_alert',
+             # 🔥 P5：FULL_FILL 共享 finalizer（结算段已从 monitor 抽到该函数；
+             # 未绑定 → MagicMock 静默吞掉 → 撤 TP/clear 全不发生，测试假红）
+             '_finalize_limit_full_fill', '_claim_settlement_reported',
+             '_batch_net_position', '_notify_snapshot')
     for _n in _bind:
         if hasattr(CryptoTrader, _n):
             setattr(fake, _n, (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(
@@ -298,14 +302,18 @@ def t_b0_settle_tp():
             _, err = _call('_monitor_limit_close', fake, SYMBOL, BATCH, 'lc1',
                            0.002, 85000.0, 0.5, 'BUY', 1, [0.002], [85000.0])
         # R-B1：结算后本批次 TP 残单必须 = 0（现状只撤 SL → RED）
+        # 🔥 P5 契约更新：FULL_FILL 由共享 finalizer 直接 converge+clear（替代
+        # 「不调 clear、留给主循环 finally」旧契约），故 registry 终态证据改查墓碑
         ok1 = err is None and 'tp1' not in ex.orders and 'sl1' not in ex.orders
-        reg = env.load_state().get(SYMBOL, {}).get(BATCH, {}).get('protection_registry', {})
-        tp_ent = reg.get(IDENT_TP, {})
-        ok2 = tp_ent.get('state') == 'PROGRAMMATIC_CANCELED' and \
-            tp_ent.get('terminated_reason') == 'close_settled_canceled_tp'
-        report("R-B1/B0结算撤TP+终态(reason=close_settled_canceled_tp)", ok1 and ok2,
-               f"(err={err}, tp_open={'tp1' in ex.orders}, tp_reg={tp_ent.get('state')}"
-               f"/{tp_ent.get('terminated_reason')})")
+        tomb = env.load_tomb() or {}
+        conv = []
+        for v in (tomb.values() if isinstance(tomb, dict) else tomb):
+            conv = list((v or {}).get('converged_order_ids') or [])
+            if conv:
+                break
+        ok2 = ('tp1' in conv and 'sl1' in conv)
+        report("R-B1/B0结算撤TP+终态(墓碑收敛证据)", ok1 and ok2,
+               f"(err={err}, tp_open={'tp1' in ex.orders}, 收敛={conv})")
 
         # G-B2 幂等：TP 已不在交易所（-2011）→ 视为事实终态，零 critical
         env2_ok = True
@@ -319,13 +327,16 @@ def t_b0_settle_tp():
             with mock.patch('trader_260725.time.sleep', lambda s: None):
                 _, err2 = _call('_monitor_limit_close', fake2, SYMBOL, BATCH, 'lc2',
                                 0.002, 85000.0, 0.5, 'BUY', 1, [0.002], [85000.0])
-            reg2 = env2.load_state().get(SYMBOL, {}).get(BATCH, {}).get(
-                'protection_registry', {}).get(IDENT_TP, {})
-            env2_ok = (err2 is None and reg2.get('state') == 'PROGRAMMATIC_CANCELED'
-                       and reg2.get('terminated_reason') == 'close_settled_canceled_tp'
-                       and not _crits(fake2))
+            # 🔥 P5 契约更新：finalizer 收敛后状态已清理 → -2011 幂等证据改查墓碑收敛串
+            tomb2 = env2.load_tomb() or {}
+            conv2 = []
+            for v in (tomb2.values() if isinstance(tomb2, dict) else tomb2):
+                conv2 = list((v or {}).get('converged_order_ids') or [])
+                if conv2:
+                    break
+            env2_ok = (err2 is None and 'tp1' in conv2 and not _crits(fake2))
             report("G-B2/B0幂等(-2011=事实终态,零critical)", env2_ok,
-                   f"(err={err2}, tp_reg={reg2.get('state')}, crit={len(_crits(fake2))})")
+                   f"(err={err2}, 收敛={conv2}, crit={len(_crits(fake2))})")
 
 
 # =====================================================================
@@ -667,26 +678,49 @@ def t_g_b1_full_lifecycle():
                 IDENT_TP: _reg(state='CONFIRMED', order_id='tp1', role='TP'),
             })}})
         fake = make_fake_b(env, ex)
+        # 🔥 P5 契约更新：FULL_FILL 由共享 finalizer 直接完成
+        # B0 撤 TP/SL → converge 证明 → clear → 墓碑（旧契约「留给主循环 finally」
+        # 已被 P5 finalizer 取代）。此处验证：
+        #   ① monitor 驱动的完整生命周期（converge+clear+墓碑一次到位）
+        #   ② 手工链（未结算态）converge→proof→clear 仍可用（幂等路径不回归）
         with mock.patch('trader_260725.time.sleep', lambda s: None):
             _call('_monitor_limit_close', fake, SYMBOL, BATCH, 'lc1',
                   0.002, 85000.0, 0.5, 'BUY', 1, [0.002], [85000.0])
-        # B0 已撤 TP/SL → converge 证明 → clear
-        proof, err = _call('_converge_batch_orders_before_clear', fake, SYMBOL, BATCH)
-        cleared = None
-        if isinstance(proof, dict):
-            cleared, _ = _call('clear_batch_state', fake, SYMBOL, BATCH, proof=proof)
         tomb = env.load_tomb().get(BATCH, {})
-        ok = (err is None and isinstance(proof, dict)
-              and proof.get('scope') == 'FULL'
-              and 'sl1' in proof.get('state_ids_resolved', [])
-              and 'tp1' in proof.get('state_ids_resolved', [])
-              and cleared is True and BATCH not in env.load_state().get(SYMBOL, {})
-              and not any(o for o in ex.orders.values())
-              and tomb.get('close_phase') == 3
-              and sorted(tomb.get('converged_order_ids') or []) == ['sl1', 'tp1'])
+        ok1 = (BATCH not in env.load_state().get(SYMBOL, {})
+               and not any(o for o in ex.orders.values())
+               and tomb.get('close_phase') == 3
+               and sorted(tomb.get('converged_order_ids') or []) == ['sl1', 'tp1'])
+        # ② 手工链：另起一份未结算状态，验证 converge/clear 门链未被 P5 破坏
+        ok2 = False
+        with _Env() as env2:
+            ex2 = FakeExchange()
+            ex2.seed_order('sl2', 'STOP_MARKET', 'SELL', 0.002, 75002.0)
+            ex2.seed_order('tp2', 'TAKE_PROFIT_MARKET', 'SELL', 0.002, 85000.0)
+            env2.write_state({SYMBOL: {BATCH: _batch(
+                settled_by_limit_close=False, close_phase=0, pending_close=False,
+                is_programmatic_cancel=False, close_reason='',
+                limit_close_order_id='',
+                protection_registry={
+                    IDENT_SL: _reg(state='CONFIRMED', order_id='sl2', role='SL'),
+                    IDENT_TP: _reg(state='CONFIRMED', order_id='tp2', role='TP'),
+                })}})
+            fake2 = make_fake_b(env2, ex2)
+            proof2, err2 = _call('_converge_batch_orders_before_clear', fake2,
+                                 SYMBOL, BATCH)
+            cleared2 = None
+            if isinstance(proof2, dict):
+                cleared2, _ = _call('clear_batch_state', fake2, SYMBOL, BATCH,
+                                    proof=proof2)
+            ok2 = (err2 is None and isinstance(proof2, dict)
+                   and cleared2 is True
+                   and BATCH not in env2.load_state().get(SYMBOL, {}))
+        ok = ok1 and ok2
+        proof = tomb.get('converged_order_ids') or []
+        cleared = ok1
         report("G-B1/全生命周期(B0→converge→proof→clear→墓碑)", ok,
-               f"(proof={'✓' if isinstance(proof, dict) else proof}, cleared={cleared}, "
-               f"residual={len(ex.orders)}, tomb_phase={tomb.get('close_phase')})")
+               f"(monitor链={ok1}, 手工链={ok2}, residual={len(ex.orders)}, "
+               f"tomb_phase={tomb.get('close_phase')}, 收敛={proof})")
 
 
 # =====================================================================
