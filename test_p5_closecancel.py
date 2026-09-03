@@ -1222,20 +1222,39 @@ def r30_clear_authorization_atomic():
 
 def r31_monitor_error_pending_keeps_main_monitor():
     """R31：完整启动恢复 monitor_error + PENDING（限价在途、仓位仍在）→
-    必须重新接管并持有主监控所有权（限价监控退出后不得无人维护）。"""
+    必须重新接管并持有主监控所有权；且 Hedge Mode 双记录下（对侧零仓在前）
+    不得误判归零，主监控与限价监控各恰好一个（不得重复启动）。"""
     t, ex = make_trader(tempfile.mkdtemp(prefix='p5_'))
     b = _lp_batch(net=0.002, reason='limit_pending_normal')
     b['monitor_error'] = True
     _state_write(t, _single(b))
     ex._mk('S1', otype='STOP_MARKET', amount=0.002, stop=75001.0)
     ex._mk('L1', otype='LIMIT', amount=0.002, status='open', filled=0.0)
-    ex.positions = [{'symbol': SYM, 'contracts': 0.002, 'side': 'long',
+    # Hedge Mode 双记录：对侧（SHORT，零仓）在前，本侧（LONG，0.002）在后
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'short',
+                     'positionSide': 'SHORT'},
+                    {'symbol': SYM, 'contracts': 0.002, 'side': 'long',
                      'positionSide': 'LONG'}]
+    counts = {'main': 0, 'limit': 0}
+    _real_main = t._start_monitoring
+    _real_limit = t._monitor_limit_close
+
+    def _main(*a, **k):
+        counts['main'] += 1
+        return _real_main(*a, **k)
+
+    def _limit(*a, **k):
+        counts['limit'] += 1
+        return _real_limit(*a, **k)
+    t._start_monitoring = _main
+    t._monitor_limit_close = _limit
     t.recover_active_batches()
     b2 = _state_read(t).get(SYM, {}).get(BID)
     assert b2 is not None, 'PENDING 限价在途批次不得被清理'
     assert BID in t._active_monitors, \
         f'必须有主监控所有权（限价监控退出后仍需维护批次）: {t._active_monitors}'
+    assert counts['main'] == 1, f'主监控必须恰好一个（Hedge 双记录不得误判）: {counts}'
+    assert counts['limit'] == 1, f'限价监控必须恰好一个（不得重复启动）: {counts}'
     # monitor_error 保留为崩溃证据；关键不变量是「不再因该标记被无条件清理」
     # 且已重新获得主监控所有权（下轮重启幂等重复接管，不影响正确性）
 

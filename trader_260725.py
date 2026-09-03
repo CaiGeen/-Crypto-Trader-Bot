@@ -2271,14 +2271,14 @@ class CryptoTrader:
                     has_pending_orders = len(entry_orders) > last_filled_count
 
                     # 检查是否有持仓
+                    # 🔥 P5i（ChatGPT 八复审 P0）：Hedge Mode 下同一 symbol 有
+                    # LONG/SHORT 双记录——必须按本批次 side 取方向感知净仓。
+                    # 旧实现取首个同 symbol 记录即 break，若先读到对侧零仓位
+                    # 会误判"无持仓" → 落入 stale/恢复分支 → 主监控永不接管。
                     try:
-                        positions = self._safe_api_call(self.exchange.fetch_positions, [symbol])
-                        current_pos = 0.0
-                        for pos in positions:
-                            if pos.get('symbol') == symbol or pos.get('info', {}).get('symbol') == \
-                                    symbol.replace('/', '').split(':')[0]:
-                                current_pos = abs(float(pos.get('contracts', 0) or pos.get('positionAmt', 0)))
-                                break
+                        current_pos = self._get_current_position_amt(
+                            symbol, bool(b_data.get('is_hedge_mode', False)),
+                            b_data.get('side') or 'BUY')
                     except Exception:
                         current_pos = None  # R11: UNKNOWN ≠ EMPTY，查询失败不得当作无持仓
 
@@ -3240,6 +3240,19 @@ class CryptoTrader:
           不可证明 → 保持冻结 + loud。"""
         try:
             b = (self.load_all_states().get(symbol, {}) or {}).get(batch_id) or {}
+            # 🔥 P5i（ChatGPT 八复审 P1）：进程内单次守卫——monitor_error 分支与
+            # 正常接管流程都会调用本 handler；PENDING 分支每次都会新建
+            # _monitor_limit_close 线程。无守卫会产生两个并发限价监控线程
+            # （重复轮询/重复裁决/重复告警）。同一 (batch, close_op) 只执行一次；
+            # 新事务（新 op_id）可再次进入。
+            _done = getattr(self, '_limit_recovery_done', None)
+            if _done is None:
+                _done = set()
+                self._limit_recovery_done = _done
+            _guard_key = (symbol, batch_id, b.get('close_op_id') or '')
+            if _guard_key in _done:
+                return
+            _done.add(_guard_key)
             op = b.get('close_op_id') or ''
             oid = b.get('limit_close_order_id') or ''
             reason = b.get('close_reason') or ''

@@ -54,6 +54,12 @@ def make_fake_self(states, exchange):
     fake.clear_batch_state = lambda symbol, batch_id: None
     fake._active_monitors_lock = threading.Lock()
     fake._active_monitors = set()
+    # P5i：恢复改为方向感知仓位查询——未绑定时 MagicMock 参与 `> 0` 比较抛
+    # TypeError（同 _assert_create_allowed / _finally_cleanup_decision 坑）
+    fake._get_current_position_amt = (
+        lambda symbol, is_hedge_mode, side='BUY', retries=3:
+        CryptoTrader._get_current_position_amt(fake, symbol, is_hedge_mode, side,
+                                               retries))
     return fake
 
 
