@@ -238,6 +238,39 @@ def r43_batch_set_change_starts_new_event():
         len(t._criticals), len(t._warnings))
 
 
+# ── R44：批次集部分重叠 → 保留计时与棘轮（ChatGPT 终审收口）──────────────
+def r44_partial_overlap_keeps_event():
+    # 段 1：{A,B} → {A,B,C}：新增批次，真实冲突从未消失 → 计时/棘轮不得重置
+    t = make_trader([_b('bA'), _inflight(_b('bB'))], actual=0.003)
+    _obs(t, 0.003)                            # warning + 事件建立
+    ev = _ev(t)
+    old_first_seen = ev['first_seen']
+    t._states[SYM]['bC'] = _inflight(_b('bC', op='OP2', oid='L2'))
+    _obs(t, 0.003)
+    ev = _ev(t)
+    assert ev['first_seen'] == old_first_seen, \
+        f'重叠批次集不得重置计时（重新获得宽限）: {ev}'
+    assert ev['critical_count'] == 0, ev
+    assert len(t._warnings) == 1, f'不得重发 warning: {len(t._warnings)}'
+    assert len(t._criticals) == 0, f'宽限期内不得 critical: {len(t._criticals)}'
+    # 段 2：{A,B,C} → {A,C}：B 归档，冲突仍在 → 事件延续（不重置）
+    del t._states[SYM]['bB']
+    _obs(t, 0.003)
+    ev = _ev(t)
+    assert ev['first_seen'] == old_first_seen and ev['critical_count'] == 0, ev
+    assert len(t._warnings) == 1 and len(t._criticals) == 0
+    # 段 3：时钟注入宽限期满 → 正常升级 critical（棘轮启动）
+    ev['first_seen'] = old_first_seen - (GRACE + 1)
+    _obs(t, 0.003)
+    assert len(t._criticals) == 1, f'事件延续后仍必须按时升级: {len(t._criticals)}'
+    # 段 4：critical 后批次集再变（{A,C} → {A,C,D}）→ 棘轮保持，不降级不重宽限
+    t._states[SYM]['bD'] = _inflight(_b('bD', op='OP3', oid='L3'))
+    _obs(t, 0.003)
+    assert len(t._criticals) == 2, f'critical 后不得因批次集变更降级: {len(t._criticals)}'
+    assert len(t._warnings) == 1, f'不得重发 warning: {len(t._warnings)}'
+    assert _ev(t)['critical_count'] == 2, _ev(t)
+
+
 TESTS = [r34_inflight_transient_conflict_warning_only,
          r35_no_inflight_immediate_critical,
          r36_inflight_conflict_escalates_after_grace,
@@ -247,7 +280,8 @@ TESTS = [r34_inflight_transient_conflict_warning_only,
          r40_stale_reason_denies_grace,
          r41_sibling_disappearance_full_reset,
          r42_monotonic_no_downgrade_after_critical,
-         r43_batch_set_change_starts_new_event]
+         r43_batch_set_change_starts_new_event,
+         r44_partial_overlap_keeps_event]
 
 
 def main():

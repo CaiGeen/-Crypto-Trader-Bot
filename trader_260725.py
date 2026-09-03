@@ -3181,7 +3181,7 @@ class CryptoTrader:
         return (gross_qty - float(b_data.get('realized_reduce_amount', 0.0) or 0.0),
                 gross_cost - float(b_data.get('realized_reduce_cost', 0.0) or 0.0))
 
-    def _check_conservation_conflict(self, symbol, all_states, actual, side='', tol=0.0005):
+    def _check_conservation_conflict(self, symbol, all_states, actual, side, tol=0.0005):
         """🔥 v6.4-P0：守恒破坏检测——actual < Σnet − tol ⇒ 归属不可知（ATTRIBUTION_CONFLICT）。
 
         tol 默认半档 amount 精度（0.0005），防精度抖动误报；真实发散 ≥0.001 必触发。
@@ -3189,14 +3189,19 @@ class CryptoTrader:
         触发后由人工 reconcile，不做自动归属猜测。
         🔥 v6.4-P6（设计 v1.3）：计量边界收窄为 (symbol, side)——Hedge 模式下
         LONG/SHORT 批次可并存（same_side_close_inflight 只禁同方向并行 close），
-        Σnet 只累加同方向批次，杜绝「单方向 actual vs 双方向台账」误判。"""
-        symbol_state = all_states.get(symbol, {}) or {}
+        Σnet 只累加同方向批次，杜绝「单方向 actual vs 双方向台账」误判。
+        🔥 v6.4-P6 终审收紧（ChatGPT）：side 必填且仅接受 BUY/SELL——无默认值、
+        非法值即 raise，杜绝未来调用方漏传时静默回退到双方向求和绕过 Hedge 修复。"""
         side_u = str(side or '').upper()
+        if side_u not in ('BUY', 'SELL'):
+            raise ValueError(
+                f'守恒检测必须显式指定方向 BUY/SELL（拒绝静默双方向求和）: {side!r}')
+        symbol_state = all_states.get(symbol, {}) or {}
         net_sum = 0.0
         for _b in symbol_state.values():
             if not isinstance(_b, dict) or not _b.get('is_active'):
                 continue
-            if side_u and str(_b.get('side') or '').upper() != side_u:
+            if str(_b.get('side') or '').upper() != side_u:
                 continue
             _q, _c = self._batch_net_position(_b)
             net_sum += max(_q, 0.0)
@@ -3261,12 +3266,15 @@ class CryptoTrader:
                     self._conservation_events.pop(key, None)   # 显式收敛
                     return
                 ev = self._conservation_events.get(key)
-                # 🔥 v1.3 实施自检（R43）：事件绑定其发生时的批次集——不同批次集
-                # 不可能是同一次冲突。防「全部监控线程退出 → 观察器停调 → 删除
-                # 路径不可达」窗口内旧事件滞留，污染新批次集的新事件（旧
-                # critical 状态经单调棘轮使新事件跳过 warning 直接 critical）。
+                # 🔥 v1.3 实施自检（R43）+ 终审收口（R44，ChatGPT 判据）：事件绑定
+                # 其发生时的批次集——**仅当新旧批次集完全不相交**才认定新事件
+                # （旧冲突批次全部消失=上下文 truly 消失）。部分重叠（新增/归档
+                # 部分批次）时真实冲突从未消失，必须保留计时与 critical 棘轮、
+                # 只更新 _batch_ids——否则批次频繁增减可持续延期 critical，
+                # 违反 R38 与事件内单调棘轮。
                 _cur_ids = frozenset(b.get('batch_id') or '' for b in same_side)
-                if ev is not None and ev.get('_batch_ids') != _cur_ids:
+                _old_ids = frozenset(ev.get('_batch_ids') or ()) if ev else frozenset()
+                if ev is not None and _old_ids and _old_ids.isdisjoint(_cur_ids):
                     ev = None
                 if ev is None:
                     ev = self._conservation_events[key] = {
