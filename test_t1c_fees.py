@@ -542,6 +542,22 @@ def f22_qty_conflict_persists_and_skips_cleanup():
                        'entry_fee_total': 0.154, 'exit_fee': 0.031,
                        'exit_fee_source': 'estimated', 'exit_note': '',
                        'fee_note': ''}}
+    # 生产分支顺序：冲突判断必须位于普通 TG / 普通 PnL 落盘 / 清理链之前
+    import re
+    src = open(os.path.abspath(trader_260725.__file__), encoding='utf-8').read()
+    for tag, tg in (('_sl', 'sl_msg'), ('_tp', 'tp_msg')):
+        # 整段顺序比较：冲突拦截必须早于普通 TG / 普通 PnL 落盘 / 清理链
+        region = src.split('self._settle_protection_fill(')[
+            1 if tag == '_sl' else 2][:4000]
+        i_conflict = region.find("if %s['qty_conflict']:" % tag)
+        assert i_conflict != -1, '%s 缺冲突拦截' % tag
+        for later in ('send_tg_notification(%s)' % tg, '_record_realized_pnl',
+                      '_cancel_remaining_entries(symbol, entry_orders, filled_layers)',
+                      '_converge_batch_orders_before_clear'):
+            i_l = region.find(later)
+            assert i_l != -1 and i_l > i_conflict, \
+                '%s 冲突拦截必须早于 %s（否则 normal/conflict 双写）' % (tag, later)
+
     ok = t._settle_qty_conflict(SYM, p5.BID, b, settle, 77885.20,
                                 {'kind': 'algo', 'order_id': 'S1'}, '止损')
     assert ok, '冲突结算必须成功记账'
@@ -562,14 +578,22 @@ def f22_qty_conflict_persists_and_skips_cleanup():
     n1 = len([r for r in stats1['trades']
               if r.get('dedup_key') == f'{SYM}:S1:qtyconflict'])
     assert n1 == 1, n1
-    ok2 = t._settle_qty_conflict(SYM, p5.BID, b, settle, 77885.20,
-                                 {'kind': 'algo', 'order_id': 'S1'}, '止损')
+    # 真实重启：新建 trader 实例读取同一份状态/盈亏文件
+    t2, ex2 = p5.make_trader(tmp)
+    t2.send_tg_notification = lambda msg, level='info': alerts.append((level, msg))
+    st2 = t2.load_all_states()
+    b2 = (st2.get(SYM) or {}).get(p5.BID) or {}
+    assert b2.get('qty_conflict_pending') is True, '冲突态必须跨实例可读'
+    assert t2._settlement_frozen_for_conflict(b2) is True, \
+        '冻结门必须生效（否则重启后会重复结算同一 SL）'
+    ok2 = t2._settle_qty_conflict(SYM, p5.BID, b2, settle, 77885.20,
+                                  {'kind': 'algo', 'order_id': 'S1'}, '止损')
     assert ok2, '恢复路径必须幂等成功'
     stats2 = json.load(open(os.path.join(tmp, 'trade_stats.json'), encoding='utf-8'))
     n2 = len([r for r in stats2['trades']
               if r.get('dedup_key') == f'{SYM}:S1:qtyconflict'])
     assert n2 == 1, f'重启恢复不得双记: {n2}'
-    assert ex.cancel_calls == [], '恢复路径同样不得撤单'
+    assert ex2.cancel_calls == [], '恢复路径同样不得撤单'
 
 
 # ── F24：未知费用不得形成「零费正常 PnL」─────────────────────────────────
@@ -650,6 +674,75 @@ def f26_invalid_source_flagged():
 
 
 
+
+# ── F27：冻结门（qty_conflict_pending 真正接线，不再只写不读）────────────
+def f27_conflict_freeze_gate():
+    t = make_settlement_trader()
+    b = _settle_batch()
+    assert t._settlement_frozen_for_conflict(b) is False, '正常批次不得冻结'
+    b['qty_conflict_pending'] = True                # 只置冲突标记（缺冻结字段）
+    assert t._settlement_frozen_for_conflict(b) is False, \
+        '仅冲突标记而不满足冻结契约（phase/pending_close）不得视为冻结'
+    b['close_phase'] = 1
+    b['pending_close'] = True
+    assert t._settlement_frozen_for_conflict(b) is True, '完整冻结契约必须生效'
+    src = open(os.path.abspath(trader_260725.__file__), encoding='utf-8').read()
+    assert src.count('_settlement_frozen_for_conflict(latest_b_data)') == 2, \
+        'SL 与 TP 触发判定都必须接冻结门'
+
+
+# ── F28：未知费用消费者闭环（TG / 日报 / D-006 文案）─────────────────────
+def f28_unknown_fee_consumers():
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix='t1c_f28_')
+    t, ex = p5.make_trader(tmp)
+    b = p5._lp_batch(net=0.002, reason='limit_pending_normal')
+    b['target_amounts'] = [0.002]
+    b['filled_details'] = [76885.20]
+    b['total_entry_fee'] = 0.077
+    b['realized_reduce_amount'] = 0.0
+    p5._state_write(t, p5._single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           stop=77885.20, avg=77885.20)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+
+    def _boom(*a, **k):
+        raise RuntimeError('query down')
+    ex.fetch_my_trades = _boom
+    ex.fetch_order = _boom
+
+    # ① 消费者：D-006 拒绝文案必须区分「未对账费用」，且不得建议删除账本
+    fees = t._compute_settlement_fees(SYM, b, 0.002,
+                                      {'kind': 'regular', 'order_id': 'L1'},
+                                      float('nan'))
+    assert fees['fee_note'] == 'fee_unknown', fees
+    sf = os.path.join(tmp, 'trade_stats.json')
+    t._record_realized_pnl('bU', SYM, 'BUY', 0.002, 76885.20, 77885.20,
+                           2.0, '限价平仓', dedup_key=f'{SYM}:L1U',
+                           stats_file=sf, fee_breakdown=fees)
+    os.environ['RISK_DAILY_REALIZED_LOSS_LIMIT'] = '1000'
+    try:
+        allowed, reason = t._check_account_risk(
+            t.load_all_states(),
+            type('S', (), {'leverage': 1, 'symbol': SYM, 'side': 'BUY'})(),
+            stats_file=sf)
+        assert allowed is False, '未知费用存在时 D-006 必须 Fail-Closed'
+        assert '不要删除' in reason, f'不得建议删除账本（会销毁证据）: {reason}'
+        assert '删除该文件' not in reason, reason
+    finally:
+        os.environ.pop('RISK_DAILY_REALIZED_LOSS_LIMIT', None)
+    # ② 消费方源码：SL/TP 即时通知不得在费用未对账时声称权威净盈亏
+    src = open(os.path.abspath(trader_260725.__file__), encoding='utf-8').read()
+    assert '_fee_unknown_sl' in src and '_fee_unknown_tp' in src, \
+        'SL/TP 即时 TG 必须区分费用未对账'
+    assert '_pnl_label' in src, '未对账时应标为估算净盈亏'
+    # ③ 日报：非权威记录单独统计且不计入权威总额
+    assert '_unknown_pnl' in src and '_unknown_n' in src, \
+        '日报必须分开统计未对账费用记录'
+
+
+
 TESTS = [f1_regular_order_direct_actual,
          f2_algo_mapping_chain,
          f3_non_usdt_commission,
@@ -674,7 +767,9 @@ TESTS = [f1_regular_order_direct_actual,
          f22_qty_conflict_persists_and_skips_cleanup,
          f24_unknown_fee_not_counted_as_zero_fee_pnl,
          f25_invalid_commission_not_actual_zero,
-         f26_invalid_source_flagged]
+         f26_invalid_source_flagged,
+         f27_conflict_freeze_gate,
+         f28_unknown_fee_consumers]
 
 
 def main():

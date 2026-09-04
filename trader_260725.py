@@ -1155,29 +1155,50 @@ class CryptoTrader:
                 'total_fees': total_fees, 'net_pnl': gross_pnl - total_fees,
                 'fees': fees, 'qty_conflict': qty_conflict, 'ledger_qty': net_qty}
 
+    @staticmethod
+    def _settlement_frozen_for_conflict(b_data) -> bool:
+        """冻结门（消费者）：批次处于数量冲突冻结态 → 禁止 SL/TP 再次结算，
+        避免重启后重复记账。"""
+        return bool(isinstance(b_data, dict)
+                    and b_data.get('qty_conflict_pending')
+                    and b_data.get('pending_close')
+                    and int(b_data.get('close_phase', 0) or 0) >= 1)
+
     def _settle_qty_conflict(self, symbol, batch_id, b_data, settle,
                              exit_price, exit_order_ref, mode):
-        """🔥 v6.4-T1-C（阻断 1）：实际成交量 ≠ 账本净量时的**冲突结算**。
+        """🔥 v6.4-T1-C（P0-1）：实际成交量 ≠ 账本净量时的**冲突结算**。
 
-        语义：只按实际成交量记一次部分 PnL，**持久化冲突态**，绝不做撤保护链/
-        撤限价平仓/converge/clear（交归零检测或人工对账接管）。
-        - dedup_key 由 (symbol, 退出单 id) 确定性生成 → 崩溃/重启重试只记一次；
-        - 冲突态写入账本（qty_conflict_pending/qty_conflict_qty/qty_conflict_ledger_qty）
-          → 跨重启幂等可识别。"""
+        与普通结算互斥（调用方必须在普通 TG/落盘之前拦截）。语义：
+        - 复用既有持久冻结契约：close_phase=1 / pending_close=True /
+          close_reason='qty_conflict_pending'（+ 冲突数量），**先冻结成功再记账**；
+        - 冻结写盘失败 → 不记账、只告警（等下轮重试，避免重启后重复记账）；
+        - dedup_key = symbol:order:qtyconflict（重启/重试只记一次）；
+        - 不做撤保护链 / 撤限价平仓 / converge / clear。"""
         oid = str((exit_order_ref or {}).get('order_id') or '')
         dedup = f'{symbol}:{oid}:qtyconflict'
+        persisted = False
         try:
-            # 不持锁：save_batch_state 内部已获取 _state_lock（普通 Lock，
-            # 外层再持会自锁死——本轮实测）
-            st = self.load_all_states()
-            bb = (st.get(symbol) or {}).get(batch_id)
+            all_states = self.load_all_states()
+            bb = (all_states.get(symbol) or {}).get(batch_id)
             if isinstance(bb, dict) and bb.get('is_active'):
+                bb['close_phase'] = 1
+                bb['pending_close'] = True
+                bb['is_programmatic_cancel'] = False
+                bb['close_reason'] = 'qty_conflict_pending'
+                bb['close_op_id'] = bb.get('close_op_id') or f'qtyconflict:{oid}'
                 bb['qty_conflict_pending'] = True
                 bb['qty_conflict_qty'] = float(settle['qty'])
                 bb['qty_conflict_ledger_qty'] = float(settle['ledger_qty'])
-                self.save_batch_state(symbol, batch_id, bb)
+                persisted = bool(self._persist_states(all_states))
         except Exception as e:
-            print(f"⚠️ [T1-C] 数量冲突态持久化失败（记账继续）: {type(e).__name__}: {e}")
+            print(f"⚠️ [T1-C] 冲突冻结态写入异常: {type(e).__name__}: {e}")
+        if not persisted:
+            self.send_tg_notification(
+                f"⚠️【数量冲突·冻结失败】批次 `{batch_id}` {mode} 实际成交 "
+                f"`{settle['qty']}` ≠ 账本净量 `{settle['ledger_qty']}`；\n"
+                f"💡 冻结态写盘失败，**本条 PnL 未记账**（等下轮重试），请人工关注。",
+                level='critical')
+            return False
         ok = self._record_realized_pnl(
             batch_id, symbol, str(b_data.get('side') or 'BUY'), float(settle['qty']),
             settle['avg_entry'], exit_price, settle['net_pnl'], mode,
@@ -1185,8 +1206,8 @@ class CryptoTrader:
         self.send_tg_notification(
             f"⚠️【数量冲突】批次 `{batch_id}` {mode} 实际成交 `{settle['qty']}` ≠ "
             f"账本净量 `{settle['ledger_qty']}`。\n"
-            f"💡 已按实际成交量记账（部分，dedup 幂等），批次保留待人工对账；"
-            f"本轮不撤保护链、不 converge/clear。",
+            f"💡 已冻结批次（close_phase=1/pending_close）并按实际成交量记账一次"
+            f"（dedup 幂等）；不撤保护链、不 converge/clear，待人工对账。",
             level='critical')
         return bool(ok)
 
@@ -1431,8 +1452,26 @@ class CryptoTrader:
         if daily_loss_limit > 0:
             pnl_today, stats_ok = self._get_today_realized_pnl(stats_file)
             if not stats_ok:
+                # P0-2：区分「文件损坏」与「存在未对账费用」——后者是**证据**，
+                # 绝不能建议删除 trade_stats.json（会销毁证据并绕过 Fail-Closed）
+                _sf = stats_file or os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "trade_stats.json")
+                _unknown_fee = False
+                try:
+                    with open(_sf, "r", encoding="utf-8") as _f:
+                        _st = json.load(_f)
+                    _unknown_fee = any(
+                        isinstance(_r, dict)
+                        and (_r.get("pnl_not_authoritative") or _r.get("fee_metadata_error"))
+                        for _r in (_st.get("trades", []) or []))
+                except Exception:
+                    _unknown_fee = False
+                if _unknown_fee:
+                    return False, ("trade_stats.json 含**费用未对账**记录（非权威净盈亏），"
+                                   "当日盈亏不可判定（Fail-Closed）。请人工核对对应批次"
+                                   "手续费后修正台账；**不要删除** trade_stats.json（会销毁证据）")
                 return False, ("trade_stats.json 损坏，无法评估当日盈亏（Fail-Closed）。"
-                               "修复或删除该文件后下一条信号自动恢复，无需重启；"
+                               "修复该 JSON 后下一条信号自动恢复，无需重启；"
                                "期间存量批次的止盈止损/平仓/监控不受影响")
             if pnl_today <= -daily_loss_limit:
                 return False, (f"当日已实现亏损 {pnl_today:.2f} USDT 已达上限 {daily_loss_limit:.2f}"
@@ -1491,6 +1530,8 @@ class CryptoTrader:
             stats_file = os.path.join(base_dir, "trade_stats.json")
             today_trades = []
             total_pnl = 0.0
+            _unknown_pnl = 0.0        # T1-C P0-2：未对账费用记录（非权威）
+            _unknown_n = 0
             if os.path.exists(stats_file):
                 try:
                     with open(stats_file, "r", encoding="utf-8") as f:
@@ -1498,7 +1539,12 @@ class CryptoTrader:
                     for t in stats.get("trades", []):
                         if str(t.get("time", "")).startswith(report_date):
                             today_trades.append(t)
-                            total_pnl += float(t.get("net_pnl", 0.0))
+                            if t.get("pnl_not_authoritative") or t.get("fee_metadata_error"):
+                                # 证据保留，但不计入权威总额（费用未对账 → 非权威）
+                                _unknown_pnl += float(t.get("net_pnl", 0.0))
+                                _unknown_n += 1
+                            else:
+                                total_pnl += float(t.get("net_pnl", 0.0))
                 except Exception:
                     pass
 
@@ -1519,6 +1565,9 @@ class CryptoTrader:
             )
             if today_trades:
                 msg += f"💰 昨日已实现盈亏: `{total_pnl:+.2f}` USDT\n"
+                if _unknown_n:
+                    msg += (f"\n⚠️ **另有 {_unknown_n} 笔费用未对账（非权威）**："
+                            f"合计估算 `{_unknown_pnl:+.2f}` USDT，未计入上方权威总额\n")
                 msg += "📝 明细（最近5笔）：\n"
                 for t in today_trades[-5:]:
                     emoji = "🟢" if t['net_pnl'] >= 0 else "🔴"
@@ -7744,7 +7793,8 @@ class CryptoTrader:
                                 k for k in self._sg3_alerted
                                 if not (k[0] == batch_id and k[1] == str(current_sl_id))}
 
-                if sl_triggered and sl_detail:
+                if sl_triggered and sl_detail and \
+                        not self._settlement_frozen_for_conflict(latest_b_data):
                     sl_exit_price = float(sl_detail.get('average') or 0.0)
                     if sl_exit_price == 0.0:
                         info = sl_detail.get('info', {})
@@ -7774,6 +7824,24 @@ class CryptoTrader:
                     capital_base = batch_entry_vwap * batch_filled_amount
                     net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
 
+                    # P0-2：费用未对账 → 明确标注为估算，不声称权威净盈亏
+                    _fee_unknown_sl = str((_sl['fees'] or {}).get('fee_note') or '') == 'fee_unknown'
+                    if _fee_unknown_sl:
+                        _fee_note_line = "🧾 费用未对账：本条为**估算**，不作为权威净盈亏\n"
+                        _pnl_label = "📉 **估算净盈亏**"
+                    else:
+                        _fee_note_line = ""
+                        _pnl_label = "💰 **最终净盈亏**"
+                    if _sl['qty_conflict']:
+                        # P0-1：冲突路径与普通结算**互斥**——必须在普通 TG/普通
+                        # PnL 落盘之前拦截，否则会写两条（普通无 dedup + 冲突带
+                        # dedup），重启后还会继续虚增。
+                        self._settle_qty_conflict(
+                            symbol, batch_id, latest_b_data, _sl, sl_exit_price,
+                            {'kind': 'algo', 'order_id': str(current_sl_id or '')},
+                            '止损')
+                        continue
+
                     sl_msg = (
                         f"🚨 **[止损平仓结算提醒]**\n\n"
                         f"🆔 **批次号**：`{batch_id}`\n"
@@ -7785,7 +7853,8 @@ class CryptoTrader:
                         f"平仓数量：`{batch_filled_amount}`\n"
                         f"名义盈亏：`{gross_pnl:+.2f}` USDT\n"
                         f"扣除手续费：`{total_fees:.4f}` USDT\n"
-                        f"💰 **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
+                        f"{_fee_note_line}"
+                        f"{_pnl_label}：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
                     )
                     print(f"\n🚨 [风控触发] 批次 [{batch_id}] 专属止损单已触发成交！净盈亏: {net_pnl:+.2f} USDT")
                     self.send_tg_notification(sl_msg)
@@ -7797,14 +7866,6 @@ class CryptoTrader:
                                               fee_breakdown=fees)
                     self._notify_snapshot(batch_id)
 
-                    if _sl['qty_conflict']:
-                        # 阻断 1：按实际成交量记一次，持久化冲突态；本轮不做任何
-                        # 撤保护链/撤限价单/converge/clear（continue 跳过清理链）
-                        self._settle_qty_conflict(
-                            symbol, batch_id, latest_b_data, _sl, sl_exit_price,
-                            {'kind': 'algo', 'order_id': str(current_sl_id or '')},
-                            '止损')
-                        continue
                     self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
                     if tp_order_id:
                         try:
@@ -7930,7 +7991,8 @@ class CryptoTrader:
                     else:
                         print(f"⏸️ [F3 裁决] 批次 {batch_id} 止盈单结果未知，保守保留下轮")
 
-                if tp_triggered and tp_detail:
+                if tp_triggered and tp_detail and \
+                        not self._settlement_frozen_for_conflict(latest_b_data):
                     tp_exit_price = float(tp_detail.get('average') or 0.0)
                     if tp_exit_price == 0.0:
                         info = tp_detail.get('info', {})
@@ -7959,6 +8021,21 @@ class CryptoTrader:
                     capital_base = batch_entry_vwap * batch_filled_amount
                     net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
 
+                    # P0-2：费用未对账 → 明确标注为估算，不声称权威净盈亏
+                    _fee_unknown_tp = str((_tp['fees'] or {}).get('fee_note') or '') == 'fee_unknown'
+                    if _fee_unknown_tp:
+                        _fee_note_line = "🧾 费用未对账：本条为**估算**，不作为权威净盈亏\n"
+                        _pnl_label = "📉 **估算净盈亏**"
+                    else:
+                        _fee_note_line = ""
+                        _pnl_label = "💰 **最终净盈亏**"
+                    if _tp['qty_conflict']:
+                        self._settle_qty_conflict(
+                            symbol, batch_id, latest_b_data, _tp, tp_exit_price,
+                            {'kind': 'algo', 'order_id': str(tp_order_id or '')},
+                            '止盈')
+                        continue
+
                     tp_msg = (
                         f"🎉 **[止盈平仓结算提醒]**\n\n"
                         f"🆔 **批次号**：`{batch_id}`\n"
@@ -7970,7 +8047,8 @@ class CryptoTrader:
                         f"平仓数量：`{batch_filled_amount}`\n"
                         f"名义盈亏：`{gross_pnl:+.2f}` USDT\n"
                         f"扣除手续费：`{total_fees:.4f}` USDT\n"
-                        f"💰 **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
+                        f"{_fee_note_line}"
+                        f"{_pnl_label}：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
                     )
                     print(f"\n🎉 [止盈触发] 批次 [{batch_id}] 专属止盈单已触发成交！净盈亏: {net_pnl:+.2f} USDT")
                     self.send_tg_notification(tp_msg)
@@ -7982,12 +8060,6 @@ class CryptoTrader:
                                               fee_breakdown=fees)
                     self._notify_snapshot(batch_id)
 
-                    if _tp['qty_conflict']:
-                        self._settle_qty_conflict(
-                            symbol, batch_id, latest_b_data, _tp, tp_exit_price,
-                            {'kind': 'algo', 'order_id': str(tp_order_id or '')},
-                            '止盈')
-                        continue
                     self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
                     if current_sl_id:
                         try:

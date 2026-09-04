@@ -1,9 +1,10 @@
 # T1-C Entry-Fee 记账 —— 设计草案送审 ChatGPT（**v1.3 + 补充条款**，2026-09-04）
 
-> 状态：**设计稿，未动任何生产代码**。v1.3 = 四项账本级阻断收口；**补充条款**
-> = ChatGPT 三条 ADDENDUM（NEARLY ALIGNED → 补齐即批准 F1–F13 实施）。
-> 修订链：v1.0 → v1.1（探针）→ v1.2 → v1.3（本稿+补充条款）。
-> 事实基线：HEAD = 32eb10c。**本轮零 API 调用。**
+> 状态：**已实施，复审中**（v1.3 + 补充条款，ChatGPT 批准进入 RED-first）。
+> 实施提交链（基线 `32eb10c`）：`ac0642e` → `c5fc813` → `df729b5` → `f22f859`
+> → `1b42c60` → 本轮 P0-1/P0-2 收口。
+> 设计链：v1.0 → v1.1（三轮只读探针实证）→ v1.2（账本设计）→ v1.3 + 三条
+> ADDENDUM。实施状态与新增测试见 §5b / §5c。
 
 ---
 
@@ -194,6 +195,18 @@ fee_rem=0.0770、exit=0.002@77885.20、exit_fee=0.0389：
   清理链），**不是**常规清理路径；残余保护链/converge/clear 全部不执行；
 - 未知费用：落盘 `pnl_not_authoritative=True`，D-006 汇总 Fail-Closed（`ok=False`）；
 - 白名单：统一使用模块级 `_FEE_BREAKDOWN_KEYS`，无局部重复定义。
+
+## 5c. 本轮（P0-1 / P0-2）实施状态
+
+- **冲突结算与普通结算互斥**：冲突判断已前移到普通 TG / 普通 PnL 落盘 /
+  清理链**之前**，`continue` 退出；normal 与 conflict 不再双写；
+- **冻结契约复用**：`close_phase=1 / pending_close=True / close_reason=
+  'qty_conflict_pending'`，**先冻结成功再记账**（`_persist_states` 校验），
+  冻结失败则不记账并告警；`_settlement_frozen_for_conflict()` 作为冻结门
+  同时接在 SL 与 TP 触发判定上（不再只写不读）；
+- **未知费用闭环**：落 `pnl_not_authoritative`；SL/TP 即时 TG 标为「估算
+  净盈亏」；日报分开统计且不计入权威总额；D-006 文案区分「文件损坏」与
+  「存在未对账费用」，后者明确**不得删除 trade_stats.json**（保留证据）。
 
 ## 6. KNOWN_LIMITATION（开放问题裁决记录 + 可度量升级触发）
 
