@@ -85,6 +85,7 @@ def s3_dedup_retry_single_record():
 def s4_invalid_json_rejected_bytes_unchanged():
     t = _trader()
     sf = _sf('s4.json')
+    t.send_tg_notification = lambda *a, **k: None
     raw = b'{"trades": [{oops'
     open(sf, 'wb').write(raw)
     before = _bytes(sf)
@@ -153,6 +154,7 @@ def s8_no_activation_record_from_p0():
 def s9_corrupt_blocks_everything():
     t = _trader()
     sf = _sf('s9.json')
+    t.send_tg_notification = lambda *a, **k: None   # 告警桩（防 __new__ 实例缺 tg_bot）
     raw = b'not json at all'
     open(sf, 'wb').write(raw)
     before = _bytes(sf)
@@ -171,6 +173,81 @@ def s10_p0_never_activates():
     assert not any('record_type' in r for r in stats['trades'])
 
 
+
+# S11：{} 与 {"trades":[1]} 均拒写且字节不变（{} ≠ 空账本）
+def s11_empty_obj_and_non_dict_trades_rejected():
+    t = _trader()
+    sf1 = _sf('s11a.json')
+    open(sf1, 'wb').write(b'{}')
+    b1 = _bytes(sf1)
+    assert t._record_realized_pnl(stats_file=sf1, **_rec()) is False
+    assert _bytes(sf1) == b1, '{} 不得被当成空账本覆盖'
+    sf2 = _sf('s11b.json')
+    open(sf2, 'wb').write(b'{"trades": [1, "x"]}')
+    b2 = _bytes(sf2)
+    assert t._record_realized_pnl(stats_file=sf2, **_rec()) is False
+    assert _bytes(sf2) == b2, 'trades 含非 dict 记录必须拒写'
+
+
+# S12：重复损坏 → 限频 critical（≤3 次）且发送时未持 _state_lock
+def s12_corrupt_alert_rate_limited_and_outside_lock():
+    t = _trader()
+    sf = _sf('s12.json')
+    open(sf, 'wb').write(b'broken')
+    seen = []
+
+    def _spy(msg, level='info'):
+        seen.append((level, msg, t._state_lock.locked()))
+    t.send_tg_notification = _spy
+    for _ in range(5):
+        t._record_realized_pnl(stats_file=sf, **_rec())
+    criticals = [x for x in seen if x[0] == 'critical']
+    assert 1 <= len(criticals) <= 3, f'限频契约：最多 3 次 critical: {len(criticals)}'
+    assert all(locked is False for _lv, _m, locked in criticals), \
+        'critical 告警必须在锁外发送（不得持 _state_lock）'
+
+
+# S13：replace/fsync 失败 → 目标不变 + 临时文件零残留
+def s13_failure_leaves_no_temp_residue():
+    t = _trader()
+    d = _sf('s13dir') + '_' + str(abs(hash('s13')) % 10000)
+    os.makedirs(d, exist_ok=True)
+    sf = os.path.join(d, 'trade_stats.json')
+    t._record_realized_pnl(stats_file=sf, **_rec())   # 建立合法账本
+    before = _bytes(sf)
+    files_before = set(os.listdir(d))
+    import trader_260725 as mod
+    real_replace = mod.os.replace
+
+    def _boom(*a, **k):
+        raise OSError('injected')
+    mod.os.replace = _boom
+    try:
+        assert t._record_realized_pnl(stats_file=sf, **_rec(batch_id='z')) is False
+    finally:
+        mod.os.replace = real_replace
+    assert _bytes(sf) == before, '失败后目标文件必须不变'
+    residue = set(os.listdir(d)) - files_before
+    assert not residue, f'临时文件零残留: {residue}'
+
+
+# S14：_fsync_dir() 降级不把已完成写入误判失败（D-009 P0-A 安全方向）
+def s14_fsync_dir_degrade_not_failure():
+    t = _trader()
+    sf = _sf('s14.json')
+    import trader_260725 as mod
+    real = mod._fsync_dir
+    mod._fsync_dir = lambda *a, **k: False    # 平台不支持 → 降级
+    try:
+        assert t._record_realized_pnl(stats_file=sf, **_rec()) is True, \
+            '目录 fsync 降级不得判定写入失败'
+    finally:
+        mod._fsync_dir = real
+    stats = json.load(open(sf, encoding='utf-8'))
+    assert len(stats['trades']) == 1
+
+
+
 TESTS = [s1_missing_file_first_write,
          s2_valid_file_append,
          s3_dedup_retry_single_record,
@@ -180,7 +257,11 @@ TESTS = [s1_missing_file_first_write,
          s7_side_enum_and_finite_amounts,
          s8_no_activation_record_from_p0,
          s9_corrupt_blocks_everything,
-         s10_p0_never_activates]
+         s10_p0_never_activates,
+         s11_empty_obj_and_non_dict_trades_rejected,
+         s12_corrupt_alert_rate_limited_and_outside_lock,
+         s13_failure_leaves_no_temp_residue,
+         s14_fsync_dir_degrade_not_failure]
 
 
 def main():

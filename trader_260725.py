@@ -899,9 +899,8 @@ class CryptoTrader:
         返回 bool：True=已记录（含 dedup 命中=幂等成功），False=写盘失败
         （P5 finalizer 依赖此返回值：失败必须保持 phase=2，绝不 clear——否则
         成交记录永久丢失）。"""
-        # 🔥 P0-stats-durability（v2.2 §6）：三态读取 + CORRUPT 拒写。
-        # 输入校验先行（在锁外）：side 枚举 + 金额有限性——非法输入绝不入账。
-        def _finite(v):
+        # 🔥 P0-stats-durability：输入校验先行（锁外）——side 枚举 + 金额有限性
+        def _finite_pnl(v):
             try:
                 f = float(v)
             except (TypeError, ValueError):
@@ -913,68 +912,99 @@ class CryptoTrader:
         if side not in ('BUY', 'SELL'):
             print(f"⚠️ [盈亏记录] 非法 side={side!r}，拒绝入账")
             return False
-        _vals = [_finite(amount), _finite(avg_price), _finite(exit_price),
-                 _finite(net_pnl)]
+        _vals = [_finite_pnl(amount), _finite_pnl(avg_price),
+                 _finite_pnl(exit_price), _finite_pnl(net_pnl)]
         if any(v is None for v in _vals):
             print("⚠️ [盈亏记录] 金额非有限/不可解析，拒绝入账")
             return False
         amount, avg_price, exit_price, net_pnl = _vals
 
+        corrupt_alert_path = None   # 锁外限频 critical 的目标文件
+        proceed = False             # MISSING/VALID 且通过校验 → True
+        result = False
+        stats = None
         try:
             base_dir = os.path.dirname(os.path.abspath(__file__))
             stats_file = stats_file or os.path.join(base_dir, "trade_stats.json")
             with self._state_lock:
                 # 三态读取：MISSING（可建新账本）/ VALID（可 dedup+追加）/
-                # CORRUPT（拒绝写入，原文件字节保持不变——UNKNOWN ≠ EMPTY）
+                # CORRUPT（拒绝写入，原文件字节保持不变——UNKNOWN ≠ EMPTY）。
+                # 严格校验：trades 必须存在且为「全部是 dict 的列表」；缺失、
+                # 非 list、含非 dict 记录一律 CORRUPT（{} ≠ 空账本）。
                 if os.path.exists(stats_file):
                     try:
                         with open(stats_file, "r", encoding="utf-8") as f:
                             stats = json.load(f)
-                        if not isinstance(stats, dict) or \
-                                not isinstance(stats.get("trades", []), list):
-                            print("⚠️ [盈亏记录] trade_stats.json 结构非法，"
-                                  "拒绝写入并保留原文件（ Fail-Closed ）")
-                            return False
+                        _trades = stats.get("trades") if isinstance(stats, dict) else None
+                        if not isinstance(_trades, list) or \
+                                any(not isinstance(_r, dict) for _r in _trades):
+                            corrupt_alert_path = stats_file   # CORRUPT：锁内仅判定
+                        else:
+                            proceed = True                    # VALID
                     except Exception:
-                        print("⚠️ [盈亏记录] trade_stats.json 损坏，拒绝写入并"
-                              "保留原文件（Fail-Closed）；请人工修复，"
-                              "**不要删除**该文件")
-                        return False
+                        corrupt_alert_path = stats_file       # CORRUPT：JSON 非法
                 else:
-                    stats = {"trades": []}
-                if dedup_key and any(r.get('dedup_key') == dedup_key
-                                     for r in stats.get('trades', []) or []):
-                    return True  # 幂等：同订单 PnL 已记录（finalizer 接管/重试语义）
-                record = {
-                    "time": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-                    "batch_id": batch_id,
-                    "symbol": symbol,
-                    "side": side,
-                    "amount": round(amount, 6),
-                    "avg_price": round(avg_price, 4),
-                    "exit_price": round(exit_price, 4),
-                    "net_pnl": round(net_pnl, 4),
-                    "mode": mode,
-                }
-                if dedup_key:
-                    record['dedup_key'] = dedup_key
-                stats.setdefault("trades", []).append(record)
-                with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(stats_file), delete=False, encoding="utf-8") as tf:
-                    json.dump(stats, tf, ensure_ascii=False, indent=2)
-                    tf.flush()
-                    os.fsync(tf.fileno())
-                    temp_name = tf.name
-                os.replace(temp_name, stats_file)
-                # 尽力 fsync 目录（Windows 对目录 fsync 不可用 → 静默跳过）
-                try:
-                    _df = os.open(os.path.dirname(stats_file) or '.', os.O_RDONLY)
-                    try:
-                        os.fsync(_df)
-                    finally:
-                        os.close(_df)
-                except Exception:
-                    pass
-            return True
+                    stats = {"trades": []}                    # MISSING
+                    proceed = True
+                if corrupt_alert_path is None and proceed:
+                    if dedup_key and any(r.get('dedup_key') == dedup_key
+                                         for r in stats.get('trades', []) or []):
+                        result = True  # 幂等：同订单 PnL 已记录（重试语义）
+                    else:
+                        record = {
+                            "time": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                            "batch_id": batch_id,
+                            "symbol": symbol,
+                            "side": side,
+                            "amount": round(amount, 6),
+                            "avg_price": round(avg_price, 4),
+                            "exit_price": round(exit_price, 4),
+                            "net_pnl": round(net_pnl, 4),
+                            "mode": mode,
+                        }
+                        if dedup_key:
+                            record['dedup_key'] = dedup_key
+                        stats.setdefault("trades", []).append(record)
+                        temp_name = None
+                        try:
+                            with tempfile.NamedTemporaryFile(
+                                    "w", dir=os.path.dirname(stats_file),
+                                    delete=False, encoding="utf-8") as tf:
+                                json.dump(stats, tf, ensure_ascii=False, indent=2)
+                                tf.flush()
+                                os.fsync(tf.fileno())
+                                temp_name = tf.name
+                            os.replace(temp_name, stats_file)
+                            temp_name = None
+                        finally:
+                            # 原子写失败路径统一清理临时文件（零残留）
+                            if temp_name and os.path.exists(temp_name):
+                                try:
+                                    os.unlink(temp_name)
+                                except OSError:
+                                    pass
+                        # 目录项 fsync：复用模块级 _fsync_dir（返回值仅诊断，
+                        # 绝不参与写入成败判断——D-009 P0-A 裁定）
+                        _fsync_dir(os.path.dirname(stats_file) or '.')
+                        result = True
+            if corrupt_alert_path:
+                # 🔥 锁外限频 critical（复用既有告警模式：同键最多 3 次后静默）
+                counts = getattr(self, '_stats_corrupt_alert_counts', None)
+                if counts is None:
+                    counts = self._stats_corrupt_alert_counts = {}
+                n = counts.get(corrupt_alert_path, 0)
+                if n < 3:
+                    counts[corrupt_alert_path] = n + 1
+                    if n == 0:
+                        msg = (f"⚠️【账本损坏】`{corrupt_alert_path}` 读取失败或结构非法，"
+                               f"已拒绝写入并保留原文件（Fail-Closed）。\n"
+                               f"💡 请人工修复该 JSON（**不要删除**，保留证据）；"
+                               f"修复前 PnL 记录持续被拒绝。")
+                    else:
+                        msg = (f"⚠️【账本损坏】`{corrupt_alert_path}` 仍处于拒绝写入状态"
+                               f"（第 {n + 1}/3 次告警）。")
+                    self.send_tg_notification(msg, level='critical')
+            return result
         except Exception as e:
             print(f"⚠️ [盈亏记录] 写入失败: {e}")
             return False
