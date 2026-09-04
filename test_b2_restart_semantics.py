@@ -30,6 +30,13 @@ import ccxt
 import trader_260725
 from trader_260725 import CryptoTrader
 
+# 🔥 T1-C 运维铁律（ChatGPT 裁决）：测试必须注入隔离的临时授权状态，
+# 绝不依赖、更不要求真实 auth_blocked.json 被改成 UNBLOCKED。
+import tempfile as _tf
+_AUTH_TMP = _tf.mkdtemp(prefix='authiso_')
+trader_260725.AUTH_BLOCKED_FILE = os.path.join(_AUTH_TMP, 'auth_blocked.json')
+
+
 SYMBOL = 'BTCUSDT'
 BATCH = 'batch_b2_7'
 PASS, FAIL = 0, 0
