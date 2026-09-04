@@ -179,9 +179,21 @@ fee_rem=0.0770、exit=0.002@77885.20、exit_fee=0.0389：
 | F17 | partial → TP 净口径 + TAKER（P1） | 同净口径；降级退出费必须 TAKER(0.0389) 而非 MAKER(0.0156) |
 | F18 | 非有限/残缺账本 | lfc 超数组长度 → `entry_ledger_incomplete`；非有限 estimated_fee → 有限降级 + `estimated_fee_invalid` 留痕 |
 | F19 | TP 查询失败 | 退出费走 TAKER 估算，net_pnl 不得因费率错配被抬高 |
+| F22 | **数量冲突生产级**（阻断 1） | 冲突态持久化（qty_conflict_pending/qty/ledger_qty）、确定性 dedup_key 只记一次、**零撤单 / 零撤限价单 / 零 converge / 零 clear**、批次仍在 |
+| F23 | 重启恢复幂等（含于 F22） | 同一 dedup_key 二次调用不双记；恢复路径同样零撤单 |
+| F24 | **未知费用不得形成零费正常 PnL**（阻断 2） | 落 `fee_metadata_error` + `pnl_not_authoritative`；D-006 `_get_today_realized_pnl` 返回 `ok=False`（Fail-Closed） |
+| F25 | 非法 commission（阻断 3） | commission 缺失/NaN/不可解析 → `commission_invalid`，严禁 `actual + 0` |
+| F26 | 非法 source 枚举（阻断 4） | 非法 `entry_fee_source` 必须落 `fee_metadata_error=True` |
 | F12 | **partial 后新层成交反例** | 新层费被错误卷入早期分摊 → 必须 estimated（0.45≠0.525 反例） |
 | F13 | **market confirmed < 净量反例** | entry_fee_for_record 按比例份额；expected_qty 契约生效 |
 | — | 回归 | 42 rc=0 + P6 12 项零新增；F7 数字为回归锚 |
+
+## 5b. 实施状态（2026-09-04 f22f859 之后）
+
+- 数量冲突：**冲突结算**（按实际成交量记一次 + 持久化冲突态 + `continue` 退出
+  清理链），**不是**常规清理路径；残余保护链/converge/clear 全部不执行；
+- 未知费用：落盘 `pnl_not_authoritative=True`，D-006 汇总 Fail-Closed（`ok=False`）；
+- 白名单：统一使用模块级 `_FEE_BREAKDOWN_KEYS`，无局部重复定义。
 
 ## 6. KNOWN_LIMITATION（开放问题裁决记录 + 可度量升级触发）
 

@@ -299,15 +299,18 @@ def f11_four_path_wiring_locked():
     assert src.count('snapshot=sl_detail') == 1, 'SL 必须传入 sl_detail 权威快照'
     assert src.count('snapshot=tp_detail') == 1, 'TP 必须传入 tp_detail 权威快照'
     assert src.count('order_snapshot=order)') >= 2, 'finalizer/市价必须传入订单详情'
-    # 数量冲突必须阻断完整结算清理（清理调用必须位于 qty_conflict 的 else 分支）
-    assert src.count("if _sl['qty_conflict']:") == 1, 'SL 缺数量冲突分支'
-    assert src.count("if _tp['qty_conflict']:") == 1, 'TP 缺数量冲突分支'
-    for _seg in src.split("if _sl['qty_conflict']:")[1:]:
-        assert 'else:' in _seg[:2000] and '_cancel_remaining_entries' in _seg[:2000], \
-            'SL 数量冲突时不得执行残余挂单清理'
-    for _seg in src.split("if _tp['qty_conflict']:")[1:]:
-        assert 'else:' in _seg[:2000] and '_cancel_remaining_entries' in _seg[:2000], \
-            'TP 数量冲突时不得执行残余挂单清理'
+    # 数量冲突必须走 _settle_qty_conflict 并 continue 退出清理链（阻断 1）
+    assert src.count('self._settle_qty_conflict(') == 2, 'SL/TP 各 1 处冲突结算'
+    for tag in ('_sl', '_tp'):
+        seg = src.split("if %s['qty_conflict']:" % tag)[1][:1500]
+        i_continue = seg.find('continue')
+        assert i_continue != -1, '%s 冲突必须 continue 退出清理链' % tag
+        for cleanup in ('_cancel_remaining_entries(symbol, entry_orders, filled_layers)',
+                        '_converge_batch_orders_before_clear',
+                        '_cancel_limit_close_order'):
+            i_c = seg.find(cleanup)
+            assert i_c == -1 or i_c > i_continue, \
+                '%s 冲突分支必须先 continue，不得落到 %s' % (tag, cleanup)
     for m in re.finditer(r'self\._record_realized_pnl\(', src):
         seg = src[max(0, m.start() - 8000):m.start()]
         assert ('_compute_settlement_fees(' in seg) or ('_settle_protection_fill(' in seg), \
@@ -517,6 +520,136 @@ def f19_tp_query_failure_not_inflate_pnl():
 
 
 
+
+# ── F22：数量冲突生产级——持久化 + 只记一次 + 零撤单/零 converge/clear ────
+def f22_qty_conflict_persists_and_skips_cleanup():
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix='t1c_f22_')
+    t, ex = p5.make_trader(tmp)
+    b = p5._lp_batch(net=0.001, reason='limit_pending_normal')
+    b['target_amounts'] = [0.002]
+    b['filled_details'] = [76885.20]
+    b['realized_reduce_amount'] = 0.001
+    b['realized_reduce_cost'] = 76885.20 * 0.001
+    b['total_entry_fee'] = 0.154
+    p5._state_write(t, p5._single(b))
+    alerts = []
+    t.send_tg_notification = lambda msg, level='info': alerts.append((level, msg))
+    settle = {'avg_entry': 76885.20, 'qty': 0.0008, 'ledger_qty': 0.001,
+              'gross_pnl': 0.8, 'total_fees': 0.09, 'net_pnl': 0.71,
+              'fees': {'entry_fee': 0.0616, 'entry_fee_source': 'estimated',
+                       'entry_note': 'partial_allocation_unknown',
+                       'entry_fee_total': 0.154, 'exit_fee': 0.031,
+                       'exit_fee_source': 'estimated', 'exit_note': '',
+                       'fee_note': ''}}
+    ok = t._settle_qty_conflict(SYM, p5.BID, b, settle, 77885.20,
+                                {'kind': 'algo', 'order_id': 'S1'}, '止损')
+    assert ok, '冲突结算必须成功记账'
+    assert any(lv == 'critical' and '数量冲突' in msg for lv, msg in alerts), \
+        f'必须发出数量冲突 critical 告警: {alerts}'
+    # ① 冲突态持久化（跨重启可识别）
+    st = t.load_all_states()
+    bb = (st.get(SYM) or {}).get(p5.BID) or {}
+    assert bb.get('qty_conflict_pending') is True, bb
+    assert abs(float(bb.get('qty_conflict_qty', 0)) - 0.0008) < 1e-9, bb
+    # ② 零撤单 / 零限价单撤销 / 零 converge（清理链全程未被触碰）
+    assert ex.cancel_calls == [], f'冲突时不得撤任何单: {ex.cancel_calls}'
+    # ③ 批次仍在（未 clear）
+    assert (bb.get('is_active') is True), '冲突时不得清理批次'
+
+    # ── F23：重启恢复——确定性 dedup_key，只记一次，不双记
+    stats1 = json.load(open(os.path.join(tmp, 'trade_stats.json'), encoding='utf-8'))
+    n1 = len([r for r in stats1['trades']
+              if r.get('dedup_key') == f'{SYM}:S1:qtyconflict'])
+    assert n1 == 1, n1
+    ok2 = t._settle_qty_conflict(SYM, p5.BID, b, settle, 77885.20,
+                                 {'kind': 'algo', 'order_id': 'S1'}, '止损')
+    assert ok2, '恢复路径必须幂等成功'
+    stats2 = json.load(open(os.path.join(tmp, 'trade_stats.json'), encoding='utf-8'))
+    n2 = len([r for r in stats2['trades']
+              if r.get('dedup_key') == f'{SYM}:S1:qtyconflict'])
+    assert n2 == 1, f'重启恢复不得双记: {n2}'
+    assert ex.cancel_calls == [], '恢复路径同样不得撤单'
+
+
+# ── F24：未知费用不得形成「零费正常 PnL」─────────────────────────────────
+def f24_unknown_fee_not_counted_as_zero_fee_pnl():
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix='t1c_f24_')
+    t, ex = p5.make_trader(tmp)
+    b = p5._lp_batch(net=0.002, reason='limit_pending_normal')
+    b['target_amounts'] = [0.002]
+    b['filled_details'] = [76885.20]
+    b['total_entry_fee'] = 0.077
+    b['realized_reduce_amount'] = 0.0
+    p5._state_write(t, p5._single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           stop=77885.20, avg=77885.20)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+
+    def _boom(*a, **k):
+        raise RuntimeError('query down')
+    ex.fetch_my_trades = _boom
+    ex.fetch_order = _boom
+    # 调用方估算本身非有限 → 连保守估算都不可得 → unknown
+    fees = t._compute_settlement_fees(SYM, b, 0.002,
+                                      {'kind': 'regular', 'order_id': 'L1'},
+                                      float('nan'))
+    assert fees['fee_note'] == 'fee_unknown', fees
+    sf = os.path.join(tmp, 'trade_stats.json')
+    t._record_realized_pnl('bU', SYM, 'BUY', 0.002, 76885.20, 77885.20,
+                           2.0, '限价平仓', dedup_key=f'{SYM}:L1U',
+                           stats_file=sf, fee_breakdown=fees)
+    rec = json.load(open(sf, encoding='utf-8'))['trades'][-1]
+    assert rec.get('fee_metadata_error') is True, rec
+    assert rec.get('pnl_not_authoritative') is True, \
+        f'未知费用必须标记不可作为权威净收益消费: {rec}'
+    # D-006 消费方：存在未知费用 → 必须 Fail-Closed（ok=False）
+    pnl_sum, ok = t._get_today_realized_pnl(stats_file=sf)
+    assert ok is False, '未知费用存在时 D-006 汇总必须 ok=False（Fail-Closed）'
+    assert isinstance(pnl_sum, float)
+
+
+# ── F25：非法 commission 不得标 actual 0 ─────────────────────────────────
+def f25_invalid_commission_not_actual_zero():
+    bad = [{'order': 'L1', 'amount': 0.002,
+            'info': {'qty': '0.002', 'commission': 'abc',
+                     'commissionAsset': 'USDT'}}]
+    t = _resolver_trader(fills_by_oid={'L1': bad})
+    fee, source, note = t._resolve_order_fees(
+        SYM, {'kind': 'regular', 'order_id': 'L1'}, 0.002, 0.9,
+        order_snapshot={'filled': 0.002})
+    assert source == 'estimated', f'非法 commission 不得标 actual: {(source, note)}'
+    assert note == 'commission_invalid', note
+    assert not (source == 'actual' and fee == 0.0), '严禁 actual + 0 手续费'
+
+    # 缺失 commission 同理
+    missing = [{'order': 'L1', 'amount': 0.002,
+                'info': {'qty': '0.002', 'commissionAsset': 'USDT'}}]
+    t2 = _resolver_trader(fills_by_oid={'L1': missing})
+    f2, s2, n2 = t2._resolve_order_fees(
+        SYM, {'kind': 'regular', 'order_id': 'L1'}, 0.002, 0.9,
+        order_snapshot={'filled': 0.002})
+    assert s2 == 'estimated' and n2 == 'commission_invalid', (s2, n2)
+
+
+# ── F26：非法 source 枚举必须落错误标志 ──────────────────────────────────
+def f26_invalid_source_flagged():
+    t = make_settlement_trader()
+    sf = os.path.join(TMP, 'trade_stats_meta2.json')
+    t._record_realized_pnl(
+        'b1', SYM, 'BUY', 0.001, 100.0, 101.0, 0.9, '市价平仓', stats_file=sf,
+        fee_breakdown={'entry_fee': 0.01, 'entry_fee_source': 'ACTUAL_TYPO',
+                       'exit_fee': 0.01, 'exit_fee_source': 'estimated',
+                       'entry_note': '', 'exit_note': '', 'fee_note': ''})
+    rec = json.load(open(sf, encoding='utf-8'))['trades'][-1]
+    assert rec.get('fee_metadata_error') is True, \
+        f'非法 source 必须落错误标志（_meta_ok 未生效）: {rec}'
+    assert abs(rec['net_pnl'] - 0.9) < 1e-9, rec
+
+
+
 TESTS = [f1_regular_order_direct_actual,
          f2_algo_mapping_chain,
          f3_non_usdt_commission,
@@ -537,7 +670,11 @@ TESTS = [f1_regular_order_direct_actual,
          f18_bad_ledger_and_non_finite,
          f19_tp_query_failure_not_inflate_pnl,
          f20_actual_qty_conflict_records_actual_qty,
-         f21_authoritative_qty_unknown]
+         f21_authoritative_qty_unknown,
+         f22_qty_conflict_persists_and_skips_cleanup,
+         f24_unknown_fee_not_counted_as_zero_fee_pnl,
+         f25_invalid_commission_not_actual_zero,
+         f26_invalid_source_flagged]
 
 
 def main():

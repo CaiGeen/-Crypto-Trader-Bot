@@ -943,9 +943,7 @@ class CryptoTrader:
                         record['fee_metadata_error'] = True
                         print("⚠️ [T1-C] fee_breakdown 非 dict，跳过 fee 元数据")
                     else:
-                        _FB_KEYS = ('entry_fee', 'entry_fee_source', 'entry_note',
-                                    'entry_fee_total', 'exit_fee', 'exit_fee_source',
-                                    'exit_note', 'fee_note')
+                        _FB_KEYS = self._FEE_BREAKDOWN_KEYS   # 复用模块级白名单
                         unknown = [k for k in fee_breakdown if k not in _FB_KEYS]
                         if unknown:
                             print(f"⚠️ [T1-C] fee_breakdown 未知键已忽略: {unknown}")
@@ -973,7 +971,12 @@ class CryptoTrader:
                         if any(k not in record for k in
                                ('entry_fee', 'entry_fee_source',
                                 'exit_fee', 'exit_fee_source')):
+                            _meta_ok = False
+                        # 阻断 4：非法枚举 / fee_unknown / 缺字段 必须落到错误标志
+                        if not _meta_ok:
                             record['fee_metadata_error'] = True
+                        if 'fee_unknown' in str(record.get('fee_note') or ''):
+                            record['pnl_not_authoritative'] = True
                 stats.setdefault("trades", []).append(record)
                 with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(stats_file), delete=False, encoding="utf-8") as tf:
                     json.dump(stats, tf, ensure_ascii=False, indent=2)
@@ -1058,13 +1061,18 @@ class CryptoTrader:
 
             total_qty = 0.0
             _sum = 0.0
+            commission_valid = True      # 阻断 3：任一 fill 手续费非法 → 不参与 actual
             for _t in fills:
                 _info = _t.get('info', {}) if isinstance(_t, dict) else {}
                 total_qty += (self._fee_float(_t.get('amount'))
                               or self._fee_float(_info.get('qty')) or 0.0)
-                _sum += (self._fee_float(_info.get('commission')) or 0.0)
+                _c = self._fee_float(_info.get('commission'))
+                if _c is None:
+                    commission_valid = False
+                else:
+                    _sum += _c
                 assets.add(str(_info.get('commissionAsset') or ''))
-            total_fee = _sum
+            total_fee = _sum if commission_valid else None
 
             exp = self._fee_float(expected_qty)
             if exp is None or exp <= 0 or abs(total_qty - exp) > max(1e-8, exp * 1e-6):
@@ -1098,6 +1106,9 @@ class CryptoTrader:
                 return _deg('qty_mismatch')
             if assets != {'USDT'}:
                 return _deg('non_usdt_commission')
+            if not commission_valid:
+                # commission 缺失/NaN/不可解析 → 绝不以 0 冒充 actual
+                return _deg('commission_invalid')
             return total_fee, 'actual', ''
         except Exception:
             # 不得在此再 float() 抛出；不可转换时 est 已为 None → 上层走 unknown
@@ -1143,6 +1154,41 @@ class CryptoTrader:
         return {'avg_entry': avg_entry, 'qty': settle_qty, 'gross_pnl': gross_pnl,
                 'total_fees': total_fees, 'net_pnl': gross_pnl - total_fees,
                 'fees': fees, 'qty_conflict': qty_conflict, 'ledger_qty': net_qty}
+
+    def _settle_qty_conflict(self, symbol, batch_id, b_data, settle,
+                             exit_price, exit_order_ref, mode):
+        """🔥 v6.4-T1-C（阻断 1）：实际成交量 ≠ 账本净量时的**冲突结算**。
+
+        语义：只按实际成交量记一次部分 PnL，**持久化冲突态**，绝不做撤保护链/
+        撤限价平仓/converge/clear（交归零检测或人工对账接管）。
+        - dedup_key 由 (symbol, 退出单 id) 确定性生成 → 崩溃/重启重试只记一次；
+        - 冲突态写入账本（qty_conflict_pending/qty_conflict_qty/qty_conflict_ledger_qty）
+          → 跨重启幂等可识别。"""
+        oid = str((exit_order_ref or {}).get('order_id') or '')
+        dedup = f'{symbol}:{oid}:qtyconflict'
+        try:
+            # 不持锁：save_batch_state 内部已获取 _state_lock（普通 Lock，
+            # 外层再持会自锁死——本轮实测）
+            st = self.load_all_states()
+            bb = (st.get(symbol) or {}).get(batch_id)
+            if isinstance(bb, dict) and bb.get('is_active'):
+                bb['qty_conflict_pending'] = True
+                bb['qty_conflict_qty'] = float(settle['qty'])
+                bb['qty_conflict_ledger_qty'] = float(settle['ledger_qty'])
+                self.save_batch_state(symbol, batch_id, bb)
+        except Exception as e:
+            print(f"⚠️ [T1-C] 数量冲突态持久化失败（记账继续）: {type(e).__name__}: {e}")
+        ok = self._record_realized_pnl(
+            batch_id, symbol, str(b_data.get('side') or 'BUY'), float(settle['qty']),
+            settle['avg_entry'], exit_price, settle['net_pnl'], mode,
+            pnl_partial=True, dedup_key=dedup, fee_breakdown=settle['fees'])
+        self.send_tg_notification(
+            f"⚠️【数量冲突】批次 `{batch_id}` {mode} 实际成交 `{settle['qty']}` ≠ "
+            f"账本净量 `{settle['ledger_qty']}`。\n"
+            f"💡 已按实际成交量记账（部分，dedup 幂等），批次保留待人工对账；"
+            f"本轮不撤保护链、不 converge/clear。",
+            level='critical')
+        return bool(ok)
 
     def _compute_settlement_fees(self, symbol, b_data, settlement_qty,
                                  exit_order_ref, estimated_exit_fee,
@@ -1318,16 +1364,23 @@ class CryptoTrader:
             return 0.0, False
         today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
         total = 0.0
+        unknown_fee = False      # 🔥 T1-C 阻断 2：未知/非法费用 ⇒ 汇总不可作为权威
         for t in stats["trades"]:
             if not isinstance(t, dict):
                 continue
             t_time = t.get("time")
             if not isinstance(t_time, str) or not t_time.startswith(today):
                 continue
+            if t.get("pnl_not_authoritative") or t.get("fee_metadata_error"):
+                unknown_fee = True
             try:
                 total += float(t.get("net_pnl", 0.0))
             except (TypeError, ValueError):
                 continue
+        if unknown_fee:
+            # 已知「某条 PnL 的费用不可知」→ Fail-Closed：调用方不得按普通权威
+            # 净收益放行（D-006 日亏损闸门同哲学：未知状态 ≠ 允许）
+            return round(total, 4), False
         return round(total, 4), True
 
     def _check_account_risk(self, all_states, signal, stats_file=None):
@@ -7745,17 +7798,14 @@ class CryptoTrader:
                     self._notify_snapshot(batch_id)
 
                     if _sl['qty_conflict']:
-                        # 实际成交量 ≠ 账本净量：只按实际成交量记账，保留批次待
-                        # 对账/归零检测接管，绝不按完整结算清理
-                        print(f"  └─ ⚠️ [T1-C] SL 实际成交量 {_sl['qty']} ≠ 账本净量 "
-                              f"{_sl['ledger_qty']}：保留批次待对账，不清理残余挂单")
-                        self.send_tg_notification(
-                            f"⚠️【数量冲突】批次 `{batch_id}` SL 实际成交 "
-                            f"`{_sl['qty']}` ≠ 账本净量 `{_sl['ledger_qty']}`。\n"
-                            f"💡 已按实际成交量记账（部分），批次保留待人工对账。",
-                            level='critical')
-                    else:
-                        self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
+                        # 阻断 1：按实际成交量记一次，持久化冲突态；本轮不做任何
+                        # 撤保护链/撤限价单/converge/clear（continue 跳过清理链）
+                        self._settle_qty_conflict(
+                            symbol, batch_id, latest_b_data, _sl, sl_exit_price,
+                            {'kind': 'algo', 'order_id': str(current_sl_id or '')},
+                            '止损')
+                        continue
+                    self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
                     if tp_order_id:
                         try:
                             self._safe_api_call(self.exchange.cancel_order, tp_order_id, symbol, params={'stop': True})
@@ -7933,15 +7983,12 @@ class CryptoTrader:
                     self._notify_snapshot(batch_id)
 
                     if _tp['qty_conflict']:
-                        print(f"  └─ ⚠️ [T1-C] TP 实际成交量 {_tp['qty']} ≠ 账本净量 "
-                              f"{_tp['ledger_qty']}：保留批次待对账，不清理残余挂单")
-                        self.send_tg_notification(
-                            f"⚠️【数量冲突】批次 `{batch_id}` TP 实际成交 "
-                            f"`{_tp['qty']}` ≠ 账本净量 `{_tp['ledger_qty']}`。\n"
-                            f"💡 已按实际成交量记账（部分），批次保留待人工对账。",
-                            level='critical')
-                    else:
-                        self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
+                        self._settle_qty_conflict(
+                            symbol, batch_id, latest_b_data, _tp, tp_exit_price,
+                            {'kind': 'algo', 'order_id': str(tp_order_id or '')},
+                            '止盈')
+                        continue
+                    self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
                     if current_sl_id:
                         try:
                             self._safe_api_call(self.exchange.cancel_order, current_sl_id, symbol,
