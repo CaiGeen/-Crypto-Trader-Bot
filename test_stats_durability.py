@@ -30,7 +30,10 @@ def _trader():
 def _rec(**kw):
     base = dict(batch_id='b1', symbol='BTC/USDT:USDT', side='BUY',
                 amount=0.001, avg_price=100.0, exit_price=101.0,
-                net_pnl=0.9, mode='市价平仓')
+                net_pnl=0.9, mode='市价平仓',
+                expected_qty=0.001, observed_qty=0.001,
+                entry_notional=100.0 * 0.001, allocation_status='PROVEN',
+                entry_order_refs=['A1'], exit_order_ref={'order_id': 'X1'})
     base.update(kw)
     return base
 
@@ -58,7 +61,10 @@ def s1_missing_file_first_write():
     sf = _sf('s1.json')
     assert t._record_realized_pnl(stats_file=sf, **_rec()) is True
     stats = json.load(open(sf, encoding='utf-8'))
-    assert len(stats['trades']) == 1 and stats['trades'][0]['side'] == 'BUY'
+    settlements = [r for r in stats['trades'] if r.get('record_type') == 'settlement']
+    assert len(settlements) == 1 and settlements[0]['side'] == 'BUY'
+    assert sum(1 for r in stats['trades']
+               if r.get('dedup_key') == 'schema_activation:v2') == 1
 
 
 # S2：合法文件 → 正常追加（既有记录保留）
@@ -68,7 +74,8 @@ def s2_valid_file_append():
     t._record_realized_pnl(stats_file=sf, **_rec(batch_id='a'))
     t._record_realized_pnl(stats_file=sf, **_rec(batch_id='b'))
     stats = json.load(open(sf, encoding='utf-8'))
-    assert len(stats['trades']) == 2, len(stats['trades'])
+    assert len([r for r in stats['trades']
+                if r.get('record_type') == 'settlement']) == 2
 
 
 # S3：相同 dedup 重试 → 只保留一条，返回 True（幂等成功）
@@ -79,6 +86,8 @@ def s3_dedup_retry_single_record():
     assert t._record_realized_pnl(stats_file=sf, dedup_key=k, **_rec()) is True
     assert t._record_realized_pnl(stats_file=sf, dedup_key=k, **_rec()) is True
     assert _dedup_count(sf, k) == 1
+    assert sum(1 for r in json.load(open(sf, encoding='utf-8'))['trades']
+               if r.get('dedup_key') == 'schema_activation:v2') == 1
 
 
 # S4：非法 JSON → False，原文件逐字节不变
@@ -146,8 +155,9 @@ def s8_no_activation_record_from_p0():
     for i in range(3):
         t._record_realized_pnl(stats_file=sf, **_rec(batch_id=f'b{i}'))
     stats = json.load(open(sf, encoding='utf-8'))
-    assert all(r.get('record_type') is None for r in stats['trades']), (
-        'P0 不得写 schema_activation')
+    # v2A 分层后：settlement 记录存在，但 schema_activation 幂等仅一条
+    assert sum(1 for r in stats['trades']
+               if r.get('dedup_key') == 'schema_activation:v2') == 1
 
 
 # S9：CORRUPT → activation 与 settlement 均不得写入
@@ -170,7 +180,8 @@ def s10_p0_never_activates():
     for i in range(5):
         t._record_realized_pnl(stats_file=sf, dedup_key=f'K{i}', **_rec())
     stats = json.load(open(sf, encoding='utf-8'))
-    assert not any('record_type' in r for r in stats['trades'])
+    assert sum(1 for r in stats['trades']
+               if r.get('dedup_key') == 'schema_activation:v2') == 1
 
 
 
@@ -244,7 +255,8 @@ def s14_fsync_dir_degrade_not_failure():
     finally:
         mod._fsync_dir = real
     stats = json.load(open(sf, encoding='utf-8'))
-    assert len(stats['trades']) == 1
+    assert len([r for r in stats['trades']
+                if r.get('record_type') == 'settlement']) == 1
 
 
 

@@ -888,7 +888,11 @@ class CryptoTrader:
                              avg_price: float, exit_price: float, net_pnl: float,
                              mode: str, pnl_partial: bool = False,
                              dedup_key: str | None = None,
-                             stats_file: str | None = None) -> bool:
+                             stats_file: str | None = None, *,
+                             expected_qty=None, observed_qty=None,
+                             entry_notional=None, allocation_status='PROVEN',
+                             entry_order_refs=None, exit_order_ref=None,
+                             entry_fee=None, exit_fee=None) -> bool:
         """记录一笔已实现盈亏到 trade_stats.json（原子写入，失败静默）
 
         dedup_key —— P5：同一 close 订单的 PnL 幂等记录（/closecancel 与
@@ -983,6 +987,74 @@ class CryptoTrader:
                         }
                         if dedup_key:
                             record['dedup_key'] = dedup_key
+                        # 🔥 T1C-v2A：数量双证据（durable expected vs 快照 observed）
+                        # → PROVEN settlement 或 DISPUTED（不写权威 net_pnl）
+                        _expected = _finite_pnl(expected_qty) if expected_qty is not None else None
+                        _observed = _finite_pnl(observed_qty) if observed_qty is not None else None
+                        _exit_oid = str((exit_order_ref or {}).get('order_id') or '')
+                        if _expected is None or _observed is None or _expected <= 0                                 or _observed <= 0:
+                            dispute_reason = ('qty_missing'
+                                              if (_expected is None or _observed is None)
+                                              else 'qty_invalid')
+                        elif abs(_expected - _observed) > max(1e-8, _expected * 1e-6):
+                            dispute_reason = 'qty_mismatch'
+                        else:
+                            dispute_reason = None
+                        if dispute_reason:
+                            record = {
+                                "record_type": "settlement_dispute",
+                                "settlement_id": f"settlement:{symbol}:{_exit_oid}",
+                                "dedup_key": f"settlement_dispute:{symbol}:{_exit_oid}",
+                                "time": record["time"],
+                                "batch_id": batch_id,
+                                "symbol": symbol,
+                                "side": side,
+                                "pnl_status": "DISPUTED",
+                                "reason": dispute_reason,
+                                "expected_qty": (round(_expected, 8)
+                                                 if _expected is not None else None),
+                                "observed_qty": (round(_observed, 8)
+                                                 if _observed is not None else None),
+                                "net_pnl_estimate": round(net_pnl, 4),
+                                "mode": mode,
+                            }
+                        else:
+                            record.update({
+                                "record_type": "settlement",
+                                "settlement_id": f"settlement:{symbol}:{_exit_oid}",
+                                "amount": round(_observed, 6),
+                                "expected_qty": round(_expected, 8),
+                                "observed_qty": round(_observed, 8),
+                                "pnl_status": "ESTIMATED",
+                                "quantity_status": "PROVEN",
+                                "cost_basis_status": "PROVEN",
+                                "fee_status": "ESTIMATED",
+                                "fee_risk_basis": {
+                                    "entry_notional": (round(float(entry_notional), 8)
+                                                       if entry_notional is not None else None),
+                                    "exit_notional": round(abs(_observed * exit_price), 8),
+                                    "allocation_status": str(allocation_status or 'PROVEN'),
+                                },
+                                "entry_order_refs": list(entry_order_refs or []),
+                                "exit_order_ref": dict(exit_order_ref or {}),
+                            })
+                            if entry_fee is not None:
+                                record["entry_fee"] = round(float(entry_fee), 6)
+                            if exit_fee is not None:
+                                record["exit_fee"] = round(float(exit_fee), 6)
+                        # schema_activation:v2 原子注入（首条 v2 财务记录时；位于
+                        # 旧记录之后、新记录之前，同一次原子替换）
+                        if not any(x.get('dedup_key') == 'schema_activation:v2'
+                                   for x in stats.get('trades', []) or []):
+                            _legacy_count = len(stats.get('trades', []) or [])
+                            stats.setdefault('trades', []).insert(_legacy_count, {
+                                "record_type": "schema_activation",
+                                "schema_version": 2,
+                                "dedup_key": "schema_activation:v2",
+                                "activated_at": datetime.now(BEIJING_TZ).strftime(
+                                    "%Y-%m-%d %H:%M:%S"),
+                                "legacy_count": _legacy_count,
+                            })
                         stats.setdefault("trades", []).append(record)
                         temp_name = None
                         try:
@@ -4357,25 +4429,41 @@ class CryptoTrader:
         b = (self.load_all_states().get(symbol, {}) or {}).get(batch_id) or {}
         side = (b.get('side') or 'BUY').upper()
         net_qty, net_cost = self._batch_net_position(b)
-        gross = float(sum((b.get('target_amounts') or [])[:int(b.get('last_filled_count', 0) or 0)]))
+        _lfc = int(b.get('last_filled_count', 0) or 0)
         total_entry_fee = float(b.get('total_entry_fee', 0.0) or 0.0)
-        fee_rem = total_entry_fee * (net_qty / gross) if gross > 0 else 0.0
-        total_cost_with_fee = net_cost + fee_rem
-        avg_entry = total_cost_with_fee / net_qty if net_qty > 0 else 0.0
+        # 🔥 T1C-v2A：入场费只扣一次（cost 比例净份额）+ 净成本均价（不含费）
+        _gross_cost = net_cost + float(b.get('realized_reduce_cost', 0.0) or 0.0)
+        entry_fee_est = total_entry_fee * (net_cost / _gross_cost
+                                           if _gross_cost > 0 else 0.0)
+        avg_entry = net_cost / net_qty if net_qty > 0 else 0.0
         exit_price = avg_price
         if side == 'BUY':
             gross_pnl = (exit_price - avg_entry) * net_qty
         else:
             gross_pnl = (avg_entry - exit_price) * net_qty
         exit_fee = exit_price * net_qty * MAKER_FEE_RATE
-        total_fees = fee_rem + exit_fee
+        total_fees = entry_fee_est + exit_fee
         net_pnl = gross_pnl - total_fees
         # ③ PnL 幂等记录（dedup 键 = symbol:order_id）
         # 🔥 Blocker 4（P0）：PnL 必须 durable 成功才允许继续收敛/清理——落盘失败
         # 保持 close_phase=2（claim 已完成），由恢复/接管续跑重试（dedup 防双记）
-        if not self._record_realized_pnl(batch_id, symbol, side, net_qty, avg_entry,
-                                         exit_price, net_pnl, '限价平仓',
-                                         dedup_key=f'{symbol}:{order_id}'):
+        _observed_finalizer = None
+        if isinstance(order, dict):
+            _observed_finalizer = (order.get('actualQty')
+                                   or order.get('executedQty')
+                                   or order.get('filled'))
+        if not self._record_realized_pnl(
+                batch_id, symbol, side, net_qty, avg_entry, exit_price, net_pnl,
+                '限价平仓', dedup_key=f'{symbol}:{order_id}',
+                expected_qty=net_qty, observed_qty=_observed_finalizer,
+                entry_notional=_gross_cost,
+                allocation_status=('CONSERVATIVE_FULL'
+                                   if float(b.get('realized_reduce_amount', 0.0) or 0.0) > 0
+                                   else 'PROVEN'),
+                entry_order_refs=[str(x) for x in
+                                  (b.get('entry_orders') or [])[:_lfc]],
+                exit_order_ref={'order_id': str(order_id), 'kind': 'regular'},
+                entry_fee=entry_fee_est, exit_fee=exit_fee):
             return False, 'pnl_persist_failed（保持 close_phase=2 待续跑重试）'
         # ④ 撤 SL（N14）+ 残余 TP（B0）——同 monitor 结算惯例
         if b.get('current_sl_id'):
@@ -7428,14 +7516,23 @@ class CryptoTrader:
 
                     sl_exit_price = float(self.exchange.price_to_precision(symbol, sl_exit_price))
 
+                    # 🔥 T1C-v2A：净量/净成本基准 + cost 比例分摊 + 双证据
+                    _net_qty_sl, _net_cost_sl = self._batch_net_position(latest_b_data)
+                    _gross_cost_sl = _net_cost_sl + float(
+                        latest_b_data.get('realized_reduce_cost', 0.0) or 0.0)
+                    _alloc_ratio_sl = (_net_cost_sl / _gross_cost_sl
+                                       if _gross_cost_sl > 0 else 0.0)
+                    _entry_fee_est_sl = float(total_entry_fee or 0.0) * _alloc_ratio_sl
+                    _avg_entry_sl = (_net_cost_sl / _net_qty_sl
+                                     if _net_qty_sl > 0 else 0.0)
                     if side == 'BUY':
-                        gross_pnl = (sl_exit_price - batch_entry_vwap) * batch_filled_amount
+                        gross_pnl = (sl_exit_price - _avg_entry_sl) * _net_qty_sl
                     else:
-                        gross_pnl = (batch_entry_vwap - sl_exit_price) * batch_filled_amount
-
-                    exit_fee = sl_exit_price * batch_filled_amount * TAKER_FEE_RATE
-                    total_fees = total_entry_fee + exit_fee
+                        gross_pnl = (_avg_entry_sl - sl_exit_price) * _net_qty_sl
+                    exit_fee = sl_exit_price * _net_qty_sl * TAKER_FEE_RATE
+                    total_fees = _entry_fee_est_sl + exit_fee
                     net_pnl = gross_pnl - total_fees
+                    batch_entry_vwap, batch_filled_amount = _avg_entry_sl, _net_qty_sl
 
                     capital_base = batch_entry_vwap * batch_filled_amount
                     net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
@@ -7457,8 +7554,25 @@ class CryptoTrader:
                     self.send_tg_notification(sl_msg)
 
                     # 🔥 记录已实现盈亏 + 附带剩余持仓快照
-                    self._record_realized_pnl(batch_id, symbol, side, batch_filled_amount,
-                                              batch_entry_vwap, sl_exit_price, net_pnl, "止损")
+                    _observed_sl = None
+                    if isinstance(sl_detail, dict):
+                        _observed_sl = (sl_detail.get('actualQty')
+                                        or sl_detail.get('executedQty')
+                                        or sl_detail.get('filled'))
+                    self._record_realized_pnl(
+                        batch_id, symbol, side, batch_filled_amount,
+                        batch_entry_vwap, sl_exit_price, net_pnl, "止损",
+                        dedup_key=f'{symbol}:{current_sl_id}',
+                        expected_qty=_net_qty_sl, observed_qty=_observed_sl,
+                        entry_notional=_gross_cost_sl,
+                        allocation_status=('CONSERVATIVE_FULL'
+                                           if float(latest_b_data.get('realized_reduce_amount', 0.0) or 0.0) > 0
+                                           else 'PROVEN'),
+                        entry_order_refs=[str(x) for x in
+                                          (latest_b_data.get('entry_orders') or [])
+                                          [:int(latest_b_data.get('last_filled_count', 0) or 0)]],
+                        exit_order_ref={'order_id': str(current_sl_id), 'kind': 'algo'},
+                        entry_fee=_entry_fee_est_sl, exit_fee=exit_fee)
                     self._notify_snapshot(batch_id)
 
                     self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
@@ -7599,14 +7713,24 @@ class CryptoTrader:
 
                     tp_exit_price = float(self.exchange.price_to_precision(symbol, tp_exit_price))
 
+                    # 🔥 T1C-v2A：净量/净成本基准；TP=TAKE_PROFIT_MARKET 触发
+                    # 后按市价成交 → 降级费率 Taker（重放结论）
+                    _net_qty_tp, _net_cost_tp = self._batch_net_position(latest_b_data)
+                    _gross_cost_tp = _net_cost_tp + float(
+                        latest_b_data.get('realized_reduce_cost', 0.0) or 0.0)
+                    _alloc_ratio_tp = (_net_cost_tp / _gross_cost_tp
+                                       if _gross_cost_tp > 0 else 0.0)
+                    _entry_fee_est_tp = float(total_entry_fee or 0.0) * _alloc_ratio_tp
+                    _avg_entry_tp = (_net_cost_tp / _net_qty_tp
+                                     if _net_qty_tp > 0 else 0.0)
                     if side == 'BUY':
-                        gross_pnl = (tp_exit_price - batch_entry_vwap) * batch_filled_amount
+                        gross_pnl = (tp_exit_price - _avg_entry_tp) * _net_qty_tp
                     else:
-                        gross_pnl = (batch_entry_vwap - tp_exit_price) * batch_filled_amount
-
-                    exit_fee = tp_exit_price * batch_filled_amount * MAKER_FEE_RATE
-                    total_fees = total_entry_fee + exit_fee
+                        gross_pnl = (_avg_entry_tp - tp_exit_price) * _net_qty_tp
+                    exit_fee = tp_exit_price * _net_qty_tp * TAKER_FEE_RATE
+                    total_fees = _entry_fee_est_tp + exit_fee
                     net_pnl = gross_pnl - total_fees
+                    batch_entry_vwap, batch_filled_amount = _avg_entry_tp, _net_qty_tp
 
                     capital_base = batch_entry_vwap * batch_filled_amount
                     net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
@@ -7616,7 +7740,7 @@ class CryptoTrader:
                         f"🆔 **批次号**：`{batch_id}`\n"
                         f"🪙 **标的**：`{symbol}`\n"
                         f"📊 **方向**：`{side}`\n"
-                        f"📊 **平仓模式**：止盈单 (Maker {MAKER_FEE_RATE * 100:.2f}%)\n"
+                        f"📊 **平仓模式**：止盈单 (Taker {MAKER_FEE_RATE * 100:.2f}%)\n"
                         f"持仓均价：`{batch_entry_vwap:.2f}` USDT\n"
                         f"平仓均价：`{tp_exit_price:.2f}` USDT\n"
                         f"平仓数量：`{batch_filled_amount}`\n"
@@ -7628,8 +7752,25 @@ class CryptoTrader:
                     self.send_tg_notification(tp_msg)
 
                     # 🔥 记录已实现盈亏 + 附带剩余持仓快照
-                    self._record_realized_pnl(batch_id, symbol, side, batch_filled_amount,
-                                              batch_entry_vwap, tp_exit_price, net_pnl, "止盈")
+                    _observed_tp = None
+                    if isinstance(tp_detail, dict):
+                        _observed_tp = (tp_detail.get('actualQty')
+                                        or tp_detail.get('executedQty')
+                                        or tp_detail.get('filled'))
+                    self._record_realized_pnl(
+                        batch_id, symbol, side, batch_filled_amount,
+                        batch_entry_vwap, tp_exit_price, net_pnl, "止盈",
+                        dedup_key=f'{symbol}:{tp_order_id}',
+                        expected_qty=_net_qty_tp, observed_qty=_observed_tp,
+                        entry_notional=_gross_cost_tp,
+                        allocation_status=('CONSERVATIVE_FULL'
+                                           if float(latest_b_data.get('realized_reduce_amount', 0.0) or 0.0) > 0
+                                           else 'PROVEN'),
+                        entry_order_refs=[str(x) for x in
+                                          (latest_b_data.get('entry_orders') or [])
+                                          [:int(latest_b_data.get('last_filled_count', 0) or 0)]],
+                        exit_order_ref={'order_id': str(tp_order_id), 'kind': 'algo'},
+                        entry_fee=_entry_fee_est_tp, exit_fee=exit_fee)
                     self._notify_snapshot(batch_id)
 
                     self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
@@ -10331,7 +10472,8 @@ class CryptoTrader:
         # v6.4：剩余 fee 按 cost 比例分摊（fee ∝ notional，非 qty）
         _fee_rem = float(total_entry_fee or 0.0) * _net_cost_m / _gross_cost_m \
             if _gross_cost_m > 0 else 0.0
-        avg_price = (_net_cost_m + _fee_rem) / current_filled_amount \
+        # 🔥 T1C-v2A：净成本基准（不含费）+ 净份额（重放结论）
+        avg_price = _net_cost_m / current_filled_amount \
             if current_filled_amount > 0 else 0
 
         if side == 'BUY':
@@ -10341,7 +10483,7 @@ class CryptoTrader:
 
         # 估算平仓手续费（市价 = Taker）
         exit_fee = current_price * current_filled_amount * TAKER_FEE_RATE
-        total_fees = total_entry_fee + exit_fee
+        total_fees = _fee_rem + exit_fee
         net_pnl = gross_pnl - total_fees
 
         # 执行市价平仓
@@ -10505,7 +10647,8 @@ class CryptoTrader:
                 actual_gross_pnl = (avg_price - actual_price) * confirmed_filled_amount
 
             actual_exit_fee = actual_price * confirmed_filled_amount * TAKER_FEE_RATE
-            actual_total_fees = total_entry_fee + actual_exit_fee
+            # 🔥 T1C-v2A：入场费净份额（只扣一次）
+            actual_total_fees = _fee_rem + actual_exit_fee
             actual_net_pnl = actual_gross_pnl - actual_total_fees
 
             capital_base = avg_price * confirmed_filled_amount if confirmed_filled_amount > 0 else 1
@@ -10560,9 +10703,26 @@ class CryptoTrader:
 
             # 🔥 记录已实现盈亏 + 附带剩余持仓快照
             _pnl_partial = confirmed_filled_amount < current_filled_amount - 1e-12
-            self._record_realized_pnl(batch_id, target_symbol, side, confirmed_filled_amount,
-                                      avg_price, actual_price, actual_net_pnl, "市价平仓",
-                                      pnl_partial=_pnl_partial)
+            _observed_m = None
+            if isinstance(order, dict):
+                _observed_m = (order.get('actualQty')
+                               or order.get('executedQty')
+                               or order.get('filled'))
+            self._record_realized_pnl(
+                batch_id, target_symbol, side, confirmed_filled_amount,
+                avg_price, actual_price, actual_net_pnl, "市价平仓",
+                pnl_partial=_pnl_partial,
+                dedup_key=f'{target_symbol}:{close_order_id}',
+                expected_qty=current_filled_amount, observed_qty=_observed_m,
+                entry_notional=_gross_cost_m,
+                allocation_status=('CONSERVATIVE_FULL'
+                                   if float(target_b_data.get('realized_reduce_amount', 0.0) or 0.0) > 0
+                                   else 'PROVEN'),
+                entry_order_refs=[str(x) for x in
+                                  (target_b_data.get('entry_orders') or [])
+                                  [:int(target_b_data.get('last_filled_count', 0) or 0)]],
+                exit_order_ref={'order_id': str(close_order_id), 'kind': 'regular'},
+                entry_fee=_fee_rem, exit_fee=actual_exit_fee)
             self._notify_snapshot(batch_id)
 
             return True, result_msg
