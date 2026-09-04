@@ -307,7 +307,7 @@ def r4_full_fill_finalizer_monitor_dead():
                      'positionSide': 'LONG'}]
     cleared = []
     t._converge_batch_orders_before_clear = lambda s, bid: {'proof': 'FULL'}
-    t.clear_batch_state = lambda s, bid, proof=None: cleared.append(bid) or True
+    t.clear_batch_state = lambda s, bid, proof=None, authorization=None: cleared.append(bid) or True
     pnl = []
 
     def _rec(*a, **k):  # 模拟真函数的 dedup 契约（真行为由 R12 单测）
@@ -339,7 +339,7 @@ def r4b_phase2_takeover_after_crash():
            avg=76500.0)
     cleared = []
     t._converge_batch_orders_before_clear = lambda s, bid: {'proof': 'FULL'}
-    t.clear_batch_state = lambda s, bid, proof=None: cleared.append(bid) or True
+    t.clear_batch_state = lambda s, bid, proof=None, authorization=None: cleared.append(bid) or True
     pnl = []
     t._record_realized_pnl = lambda *a, **k: pnl.append((a, k)) or True
     # 恢复路径：经裁决器（settled 分支）→ 接管 finalizer
@@ -428,7 +428,7 @@ def r13_generation_isolation():
            avg=76500.0)
     cleared = []
     t._converge_batch_orders_before_clear = lambda s, bid: {'proof': 'FULL'}
-    t.clear_batch_state = lambda s, bid, proof=None: cleared.append(bid) or True
+    t.clear_batch_state = lambda s, bid, proof=None, authorization=None: cleared.append(bid) or True
     # 旧 monitor 拿 L1 来裁决/结算 → 必须拒绝且零副作用
     ok1, msg1 = t._adjudicate_closed_limit_close(SYM, BID, 'L1')
     assert not ok1 and 'order_generation_mismatch' in msg1, (ok1, msg1)
@@ -450,10 +450,10 @@ def r14_pnl_persist_failure_keeps_phase2():
            avg=76500.0)
     cleared = []
     t._converge_batch_orders_before_clear = lambda s, bid: {'proof': 'FULL'}
-    t.clear_batch_state = lambda s, bid, proof=None: cleared.append(bid) or True
+    t.clear_batch_state = lambda s, bid, proof=None, authorization=None: cleared.append(bid) or True
     t._record_realized_pnl = lambda *a, **k: False  # 落盘失败注入
     ok, msg = t._finalize_limit_full_fill(SYM, BID, 'L1')
-    assert not ok and 'pnl_persist_failed' in msg, (ok, msg)
+    assert not ok and 'finalize_pending' in msg, (ok, msg)
     b2 = _state_read(t)[SYM][BID]
     assert b2.get('close_phase') == 2, 'PnL 未 durable 绝不回 phase<2'
     assert cleared == [], 'PnL 写失败绝不 clear（成交记录会永久丢失）'
@@ -1084,7 +1084,7 @@ def r27_converge_window_migration_refuses_clear():
                       'positionSide': 'LONG'}]
     cleared2 = []
 
-    def _clear2(s, bid, proof=None):  # 建模真实 clear：记录 + 从账本移除
+    def _clear2(s, bid, proof=None, authorization=None):  # 建模真实 clear：记录 + 从账本移除
         cleared2.append(bid)
         st = _state_read(t2)
         (st.get(s, {}) or {}).pop(bid, None)

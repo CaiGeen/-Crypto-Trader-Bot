@@ -222,11 +222,25 @@ def make_fake_b(env, ex):
              # 🔥 P5：FULL_FILL 共享 finalizer（结算段已从 monitor 抽到该函数；
              # 未绑定 → MagicMock 静默吞掉 → 撤 TP/clear 全不发生，测试假红）
              '_finalize_limit_full_fill', '_claim_settlement_reported',
-             '_batch_net_position', '_notify_snapshot')
+             '_batch_net_position', '_notify_snapshot',
+             # 🔥 T1C-v2A：结算事务 outbox 路径 helper（未绑定 → MagicMock 泄漏进
+             # pending_settlement → json.dump 失败 → outbox 持久化失败 → 批次不清算，
+             # 复现生产接线后的 G-B1/G-B2/R-B1 假红）。同 P5 绑定惯例。
+             '_build_settlement_evidence', '_derive_base_dedup',
+             '_derive_settlement_mode',
+             '_atomic_outbox_begin', '_try_finalize_outbox',
+             '_resume_pending_settlement', '_record_realized_pnl')
     for _n in _bind:
         if hasattr(CryptoTrader, _n):
             setattr(fake, _n, (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(
                 fake, *a, **k))())
+    # 🔥 v2A：_record_realized_pnl 经 __file__ 相邻路径写真实 trade_stats.json，
+    # 测试须重定向到 tmp（r99 生产文件零污染哨兵）。本方法忽略 self.stats_file，
+    # 故显式注入 stats_file 参数（仅测试隔离，不改生产契约）。
+    _stats_tmp = os.path.join(env.dir, 'trade_stats.json')
+    fake._stats_file = _stats_tmp
+    _real_rec = fake._record_realized_pnl
+    fake._record_realized_pnl = lambda *a, **k: _real_rec(*a, stats_file=_stats_tmp, **k)
     return fake
 
 
