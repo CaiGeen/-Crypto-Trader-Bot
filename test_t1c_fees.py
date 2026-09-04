@@ -307,6 +307,26 @@ def make_settlement_trader():
     return t
 
 
+
+
+# ── F14：总异常兜底 → entry_fee 必须有限非 0（补 2 契约）──────────────────
+def f14_total_exception_entry_fee_finite():
+    t = make_settlement_trader()
+    def _boom(b):
+        raise RuntimeError('injected')
+    t._batch_net_position = _boom
+    b = _settle_batch()
+    b['total_entry_fee'] = 0.154
+    fees = t._compute_settlement_fees(SYM, b, 0.002,
+                                      {'kind': 'algo', 'order_id': 'S1'}, 0.04)
+    assert fees['entry_fee_source'] == 'estimated', fees
+    assert fees['entry_fee'] == fees['entry_fee'] and abs(fees['entry_fee']) != float('inf'), fees
+    assert fees['entry_fee'] > 0, f'总异常兜底不得返 0（补 2）: {fees}'
+    assert abs(fees['entry_fee'] - 0.154) < 1e-9, f'兜底=账本全量入场费: {fees}'
+    assert fees['entry_note'] == 'query_failed', fees
+
+
+
 TESTS = [f1_regular_order_direct_actual,
          f2_algo_mapping_chain,
          f3_non_usdt_commission,
@@ -318,7 +338,8 @@ TESTS = [f1_regular_order_direct_actual,
          f11_four_path_wiring_locked,
          f12_partial_then_new_layer_must_be_estimated,
          f13_market_confirmed_less_than_net,
-         f_meta_error_never_swallows_pnl]
+         f_meta_error_never_swallows_pnl,
+         f14_total_exception_entry_fee_finite]
 
 
 def main():

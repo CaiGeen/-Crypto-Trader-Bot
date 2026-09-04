@@ -1133,7 +1133,9 @@ class CryptoTrader:
             except Exception:
                 total_entry_fee = 0.0
             print(f"⚠️ [T1-C] 手续费解析异常，整单降级估算: {type(e).__name__}: {e}")
-            return {'entry_fee': 0.0, 'entry_fee_source': 'estimated',
+            # 🔥 补 2（绝不返 0）：总异常兜底 = 账本全量入场费（保守有限估算），
+            # 而非 0——0 会让 net_pnl 虚增且违反「降级绝不返 0」契约。
+            return {'entry_fee': total_entry_fee, 'entry_fee_source': 'estimated',
                     'entry_note': 'query_failed', 'entry_fee_total': total_entry_fee,
                     'exit_fee': est, 'exit_fee_source': 'estimated',
                     'exit_note': 'query_failed', 'fee_note': ''}
