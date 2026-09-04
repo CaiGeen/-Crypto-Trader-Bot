@@ -888,7 +888,7 @@ class CryptoTrader:
                              avg_price: float, exit_price: float, net_pnl: float,
                              mode: str, pnl_partial: bool = False,
                              dedup_key: str | None = None,
-                             stats_file: str | None = None) -> None:
+                             stats_file: str | None = None) -> bool:
         """记录一笔已实现盈亏到 trade_stats.json（原子写入，失败静默）
 
         dedup_key —— P5：同一 close 订单的 PnL 幂等记录（/closecancel 与
@@ -899,17 +899,49 @@ class CryptoTrader:
         返回 bool：True=已记录（含 dedup 命中=幂等成功），False=写盘失败
         （P5 finalizer 依赖此返回值：失败必须保持 phase=2，绝不 clear——否则
         成交记录永久丢失）。"""
+        # 🔥 P0-stats-durability（v2.2 §6）：三态读取 + CORRUPT 拒写。
+        # 输入校验先行（在锁外）：side 枚举 + 金额有限性——非法输入绝不入账。
+        def _finite(v):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            if f != f or f in (float('inf'), float('-inf')):
+                return None
+            return f
+
+        if side not in ('BUY', 'SELL'):
+            print(f"⚠️ [盈亏记录] 非法 side={side!r}，拒绝入账")
+            return False
+        _vals = [_finite(amount), _finite(avg_price), _finite(exit_price),
+                 _finite(net_pnl)]
+        if any(v is None for v in _vals):
+            print("⚠️ [盈亏记录] 金额非有限/不可解析，拒绝入账")
+            return False
+        amount, avg_price, exit_price, net_pnl = _vals
+
         try:
             base_dir = os.path.dirname(os.path.abspath(__file__))
             stats_file = stats_file or os.path.join(base_dir, "trade_stats.json")
             with self._state_lock:
-                stats = {}
+                # 三态读取：MISSING（可建新账本）/ VALID（可 dedup+追加）/
+                # CORRUPT（拒绝写入，原文件字节保持不变——UNKNOWN ≠ EMPTY）
                 if os.path.exists(stats_file):
                     try:
                         with open(stats_file, "r", encoding="utf-8") as f:
                             stats = json.load(f)
+                        if not isinstance(stats, dict) or \
+                                not isinstance(stats.get("trades", []), list):
+                            print("⚠️ [盈亏记录] trade_stats.json 结构非法，"
+                                  "拒绝写入并保留原文件（ Fail-Closed ）")
+                            return False
                     except Exception:
-                        stats = {}
+                        print("⚠️ [盈亏记录] trade_stats.json 损坏，拒绝写入并"
+                              "保留原文件（Fail-Closed）；请人工修复，"
+                              "**不要删除**该文件")
+                        return False
+                else:
+                    stats = {"trades": []}
                 if dedup_key and any(r.get('dedup_key') == dedup_key
                                      for r in stats.get('trades', []) or []):
                     return True  # 幂等：同订单 PnL 已记录（finalizer 接管/重试语义）
@@ -918,10 +950,10 @@ class CryptoTrader:
                     "batch_id": batch_id,
                     "symbol": symbol,
                     "side": side,
-                    "amount": round(float(amount), 6),
-                    "avg_price": round(float(avg_price), 4),
-                    "exit_price": round(float(exit_price), 4),
-                    "net_pnl": round(float(net_pnl), 4),
+                    "amount": round(amount, 6),
+                    "avg_price": round(avg_price, 4),
+                    "exit_price": round(exit_price, 4),
+                    "net_pnl": round(net_pnl, 4),
                     "mode": mode,
                 }
                 if dedup_key:
@@ -929,8 +961,19 @@ class CryptoTrader:
                 stats.setdefault("trades", []).append(record)
                 with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(stats_file), delete=False, encoding="utf-8") as tf:
                     json.dump(stats, tf, ensure_ascii=False, indent=2)
+                    tf.flush()
+                    os.fsync(tf.fileno())
                     temp_name = tf.name
                 os.replace(temp_name, stats_file)
+                # 尽力 fsync 目录（Windows 对目录 fsync 不可用 → 静默跳过）
+                try:
+                    _df = os.open(os.path.dirname(stats_file) or '.', os.O_RDONLY)
+                    try:
+                        os.fsync(_df)
+                    finally:
+                        os.close(_df)
+                except Exception:
+                    pass
             return True
         except Exception as e:
             print(f"⚠️ [盈亏记录] 写入失败: {e}")
