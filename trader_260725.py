@@ -919,7 +919,7 @@ class CryptoTrader:
             return False
         amount, avg_price, exit_price, net_pnl = _vals
 
-        corrupt_alert_path = None   # 锁外限频 critical 的目标文件
+        alert_msg = None            # 锁内决定；仅把消息带出锁外发送
         proceed = False             # MISSING/VALID 且通过校验 → True
         result = False
         stats = None
@@ -938,15 +938,34 @@ class CryptoTrader:
                         _trades = stats.get("trades") if isinstance(stats, dict) else None
                         if not isinstance(_trades, list) or \
                                 any(not isinstance(_r, dict) for _r in _trades):
-                            corrupt_alert_path = stats_file   # CORRUPT：锁内仅判定
+                            proceed = False                      # CORRUPT
                         else:
-                            proceed = True                    # VALID
+                            proceed = True                       # VALID
                     except Exception:
-                        corrupt_alert_path = stats_file       # CORRUPT：JSON 非法
+                        proceed = False                          # CORRUPT：JSON 非法
                 else:
-                    stats = {"trades": []}                    # MISSING
+                    stats = {"trades": []}                       # MISSING
                     proceed = True
-                if corrupt_alert_path is None and proceed:
+                # 限频计数在锁内原子更新：并发损坏调用也突破不了 3 次上限；
+                # 文件恢复 VALID/MISSING 时清除计数 → 修复后再次损坏可重新告警
+                counts = getattr(self, '_stats_corrupt_alert_counts', None)
+                if counts is None:
+                    counts = self._stats_corrupt_alert_counts = {}
+                if not proceed:
+                    n = counts.get(stats_file, 0)
+                    if n < 3:
+                        counts[stats_file] = n + 1
+                        if n == 0:
+                            alert_msg = (f"⚠️【账本损坏】`{stats_file}` 读取失败或结构非法，"
+                                         f"已拒绝写入并保留原文件（Fail-Closed）。\n"
+                                         f"💡 请人工修复该 JSON（**不要删除**，保留证据）；"
+                                         f"修复前 PnL 记录持续被拒绝。")
+                        else:
+                            alert_msg = (f"⚠️【账本损坏】`{stats_file}` 仍处于拒绝写入状态"
+                                         f"（第 {n + 1}/3 次告警）。")
+                else:
+                    counts.pop(stats_file, None)   # 修复/正常 → 重新武装
+                if proceed:
                     if dedup_key and any(r.get('dedup_key') == dedup_key
                                          for r in stats.get('trades', []) or []):
                         result = True  # 幂等：同订单 PnL 已记录（重试语义）
@@ -970,10 +989,12 @@ class CryptoTrader:
                             with tempfile.NamedTemporaryFile(
                                     "w", dir=os.path.dirname(stats_file),
                                     delete=False, encoding="utf-8") as tf:
+                                # 🔥 认领必须先于 dump/flush/fsync：前三步任一
+                                # 抛错时 finally 也能清理已创建的临时文件
+                                temp_name = tf.name
                                 json.dump(stats, tf, ensure_ascii=False, indent=2)
                                 tf.flush()
                                 os.fsync(tf.fileno())
-                                temp_name = tf.name
                             os.replace(temp_name, stats_file)
                             temp_name = None
                         finally:
@@ -987,23 +1008,9 @@ class CryptoTrader:
                         # 绝不参与写入成败判断——D-009 P0-A 裁定）
                         _fsync_dir(os.path.dirname(stats_file) or '.')
                         result = True
-            if corrupt_alert_path:
-                # 🔥 锁外限频 critical（复用既有告警模式：同键最多 3 次后静默）
-                counts = getattr(self, '_stats_corrupt_alert_counts', None)
-                if counts is None:
-                    counts = self._stats_corrupt_alert_counts = {}
-                n = counts.get(corrupt_alert_path, 0)
-                if n < 3:
-                    counts[corrupt_alert_path] = n + 1
-                    if n == 0:
-                        msg = (f"⚠️【账本损坏】`{corrupt_alert_path}` 读取失败或结构非法，"
-                               f"已拒绝写入并保留原文件（Fail-Closed）。\n"
-                               f"💡 请人工修复该 JSON（**不要删除**，保留证据）；"
-                               f"修复前 PnL 记录持续被拒绝。")
-                    else:
-                        msg = (f"⚠️【账本损坏】`{corrupt_alert_path}` 仍处于拒绝写入状态"
-                               f"（第 {n + 1}/3 次告警）。")
-                    self.send_tg_notification(msg, level='critical')
+            if alert_msg:
+                # 🔥 锁外发送（判定与计数已在锁内完成）
+                self.send_tg_notification(alert_msg, level='critical')
             return result
         except Exception as e:
             print(f"⚠️ [盈亏记录] 写入失败: {e}")

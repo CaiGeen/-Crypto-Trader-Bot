@@ -248,6 +248,86 @@ def s14_fsync_dir_degrade_not_failure():
 
 
 
+
+# S15：json.dump / 文件 fsync 失败 → 目标字节不变 + 临时文件零残留
+def s15_dump_and_fsync_failure_no_residue():
+    t = _trader()
+    d = os.path.join(TMP, 's15dir')
+    os.makedirs(d, exist_ok=True)
+    sf = os.path.join(d, 'trade_stats.json')
+    t._record_realized_pnl(stats_file=sf, **_rec())
+    before = _bytes(sf)
+    files_before = set(os.listdir(d))
+    import trader_260725 as mod
+
+    # ① json.dump 失败
+    real_dump = mod.json.dump
+    mod.json.dump = lambda *a, **k: (_ for _ in ()).throw(OSError('dump fail'))
+    try:
+        assert t._record_realized_pnl(stats_file=sf, **_rec(batch_id='d1')) is False
+    finally:
+        mod.json.dump = real_dump
+    assert _bytes(sf) == before, 'dump 失败后目标不变'
+    assert not (set(os.listdir(d)) - files_before), 'dump 失败零残留'
+
+    # ② 文件 fsync 失败
+    real_fsync = mod.os.fsync
+    mod.os.fsync = lambda *a, **k: (_ for _ in ()).throw(OSError('fsync fail'))
+    try:
+        assert t._record_realized_pnl(stats_file=sf, **_rec(batch_id='d2')) is False
+    finally:
+        mod.os.fsync = real_fsync
+    assert _bytes(sf) == before, 'fsync 失败后目标不变'
+    assert not (set(os.listdir(d)) - files_before), 'fsync 失败零残留'
+
+
+# S16：CORRUPT → 修复 → 再次 CORRUPT 会重新告警（限频器可重武装）─────────────
+def s16_rearm_after_repair():
+    t = _trader()
+    sf = _sf('s16.json')
+    seen = []
+    t.send_tg_notification = lambda msg, level='info': (
+        seen.append(level) if level == 'critical' else None)
+    open(sf, 'wb').write(b'broken-1')
+    for _ in range(4):                       # 第一次事故：3 次告警后静默
+        t._record_realized_pnl(stats_file=sf, **_rec())
+    n_first = len(seen)
+    assert n_first == 3, f'第一次事故应恰好 3 次: {n_first}'
+    # 人工修复：写回合法账本 → 下一次调用 VALID → 清除限频计数
+    json.dump({'trades': []}, open(sf, 'w', encoding='utf-8'))
+    assert t._record_realized_pnl(stats_file=sf, **_rec()) is True
+    # 再次损坏：必须重新告警（不得永久静默）
+    open(sf, 'wb').write(b'broken-2')
+    t._record_realized_pnl(stats_file=sf, **_rec())
+    n_second = len(seen) - n_first
+    assert n_second == 1, f'修复后再次损坏必须重新告警: {n_second}'
+
+
+# S17：并发损坏调用仍不超过限额（限频计数锁内原子更新）────────────────────
+def s17_concurrent_corrupt_within_limit():
+    t = _trader()
+    sf = _sf('s17.json')
+    open(sf, 'wb').write(b'broken-concurrent')
+    seen = []
+    lock = threading.Lock()
+
+    def _spy(msg, level='info'):
+        with lock:
+            seen.append(level)
+    t.send_tg_notification = _spy
+    threads = [threading.Thread(target=t._record_realized_pnl,
+                                kwargs=dict(stats_file=sf, **_rec(batch_id=f't{i}')))
+               for i in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    criticals = sum(1 for lv in seen if lv == 'critical')
+    assert criticals <= 3, f'并发损坏告警必须 ≤3: {criticals}'
+    assert criticals >= 1, f'至少应有 1 次告警: {seen}'
+
+
+
 TESTS = [s1_missing_file_first_write,
          s2_valid_file_append,
          s3_dedup_retry_single_record,
@@ -261,7 +341,10 @@ TESTS = [s1_missing_file_first_write,
          s11_empty_obj_and_non_dict_trades_rejected,
          s12_corrupt_alert_rate_limited_and_outside_lock,
          s13_failure_leaves_no_temp_residue,
-         s14_fsync_dir_degrade_not_failure]
+         s14_fsync_dir_degrade_not_failure,
+         s15_dump_and_fsync_failure_no_residue,
+         s16_rearm_after_repair,
+         s17_concurrent_corrupt_within_limit]
 
 
 def main():
