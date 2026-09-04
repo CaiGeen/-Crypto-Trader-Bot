@@ -888,7 +888,8 @@ class CryptoTrader:
                              avg_price: float, exit_price: float, net_pnl: float,
                              mode: str, pnl_partial: bool = False,
                              dedup_key: str | None = None,
-                             stats_file: str | None = None) -> None:
+                             stats_file: str | None = None, *,
+                             fee_breakdown: dict | None = None) -> bool:
         """记录一笔已实现盈亏到 trade_stats.json（原子写入，失败静默）
 
         dedup_key —— P5：同一 close 订单的 PnL 幂等记录（/closecancel 与
@@ -896,6 +897,14 @@ class CryptoTrader:
         pnl_partial=True —— 本次实际成交**小于台账**（此前存在未被跟踪的减仓：
         手动减仓 / ADL / 他方平仓）。此时 net_pnl 仅覆盖本次成交部分，**不是该
         批次的完整已实现盈亏**；落 `prior_reduction_unknown` 标记供日报/汇总识别。
+        fee_breakdown —— T1-C（v1.3+补充条款）：手续费元数据（keyword-only）。
+        固定字段白名单：entry_fee / entry_fee_source / entry_note /
+        entry_fee_total / exit_fee / exit_fee_source / exit_note / fee_note。
+        未知键忽略 + loud console；必需字段（entry_fee/entry_fee_source/
+        exit_fee/exit_fee_source）缺失或金额非有限数 → 基础 PnL 照常落盘并打
+        `fee_metadata_error=True`（元数据异常绝不吞掉 net_pnl 记录）。
+        entry_fee 定义 = **本条 PnL 实际扣除的入场费**（与 net_pnl 可对账）；
+        全部历史入场费只能进 entry_fee_total。
         返回 bool：True=已记录（含 dedup 命中=幂等成功），False=写盘失败
         （P5 finalizer 依赖此返回值：失败必须保持 phase=2，绝不 clear——否则
         成交记录永久丢失）。"""
@@ -926,6 +935,37 @@ class CryptoTrader:
                 }
                 if dedup_key:
                     record['dedup_key'] = dedup_key
+                if pnl_partial:
+                    # 🔥 T1-C 补1：兑现 docstring 既有语义（此前从未真正写入）
+                    record['prior_reduction_unknown'] = True
+                if fee_breakdown is not None:
+                    if not isinstance(fee_breakdown, dict):
+                        record['fee_metadata_error'] = True
+                        print("⚠️ [T1-C] fee_breakdown 非 dict，跳过 fee 元数据")
+                    else:
+                        _FB_KEYS = ('entry_fee', 'entry_fee_source', 'entry_note',
+                                    'entry_fee_total', 'exit_fee', 'exit_fee_source',
+                                    'exit_note', 'fee_note')
+                        unknown = [k for k in fee_breakdown if k not in _FB_KEYS]
+                        if unknown:
+                            print(f"⚠️ [T1-C] fee_breakdown 未知键已忽略: {unknown}")
+                        _meta_ok = True
+                        for k in _FB_KEYS:
+                            if k not in fee_breakdown:
+                                continue
+                            v = fee_breakdown[k]
+                            if k in ('entry_fee', 'entry_fee_total', 'exit_fee'):
+                                if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                                        or v != v or v in (float('inf'), float('-inf')):
+                                    _meta_ok = False        # 必需金额非法
+                                    continue
+                                record[k] = round(float(v), 6)
+                            else:
+                                record[k] = str(v or '')
+                        if any(k not in record for k in
+                               ('entry_fee', 'entry_fee_source',
+                                'exit_fee', 'exit_fee_source')):
+                            record['fee_metadata_error'] = True
                 stats.setdefault("trades", []).append(record)
                 with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(stats_file), delete=False, encoding="utf-8") as tf:
                     json.dump(stats, tf, ensure_ascii=False, indent=2)
@@ -935,6 +975,168 @@ class CryptoTrader:
         except Exception as e:
             print(f"⚠️ [盈亏记录] 写入失败: {e}")
             return False
+
+    # 🔥 T1-C（v1.3+补充条款）：fee_breakdown 白名单（模块级常量，resolver 与
+    # 落盘层共用同一契约）。
+    _FEE_BREAKDOWN_KEYS = ('entry_fee', 'entry_fee_source', 'entry_note',
+                           'entry_fee_total', 'exit_fee', 'exit_fee_source',
+                           'exit_note', 'fee_note')
+
+    def _resolve_order_fees(self, symbol, order_ref, expected_qty,
+                            estimated_fee, order_snapshot=None):
+        """🔥 v6.4-T1-C：单订单手续费解析——actual 优先，fail-soft（绝不抛出、绝不返 0）。
+
+        order_ref: {'kind': 'regular'|'algo', 'order_id': str}
+          - regular（市价平仓/限价平仓）：orderId 直查 userTrades（探针 P4：过滤生效）；
+          - algo（入场 STOP_MARKET 层 / SL / TP）：账本 id 为 algoId，在 userTrades
+            中永不出现（探针 P1/P6 实锤）→ 经 algo 记录的 actualOrderId 映射：
+            order_snapshot 提供 actualOrderId 则免查询，否则 fapiPrivateGetAlgoOrder
+            （weight 0.1）单查。
+        expected_qty: 数量归因契约——fills 合计必须 ≈ 该订单权威成交量
+          （executedQty / actualQty），否则 fills_incomplete。
+        estimated_fee: 调用方传入的有限估算值——任何降级路径（查询失败/空 fills/
+          非 USDT/数量不完整/超窗）都返回它，**绝不返回 0、绝不抛出**。
+        返回 (fee: float, source: 'actual'|'estimated', note: str)。"""
+        try:
+            est = float(estimated_fee)
+            if est != est or est in (float('inf'), float('-inf')):
+                est = 0.0
+            kind = str((order_ref or {}).get('kind') or '')
+            oid = str((order_ref or {}).get('order_id') or '')
+            if not oid:
+                return est, 'estimated', 'query_failed'
+            real_oid = oid
+            if kind == 'algo':
+                snap = order_snapshot
+                if not (isinstance(snap, dict) and str(snap.get('actualOrderId') or '')):
+                    try:
+                        snap = self._safe_api_call(
+                            self.exchange.fapiPrivateGetAlgoOrder,
+                            {'symbol': symbol, 'algoId': oid})
+                    except Exception:
+                        return est, 'estimated', 'query_failed'
+                real_oid = str((snap or {}).get('actualOrderId') or '')
+                if not real_oid:
+                    return est, 'estimated', 'algo_no_actual_order'
+            fills = self._safe_api_call(
+                self.exchange.fetch_my_trades, symbol, None, None,
+                {'orderId': real_oid})
+            if not fills:
+                return est, 'estimated', 'fills_empty'
+            total_qty = 0.0
+            total_fee = 0.0
+            assets = set()
+            for _t in fills:
+                _info = _t.get('info', {}) if isinstance(_t, dict) else {}
+                total_qty += float(_t.get('amount') or _info.get('qty') or 0.0)
+                total_fee += float(_info.get('commission') or 0.0)
+                assets.add(str(_info.get('commissionAsset') or ''))
+            exp = float(expected_qty or 0.0)
+            if exp <= 0 or abs(total_qty - exp) > max(1e-8, exp * 1e-6):
+                return est, 'estimated', 'fills_incomplete'
+            if assets != {'USDT'}:
+                return est, 'estimated', 'non_usdt_commission'
+            if total_fee != total_fee or total_fee in (float('inf'), float('-inf')):
+                return est, 'estimated', 'query_failed'
+            return total_fee, 'actual', ''
+        except Exception:
+            est = float(estimated_fee)
+            if est != est or est in (float('inf'), float('-inf')):
+                est = 0.0
+            return est, 'estimated', 'query_failed'
+
+    def _compute_settlement_fees(self, symbol, b_data, settlement_qty,
+                                 exit_order_ref, estimated_exit_fee):
+        """🔥 v6.4-T1-C：四路径统一手续费口径（入场费只扣一次；净份额分摊；fail-soft）。
+
+        - 剩余入场费口径（v1.3 阻断 2）：
+          realized_reduce_amount == 0（无 partial 史）→ 逐层解析入场单（可 actual）；
+          曾发生 partial → total_entry_fee × (net_cost/gross_cost)，一律 estimated
+          + partial_allocation_unknown（聚合比例式对新层费错误分摊——0.45≠0.525 反例）；
+        - 数量归因（v1.3 阻断 3）：
+          entry_fee_for_record = 剩余入场费 × settlement_qty/net_qty
+          （settlement_qty < net_qty ⇒ 此前存在未记账减仓 → estimated +
+          prior_reduction_unknown）；
+        - 入场解析范围仅 entry_orders[:last_filled_count]（尾部可能是未成交挂单）；
+        - 入场单全部为 STOP_MARKET 条件单（L4950 实锤）→ kind='algo' 来自生产
+          调用点上下文，非 id 长度猜测；
+        - KNOWN_LIMITATION：/partial 不记录中间 PnL；fee_note 只能揭示该限制。
+          UPGRADE_TRIGGER：引入逐层剩余手续费账本后 partial_allocation_unknown
+          可升级为 actual。"""
+        try:
+            net_qty, net_cost = self._batch_net_position(b_data)
+            lfc = int(b_data.get('last_filled_count', 0) or 0)
+            tas = list(b_data.get('target_amounts') or [])[:lfc]
+            fds = list(b_data.get('filled_details') or [])[:lfc]
+            gross_cost = float(sum(ta * fd for ta, fd in zip(tas, fds)))
+            total_entry_fee = float(b_data.get('total_entry_fee', 0.0) or 0.0)
+            realized = float(b_data.get('realized_reduce_amount', 0.0) or 0.0)
+            settlement_qty = float(settlement_qty or 0.0)
+            settle_ratio = (settlement_qty / net_qty) if net_qty > 0 else 0.0
+
+            prior_reduction = settlement_qty < net_qty - 1e-12
+            if realized > 0:
+                # 曾 partial：聚合比例式对新层费错误分摊（0.45≠0.525 反例）→ 不猜
+                remaining = total_entry_fee * ((net_cost / gross_cost) if gross_cost > 0 else 0.0)
+                entry_fee = remaining * settle_ratio
+                entry_source, entry_note = 'estimated', 'partial_allocation_unknown'
+            elif prior_reduction:
+                # settlement < net：此前存在未记账减仓 → 分配不可证明
+                remaining = total_entry_fee * ((net_cost / gross_cost) if gross_cost > 0 else 0.0)
+                entry_fee = remaining * settle_ratio
+                entry_source, entry_note = 'estimated', 'prior_reduction_unknown'
+            else:
+                remaining = 0.0
+                notes = set()
+                any_est = False
+                entry_orders = list(b_data.get('entry_orders') or [])[:lfc]
+                for i, _oid in enumerate(entry_orders):
+                    exp_qty = float(tas[i]) if i < len(tas) else 0.0
+                    est_layer = (float(tas[i]) * float(fds[i]) * TAKER_FEE_RATE
+                                 if i < len(fds) else 0.0)
+                    fee_i, src_i, note_i = self._resolve_order_fees(
+                        symbol, {'kind': 'algo', 'order_id': str(_oid or '')},
+                        exp_qty, est_layer)
+                    remaining += fee_i
+                    if src_i != 'actual':
+                        any_est = True
+                        if note_i:
+                            notes.add(note_i)
+                entry_fee = remaining * settle_ratio
+                if any_est:
+                    entry_source, entry_note = 'estimated', ';'.join(sorted(notes))
+                else:
+                    entry_source, entry_note = 'actual', ''
+
+            exit_fee, exit_source, exit_note = self._resolve_order_fees(
+                symbol, exit_order_ref, settlement_qty, estimated_exit_fee)
+            out = {
+                'entry_fee': entry_fee, 'entry_fee_source': entry_source,
+                'entry_note': entry_note, 'entry_fee_total': total_entry_fee,
+                'exit_fee': exit_fee, 'exit_fee_source': exit_source,
+                'exit_note': exit_note, 'fee_note': '',
+            }
+            # 出口防御：金额必须有限（resolver 已拦，此处兜底）
+            for _k in ('entry_fee', 'exit_fee', 'entry_fee_total'):
+                v = out[_k]
+                if not isinstance(v, (int, float)) or v != v or v in (
+                        float('inf'), float('-inf')):
+                    out[_k] = 0.0
+                    out['fee_metadata_error_hint'] = True
+            return out
+        except Exception as e:
+            est = float(estimated_exit_fee)
+            if est != est or est in (float('inf'), float('-inf')):
+                est = 0.0
+            try:
+                total_entry_fee = float(b_data.get('total_entry_fee', 0.0) or 0.0)
+            except Exception:
+                total_entry_fee = 0.0
+            print(f"⚠️ [T1-C] 手续费解析异常，整单降级估算: {type(e).__name__}: {e}")
+            return {'entry_fee': 0.0, 'entry_fee_source': 'estimated',
+                    'entry_note': 'query_failed', 'entry_fee_total': total_entry_fee,
+                    'exit_fee': est, 'exit_fee_source': 'estimated',
+                    'exit_note': 'query_failed', 'fee_note': ''}
 
     def _count_active_batches(self, all_states):
         """D-006: 统计全账户活跃批次数与带活跃批次的交易对集合（零 API，只读本地状态文件）"""
@@ -4278,24 +4480,27 @@ class CryptoTrader:
         side = (b.get('side') or 'BUY').upper()
         net_qty, net_cost = self._batch_net_position(b)
         gross = float(sum((b.get('target_amounts') or [])[:int(b.get('last_filled_count', 0) or 0)]))
-        total_entry_fee = float(b.get('total_entry_fee', 0.0) or 0.0)
-        fee_rem = total_entry_fee * (net_qty / gross) if gross > 0 else 0.0
-        total_cost_with_fee = net_cost + fee_rem
-        avg_entry = total_cost_with_fee / net_qty if net_qty > 0 else 0.0
+        # 🔥 T1-C（v1.3+补充条款）：统一手续费口径——入场费只扣一次（旧公式
+        # avg_entry 含 fee_rem + total_fees 再扣 = 双重扣）；avg_entry 改净成本
+        # 基准（未含手续费，与 batch_entry_vwap 口径一致）。
+        avg_entry = net_cost / net_qty if net_qty > 0 else 0.0
         exit_price = avg_price
         if side == 'BUY':
             gross_pnl = (exit_price - avg_entry) * net_qty
         else:
             gross_pnl = (avg_entry - exit_price) * net_qty
-        exit_fee = exit_price * net_qty * MAKER_FEE_RATE
-        total_fees = fee_rem + exit_fee
+        fees = self._compute_settlement_fees(symbol, b, net_qty,
+                                             {'kind': 'regular', 'order_id': order_id},
+                                             exit_price * net_qty * MAKER_FEE_RATE)
+        total_fees = fees['entry_fee'] + fees['exit_fee']
         net_pnl = gross_pnl - total_fees
         # ③ PnL 幂等记录（dedup 键 = symbol:order_id）
         # 🔥 Blocker 4（P0）：PnL 必须 durable 成功才允许继续收敛/清理——落盘失败
         # 保持 close_phase=2（claim 已完成），由恢复/接管续跑重试（dedup 防双记）
         if not self._record_realized_pnl(batch_id, symbol, side, net_qty, avg_entry,
                                          exit_price, net_pnl, '限价平仓',
-                                         dedup_key=f'{symbol}:{order_id}'):
+                                         dedup_key=f'{symbol}:{order_id}',
+                                         fee_breakdown=fees):
             return False, 'pnl_persist_failed（保持 close_phase=2 待续跑重试）'
         # ④ 撤 SL（N14）+ 残余 TP（B0）——同 monitor 结算惯例
         if b.get('current_sl_id'):
@@ -6809,8 +7014,9 @@ class CryptoTrader:
                             _gross_cost = _net_cost + _rr_cost
                             _fee_rem = float(total_entry_fee or 0.0) * _net_cost / _gross_cost \
                                 if _gross_cost > 0 else 0.0
-                            total_cost_with_fee = _net_cost + _fee_rem
-                            avg_price_with_fee = total_cost_with_fee / _net_qty if _net_qty > 0 else 0
+                            # 🔥 T1-C：净成本基准（未含手续费）——与四路径统一口径一致，
+                            # 根除「含费基准 + 全量 fee 再扣」的显示双重扣（display-only）
+                            avg_price_net = _net_cost / _net_qty if _net_qty > 0 else 0
                             # 🔥 v6.4-P3（R2 修正）：结算数量统一用 durable 净量——
                             # partial 后内存 gross（batch_filled_amount）不再是剩余仓位，
                             # PnL/手续费/报告数量全部按 _net_qty（2026-09-02 实盘「数量也不对」）
@@ -6821,20 +7027,21 @@ class CryptoTrader:
                                 ticker = self._safe_api_call(self.exchange.fetch_ticker, symbol)
                                 exit_price = float(ticker.get('last') or ticker.get('close') or 0.0)
                             except Exception:
-                                exit_price = avg_price_with_fee
+                                exit_price = avg_price_net
 
                             # 计算盈亏
                             if side == 'BUY':
-                                gross_pnl = (exit_price - avg_price_with_fee) * settlement_qty
+                                gross_pnl = (exit_price - avg_price_net) * settlement_qty
                             else:
-                                gross_pnl = (avg_price_with_fee - exit_price) * settlement_qty
+                                gross_pnl = (avg_price_net - exit_price) * settlement_qty
 
                             # 估算平仓手续费（市价平仓用 TAKER_FEE_RATE）
                             exit_fee = exit_price * settlement_qty * TAKER_FEE_RATE
-                            total_fees = total_entry_fee + exit_fee
+                            # 🔥 T1-C：净份额（_fee_rem），根除全量再扣的显示双重扣
+                            total_fees = _fee_rem + exit_fee
                             net_pnl = gross_pnl - total_fees
 
-                            capital_base = avg_price_with_fee * settlement_qty if settlement_qty > 0 else 1
+                            capital_base = avg_price_net * settlement_qty if settlement_qty > 0 else 1
                             net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
 
                             # 构建盈亏报告
@@ -6846,7 +7053,7 @@ class CryptoTrader:
                                 f"📊 **方向**：`{side}`\n"
                                 f"📊 **平仓模式**：未知\n"
                                 f"📊 **已成交层数**：`{batch_filled_count}/{len(entry_orders)}`\n"
-                                f"📈 **持仓均价**：`{avg_price_with_fee:.2f}` USDT\n"
+                                f"📈 **持仓均价**：`{avg_price_net:.2f}` USDT\n"
                                 f"💵 **平仓价格**：`{exit_price:.2f}` USDT\n"
                                 f"🔢 **平仓数量**：`{settlement_qty}`\n"
                                 f"📊 **名义盈亏**：`{gross_pnl:+.2f}` USDT\n"
@@ -7354,7 +7561,12 @@ class CryptoTrader:
                         gross_pnl = (batch_entry_vwap - sl_exit_price) * batch_filled_amount
 
                     exit_fee = sl_exit_price * batch_filled_amount * TAKER_FEE_RATE
-                    total_fees = total_entry_fee + exit_fee
+                    # 🔥 T1-C：统一手续费口径（fee_rem 净份额；SL=algo 映射链）
+                    fees = self._compute_settlement_fees(
+                        symbol, latest_b_data, batch_filled_amount,
+                        {'kind': 'algo', 'order_id': str(current_sl_id or '')},
+                        exit_fee)
+                    total_fees = fees['entry_fee'] + fees['exit_fee']
                     net_pnl = gross_pnl - total_fees
 
                     capital_base = batch_entry_vwap * batch_filled_amount
@@ -7378,7 +7590,8 @@ class CryptoTrader:
 
                     # 🔥 记录已实现盈亏 + 附带剩余持仓快照
                     self._record_realized_pnl(batch_id, symbol, side, batch_filled_amount,
-                                              batch_entry_vwap, sl_exit_price, net_pnl, "止损")
+                                              batch_entry_vwap, sl_exit_price, net_pnl, "止损",
+                                              fee_breakdown=fees)
                     self._notify_snapshot(batch_id)
 
                     self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
@@ -7525,7 +7738,12 @@ class CryptoTrader:
                         gross_pnl = (batch_entry_vwap - tp_exit_price) * batch_filled_amount
 
                     exit_fee = tp_exit_price * batch_filled_amount * MAKER_FEE_RATE
-                    total_fees = total_entry_fee + exit_fee
+                    # 🔥 T1-C：统一手续费口径（fee_rem 净份额；TP=algo 映射链）
+                    fees = self._compute_settlement_fees(
+                        symbol, latest_b_data, batch_filled_amount,
+                        {'kind': 'algo', 'order_id': str(tp_order_id or '')},
+                        exit_fee)
+                    total_fees = fees['entry_fee'] + fees['exit_fee']
                     net_pnl = gross_pnl - total_fees
 
                     capital_base = batch_entry_vwap * batch_filled_amount
@@ -7549,7 +7767,8 @@ class CryptoTrader:
 
                     # 🔥 记录已实现盈亏 + 附带剩余持仓快照
                     self._record_realized_pnl(batch_id, symbol, side, batch_filled_amount,
-                                              batch_entry_vwap, tp_exit_price, net_pnl, "止盈")
+                                              batch_entry_vwap, tp_exit_price, net_pnl, "止盈",
+                                              fee_breakdown=fees)
                     self._notify_snapshot(batch_id)
 
                     self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
@@ -10251,8 +10470,8 @@ class CryptoTrader:
         # v6.4：剩余 fee 按 cost 比例分摊（fee ∝ notional，非 qty）
         _fee_rem = float(total_entry_fee or 0.0) * _net_cost_m / _gross_cost_m \
             if _gross_cost_m > 0 else 0.0
-        avg_price = (_net_cost_m + _fee_rem) / current_filled_amount \
-            if current_filled_amount > 0 else 0
+        avg_price = _net_cost_m / current_filled_amount \
+            if current_filled_amount > 0 else 0   # T1-C：净成本基准（未含手续费）
 
         if side == 'BUY':
             gross_pnl = (current_price - avg_price) * current_filled_amount
@@ -10261,7 +10480,7 @@ class CryptoTrader:
 
         # 估算平仓手续费（市价 = Taker）
         exit_fee = current_price * current_filled_amount * TAKER_FEE_RATE
-        total_fees = total_entry_fee + exit_fee
+        total_fees = _fee_rem + exit_fee     # T1-C：净份额（根除全量再扣）
         net_pnl = gross_pnl - total_fees
 
         # 执行市价平仓
@@ -10425,7 +10644,13 @@ class CryptoTrader:
                 actual_gross_pnl = (avg_price - actual_price) * confirmed_filled_amount
 
             actual_exit_fee = actual_price * confirmed_filled_amount * TAKER_FEE_RATE
-            actual_total_fees = total_entry_fee + actual_exit_fee
+            # 🔥 T1-C：统一手续费口径（fee_rem 净份额 + settlement<net 数量归因；
+            # 出场=普通市价单直查）
+            fees = self._compute_settlement_fees(
+                target_symbol, target_b_data, confirmed_filled_amount,
+                {'kind': 'regular', 'order_id': str(order.get('id') or '')},
+                actual_exit_fee)
+            actual_total_fees = fees['entry_fee'] + fees['exit_fee']
             actual_net_pnl = actual_gross_pnl - actual_total_fees
 
             capital_base = avg_price * confirmed_filled_amount if confirmed_filled_amount > 0 else 1
@@ -10459,7 +10684,7 @@ class CryptoTrader:
                 f"📊 **方向**：`{side}`\n"
                 f"📊 **平仓模式**：市价单 (Taker {TAKER_FEE_RATE * 100:.2f}%)\n"
                 f"📊 **持仓**：`{confirmed_filled_amount}` (实际成交)\n"
-                f"📈 **持仓均价**：`{avg_price:.2f}` USDT\n"
+                f"📈 **持仓均价（未含手续费）**：`{avg_price:.2f}` USDT\n"
                 f"💵 **平仓均价**：`{actual_price:.2f}` USDT\n"
                 f"📊 **名义盈亏**：`{actual_gross_pnl:+.2f}` USDT\n"
                 f"💸 **总手续费**：`{actual_total_fees:.4f}` USDT\n"
@@ -10482,7 +10707,7 @@ class CryptoTrader:
             _pnl_partial = confirmed_filled_amount < current_filled_amount - 1e-12
             self._record_realized_pnl(batch_id, target_symbol, side, confirmed_filled_amount,
                                       avg_price, actual_price, actual_net_pnl, "市价平仓",
-                                      pnl_partial=_pnl_partial)
+                                      pnl_partial=_pnl_partial, fee_breakdown=fees)
             self._notify_snapshot(batch_id)
 
             return True, result_msg
@@ -10943,8 +11168,8 @@ class CryptoTrader:
         _gross_cost_l = total_cost
         _fee_rem_l = float(total_entry_fee or 0.0) * _net_cost_l / _gross_cost_l \
             if _gross_cost_l > 0 else 0.0
-        avg_price = (_net_cost_l + _fee_rem_l) / current_filled_amount \
-            if current_filled_amount > 0 else 0
+        avg_price = _net_cost_l / current_filled_amount \
+            if current_filled_amount > 0 else 0   # T1-C：净成本基准（未含手续费）
 
         if side == 'BUY' and limit_price <= avg_price:
             print(f"⚠️ 警告：平仓价 {limit_price} 不高于均价 {avg_price}，可能亏损")
@@ -11119,7 +11344,7 @@ class CryptoTrader:
                 est_gross_pnl = (avg_price - limit_price) * current_filled_amount
 
             est_exit_fee = limit_price * current_filled_amount * MAKER_FEE_RATE
-            est_total_fees = total_entry_fee + est_exit_fee
+            est_total_fees = _fee_rem_l + est_exit_fee     # T1-C：净份额
             est_net_pnl = est_gross_pnl - est_total_fees
 
             pnl_emoji = "🟢" if est_net_pnl >= 0 else "🔴"
@@ -11130,7 +11355,7 @@ class CryptoTrader:
                 f"🪙 **标的**：`{target_symbol}`\n"
                 f"📊 **方向**：`{side}`\n"
                 f"📊 **持仓**：`{current_filled_amount}` ({last_filled_count}层)\n"
-                f"📈 **持仓均价**：`{avg_price:.2f}` USDT\n"
+                f"📈 **持仓均价（未含手续费）**：`{avg_price:.2f}` USDT\n"
                 f"📊 **挂单价**：`{limit_price:.2f}` USDT\n"
                 f"📊 **模式**：{price_mode}\n"
                 f"📊 **预计盈亏**：{pnl_emoji} `{est_net_pnl:+.2f}` USDT\n\n"
