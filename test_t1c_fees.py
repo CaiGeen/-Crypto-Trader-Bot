@@ -200,20 +200,24 @@ def f10_multi_layer_mixed():
 
 # ── F11：四路径接线锁（AST）+ finalizer 已端到端（F7）────────────────────
 def f11_four_path_wiring_locked():
-    import os
+    """接线锁（AST）+ 行为覆盖分工说明（本测试不做行为验证）：
+    - finalizer / 市价：生产代码直接调 _compute_settlement_fees（行为见 F7/F13）；
+    - SL / TP：生产代码经 _settle_protection_fill 调同一口径（行为见 F16/F17）；
+    - 本测试只锁「接线存在且位于对应调用路径上」。"""
+    import re
     src = open(os.path.abspath(trader_260725.__file__), encoding='utf-8').read()
-    assert src.count('self._compute_settlement_fees(') == 4, \
-        f'四路径必须各自调用统一口径 helper（实际 {src.count("self._compute_settlement_fees(")}）'
+    n_direct = src.count('self._compute_settlement_fees(')
+    n_helper = src.count('self._settle_protection_fill(')
+    assert n_direct == 3, 'finalizer/市价直调 + helper 内调用 = 3（实际 %d）' % n_direct
+    assert n_helper == 2, 'SL 与 TP 各调用 1 次 _settle_protection_fill（实际 %d）' % n_helper
     assert '_resolve_order_fees' in src, 'resolver 缺失'
-    # 旧式全量扣减零残留
     assert 'total_fees = total_entry_fee + exit_fee' not in src, 'SL/TP 旧全量扣减残留'
     assert 'actual_total_fees = total_entry_fee + actual_exit_fee' not in src, '市价旧全量扣减残留'
     assert 'total_cost_with_fee' not in src, 'finalizer 双重扣残留'
-    # 每处 _record_realized_pnl 调用前 40 行内必有统一口径调用（接线顺序）
-    import re
     for m in re.finditer(r'self\._record_realized_pnl\(', src):
         seg = src[max(0, m.start() - 8000):m.start()]
-        assert '_compute_settlement_fees(' in seg, 'record 调用前必须已完成统一口径解析'
+        assert ('_compute_settlement_fees(' in seg) or ('_settle_protection_fill(' in seg), \
+            'record 调用前必须已完成统一口径解析'
 
 
 # ── F12：partial 后新层成交反例（聚合比例式必错 → 强制 estimated）─────────
@@ -327,6 +331,92 @@ def f14_total_exception_entry_fee_finite():
 
 
 
+
+# ── F15：权威数量不一致 → 不得标 actual（P0-2 双重校验）──────────────────
+def f15_authoritative_qty_mismatch():
+    t = _resolver_trader(fills_by_oid={'L1': [_fill(0.001, 0.02, order='L1')]})
+    # actualQty=0.002 但 fills 只 0.001，expected_qty 恰好 0.001 → 旧实现会误判 actual
+    fee, source, note = t._resolve_order_fees(
+        SYM, {'kind': 'regular', 'order_id': 'L1'}, 0.001, 0.9,
+        order_snapshot={'executedQty': '0.002', 'filled': 0.002})
+    assert source == 'estimated', '权威数量与 expected 不一致不得 actual: %r' % ((fee, source, note),)
+    assert note == 'qty_mismatch', note
+    assert abs(fee - 0.9) < 1e-9, '降级返回调用方有限估算: %r' % fee
+
+
+# ── F16：partial → SL 必须按净量/净成本结算（P0-1 行为验证）──────────────
+def f16_partial_sl_uses_net_qty():
+    t = make_settlement_trader()
+    b = _settle_batch()
+    b['total_entry_fee'] = 0.154
+    b['realized_reduce_amount'] = 0.001          # 曾 partial 减半
+    b['realized_reduce_cost'] = 76885.20 * 0.001
+    r = t._settle_protection_fill(SYM, 'bS', b, 77885.20,
+                                  {'kind': 'algo', 'order_id': 'S1'})
+    assert abs(r['qty'] - 0.001) < 1e-9, '结算数量必须是净量 0.001（非毛量 0.002）: %r' % (r,)
+    assert abs(r['avg_entry'] - 76885.20) < 0.01, '净成本均价: %r' % (r,)
+    assert abs(r['gross_pnl'] - 1.0) < 1e-6, 'gross=(77885.2-76885.2)*0.001: %r' % (r,)
+    assert r['fees']['entry_fee_source'] == 'estimated', r['fees']
+    assert r['fees']['entry_note'] == 'partial_allocation_unknown', r['fees']
+    assert abs(r['fees']['entry_fee'] - 0.077) < 1e-9, r['fees']
+    assert abs(r['fees']['exit_fee'] - 77885.20 * 0.001 * 0.0005) < 1e-9, r['fees']
+    assert abs(r['net_pnl'] - (1.0 - 0.077 - 0.038943)) < 1e-5, r
+
+
+# ── F17：partial → TP 同样净口径 + 降级费率 TAKER（P1）───────────────────
+def f17_partial_tp_uses_taker_on_degrade():
+    t = make_settlement_trader()
+    b = _settle_batch()
+    b['total_entry_fee'] = 0.154
+    b['realized_reduce_amount'] = 0.001
+    b['realized_reduce_cost'] = 76885.20 * 0.001
+    r = t._settle_protection_fill(SYM, 'bS', b, 77885.20,
+                                  {'kind': 'algo', 'order_id': 'T1'})
+    taker = 77885.20 * 0.001 * 0.0005
+    maker = 77885.20 * 0.001 * 0.0002
+    assert abs(r['fees']['exit_fee'] - taker) < 1e-9, \
+        'TP 触发后按市价成交 → 降级费率必须 TAKER(%r) 而非 MAKER(%r): %r' % (taker, maker, r)
+    assert abs(r['qty'] - 0.001) < 1e-9, r
+    assert abs(r['net_pnl'] - (1.0 - 0.077 - taker)) < 1e-5, r
+
+
+# ── F18：非有限/残缺账本 → 有限降级 + 明确 note，绝不静默归零 ────────────
+def f18_bad_ledger_and_non_finite():
+    t = make_settlement_trader()
+    b = _settle_batch()
+    b['last_filled_count'] = 3                    # 数组只有 1 层 → 账本残缺
+    b['total_entry_fee'] = 0.154
+    fees = t._compute_settlement_fees(SYM, b, 0.002,
+                                      {'kind': 'algo', 'order_id': 'S1'}, 0.04)
+    assert fees['entry_fee_source'] == 'estimated', fees
+    assert fees['entry_note'] == 'entry_ledger_incomplete', fees
+    t2 = _resolver_trader(fail=True)
+    f2, s2, n2 = t2._resolve_order_fees(SYM, {'kind': 'regular', 'order_id': 'L1'},
+                                        0.002, float('nan'))
+    assert s2 == 'estimated' and 'estimated_fee_invalid' in n2, (s2, n2)
+    assert f2 == f2 and abs(f2) != float('inf'), '必须有限'
+
+
+# ── F19：TP 查询失败 → 退出费走 TAKER 估算，net_pnl 不虚高 ───────────────
+def f19_tp_query_failure_not_inflate_pnl():
+    t = make_settlement_trader()
+
+    def _boom(*a, **k):
+        raise RuntimeError('query down')
+    t.exchange.fetch_my_trades = _boom
+    b = _settle_batch()
+    b['total_entry_fee'] = 0.077
+    r = t._settle_protection_fill(SYM, 'bS', b, 77885.20,
+                                  {'kind': 'algo', 'order_id': 'T1'})
+    taker = 77885.20 * 0.002 * 0.0005
+    maker = 77885.20 * 0.002 * 0.0002
+    assert r['fees']['exit_fee_source'] == 'estimated', r['fees']
+    assert abs(r['fees']['exit_fee'] - taker) < 1e-9, \
+        '降级必须用 TAKER(%r)，用 MAKER(%r) 会虚增净 PnL: %r' % (taker, maker, r)
+    assert r['net_pnl'] <= r['gross_pnl'] - maker, '净 PnL 不得因费率错配被抬高'
+
+
+
 TESTS = [f1_regular_order_direct_actual,
          f2_algo_mapping_chain,
          f3_non_usdt_commission,
@@ -339,7 +429,12 @@ TESTS = [f1_regular_order_direct_actual,
          f12_partial_then_new_layer_must_be_estimated,
          f13_market_confirmed_less_than_net,
          f_meta_error_never_swallows_pnl,
-         f14_total_exception_entry_fee_finite]
+         f14_total_exception_entry_fee_finite,
+         f15_authoritative_qty_mismatch,
+         f16_partial_sl_uses_net_qty,
+         f17_partial_tp_uses_taker_on_degrade,
+         f18_bad_ledger_and_non_finite,
+         f19_tp_query_failure_not_inflate_pnl]
 
 
 def main():

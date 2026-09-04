@@ -83,7 +83,7 @@ def _record_realized_pnl(self, batch_id, symbol, side, amount, avg_price,
 ```
 
 - `fee_breakdown` 固定字段集（白名单校验，未知键 raise/丢弃+console 告警——
-  实施期二选一，倾向 raise：资金字段宁可 loud）：
+  （契约已定死，不留实施期选项）：
   ```python
   {'entry_fee': float,            # 本条 PnL 实际扣除的入场费（定义见下）
    'entry_fee_source': 'actual'|'estimated',
@@ -173,7 +173,12 @@ fee_rem=0.0770、exit=0.002@77885.20、exit_fee=0.0389：
 | F8 | partial 估算分摊 | SL 路径扣 fee_rem=0.077 而非全量 0.154 |
 | F9 | fills 不完整 | estimated + note='fills_incomplete' |
 | F10 | 多层 mixed | entry=actual+estimated 层合并 → 整体 estimated + note |
-| F11 | **四路径行为断言**（非仅 AST） | 每路径：正确订单 ID、expected_qty、最终 net_pnl、**读实际 trade_stats.json 验证 fee 字段落盘** |
+| F11 | **接线锁（AST，不做行为验证）** | finalizer/市价直调 `_compute_settlement_fees`（各 1）+ SL/TP 经 `_settle_protection_fill`（各 1）；旧式全量扣减零残留；每处 record 前必有口径调用 |
+| F15 | 权威数量不一致（P0-2） | actualQty=0.002 / fills=0.001 / expected=0.001 → 必须 estimated+`qty_mismatch`，不得误标 actual |
+| F16 | partial → SL 净口径（P0-1） | 结算数量=净量 0.001（非毛量 0.002）、净成本均价、entry estimated `partial_allocation_unknown`、退出 TAKER 估算 |
+| F17 | partial → TP 净口径 + TAKER（P1） | 同净口径；降级退出费必须 TAKER(0.0389) 而非 MAKER(0.0156) |
+| F18 | 非有限/残缺账本 | lfc 超数组长度 → `entry_ledger_incomplete`；非有限 estimated_fee → 有限降级 + `estimated_fee_invalid` 留痕 |
+| F19 | TP 查询失败 | 退出费走 TAKER 估算，net_pnl 不得因费率错配被抬高 |
 | F12 | **partial 后新层成交反例** | 新层费被错误卷入早期分摊 → 必须 estimated（0.45≠0.525 反例） |
 | F13 | **market confirmed < 净量反例** | entry_fee_for_record 按比例份额；expected_qty 契约生效 |
 | — | 回归 | 42 rc=0 + P6 12 项零新增；F7 数字为回归锚 |
@@ -183,7 +188,7 @@ fee_rem=0.0770、exit=0.002@77885.20、exit_fee=0.0389：
 | # | KNOWN_LIMITATION | UPGRADE_TRIGGER（可度量） |
 |---|---|---|
 | 1 | 净成本均价采纳；TG 标注「入场均价（未含手续费）」 | —（口径已统一，无升级项） |
-| 2 | /partial 不记录中间 PnL：fee note 只能揭示该限制，不能补回缺失 PnL | 「partial 中间段 PnL 记录」立项实施后，`entry_note='partial_entry_estimated'` 消失、partial 段 trade 记录出现 |
+| 2 | /partial 不记录中间 PnL：fee note 只能揭示该限制，不能补回缺失 PnL | 「partial 中间段 PnL 记录」立项实施后，`entry_note='partial_allocation_unknown'` 与 `entry_note='prior_reduction_unknown'` 出现率降为 0、partial 段 trade 记录出现 |
 | 3 | `net_cost/gross_cost` 比例分摊只能作 partial 的估算，永不能标 actual | 逐层剩余手续费账本（每层记录 actual 费 + 剩余份额）落地后，`entry_note='partial_allocation_unknown'` 消失、`entry_fee_source='actual'` 占比可统计（目标 100%） |
 | 4 | 非 USDT commission（BNB 等）不做历史汇率换算 | 接入 BNB/USDT 历史汇率服务后，`entry_note='non_usdt_commission'` 消失 |
 | 5 | userTrades/algo 历史 7 天窗口外订单无法取 actual | 窗口策略变更或逐单归档（结算时即时解析即天然规避——本期已是即时代） |
