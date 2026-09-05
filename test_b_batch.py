@@ -169,6 +169,9 @@ class _Env:
         self.dir = tempfile.mkdtemp(prefix='p0b_')
         self.state_file = os.path.join(self.dir, 'trade_state.json')
         self.tomb_file = os.path.join(self.dir, 'trade_tombstones.json')
+        # 🔥 T1C-v2A：stats 同样必须重定向。_record_settlement_v2 在 stats_file
+        # 为假值时回退到真实 trade_stats.json（生产文件），不重定向即污染实盘。
+        self.stats_file = os.path.join(self.dir, 'trade_stats.json')
         trader_260725.STATE_FILE = self.state_file
         return self
 
@@ -203,6 +206,9 @@ def make_fake_b(env, ex):
     fake._tp_breaker_alerted = None
     fake._tombstone_alerted = set()
     fake._converge_alert_counts = {}             # ⚠️ 不绑 → getattr MagicMock 非 None
+    # ⚠️ 不重定向 → MagicMock 路径（非 None 且非 str）→ os.path.exists 抛 TypeError
+    # → _record_settlement_v2 返回 False → finalize 永远失败 → monitor 轮询死循环
+    fake._stats_file = env.stats_file
     fake.tombstone_file = env.tomb_file
     fake.exchange = ex
     fake._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
@@ -222,7 +228,14 @@ def make_fake_b(env, ex):
              # 🔥 P5：FULL_FILL 共享 finalizer（结算段已从 monitor 抽到该函数；
              # 未绑定 → MagicMock 静默吞掉 → 撤 TP/clear 全不发生，测试假红）
              '_finalize_limit_full_fill', '_claim_settlement_reported',
-             '_batch_net_position', '_notify_snapshot')
+             '_batch_net_position', '_notify_snapshot',
+             # 🔥 T1C-v2A 结算事务 helper：不绑定 → MagicMock，而 MagicMock 不是
+             # dict → _atomic_outbox_begin 返回值 isinstance(dict)=False →
+             # outbox_begin_failed → monitor 判为「可重试」保持轮询，叠加本文件
+             # time.sleep 打桩 → 忙等死循环（第 8 次 MagicMock 实证，同 L24 注记）
+             '_atomic_outbox_begin', '_try_finalize_outbox',
+             '_build_settlement_evidence', '_derive_entry_order_refs',
+             '_record_settlement_v2')
     for _n in _bind:
         if hasattr(CryptoTrader, _n):
             setattr(fake, _n, (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(
@@ -233,7 +246,13 @@ def make_fake_b(env, ex):
 def _batch(**over):
     b = {
         'is_active': True, 'batch_id': BATCH, 'symbol': SYMBOL, 'side': 'BUY',
-        'is_hedge_mode': False, 'entry_orders': [], 'stop_steps': [55000.0],
+        'is_hedge_mode': False, 'stop_steps': [55000.0],
+        # 🔥 T1C-v2A：本 fixture 语义是「1 层入场已成交」（last_filled_count=1、
+        # filled_details=[85000.0] → net_cost=170）。生产账本上这类批次
+        # entry_orders 必然非空（下单成功后由 L5521/L5604 写入）；仅「前置落盘
+        # 骨架 / 崩溃窗口」批次才为 []，而那些批次没有任何成交。留空会让
+        # _derive_entry_order_refs 返回 [] → 证据缺 entry_refs → DISPUTED。
+        'entry_orders': ['e1'],
         'take_profit_price': 60000.0, 'current_sl_id': 'sl1', 'tp_order_id': 'tp1',
         # 🔥 P5：限价平仓事务必有 close_op_id（finalizer 代际隔离依赖，生产契约）
         'close_op_id': 'OP1',

@@ -141,6 +141,13 @@ def make_trader(tmp):
             t = CryptoTrader('k', 's')
     _stats_file = os.path.join(str(tmp), 'trade_stats.json')
     _real_pnl = t._record_realized_pnl
+    t._stats_file = _stats_file          # 🔥 v2A：_record_settlement_v2 经 _stats_file 重定向
+    def _stats_trades():
+        if not os.path.exists(_stats_file):
+            return []
+        with open(_stats_file, 'r', encoding='utf-8') as f:
+            return json.load(f).get('trades', [])
+    t._stats_trades = _stats_trades
 
     def _isolated_pnl(*a, **k):
         k.setdefault('stats_file', _stats_file)
@@ -307,23 +314,23 @@ def r4_full_fill_finalizer_monitor_dead():
                      'positionSide': 'LONG'}]
     cleared = []
     t._converge_batch_orders_before_clear = lambda s, bid: {'proof': 'FULL'}
-    t.clear_batch_state = lambda s, bid, proof=None: cleared.append(bid) or True
-    pnl = []
-
-    def _rec(*a, **k):  # 模拟真函数的 dedup 契约（真行为由 R12 单测）
-        if k.get('dedup_key') and any(r.get('dedup_key') == k['dedup_key']
-                                      for _, r in pnl):
-            return True
-        pnl.append((a, k))
-        return True
-    t._record_realized_pnl = _rec
+    t.clear_batch_state = lambda s, bid, proof=None, authorization=None: cleared.append(bid) or True
     ok, msg = t._submit_closecancel(SYM, BID)
     assert ok, msg
     assert cleared == [BID], 'FULL_FILL 必须 converge+clear'
-    assert len(pnl) == 1, f'PnL 恰好一次: {pnl}'
-    # monitor 死亡场景：直接再调 finalizer（接管语义）→ PnL 不重记、不崩溃
+    # v2A：v2 富记录真实落盘（settlement + activation），恰好一条 settlement（dedup）
+    _tr = t._stats_trades()
+    _v2s = [r for r in _tr if r.get('record_type') == 'settlement'
+            and r.get('dedup_key') == f'{SYM}:L1']
+    assert len(_v2s) == 1, f'v2 settlement 恰好一次: {_tr}'
+    assert any(r.get('dedup_key') == 'schema_activation:v2' for r in _tr), \
+        'activation 必须随首条 v2 记录同一次原子写入'
+    # monitor 死亡场景：直接再调 finalizer（接管语义）→ 不重记、不崩溃
     ok2, msg2 = t._finalize_limit_full_fill(SYM, BID, 'L1')
-    assert len(pnl) == 1, f'PnL 幂等: {len(pnl)}'
+    _tr2 = t._stats_trades()
+    _v2s2 = [r for r in _tr2 if r.get('record_type') == 'settlement'
+             and r.get('dedup_key') == f'{SYM}:L1']
+    assert len(_v2s2) == 1, f'v2 settlement 幂等: {len(_v2s2)}'
 
 
 def r4b_phase2_takeover_after_crash():
@@ -339,14 +346,15 @@ def r4b_phase2_takeover_after_crash():
            avg=76500.0)
     cleared = []
     t._converge_batch_orders_before_clear = lambda s, bid: {'proof': 'FULL'}
-    t.clear_batch_state = lambda s, bid, proof=None: cleared.append(bid) or True
-    pnl = []
-    t._record_realized_pnl = lambda *a, **k: pnl.append((a, k)) or True
-    # 恢复路径：经裁决器（settled 分支）→ 接管 finalizer
+    t.clear_batch_state = lambda s, bid, proof=None, authorization=None: cleared.append(bid) or True
+    # 恢复路径：经裁决器（settled 分支）→ 接管 finalizer（v2A 富记录真实落盘）
     ok, msg = t._adjudicate_closed_limit_close(SYM, BID, 'L1')
     assert ok, msg
     assert cleared == [BID], 'phase=2 接管必须续跑 converge+clear'
-    assert len(pnl) == 1, f'PnL 接管只记一次: {pnl}'
+    _tr = t._stats_trades()
+    _v2s = [r for r in _tr if r.get('record_type') == 'settlement'
+            and r.get('dedup_key') == f'{SYM}:L1']
+    assert len(_v2s) == 1, f'v2 settlement 接管只记一次: {_tr}'
 
 
 # ────────────────── R5 守恒门失败 ──────────────────
@@ -428,12 +436,15 @@ def r13_generation_isolation():
            avg=76500.0)
     cleared = []
     t._converge_batch_orders_before_clear = lambda s, bid: {'proof': 'FULL'}
-    t.clear_batch_state = lambda s, bid, proof=None: cleared.append(bid) or True
+    t.clear_batch_state = lambda s, bid, proof=None, authorization=None: cleared.append(bid) or True
     # 旧 monitor 拿 L1 来裁决/结算 → 必须拒绝且零副作用
     ok1, msg1 = t._adjudicate_closed_limit_close(SYM, BID, 'L1')
     assert not ok1 and 'order_generation_mismatch' in msg1, (ok1, msg1)
     ok2, msg2 = t._finalize_limit_full_fill(SYM, BID, 'L1')
-    assert not ok2 and 'order_generation_mismatch' in msg2, (ok2, msg2)
+    # §8.3：代际不匹配属「可重试失败」→ 必须**精确**返回 SETTLE_PENDING_RETRY
+    # （比原 `not ok2` 更严：终态 MANUAL_REVIEW 也满足 not ok，必须区分开）
+    assert ok2 == trader_260725.SETTLE_PENDING_RETRY \
+        and 'order_generation_mismatch' in msg2, (ok2, msg2)
     b2 = _state_read(t)[SYM][BID]
     assert b2['close_phase'] == 1 and not b2.get('settled_by_limit_close'), b2
     assert cleared == [], '旧订单绝不得触发 clear'
@@ -450,10 +461,14 @@ def r14_pnl_persist_failure_keeps_phase2():
            avg=76500.0)
     cleared = []
     t._converge_batch_orders_before_clear = lambda s, bid: {'proof': 'FULL'}
-    t.clear_batch_state = lambda s, bid, proof=None: cleared.append(bid) or True
-    t._record_realized_pnl = lambda *a, **k: False  # 落盘失败注入
+    t.clear_batch_state = lambda s, bid, proof=None, authorization=None: cleared.append(bid) or True
+    # v2A：PnL 落盘失败 = v2 stats CORRUPT/IO → _record_settlement_v2 拒写（原字节不变）
+    with open(t._stats_file, 'w', encoding='utf-8') as f:
+        f.write('{ 损坏JSON 不合法 ')
     ok, msg = t._finalize_limit_full_fill(SYM, BID, 'L1')
-    assert not ok and 'pnl_persist_failed' in msg, (ok, msg)
+    # §8.3：PnL 落盘失败属「可重试失败」→ 必须**精确**返回 SETTLE_PENDING_RETRY
+    assert ok == trader_260725.SETTLE_PENDING_RETRY \
+        and 'finalize_pending' in msg, (ok, msg)
     b2 = _state_read(t)[SYM][BID]
     assert b2.get('close_phase') == 2, 'PnL 未 durable 绝不回 phase<2'
     assert cleared == [], 'PnL 写失败绝不 clear（成交记录会永久丢失）'
@@ -505,7 +520,7 @@ def r9_concurrent_single_commit_and_pnl():
             return None
         return {'proof': 'FULL'}
 
-    def _clear(s, bid, proof=None):
+    def _clear(s, bid, proof=None, authorization=None):
         with t._state_lock:  # 建模真实 clear：串行移除批次（存在性幂等）
             st = _state_read(t)
             if bid in (dict(st.get(SYM) or {}) or {}):
@@ -516,15 +531,6 @@ def r9_concurrent_single_commit_and_pnl():
             return False
     t._converge_batch_orders_before_clear = _converge
     t.clear_batch_state = _clear
-    pnl = []
-
-    def _rec(*a, **k):  # dedup 契约（真行为由 R12 单测）
-        if k.get('dedup_key') and any(r.get('dedup_key') == k['dedup_key']
-                                      for _, r in pnl):
-            return True
-        pnl.append((a, k))
-        return True
-    t._record_realized_pnl = _rec
     barrier = threading.Barrier(2)
     results = []
 
@@ -546,7 +552,11 @@ def r9_concurrent_single_commit_and_pnl():
         th.start()
     for th in ths:
         th.join()
-    assert len(pnl) == 1, f'PnL 恰好一次（CAS+dedup 定终局）: {pnl}'
+    # v2A：真实 v2 stats 只落一条 settlement（并发 CAS + writer dedup 定终局）
+    _tr = t._stats_trades()
+    _v2s = [r for r in _tr if r.get('record_type') == 'settlement'
+            and r.get('dedup_key') == f'{SYM}:L1']
+    assert len(_v2s) == 1, f'v2 settlement 恰好一次（CAS+dedup 定终局）: {_tr}'
     assert len(cleared) <= 1, f'clear 幂等: {cleared}'
     b2 = _state_read(t).get(SYM, {}).get(BID)
     assert b2 is None or b2.get('close_phase') == 2 or not b2.get('is_active'), \
@@ -646,10 +656,12 @@ def r16_pnl_gate_monitor_no_bypass_clear():
            avg=76500.0)
     ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
                      'positionSide': 'LONG'}]
-    t._record_realized_pnl = lambda *a, **k: False  # PnL 持续落盘失败
+    # v2A：PnL 落盘失败 = v2 stats CORRUPT（_record_settlement_v2 拒写，原字节不变）
+    with open(t._stats_file, 'w', encoding='utf-8') as f:
+        f.write('{ 损坏JSON ')
     cleared = []
 
-    def _clear(s, bid, proof=None):
+    def _clear(s, bid, proof=None, authorization=None):
         cleared.append(bid)
         return True
     t.clear_batch_state = _clear
@@ -713,13 +725,14 @@ def r17_monitor_fail_command_takeover():
     seg = src[i:i + 500]
     assert '_ok_f' in seg, 'monitor 必须检查 finalizer 返回值'
     assert 'continue' in seg, 'monitor 对 finalizer 失败必须继续轮询'
-    # 运行期自愈调度 phase=2 finalizer（结构断言：经 _maybe_runtime_finalize_limit）
+    # 运行期自愈调度（结构断言）：v2A outbox 优先接管（§8.1）+ legacy phase=2 finalizer
     j = src.find('🧊 [P0 冻结]')
     assert j > 0
-    k = src.find('continue', j)
-    seg2 = src[j:k]
+    seg2 = src[j:j + 4000]
+    assert '_resume_pending_settlement' in seg2, \
+        '运行期自愈必须优先接管 pending_settlement（§8.1）'
     assert 'settled_by_limit_close' in seg2 and '_maybe_runtime_finalize_limit' in seg2, \
-        '运行期自愈必须调度 phase=2 finalizer 接管'
+        '运行期自愈仍须调度 legacy phase=2 finalizer 接管'
 
 
 # ────────────────── P5d：ChatGPT 三复审 P0（SL 归零 × 限价撤单 组合竞态） ──────────────────
@@ -737,7 +750,7 @@ def _run_sl_zeroed_monitor(t, ex, filled):
                      'positionSide': 'LONG'}]
     cleared = []
 
-    def _clear(s, bid, proof=None):
+    def _clear(s, bid, proof=None, authorization=None):
         cleared.append(bid)
         return True
     t.clear_batch_state = _clear
@@ -810,7 +823,7 @@ def r19_monitor_crash_freeze_survives_finally():
                      'positionSide': 'LONG'}]
     cleared = []
 
-    def _clear(s, bid, proof=None):
+    def _clear(s, bid, proof=None, authorization=None):
         cleared.append(bid)
         return True
     t.clear_batch_state = _clear
@@ -924,7 +937,7 @@ def r22_monitor_error_freeze_survives_startup_recovery():
                      'positionSide': 'LONG'}]
     cleared = []
 
-    def _clear(s, bid, proof=None):
+    def _clear(s, bid, proof=None, authorization=None):
         cleared.append(bid)
         return True
     t.clear_batch_state = _clear
@@ -1016,7 +1029,7 @@ def r26_crash_before_marker_finally_no_clear():
                      'positionSide': 'LONG'}]
     cleared = []
 
-    def _clear(s, bid, proof=None):
+    def _clear(s, bid, proof=None, authorization=None):
         cleared.append(bid)
         return True
     t.clear_batch_state = _clear
@@ -1061,7 +1074,7 @@ def r27_converge_window_migration_refuses_clear():
                      'positionSide': 'LONG'}]
     cleared = []
 
-    def _clear(s, bid, proof=None):
+    def _clear(s, bid, proof=None, authorization=None):
         cleared.append(bid)
         return True
     t.clear_batch_state = _clear
@@ -1084,21 +1097,20 @@ def r27_converge_window_migration_refuses_clear():
                       'positionSide': 'LONG'}]
     cleared2 = []
 
-    def _clear2(s, bid, proof=None):  # 建模真实 clear：记录 + 从账本移除
+    def _clear2(s, bid, proof=None, authorization=None):  # 建模真实 clear：记录 + 从账本移除
         cleared2.append(bid)
         st = _state_read(t2)
         (st.get(s, {}) or {}).pop(bid, None)
         _state_write(t2, st)
         return True
     t2.clear_batch_state = _clear2
-    pnl2 = []
+    settlement_calls = []  # 🔥 v2A：finalizer 经 _record_settlement_v2 落 v2 富记录（非旧 _record_realized_pnl）
 
-    def _rec2(*a, **k):  # dedup 契约（真行为由 R12 单测；此桩同时避免写生产 stats）
-        if any(r.get('dedup_key') == k.get('dedup_key') for r in pnl2):
-            return True
-        pnl2.append({'dedup_key': k.get('dedup_key')})
-        return True
-    t2._record_realized_pnl = _rec2
+    _real_settlement_v2 = t2._record_settlement_v2
+    def _spy_settlement_v2(*a, **k):
+        settlement_calls.append(k.get('record') or {})
+        return _real_settlement_v2(*a, **k)  # 仍真实落盘（dedup/激活由真实实现保证）
+    t2._record_settlement_v2 = _spy_settlement_v2
     t2._converge_batch_orders_before_clear = (
         lambda s, bid: {'proof': 'FULL'})
     # 直接标记 settled（模拟 converge 期内另一线程认领），finalizer 应完成结算
@@ -1106,7 +1118,10 @@ def r27_converge_window_migration_refuses_clear():
     b_settled['close_phase'] = 2
     _state_write(t2, _single(b_settled))
     t2._finalize_limit_full_fill(SYM, BID, 'L1')
-    assert len(pnl2) == 1, f'settled 迁移必须经 finalizer 记录 PnL 恰好一次: {pnl2}'
+    assert len(settlement_calls) == 1, \
+        f'settled 迁移必须经 finalizer 记录 v2 富盈亏恰好一次: {settlement_calls}'
+    assert settlement_calls[0].get('core_status') == 'PROVEN', \
+        f'全证据齐备必须为 PROVEN（非 DISPUTED 静默压零）: {settlement_calls[0]}'
     assert BID not in _state_read(t2).get(SYM, {}), 'finalizer 结算后完成归档清理'
 
 

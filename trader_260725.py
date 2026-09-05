@@ -238,6 +238,26 @@ _API_METRICS = ApiMetrics()
 
 TAKER_FEE_RATE = 0.0005
 MAKER_FEE_RATE = 0.0002
+# T1C-v2A §8.3 结算终态三态（ChatGPT 裁定 2026-09-05）：DISPUTED 是「自动化终态
+# / 人工核对态」，不是可重试失败。以三态取代 finalizer 的 bool 返回值：
+#   CLEARED        已记账 + 已收敛 + 已授权 clear（终态，批次生命周期结束）
+#   MANUAL_REVIEW  DISPUTED 已幂等落盘（stats_committed=True 且
+#                  close_reason='settlement_disputed'）→ 监控只做限频 critical，
+#                  禁止重建 outbox / 重置 flag / 调用交易所 API / clear
+#   PENDING_RETRY  可重试失败（BEGIN 失败、stats 写入/持久化失败、proof 未生成、
+#                  授权 clear 被拒）→ 保持 close_phase=2 下轮续跑
+SETTLE_CLEARED = 'CLEARED'
+SETTLE_MANUAL_REVIEW = 'MANUAL_REVIEW'
+SETTLE_PENDING_RETRY = 'PENDING_RETRY'
+
+
+def _settle_glyph(state):
+    """结算三态 → 日志展示符号：CLEARED=✅ / MANUAL_REVIEW=🧊 / PENDING_RETRY=⚠️。"""
+    if state == SETTLE_CLEARED:
+        return '✅'
+    if state == SETTLE_MANUAL_REVIEW:
+        return '🧊'
+    return '⚠️'
 # 🔥 v6.4-P6（设计 v1.3，ChatGPT FULLY ALIGNED）：守恒分级观察器宽限窗——
 # 仅当存在「有效在途平仓事务」（五条件合取）时，瞬时归档滞后豁免 300s；
 # 无可解释事务的守恒冲突立即 critical（f1e135 场景零延迟）。
@@ -1016,6 +1036,110 @@ class CryptoTrader:
             print(f"⚠️ [盈亏记录] 写入失败: {e}")
             return False
 
+    def _record_settlement_v2(self, *, record: dict, stats_file: str | None = None) -> bool:
+        """T1C-v2A §2.2/§10（设计稿 v1.2 终签）：v2 富记录 + schema activation 原子写。
+
+        与 legacy `_record_realized_pnl` 共用三态读取（MISSING/VALID/CORRUPT）与
+        原子替换（flush→fsync→replace→dir-fsync），但**原样写入富记录**——
+        不压扁成旧 8 参（§13.2 反例：v2B 对账锚点必须落盘，批次 clear 后仍可追溯）。
+
+        §10 activation 规则：
+          - 无 activation 且 dedup 未命中 → activation + 本条 v2 记录**同一次原子替换**写入；
+          - 已存在 activation → 仅追加本条记录；
+          - dedup 命中（含 legacy 已记账）→ 返回 True 但零写入，绝不重记、
+            也绝不在旧记录之后补画 activation 边界（§10.6）；
+          - CORRUPT → 拒写（settlement/dispute/activation 一律拒，原字节不变）。
+
+        DISPUTED 记录（record_type=settlement_dispute、core_status=DISPUTED、
+        net_pnl_estimate=None）由调用方构造后**原样落盘**，本函数不做
+        None→0 的猜测（§4.3：不写权威 net_pnl；"UNKNOWN→ZERO" 是违例）。
+        返回 bool：True=durable 成功或幂等命中；False=CORRUPT/IO 失败。
+        """
+        alert_msg = None
+        result = False
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            stats_file = stats_file or os.path.join(base_dir, "trade_stats.json")
+            with self._state_lock:
+                # ① 三态读取（与 legacy 完全同口径：CORRUPT 保持原字节）
+                if os.path.exists(stats_file):
+                    try:
+                        with open(stats_file, "r", encoding="utf-8") as f:
+                            stats = json.load(f)
+                        _trades = stats.get("trades") if isinstance(stats, dict) else None
+                        if not isinstance(_trades, list) or \
+                                any(not isinstance(_r, dict) for _r in _trades):
+                            proceed = False                      # CORRUPT
+                        else:
+                            proceed = True                       # VALID
+                    except Exception:
+                        proceed = False                          # CORRUPT：JSON 非法
+                else:
+                    stats = {"trades": []}                       # MISSING
+                    proceed = True
+                counts = getattr(self, '_stats_corrupt_alert_counts', None)
+                if counts is None:
+                    counts = self._stats_corrupt_alert_counts = {}
+                if not proceed:
+                    n = counts.get(stats_file, 0)
+                    if n < 3:
+                        counts[stats_file] = n + 1
+                        if n == 0:
+                            alert_msg = (f"⚠️【账本损坏】`{stats_file}` 读取失败或结构非法，"
+                                         f"已拒绝 v2 结算/争议写入并保留原文件（Fail-Closed）。\n"
+                                         f"💡 请人工修复该 JSON（**不要删除**，保留证据）；"
+                                         f"修复前 v2 记录持续被拒绝。")
+                        else:
+                            alert_msg = (f"⚠️【账本损坏】`{stats_file}` 仍处于拒绝写入状态"
+                                         f"（第 {n + 1}/3 次告警）。")
+                else:
+                    counts.pop(stats_file, None)
+                if proceed:
+                    trades = stats.setdefault("trades", [])
+                    _dedup = str(record.get('dedup_key') or '')
+                    # ② 幂等：同 dedup 已存在（settlement/dispute/legacy 同源）→ 零写入成功
+                    if _dedup and any(r.get('dedup_key') == _dedup for r in trades):
+                        result = True            # §10.6：不重记、不补画边界
+                    else:
+                        has_activation = any(
+                            r.get('dedup_key') == 'schema_activation:v2' for r in trades)
+                        to_append = []
+                        if not has_activation:
+                            to_append.append({
+                                'record_type': 'schema_activation', 'schema': 2,
+                                'dedup_key': 'schema_activation:v2',
+                                'activated_at': datetime.now(BEIJING_TZ).strftime(
+                                    '%Y-%m-%d %H:%M:%S'),
+                                'baseline': '3d8b63b',
+                            })
+                        to_append.append(record)
+                        trades.extend(to_append)
+                        temp_name = None
+                        try:
+                            with tempfile.NamedTemporaryFile(
+                                    "w", dir=os.path.dirname(stats_file),
+                                    delete=False, encoding="utf-8") as tf:
+                                temp_name = tf.name
+                                json.dump(stats, tf, ensure_ascii=False, indent=2)
+                                tf.flush()
+                                os.fsync(tf.fileno())
+                            os.replace(temp_name, stats_file)
+                            temp_name = None
+                        finally:
+                            if temp_name and os.path.exists(temp_name):
+                                try:
+                                    os.unlink(temp_name)
+                                except OSError:
+                                    pass
+                        _fsync_dir(os.path.dirname(stats_file) or '.')
+                        result = True
+            if alert_msg:
+                self.send_tg_notification(alert_msg, level='critical')
+            return result
+        except Exception as e:
+            print(f"⚠️ [v2 盈亏记录] 写入失败: {e}")
+            return False
+
     def _count_active_batches(self, all_states):
         """D-006: 统计全账户活跃批次数与带活跃批次的交易对集合（零 API，只读本地状态文件）"""
         total = 0
@@ -1028,6 +1152,324 @@ class CryptoTrader:
                     total += 1
                     symbols.add(sym)
         return total, symbols
+
+    # ==================== T1C-v2A：唯一结算证据 + outbox + 共享 finalizer ============
+    # 设计稿 docs/architecture/T1C-v2A-Integration-Addendum-v1.2.md（v1.2 终签 f06becb）
+    # 复审阻断收口（干净重实现，8 项）：
+    #   ① stats 落 v2 富记录 + activation（_record_settlement_v2），绝不压扁旧 8 参；
+    #   ② DISPUTED 写 settlement_dispute，net_pnl_estimate=None 原样落盘（禁 None→0）；
+    #   ③ 证据零猜测：缺 side/退出ID/引用/数量/代际 → DISPUTED，绝不 false PROVEN；
+    #   ④ BEGIN 失败零 stats、零 clear、保留恢复能力（调用方不得回落 legacy clear）；
+    #   ⑤ PROVEN/DISPUTED 在任何撤保护动作前分流（DISPUTED 保留保护与批次）；
+    #   ⑥ observed_qty 必须传真实订单成交量，expected 用 durable 净量（不得人为相等）；
+    #   ⑦ TP 展示/计算 = Taker；所有消息标「估算净盈亏/手续费待异步对账」；
+    #   ⑧ 行为测试锁真实 stats 内容与崩溃恢复，不测 helper 存在。
+
+    @staticmethod
+    def _v2a_is_finite(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return False
+        return f == f and f not in (float('inf'), float('-inf'))
+
+    def _derive_entry_order_refs(self, b):
+        """从 durable 批次账本派生入场订单引用（kind=regular + order_id + 逐层 expected_qty）。
+        只收录已有 order_id 的层；qty 缺省时保持 None（交给证据判定 DISPUTED，不猜测）。"""
+        ta = b.get('target_amounts') or []
+        eo = b.get('entry_orders') or []
+        refs = []
+        for i, oid in enumerate(eo):
+            oid_s = str(oid or '').strip()
+            if not oid_s:
+                continue
+            qty = None
+            try:
+                if i < len(ta):
+                    qty = float(ta[i])
+            except (TypeError, ValueError):
+                qty = None
+            refs.append({'kind': 'regular', 'order_id': oid_s, 'expected_qty': qty})
+        return refs
+
+    def _build_settlement_evidence(self, *, batch_id, symbol, side, mode,
+                                   base_dedup_key, settlement_id, exit_order_ref,
+                                   entry_order_refs, expected_qty, observed_qty,
+                                   net_cost, exit_price, generation,
+                                   entry_fee_estimate=None, exit_fee_estimate=None):
+        """§4 唯一结算证据对象（不可变，零猜测）。任一核心资格缺失 → DISPUTED：
+        side 非 BUY/SELL、exit_ref 缺 id/类型、expected/observed 非有限或 ≤0 或超容差、
+        net_cost 非有限或 ≤0、exit_price 非有限或 ≤0、入场引用空/不完整/逐层 qty 缺失、
+        generation 空。PROVEN 才计算 gross_pnl/net_pnl_estimate；DISPUTED 不写权威 net_pnl。
+        出场费率（§5.3）：TP/SL/MARKET 条件单 → Taker；LIMIT 普通限价 → Maker。"""
+        reasons = []
+        def _bad(cond, why):
+            if cond:
+                reasons.append(why)
+        _bad(side not in ('BUY', 'SELL'), 'side')
+        _bad(not (isinstance(exit_order_ref, dict)
+                  and str(exit_order_ref.get('order_id') or '').strip()
+                  and exit_order_ref.get('kind') in ('regular', 'algo')), 'exit_ref')
+        _exp_ok = self._v2a_is_finite(expected_qty) and float(expected_qty) > 0
+        _obs_ok = self._v2a_is_finite(observed_qty) and float(observed_qty) > 0
+        _bad(not _exp_ok, 'expected_qty')
+        _bad(not _obs_ok, 'observed_qty')
+        if _exp_ok and _obs_ok:
+            _tol = max(1e-9, 1e-6 * float(expected_qty))
+            _bad(abs(float(expected_qty) - float(observed_qty)) > _tol, 'qty_mismatch')
+        _bad(not (self._v2a_is_finite(net_cost) and float(net_cost) > 0), 'net_cost')
+        _bad(not (self._v2a_is_finite(exit_price) and float(exit_price) > 0), 'exit_price')
+        _refs_ok = bool(entry_order_refs) and all(
+            isinstance(r, dict)
+            and r.get('kind') in ('regular', 'algo')
+            and str(r.get('order_id') or '').strip()
+            and self._v2a_is_finite(r.get('expected_qty'))
+            and float(r.get('expected_qty', 0) or 0) > 0
+            for r in entry_order_refs)
+        _bad(not _refs_ok, 'entry_refs')
+        _bad(generation in (None, '', 0), 'generation')
+        core_status = 'PROVEN' if not reasons else 'DISPUTED'
+
+        avg_entry = 0.0
+        gross_pnl = None
+        if core_status == 'PROVEN':
+            avg_entry = float(net_cost) / float(expected_qty)
+            if side == 'BUY':
+                gross_pnl = (float(exit_price) - avg_entry) * float(observed_qty)
+            else:
+                gross_pnl = (avg_entry - float(exit_price)) * float(observed_qty)
+        _exit_rate = TAKER_FEE_RATE if mode in ('TP', 'SL', 'MARKET') else MAKER_FEE_RATE
+        exit_notional = float(exit_price) * float(observed_qty) if _obs_ok else 0.0
+        if exit_fee_estimate is None:
+            exit_fee_estimate = exit_notional * _exit_rate
+        if entry_fee_estimate is None:
+            entry_fee_estimate = 0.0
+        net_pnl_estimate = None
+        if core_status == 'PROVEN':
+            net_pnl_estimate = (gross_pnl - float(entry_fee_estimate)
+                                - float(exit_fee_estimate))
+        now = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
+        record = {
+            'record_type': 'settlement' if core_status == 'PROVEN' else 'settlement_dispute',
+            'core_status': core_status,
+            'quantity_status': ('PROVEN' if (_exp_ok and _obs_ok) else 'DISPUTED'),
+            'cost_basis_status': ('PROVEN' if core_status == 'PROVEN' else 'DISPUTED'),
+            'pnl_status': ('ESTIMATED' if core_status == 'PROVEN' else 'DISPUTED'),
+            'fee_status': 'ESTIMATED',
+            'dedup_key': base_dedup_key, 'settlement_id': settlement_id,
+            'batch_id': batch_id, 'symbol': symbol, 'side': side, 'mode': mode,
+            'amount': (round(float(observed_qty), 6) if _obs_ok else None),
+            'avg_price': (round(avg_entry, 6) if core_status == 'PROVEN' else None),
+            'exit_price': (round(float(exit_price), 6)
+                           if self._v2a_is_finite(exit_price) else None),
+            'gross_pnl': (round(gross_pnl, 6) if gross_pnl is not None else None),
+            'net_pnl_estimate': (round(net_pnl_estimate, 6)
+                                 if net_pnl_estimate is not None else None),
+            'time': now,
+        }
+        if core_status == 'PROVEN':
+            # legacy 兼容别名（日报/D-006 现役消费者）：PROVEN 才写，DISPUTED 永不写权威值
+            record['net_pnl'] = record['net_pnl_estimate']
+        else:
+            record['dispute_reasons'] = reasons
+        evidence = {
+            'schema': 2, 'batch_id': batch_id, 'symbol': symbol, 'side': side,
+            'mode': mode, 'base_dedup_key': base_dedup_key,
+            'settlement_id': settlement_id, 'exit_order_ref': exit_order_ref,
+            'entry_order_refs': entry_order_refs,
+            'expected_qty': (float(expected_qty) if _exp_ok else None),
+            'observed_qty': (float(observed_qty) if _obs_ok else None),
+            'net_cost': (float(net_cost) if self._v2a_is_finite(net_cost) else None),
+            'exit_price': (float(exit_price) if self._v2a_is_finite(exit_price) else None),
+            'avg_entry': avg_entry,
+            'entry_fee_estimate': entry_fee_estimate,
+            'exit_fee_estimate': exit_fee_estimate,
+            'fee_risk_basis': {
+                'entry_notional': (float(net_cost)
+                                   if self._v2a_is_finite(net_cost) else 0.0),
+                'exit_notional': exit_notional,
+                'allocation_policy': 'CONSERVATIVE_FULL',
+            },
+            'generation': generation, 'created_at': now,
+        }
+        return {'schema': 2, 'base_dedup_key': base_dedup_key,
+                'settlement_id': settlement_id, 'record': record, 'evidence': evidence}
+
+    def _atomic_outbox_begin(self, *, batch_id, symbol, mode, generation,
+                             exit_order_ref, observed_qty, exit_price,
+                             expected_qty, net_cost, entry_order_refs=None,
+                             entry_fee_estimate=None, exit_fee_estimate=None,
+                             settlement_id=None):
+        """§7 原子 BEGIN（全部在 _state_lock 内）：
+        ① 重读磁盘 ② 批次仍 active ③ 退出代际校验（LIMIT=limit_close_order_id ∧ close_op
+        在册；SL=current_sl_id；TP=tp_order_id；MARKET=close_op_id）        ④ dedup 分派：不同 dedup 活动 outbox 拒绝；**同 dedup 复用原事务**（返回既有
+        record，不重建 outbox、不重置 stats_committed——§8.3 DISPUTED 终态不被打回）
+        ⑤ 构造完整 evidence ⑥ 同一次 _persist_states 写 close_phase=2+pending_close=
+        True+close_reason='settlement_pending'+完整 outbox ⑦ 检查返回值。
+        返回 outbox['record']（含 core_status）或 None（BEGIN 失败 → 调用方必须零 stats、
+        零 clear、保留恢复能力，不得继续撤保护或回落 legacy 结算）。"""
+        with self._state_lock:
+            all_states = self.load_all_states()
+            b = (all_states.get(symbol) or {}).get(batch_id)
+            if not isinstance(b, dict) or not b.get('is_active'):
+                return None
+            _g = str(generation or '')
+            if mode == 'LIMIT':
+                _ok_gen = (bool(b.get('close_op_id'))
+                           and str(b.get('limit_close_order_id') or '') == _g)
+            elif mode == 'SL':
+                _ok_gen = str(b.get('current_sl_id') or '') == _g
+            elif mode == 'TP':
+                _ok_gen = str(b.get('tp_order_id') or '') == _g
+            elif mode == 'MARKET':
+                _ok_gen = str(b.get('close_op_id') or '') == _g
+            else:
+                _ok_gen = False
+            if not _ok_gen:
+                print(f"🚨 [v2A] 退出代际校验失败（mode={mode} gen={_g}，"
+                      f"limit={b.get('limit_close_order_id')!r} sl={b.get('current_sl_id')!r} "
+                      f"tp={b.get('tp_order_id')!r} op={b.get('close_op_id')!r}），拒绝结算")
+                return None
+            _dedup = f'{symbol}:{_g}'
+            _existing = b.get('pending_settlement')
+            if isinstance(_existing, dict) and _existing.get('base_dedup_key'):
+                if _existing['base_dedup_key'] != _dedup:
+                    print(f"🚨 [v2A] 不同 dedup 的活动 outbox 已存在"
+                          f"（disk={_existing['base_dedup_key']} new={_dedup}），拒绝新事务")
+                    return None
+                # §8.3（ChatGPT 裁定 2026-09-05）：同 dedup 复用原事务——
+                # 绝不重建 outbox、绝不把 stats_committed 重置回 False。否则
+                # DISPUTED 终态会被反复打回「未提交」态，形成
+                # 「记一次争议 → 重置 → 再记」的活锁，监控线程永不退出。
+                return _existing.get('record')
+            _refs = entry_order_refs
+            if _refs is None:
+                _refs = self._derive_entry_order_refs(b)
+            _side = str(b.get('side') or '').upper()     # 无 BUY 默认；非法 → 证据 DISPUTED
+            _sid = settlement_id or f'v2a_{batch_id}_{_g}'
+            ev = self._build_settlement_evidence(
+                batch_id=batch_id, symbol=symbol, side=_side, mode=mode,
+                base_dedup_key=_dedup, settlement_id=_sid,
+                exit_order_ref=exit_order_ref, entry_order_refs=_refs,
+                expected_qty=expected_qty, observed_qty=observed_qty,
+                net_cost=net_cost, exit_price=exit_price, generation=_g,
+                entry_fee_estimate=entry_fee_estimate,
+                exit_fee_estimate=exit_fee_estimate)
+            b['close_phase'] = 2
+            b['pending_close'] = True
+            b['close_reason'] = 'settlement_pending'
+            b['pending_settlement'] = {
+                'schema': 2, 'base_dedup_key': _dedup, 'settlement_id': _sid,
+                'record': ev['record'], 'evidence': ev['evidence'],
+                'stats_committed': False,
+            }
+            if not self._persist_states(all_states):
+                print(f"⚠️ [v2A] outbox 持久化失败（BEGIN 失败：零 stats、零 clear，"
+                      f"保留恢复能力）")
+                return None
+            return ev['record']
+
+    def _try_finalize_outbox(self, batch_id, symbol):
+        """§8.2/§8.3 共享 finalizer：只消费持久化 outbox（不依赖触发线程临时变量）。
+        PROVEN → v2 stats（settlement 富记录）→ stats_committed=False→True 持久化 →
+        现场 fresh convergence proof → 授权 clear（authorization=base_dedup_key）。
+        DISPUTED → v2 stats（settlement_dispute）→ stats_committed=True → close_reason=
+        'settlement_disputed' → 限频 critical → 不 clear、不撤保护、保留批次（§8.3）。
+        崩溃窗口（stats 已追加但 stats_committed 未持久化）由 dedup 幂等 + 重启重跑闭合。
+
+        §8.3（ChatGPT 裁定 2026-09-05）返回三态（不再是 bool）：
+          SETTLE_CLEARED        PROVEN 已记账 + 已收敛 + 已授权 clear
+          SETTLE_MANUAL_REVIEW  DISPUTED 终态：已幂等落盘，交人工核对（**不可重试**）
+          SETTLE_PENDING_RETRY  可重试失败（无 outbox / stats 写失败 / 持久化失败 /
+                                proof 未生成 / 授权 clear 被拒）
+        调用方必须据此分派：MANUAL_REVIEW 与 CLEARED 同属终态，均须停止重试；
+        且 MANUAL_REVIEW 严禁再调交易所 API 或 clear。"""
+        all_states = self.load_all_states()
+        b = (all_states.get(symbol) or {}).get(batch_id)
+        if not isinstance(b, dict):
+            return SETTLE_PENDING_RETRY
+        outbox = b.get('pending_settlement')
+        if not isinstance(outbox, dict) or not outbox.get('base_dedup_key'):
+            return SETTLE_PENDING_RETRY
+        if not outbox.get('stats_committed'):
+            _ok = self._record_settlement_v2(
+                record=outbox.get('record') or {},
+                stats_file=getattr(self, '_stats_file', None))
+            if not _ok:
+                print(f"⚠️ [v2A] v2 stats 写入失败（CORRUPT/IO），保留 outbox 待重试")
+                return SETTLE_PENDING_RETRY
+            with self._state_lock:
+                all_states = self.load_all_states()
+                b = (all_states.get(symbol) or {}).get(batch_id)
+                if not isinstance(b, dict):
+                    return SETTLE_PENDING_RETRY
+                outbox = b.get('pending_settlement')
+                if not isinstance(outbox, dict) or not outbox.get('base_dedup_key'):
+                    return SETTLE_PENDING_RETRY
+                outbox['stats_committed'] = True
+                b['pending_settlement'] = outbox
+                all_states[symbol][batch_id] = b
+                if not self._persist_states(all_states):
+                    print(f"⚠️ [v2A] stats_committed 持久化失败，保留 outbox 待重试")
+                    return SETTLE_PENDING_RETRY
+        # 锁外重读最新 core_status（持久化 outbox 为唯一事实源）
+        b = (self.load_all_states().get(symbol) or {}).get(batch_id)
+        if not isinstance(b, dict):
+            return SETTLE_PENDING_RETRY
+        _record = (b.get('pending_settlement') or {}).get('record') or {}
+        _dedup = (b.get('pending_settlement') or {}).get('base_dedup_key') or ''
+        if _record.get('core_status') == 'DISPUTED':
+            # §8.3：争议已记账 + flag 已 True；补齐 close_reason 后交 P3/manual。
+            # 幂等：close_reason 已是 settlement_disputed 即终态已落盘，重入不写盘。
+            _reason_ok = False
+            with self._state_lock:
+                all_states = self.load_all_states()
+                bb = (all_states.get(symbol) or {}).get(batch_id)
+                if isinstance(bb, dict):
+                    if bb.get('close_reason') == 'settlement_disputed':
+                        _reason_ok = True          # 终态已落盘，重入幂等
+                    else:
+                        bb['close_reason'] = 'settlement_disputed'
+                        all_states.setdefault(symbol, {})[batch_id] = bb
+                        _reason_ok = self._persist_states(all_states)
+            if not _reason_ok:
+                # 终态未落盘 → 下轮重试（_record_settlement_v2 dedup 命中零写入，不重复记账）
+                return SETTLE_PENDING_RETRY
+            self._converge_alert(
+                ('v2a_disputed', symbol, batch_id),
+                f"🚨【资金安全】批次 `{batch_id}`({symbol}) 结算证据 DISPUTED"
+                f"（{','.join(_record.get('dispute_reasons') or ['unknown'])}）。\n"
+                f"已记录 settlement_dispute，保留保护单与批次，不自动清理。\n"
+                f"💡 请人工核对交易所成交与账本后处置。", level='critical')
+            # §8.3 自动化终态：已记账 + 已落盘 → 交人工核对。调用方必须停止后续
+            # 一切交易所 API / clear，仅保留限频 critical（不再是可重试失败）。
+            return SETTLE_MANUAL_REVIEW
+        # PROVEN：fresh convergence proof（现场生成，绝不复用持久化 proof）
+        _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+        if _proof is None:
+            print(f"⚠️ [v2A] 收敛证明未生成（UNKNOWN/撤单失败），保留 outbox 不 clear")
+            return SETTLE_PENDING_RETRY
+        if not self.clear_batch_state(symbol, batch_id, proof=_proof,
+                                      authorization=_dedup):
+            print(f"⚠️ [v2A] 授权 clear 被拒（v2A 门/proof），保留 outbox 待重试")
+            return SETTLE_PENDING_RETRY
+        return SETTLE_CLEARED
+
+    def _resume_pending_settlement(self, batch_id, symbol):
+        """§8.1 唯一恢复入口：监控循环/启动恢复统一接管 pending_settlement（优先于旧限价恢复）。
+        只读检查锁外；finalize 内部自持锁。
+
+        返回结算三态（§8.3）：
+          无可接管的 pending_settlement → SETTLE_PENDING_RETRY（**非终态**，仅表示
+          当前没有可消费的结算事务，不代表失败）；
+          其余透传 _try_finalize_outbox 的三态结果。"""
+        b = (self.load_all_states().get(symbol) or {}).get(batch_id)
+        if not isinstance(b, dict):
+            return SETTLE_PENDING_RETRY
+        if not isinstance(b.get('pending_settlement'), dict) \
+                or not b.get('pending_settlement', {}).get('base_dedup_key'):
+            return SETTLE_PENDING_RETRY
+        return self._try_finalize_outbox(batch_id, symbol)
 
     def _get_today_realized_pnl(self, stats_file=None):
         """D-006: 求当日（北京时间）已实现盈亏总和，数据源 trade_stats.json。
@@ -1878,18 +2320,37 @@ class CryptoTrader:
             if b_data is None:
                 return True  # 已清理/不存在 → 幂等成功（无状态可保护）
             _reject = self._verify_clear_proof(symbol, batch_id, proof, b_data)
-            # 🔥 P5h（ChatGPT 七复审 P0-2）：删除授权与删除在同一 _state_lock 内
-            # 原子绑定——授权校验若发生在锁外，"校验通过 → 取锁 → 删除"之间
-            # 仍可发生 settled/manual_review/op 迁移，旧线程会删掉新状态。
-            # authorization=(close_op_id, close_reason, settled, limit_close_order_id)
-            if _reject is None and authorization is not None:
-                _cur_snap = (b_data.get('close_op_id') or '',
-                             b_data.get('close_reason') or '',
-                             bool(b_data.get('settled_by_limit_close')),
-                             b_data.get('limit_close_order_id') or '')
-                if _cur_snap != tuple(authorization):
-                    _reject = (f'清理授权失效：批次状态已迁移'
-                               f'({tuple(authorization)} → {_cur_snap})，拒绝删除')
+            # 🔥 T1C-v2A §9 财务授权门：批次存在 pending_settlement 时，只有共享
+            # finalizer 可 clear —— authorization 必须 == outbox base_dedup_key（字符串）
+            # 且 stats_committed=True 且核心记录非 DISPUTED。无 outbox 的旧批次走下方
+            # 既有 P5h 四元授权门（legacy tuple），互不干扰。
+            if _reject is None:
+                _v2_outbox = b_data.get('pending_settlement')
+                if isinstance(_v2_outbox, dict) and _v2_outbox.get('base_dedup_key'):
+                    _v2_dedup = _v2_outbox.get('base_dedup_key')
+                    if not isinstance(authorization, str) or authorization != _v2_dedup:
+                        _reject = (f'v2A 清理授权失效：authorization({authorization!r}) ≠ '
+                                   f'outbox base_dedup_key({_v2_dedup!r})，拒绝删除'
+                                   f'（防旧路径伪造授权清批）')
+                    elif not _v2_outbox.get('stats_committed'):
+                        _reject = ('v2A 清理被拒：stats 尚未提交（stats_committed=False），'
+                                   '保留 outbox 待重试')
+                    elif isinstance(_v2_outbox.get('record'), dict) \
+                            and _v2_outbox['record'].get('core_status') == 'DISPUTED':
+                        _reject = ('v2A 清理被拒：核心证据 DISPUTED，不自动 clear，'
+                                   '保留人工核对（§8.3）')
+                elif authorization is not None:
+                    # 🔥 P5h（ChatGPT 七复审 P0-2）：删除授权与删除在同一 _state_lock 内
+                    # 原子绑定——授权校验若发生在锁外，"校验通过 → 取锁 → 删除"之间
+                    # 仍可发生 settled/manual_review/op 迁移，旧线程会删掉新状态。
+                    # authorization=(close_op_id, close_reason, settled, limit_close_order_id)
+                    _cur_snap = (b_data.get('close_op_id') or '',
+                                 b_data.get('close_reason') or '',
+                                 bool(b_data.get('settled_by_limit_close')),
+                                 b_data.get('limit_close_order_id') or '')
+                    if _cur_snap != tuple(authorization):
+                        _reject = (f'清理授权失效：批次状态已迁移'
+                                   f'({tuple(authorization)} → {_cur_snap})，拒绝删除')
             if _reject is None:
                 # C2：先落墓碑再删 state（删记忆后墓碑是唯一防线，顺序不可倒）
                 try:
@@ -2026,6 +2487,35 @@ class CryptoTrader:
         merged = dict(snap)  # E/F/未知字段默认最新者胜（快照覆盖）
         # —— G 类（v3 §5）：user_modified 事实字段取 OR，绝不参与安全判定 ——
         merged['user_modified'] = bool(disk.get('user_modified')) or bool(snap.get('user_modified'))
+        # —— T1C-v2A §6.2：pending_settlement = 独立 Transactional Protected Field ——
+        #   1. disk 无、snap 有 → 接受 snap；2. disk 有、snap 无 → 保留 disk；
+        #   3. 同 dedup → record/evidence/settlement_id 以 disk 为准，stats_committed 仅
+        #      False→True；4. 不同 dedup → disk 胜出（拒绝新事务）；
+        #   5. 只有合法 clear 才删除；6. 陈旧线程不得以 None/缺字段/旧 snapshot 冲掉 outbox。
+        merged.pop('pending_settlement', None)
+        _v2_do = disk.get('pending_settlement')
+        _v2_so = snap.get('pending_settlement')
+        _v2_do_ok = isinstance(_v2_do, dict) and _v2_do.get('base_dedup_key')
+        _v2_so_ok = isinstance(_v2_so, dict) and _v2_so.get('base_dedup_key')
+        if _v2_do_ok and _v2_so_ok:
+            if _v2_do['base_dedup_key'] == _v2_so['base_dedup_key']:
+                _v2_out = dict(_v2_so)
+                _v2_out['schema'] = _v2_do.get('schema', _v2_so.get('schema', 2))
+                _v2_out['record'] = _v2_do.get('record') or _v2_so.get('record')
+                _v2_out['evidence'] = _v2_do.get('evidence') or _v2_so.get('evidence')
+                _v2_out['settlement_id'] = (_v2_do.get('settlement_id')
+                                            or _v2_so.get('settlement_id'))
+                # stats_committed 只允许 False→True（磁盘已 True 不得被旧快照拉回）
+                _v2_out['stats_committed'] = bool(_v2_do.get('stats_committed')
+                                                  or _v2_so.get('stats_committed'))
+                merged['pending_settlement'] = _v2_out
+            else:
+                # 规则 4：不同 dedup 的活动 outbox → disk 胜出（拒绝覆盖新事务）
+                merged['pending_settlement'] = _v2_do
+        elif _v2_do_ok:
+            merged['pending_settlement'] = _v2_do      # 规则 2/6：disk 有则保留
+        elif _v2_so_ok:
+            merged['pending_settlement'] = _v2_so      # 规则 1：disk 无则接受 snapshot
         # —— A 类棘轮：close_phase int max + Boolean False→True 单向 ——
         try:
             merged['close_phase'] = max(int(disk.get('close_phase', 0) or 0),
@@ -3433,7 +3923,7 @@ class CryptoTrader:
             # 必须先走 finalizer 续跑，绝不能因 manual_review 判断在前而永久冻结
             if b.get('settled_by_limit_close') and oid:
                 ok_s, msg_s = self._finalize_limit_full_fill(symbol, batch_id, oid)
-                print(f"  └─ {'✅' if ok_s else '⚠️'} [限价平仓恢复] 批次 [{batch_id}]: {msg_s}")
+                print(f"  └─ {_settle_glyph(ok_s)} [限价平仓恢复] 批次 [{batch_id}]: {msg_s}")
                 return
             # 🔥 P5e（ChatGPT 四复审 P0）：人工核对冻结态——只告警，不裁决不恢复
             if reason == 'limit_cancel_manual_review':
@@ -3468,7 +3958,7 @@ class CryptoTrader:
                             order_kind='normal')
                         if _fill0 and float(_fill0) >= _pre_net0 - max(1e-8, _pre_net0 * 1e-6):
                             ok_ff, msg_ff = self._finalize_limit_full_fill(symbol, batch_id, oid)
-                            print(f"  └─ {'✅' if ok_ff else '⚠️'} [限价平仓恢复] "
+                            print(f"  └─ {_settle_glyph(ok_ff)} [限价平仓恢复] "
                                   f"批次 [{batch_id}]: {msg_ff}")
                             return
                         ok_mr, msg_mr = self._mark_limit_cancel_manual_review(
@@ -4322,9 +4812,9 @@ class CryptoTrader:
                 order = self._safe_api_call(self.exchange.fetch_order, order_id, symbol)
             except Exception as e:
                 print(f"⚠️ [finalizer] fetch_order 失败，保持 phase=2 待重试: {e}")
-                return False, f'order_unavailable（{str(e)[:120]}）'
+                return SETTLE_PENDING_RETRY, f'order_unavailable（{str(e)[:120]}）'
         if not isinstance(order, dict):
-            return False, 'order_structure_unknown（保持 phase=2）'
+            return SETTLE_PENDING_RETRY, 'order_structure_unknown（保持 phase=2）'
         info = order.get('info', {}) or {}
         avg_price = float(order.get('average') or order.get('price') or 0.0)
         if avg_price == 0.0:
@@ -4333,25 +4823,26 @@ class CryptoTrader:
             if cum_quote > 0 and executed_qty > 0:
                 avg_price = cum_quote / executed_qty
         if avg_price <= 0.0:
-            return False, 'fill_price_unavailable（保持 phase=2）'
+            return SETTLE_PENDING_RETRY, 'fill_price_unavailable（保持 phase=2）'
         with self._state_lock:
             latest = self.load_all_states()
             b = (latest.get(symbol, {}) or {}).get(batch_id)
             if not isinstance(b, dict) or not b.get('is_active'):
-                return True, 'already_cleared'
+                return SETTLE_CLEARED, 'already_cleared'
             # 🔥 Blocker 1（P0）：代际隔离——只允许当前事务（close_op 在册且
             # durable limit_close_order_id == 本订单）触发结算；旧线程的 L1
             # 绝不能结算新一代 L2/OP2
             if not b.get('close_op_id') \
                     or str(b.get('limit_close_order_id') or '') != str(order_id):
-                return False, ('order_generation_mismatch（结算订单 %s ≠ 当前事务'
-                               '订单 %s）' % (order_id, b.get('limit_close_order_id')))
+                return SETTLE_PENDING_RETRY, (
+                    'order_generation_mismatch（结算订单 %s ≠ 当前事务'
+                    '订单 %s）' % (order_id, b.get('limit_close_order_id')))
             if not b.get('settled_by_limit_close'):
                 b['settled_by_limit_close'] = True
                 b['is_programmatic_cancel'] = True
                 b['close_phase'] = 2
                 if not self._persist_states(latest):
-                    return False, 'persist_failed'
+                    return SETTLE_PENDING_RETRY, 'persist_failed'
                 claimed = True
         # ② 结算数据（从 durable ledger 取，与 monitor 快照口径一致）
         b = (self.load_all_states().get(symbol, {}) or {}).get(batch_id) or {}
@@ -4370,14 +4861,59 @@ class CryptoTrader:
         exit_fee = exit_price * net_qty * MAKER_FEE_RATE
         total_fees = fee_rem + exit_fee
         net_pnl = gross_pnl - total_fees
-        # ③ PnL 幂等记录（dedup 键 = symbol:order_id）
-        # 🔥 Blocker 4（P0）：PnL 必须 durable 成功才允许继续收敛/清理——落盘失败
-        # 保持 close_phase=2（claim 已完成），由恢复/接管续跑重试（dedup 防双记）
-        if not self._record_realized_pnl(batch_id, symbol, side, net_qty, avg_entry,
-                                         exit_price, net_pnl, '限价平仓',
-                                         dedup_key=f'{symbol}:{order_id}'):
-            return False, 'pnl_persist_failed（保持 close_phase=2 待续跑重试）'
-        # ④ 撤 SL（N14）+ 残余 TP（B0）——同 monitor 结算惯例
+        # ③ T1C-v2A 原子 BEGIN（§7）：outbox 与 close_phase=2 同一次持久化。
+        #    旧「直接 _record_realized_pnl(8参)」由 finalizer 内 v2 富记录写入取代——
+        #    v2 富记录/activation 必须真实落盘（§10），禁止压扁成旧字段（复审项1/2）。
+        #    observed_qty = 退出订单权威成交快照（order.filled / executedQty），
+        #    不得用 net_qty 人为构造 expected==observed（复审项6，§11 限价路径行）。
+        _fill_qty = 0.0
+        try:
+            _fill_qty = float(order.get('filled') or 0.0)
+        except (TypeError, ValueError):
+            _fill_qty = 0.0
+        if _fill_qty <= 0.0:
+            _o_info = order.get('info') or {}
+            try:
+                _fill_qty = float(_o_info.get('executedQty') or 0.0)
+            except (TypeError, ValueError):
+                _fill_qty = 0.0
+        _lfc_g = int(b.get('last_filled_count', 0) or 0)
+        _ta_g = b.get('target_amounts') or []
+        _fdl_g = b.get('filled_details') or []
+        _gross_cost = 0.0
+        try:
+            _gross_cost = float(sum(
+                (float(_ta_g[i]) * float(_fdl_g[i]))
+                for i in range(min(_lfc_g, len(_ta_g), len(_fdl_g)))))
+        except (TypeError, ValueError):
+            _gross_cost = 0.0
+        _fee_rem = (float(b.get('total_entry_fee', 0.0) or 0.0)
+                    * (net_cost / _gross_cost) if _gross_cost > 0 else 0.0)
+        # §8.3（ChatGPT 裁定 2026-09-05）：DISPUTED 是自动化终态，不是可重试失败。
+        # 磁盘上若已是「本事务 + 已提交 + DISPUTED」，直接终态返回——绝不重建 outbox、
+        # 绝不调用交易所 API（撤 SL/TP）、绝不 clear，只保留限频 critical。
+        _pre_b = (self.load_all_states().get(symbol) or {}).get(batch_id) or {}
+        _pre_ob = _pre_b.get('pending_settlement')
+        if isinstance(_pre_ob, dict) and _pre_ob.get('stats_committed') \
+                and (_pre_ob.get('record') or {}).get('core_status') == 'DISPUTED':
+            # 幂等：仅补齐 close_reason + 限频告警（_record_settlement_v2 dedup 零写入）
+            self._try_finalize_outbox(batch_id, symbol)
+            return SETTLE_MANUAL_REVIEW, ('settlement_disputed（终态：保留保护单'
+                                          '与批次，等待人工核对）')
+        _v2_rec = self._atomic_outbox_begin(
+            batch_id=batch_id, symbol=symbol, mode='LIMIT', generation=order_id,
+            exit_order_ref={'kind': 'regular', 'order_id': order_id},
+            observed_qty=_fill_qty, exit_price=avg_price,
+            expected_qty=net_qty, net_cost=net_cost, entry_fee_estimate=_fee_rem)
+        if not isinstance(_v2_rec, dict):
+            # BEGIN 失败：零 stats、零 clear、保留恢复能力；不撤任何保护单（复审项4）
+            return SETTLE_PENDING_RETRY, ('outbox_begin_failed（零 stats/零 clear，'
+                                          '重启/接管续跑）')
+        if _v2_rec.get('core_status') != 'PROVEN':
+            # §8.3：DISPUTED 不进入会移除潜在剩余仓位保护的清理链；记争议 + 人工
+            _st_d = self._try_finalize_outbox(batch_id, symbol)
+            return _st_d, 'settlement_disputed（保留保护单与批次，等待人工核对）'
+        # ④ PROVEN 才撤 SL（N14）+ 残余 TP（B0）——同 monitor 结算惯例
         if b.get('current_sl_id'):
             _sl_id = b['current_sl_id']
             try:
@@ -4407,31 +4943,37 @@ class CryptoTrader:
                                           terminated_reason='close_settled_canceled_tp')
             except Exception:
                 pass
-        # ⑤ 结算 TG（一次）+ 记录
+        # ⑤ 结算 TG（一次）—— §12：PROVEN 显示「估算净盈亏 / 手续费待异步对账」
+        _r = _v2_rec
+        _r_net = float(_r.get('net_pnl_estimate') or 0.0)
+        _r_avg = float(_r.get('avg_price') or 0.0)
+        _r_amt = float(_r.get('amount') or 0.0)
         if claimed and self._claim_settlement_reported(symbol, batch_id):
-            capital_base = avg_entry * net_qty if net_qty > 0 else 1
-            net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
+            _r_cap = _r_avg * _r_amt if _r_amt > 0 else 1
+            _r_pct = (_r_net / _r_cap) * 100 if _r_cap > 0 else 0.0
             self.send_tg_notification(
                 f"🎉 **[限价平仓结算]**\n\n"
                 f"🆔 **批次号**：`{batch_id}`\n"
                 f"🪙 **标的**：`{symbol}`\n"
-                f"📊 **方向**：`{side}`\n"
+                f"📊 **方向**：`{_r.get('side') or side}`\n"
                 f"📊 **平仓模式**：限价单 (Maker {MAKER_FEE_RATE * 100:.2f}%)\n"
-                f"📊 **持仓**：`{net_qty}`\n"
-                f"📈 **持仓均价**：`{avg_entry:.2f}` USDT\n"
-                f"💵 **平仓均价**：`{exit_price:.2f}` USDT\n"
-                f"📊 **名义盈亏**：`{gross_pnl:+.2f}` USDT\n"
-                f"💸 **总手续费**：`{total_fees:.4f}` USDT\n"
-                f"{'🟢' if net_pnl >= 0 else '🔴'} **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
+                f"📊 **持仓**：`{_r_amt:.6f}`\n"
+                f"📈 **持仓均价（不含入场费）**：`{_r_avg:.2f}` USDT\n"
+                f"💵 **平仓均价**：`{float(_r.get('exit_price') or 0.0):.2f}` USDT\n"
+                f"📊 **名义盈亏**：`{float(_r.get('gross_pnl') or 0.0):+.2f}` USDT\n"
+                f"💸 **估算手续费**：`{float(_r.get('entry_fee_estimate') or 0.0) + float(_r.get('exit_fee_estimate') or 0.0):.4f}` USDT\n"
+                f"{'🟢' if _r_net >= 0 else '🔴'} **估算净盈亏**：`{_r_net:+.2f}` USDT (`{_r_pct:+.2f}%`)\n"
+                f"⏳ 手续费待异步对账（ESTIMATED，非最终权威）"
             )
             self._notify_snapshot(batch_id)
-        # ⑥ converge + clear（幂等；如实返回：proof 未过 / clear 失败不得谎报成功）
-        _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
-        if _proof is None:
-            return False, 'converge_pending（保持 close_phase=2，重启/接管续跑）'
-        if not self.clear_batch_state(symbol, batch_id, proof=_proof):
-            return False, 'clear_failed（保持 close_phase=2，重启/接管续跑）'
-        return True, ('finalized' if claimed else 'finalized_takeover')
+        # ⑥ 共享 finalizer：v2 stats → fresh proof → 授权 clear（幂等；如实返回）
+        _st_f = self._try_finalize_outbox(batch_id, symbol)
+        if _st_f == SETTLE_CLEARED:
+            return SETTLE_CLEARED, ('finalized' if claimed else 'finalized_takeover')
+        if _st_f == SETTLE_MANUAL_REVIEW:
+            return SETTLE_MANUAL_REVIEW, ('settlement_disputed（终态：保留保护单与'
+                                          '批次，等待人工核对）')
+        return SETTLE_PENDING_RETRY, 'finalize_pending（保持 close_phase=2，重启/接管续跑）'
 
     def _try_acquire_resize_inflight(self, batch_id):
         """🔥 v6.4-P1：resize 在途互斥（monitor 自愈线程 vs /partial 事务线程防双 create）。"""
@@ -4557,8 +5099,10 @@ class CryptoTrader:
             finally:
                 self._release_resize_inflight(batch_id)
         else:
-            ok_r, msg_r = False, 'resize_inflight'
-        if ok_r:
+            ok_r, msg_r = SETTLE_PENDING_RETRY, 'resize_inflight'
+        # §8.3：只有 CLEARED 才算「批次生命周期结束」——MANUAL_REVIEW 保留了批次，
+        # 若在此 pop 恢复态会丢掉后续人工处置上下文
+        if ok_r == SETTLE_CLEARED:
             self._partial_resume_state.pop(batch_id, None)
             print(f"  └─ ✅ [限价结算接管] 批次 {batch_id}: {msg_r}")
             return
@@ -6821,7 +7365,9 @@ class CryptoTrader:
                             if _fid:
                                 _ok_f, _msg_f = self._finalize_limit_full_fill(
                                     symbol, batch_id, _fid)
-                                if _ok_f:
+                                # §8.3：CLEARED 与 MANUAL_REVIEW 同属终态，均停止重试——
+                                # DISPUTED 是人工核对态，继续轮询只会重建 outbox 活锁
+                                if _ok_f in (SETTLE_CLEARED, SETTLE_MANUAL_REVIEW):
                                     break
                                 print(f"  └─ ⚠️ [P5 finalizer] 批次 {batch_id} "
                                       f"本轮未完成（{_msg_f}），保持 phase=2 下轮重试")
@@ -7262,6 +7808,13 @@ class CryptoTrader:
                               f"本轮跳过保护单维护")
                         self._freeze_print_state[batch_id] = (_close_reason, _b_close_phase,
                                                               _close_op, time.time())
+                    # 🔥 T1C-v2A §8.1：pending_settlement 恢复最优先（LIMIT/SL/TP/MARKET
+                    # 共用同一 finalizer；dedup+stats_committed+authorized clear 幂等，
+                    # 每轮调用安全）。settlement_pending = 确定性可续跑中间态 → 静默。
+                    _v2_outbox = (latest_b_data or {}).get('pending_settlement')
+                    if isinstance(_v2_outbox, dict) and _v2_outbox.get('base_dedup_key'):
+                        self._resume_pending_settlement(batch_id, symbol)
+                        continue
                     # 🔒 v6.2-r4：FREEZE_QUIET_REASONS（market_confirming /
                     # limit_pending_normal）之外一律周期 critical——
                     # limit_creating 是 transient，crash 重启后必须 loud（M25）。
@@ -7269,9 +7822,13 @@ class CryptoTrader:
                     # partial_closing 不进 quiet（transient，重启必须 loud）
                     # P5：limit_cancel_restore_pending 同属「可自动续跑的确定性
                     # 中间态」（归属已 durable，恢复由 _resume_closecancel_restore 续跑）
+                    # v2A：settlement_pending 进 quiet（finalizer 每轮自动续跑，
+                    # 卡住会转 settlement_stuck/disputed 变 loud）；settlement_disputed
+                    # 不进 quiet（人工核对态必须周期 loud，§8.3.8）
                     if _close_reason not in ('market_confirming', 'limit_pending_normal',
                                              'partial_resize_pending',
-                                             'limit_cancel_restore_pending'):
+                                             'limit_cancel_restore_pending',
+                                             'settlement_pending'):
                         if time.time() - self._freeze_alerted.get(batch_id, 0) >= 3600:
                             self._freeze_alerted[batch_id] = time.time()
                             self.send_tg_notification(
@@ -7437,28 +7994,84 @@ class CryptoTrader:
                     total_fees = total_entry_fee + exit_fee
                     net_pnl = gross_pnl - total_fees
 
-                    capital_base = batch_entry_vwap * batch_filled_amount
-                    net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
-
+                    # —— T1C-v2A §7/§8：原子 BEGIN → PROVEN 才允许撤保护（§8.3 DISPUTED
+                    # 保留潜在剩余仓位保护）；observed_qty = sl_detail 权威成交字段 ——
+                    _sl_fill = 0.0
+                    try:
+                        _sl_fill = float(sl_detail.get('filled') or 0.0)
+                    except (TypeError, ValueError):
+                        _sl_fill = 0.0
+                    if _sl_fill <= 0.0:
+                        try:
+                            _sl_fill = float((sl_detail.get('info') or {}).get('executedQty') or 0.0)
+                        except (TypeError, ValueError):
+                            _sl_fill = 0.0
+                    _net_qty, _net_cost = self._batch_net_position(latest_b_data)
+                    _lfc_x = int(latest_b_data.get('last_filled_count', 0) or 0)
+                    _ta_x = latest_b_data.get('target_amounts') or []
+                    _fdl_x = latest_b_data.get('filled_details') or []
+                    _gc_x = 0.0
+                    try:
+                        _gc_x = float(sum((float(_ta_x[i]) * float(_fdl_x[i]))
+                                          for i in range(min(_lfc_x, len(_ta_x), len(_fdl_x)))))
+                    except (TypeError, ValueError):
+                        _gc_x = 0.0
+                    _fee_rem_x = (float(total_entry_fee) * (_net_cost / _gc_x)
+                                  if _gc_x > 0 else 0.0)
+                    _v2_rec = self._atomic_outbox_begin(
+                        batch_id=batch_id, symbol=symbol, mode='SL',
+                        generation=current_sl_id,
+                        exit_order_ref={'kind': 'algo', 'order_id': current_sl_id},
+                        observed_qty=_sl_fill, exit_price=sl_exit_price,
+                        expected_qty=_net_qty, net_cost=_net_cost,
+                        entry_fee_estimate=_fee_rem_x)
+                    if not isinstance(_v2_rec, dict):
+                        # BEGIN 失败：零 stats、零 clear，保留保护与批次（下轮重试）
+                        print(f"  └─ ⚠️ [v2A-SL] BEGIN 失败（零 stats/零 clear），"
+                              f"保留保护与批次待重试")
+                        try:
+                            self._notify_snapshot(batch_id)   # 只读快照属必要安全观察
+                        except Exception:
+                            pass
+                        break
+                    if _v2_rec.get('core_status') != 'PROVEN':
+                        # §8.3：DISPUTED → 记争议、保留保护与批次、人工核对。
+                        # 终态幂等：close_reason 已落盘即上轮已告警，本轮静默（限频）
+                        _pre_rd = (((self.load_all_states().get(symbol) or {})
+                                    .get(batch_id) or {}).get('close_reason') or '')
+                        _st_d = self._try_finalize_outbox(batch_id, symbol)
+                        if _st_d == SETTLE_MANUAL_REVIEW \
+                                and _pre_rd != 'settlement_disputed':
+                            self.send_tg_notification(
+                                f"🚨 **[止损触发-证据冲突]**\n🆔 批次：`{batch_id}`\n"
+                                f"结算证据 DISPUTED"
+                                f"（{','.join(_v2_rec.get('dispute_reasons') or ['unknown'])}），\n"
+                                f"已保留保护单与批次，不自动清理，请人工核对交易所成交与账本。",
+                                level='critical')
+                        break
+                    # PROVEN：估算展示 + 撤保护 + finalizer（v2 富记录落盘取代旧直接记录）
+                    _r = _v2_rec
+                    _r_net = float(_r.get('net_pnl_estimate') or 0.0)
+                    _r_avg = float(_r.get('avg_price') or 0.0)
+                    _r_amt = float(_r.get('amount') or 0.0)
+                    _r_cap = _r_avg * _r_amt if _r_amt > 0 else 1
+                    _r_pct = (_r_net / _r_cap) * 100 if _r_cap > 0 else 0.0
                     sl_msg = (
                         f"🚨 **[止损平仓结算提醒]**\n\n"
                         f"🆔 **批次号**：`{batch_id}`\n"
                         f"🪙 **标的**：`{symbol}`\n"
-                        f"📊 **方向**：`{side}`\n"
+                        f"📊 **方向**：`{_r.get('side') or side}`\n"
                         f"📊 **平仓模式**：止损单 (Taker {TAKER_FEE_RATE * 100:.2f}%)\n"
-                        f"持仓均价：`{batch_entry_vwap:.2f}` USDT\n"
-                        f"平仓均价：`{sl_exit_price:.2f}` USDT\n"
-                        f"平仓数量：`{batch_filled_amount}`\n"
-                        f"名义盈亏：`{gross_pnl:+.2f}` USDT\n"
-                        f"扣除手续费：`{total_fees:.4f}` USDT\n"
-                        f"💰 **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
+                        f"持仓均价（不含入场费）：`{_r_avg:.2f}` USDT\n"
+                        f"平仓均价：`{float(_r.get('exit_price') or 0.0):.2f}` USDT\n"
+                        f"平仓数量：`{_r_amt:.6f}`\n"
+                        f"名义盈亏：`{float(_r.get('gross_pnl') or 0.0):+.2f}` USDT\n"
+                        f"估算手续费：`{float(_r.get('entry_fee_estimate') or 0.0) + float(_r.get('exit_fee_estimate') or 0.0):.4f}` USDT\n"
+                        f"{'🟢' if _r_net >= 0 else '🔴'} **估算净盈亏**：`{_r_net:+.2f}` USDT (`{_r_pct:+.2f}%`)\n"
+                        f"⏳ 手续费待异步对账（ESTIMATED，非最终权威）"
                     )
-                    print(f"\n🚨 [风控触发] 批次 [{batch_id}] 专属止损单已触发成交！净盈亏: {net_pnl:+.2f} USDT")
+                    print(f"\n🚨 [风控触发] 批次 [{batch_id}] 专属止损单已触发成交！估算净盈亏: {_r_net:+.2f} USDT")
                     self.send_tg_notification(sl_msg)
-
-                    # 🔥 记录已实现盈亏 + 附带剩余持仓快照
-                    self._record_realized_pnl(batch_id, symbol, side, batch_filled_amount,
-                                              batch_entry_vwap, sl_exit_price, net_pnl, "止损")
                     self._notify_snapshot(batch_id)
 
                     self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
@@ -7471,11 +8084,12 @@ class CryptoTrader:
                     # 🔥 A1：撤销限价平仓单，防孤儿单 + 幽灵线程
                     self._cancel_limit_close_order(symbol, batch_id)
 
-                    # P0 Batch B：converge 证明后才 clear；未收敛不 break，下轮重试
-                    _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
-                    if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+                    # 共享 finalizer：v2 stats → fresh proof → 授权 clear；未收敛不 break
+                    # §8.3：MANUAL_REVIEW 是终态（不可重试），同样必须 break
+                    if self._try_finalize_outbox(batch_id, symbol) in (
+                            SETTLE_CLEARED, SETTLE_MANUAL_REVIEW):
                         break
-                    print(f"  └─ ⚠️ [B] 批次 {batch_id} 本轮未收敛（UNKNOWN/撤单失败），保留待下轮重试")
+                    print(f"  └─ ⚠️ [B] 批次 {batch_id} v2A 结算未收敛，保留待下轮重试")
 
                 tp_triggered = False
                 tp_detail = None
@@ -7599,37 +8213,84 @@ class CryptoTrader:
 
                     tp_exit_price = float(self.exchange.price_to_precision(symbol, tp_exit_price))
 
-                    if side == 'BUY':
-                        gross_pnl = (tp_exit_price - batch_entry_vwap) * batch_filled_amount
-                    else:
-                        gross_pnl = (batch_entry_vwap - tp_exit_price) * batch_filled_amount
-
-                    exit_fee = tp_exit_price * batch_filled_amount * MAKER_FEE_RATE
-                    total_fees = total_entry_fee + exit_fee
-                    net_pnl = gross_pnl - total_fees
-
-                    capital_base = batch_entry_vwap * batch_filled_amount
-                    net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
-
+                    # —— T1C-v2A §7/§8：原子 BEGIN → PROVEN 才允许撤保护；TP 为 MARKET
+                    # 条件单（§5.3/§13.1.5：Taker 费率 + Taker 文案，禁止 Maker 常量）——
+                    _tp_fill = 0.0
+                    try:
+                        _tp_fill = float(tp_detail.get('filled') or 0.0)
+                    except (TypeError, ValueError):
+                        _tp_fill = 0.0
+                    if _tp_fill <= 0.0:
+                        try:
+                            _tp_fill = float((tp_detail.get('info') or {}).get('executedQty') or 0.0)
+                        except (TypeError, ValueError):
+                            _tp_fill = 0.0
+                    _net_qty, _net_cost = self._batch_net_position(latest_b_data)
+                    _lfc_x = int(latest_b_data.get('last_filled_count', 0) or 0)
+                    _ta_x = latest_b_data.get('target_amounts') or []
+                    _fdl_x = latest_b_data.get('filled_details') or []
+                    _gc_x = 0.0
+                    try:
+                        _gc_x = float(sum((float(_ta_x[i]) * float(_fdl_x[i]))
+                                          for i in range(min(_lfc_x, len(_ta_x), len(_fdl_x)))))
+                    except (TypeError, ValueError):
+                        _gc_x = 0.0
+                    _fee_rem_x = (float(total_entry_fee) * (_net_cost / _gc_x)
+                                  if _gc_x > 0 else 0.0)
+                    _v2_rec = self._atomic_outbox_begin(
+                        batch_id=batch_id, symbol=symbol, mode='TP',
+                        generation=tp_order_id,
+                        exit_order_ref={'kind': 'algo', 'order_id': tp_order_id},
+                        observed_qty=_tp_fill, exit_price=tp_exit_price,
+                        expected_qty=_net_qty, net_cost=_net_cost,
+                        entry_fee_estimate=_fee_rem_x)
+                    if not isinstance(_v2_rec, dict):
+                        # BEGIN 失败：零 stats、零 clear，保留保护与批次（下轮重试）
+                        print(f"  └─ ⚠️ [v2A-TP] BEGIN 失败（零 stats/零 clear），"
+                              f"保留保护与批次待重试")
+                        try:
+                            self._notify_snapshot(batch_id)   # 只读快照属必要安全观察
+                        except Exception:
+                            pass
+                        break
+                    if _v2_rec.get('core_status') != 'PROVEN':
+                        # §8.3：DISPUTED → 记争议、保留保护与批次、人工核对。
+                        # 终态幂等：close_reason 已落盘即上轮已告警，本轮静默（限频）
+                        _pre_rd = (((self.load_all_states().get(symbol) or {})
+                                    .get(batch_id) or {}).get('close_reason') or '')
+                        _st_d = self._try_finalize_outbox(batch_id, symbol)
+                        if _st_d == SETTLE_MANUAL_REVIEW \
+                                and _pre_rd != 'settlement_disputed':
+                            self.send_tg_notification(
+                                f"🚨 **[止盈触发-证据冲突]**\n🆔 批次：`{batch_id}`\n"
+                                f"结算证据 DISPUTED"
+                                f"（{','.join(_v2_rec.get('dispute_reasons') or ['unknown'])}），\n"
+                                f"已保留保护单与批次，不自动清理，请人工核对交易所成交与账本。",
+                                level='critical')
+                        break
+                    # PROVEN：Taker 费率与文案 + 估算展示 + finalizer
+                    _r = _v2_rec
+                    _r_net = float(_r.get('net_pnl_estimate') or 0.0)
+                    _r_avg = float(_r.get('avg_price') or 0.0)
+                    _r_amt = float(_r.get('amount') or 0.0)
+                    _r_cap = _r_avg * _r_amt if _r_amt > 0 else 1
+                    _r_pct = (_r_net / _r_cap) * 100 if _r_cap > 0 else 0.0
                     tp_msg = (
                         f"🎉 **[止盈平仓结算提醒]**\n\n"
                         f"🆔 **批次号**：`{batch_id}`\n"
                         f"🪙 **标的**：`{symbol}`\n"
-                        f"📊 **方向**：`{side}`\n"
-                        f"📊 **平仓模式**：止盈单 (Maker {MAKER_FEE_RATE * 100:.2f}%)\n"
-                        f"持仓均价：`{batch_entry_vwap:.2f}` USDT\n"
-                        f"平仓均价：`{tp_exit_price:.2f}` USDT\n"
-                        f"平仓数量：`{batch_filled_amount}`\n"
-                        f"名义盈亏：`{gross_pnl:+.2f}` USDT\n"
-                        f"扣除手续费：`{total_fees:.4f}` USDT\n"
-                        f"💰 **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
+                        f"📊 **方向**：`{_r.get('side') or side}`\n"
+                        f"📊 **平仓模式**：止盈单 (Taker {TAKER_FEE_RATE * 100:.2f}%)  # TP=条件单，市价触发\n"
+                        f"持仓均价（不含入场费）：`{_r_avg:.2f}` USDT\n"
+                        f"平仓均价：`{float(_r.get('exit_price') or 0.0):.2f}` USDT\n"
+                        f"平仓数量：`{_r_amt:.6f}`\n"
+                        f"名义盈亏：`{float(_r.get('gross_pnl') or 0.0):+.2f}` USDT\n"
+                        f"估算手续费：`{float(_r.get('entry_fee_estimate') or 0.0) + float(_r.get('exit_fee_estimate') or 0.0):.4f}` USDT\n"
+                        f"{'🟢' if _r_net >= 0 else '🔴'} **估算净盈亏**：`{_r_net:+.2f}` USDT (`{_r_pct:+.2f}%`)\n"
+                        f"⏳ 手续费待异步对账（ESTIMATED，非最终权威）"
                     )
-                    print(f"\n🎉 [止盈触发] 批次 [{batch_id}] 专属止盈单已触发成交！净盈亏: {net_pnl:+.2f} USDT")
+                    print(f"\n🎉 [止盈触发] 批次 [{batch_id}] 专属止盈单已触发成交！估算净盈亏: {_r_net:+.2f} USDT")
                     self.send_tg_notification(tp_msg)
-
-                    # 🔥 记录已实现盈亏 + 附带剩余持仓快照
-                    self._record_realized_pnl(batch_id, symbol, side, batch_filled_amount,
-                                              batch_entry_vwap, tp_exit_price, net_pnl, "止盈")
                     self._notify_snapshot(batch_id)
 
                     self._cancel_remaining_entries(symbol, entry_orders, filled_layers)
@@ -7643,11 +8304,12 @@ class CryptoTrader:
                     # 🔥 A1/N8：TP 结算路径同样撤销限价平仓单（补全清理覆盖）
                     self._cancel_limit_close_order(symbol, batch_id)
 
-                    # P0 Batch B：converge 证明后才 clear；未收敛不 break，下轮重试
-                    _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
-                    if _proof is not None and self.clear_batch_state(symbol, batch_id, proof=_proof):
+                    # 共享 finalizer：v2 stats → fresh proof → 授权 clear；未收敛不 break
+                    # §8.3：MANUAL_REVIEW 是终态（不可重试），同样必须 break
+                    if self._try_finalize_outbox(batch_id, symbol) in (
+                            SETTLE_CLEARED, SETTLE_MANUAL_REVIEW):
                         break
-                    print(f"  └─ ⚠️ [B] 批次 {batch_id} 本轮未收敛（UNKNOWN/撤单失败），保留待下轮重试")
+                    print(f"  └─ ⚠️ [B] 批次 {batch_id} v2A 结算未收敛，保留待下轮重试")
 
                 # ==================== 处理待补挂止损 ====================
                 if pending_sl_orders and has_entered_position and batch_filled_amount > 0:
@@ -8425,14 +9087,24 @@ class CryptoTrader:
                                         break
                                     if _attempt < 2:
                                         time.sleep(2)
-                                if _proof is not None \
-                                        and self.clear_batch_state(
-                                            symbol, batch_id, proof=_proof,
-                                            authorization=_fin_snap):
+                                # 🔥 T1C-v2A §9 + P5g：converge 是交易所 I/O 窗口，期间 close 事务
+                                # 可能被另一线程推进（settled/phase=2/manual_review）。清理执行边界必须
+                                # 重校授权——陈旧快照不得清掉迁移后的新状态（R23/§9 的 TOCTOU 收口：
+                                # 授权校验必须位于 converge 之后、clear 之前，而非仅 converge 之前）。
+                                if _proof is None:
+                                    print(f"  └─ ⚠️ [B] 程序撤单批次 {batch_id} 本轮未收敛"
+                                          f"（UNKNOWN/撤单失败），保留状态待重启恢复重试")
+                                elif not self._cleanup_authorization_still_valid(
+                                        symbol, batch_id, _fin_snap):
+                                    print(f"  └─ ⚠️ [B] 程序撤单批次 {batch_id} converge 窗口内状态已迁移"
+                                          f"（授权失效），保留状态待重启恢复重试")
+                                elif self.clear_batch_state(
+                                        symbol, batch_id, proof=_proof,
+                                        authorization=_fin_snap):
                                     print(f"  └─ 🧹 程序撤单，批次状态已清理（proof 收敛通过）")
                                 else:
-                                    print(f"  └─ ⚠️ [B] 程序撤单批次 {batch_id} 本轮未收敛"
-                                          f"（UNKNOWN/撤单失败/授权失效），保留状态待重启恢复重试")
+                                    print(f"  └─ ⚠️ [B] 程序撤单批次 {batch_id} 清理被 proof 门拒绝"
+                                          f"（保留状态待下轮重试）")
                 except Exception as e:
                     print(f"  └─ ⚠️ 清理程序撤单标记失败: {e}")
 
@@ -8475,16 +9147,18 @@ class CryptoTrader:
                         # P0 Batch B：converge 证明后才 clear；finally 无循环可重试，
                         # 未收敛则保留状态 + 告警（持仓已归零，仅剩订单面收敛）
                         _proof = self._converge_batch_orders_before_clear(symbol, batch_id)
-                        # 🔥 P5g：清理执行边界校验——converge 是交易所 I/O 窗口，
-                        # 期间事务可能已推进（settled/manual_review），clear 前必须重校
+                        # 🔥 P5g + §9：converge 是交易所 I/O 窗口，期间事务可能已推进
+                        # （settled/manual_review），清理执行边界必须重校授权（TOCTOU 收口）
                         if _proof is not None \
+                                and self._cleanup_authorization_still_valid(
+                                    symbol, batch_id, _fin_snap) \
                                 and self.clear_batch_state(
                                     symbol, batch_id, proof=_proof,
                                     authorization=_fin_snap):
                             print(f"  └─ 🧹 无持仓，已清理批次状态（proof 收敛通过）")
                         else:
-                            print(f"  └─ ⚠️ [B] 无持仓批次 {batch_id} 本轮未收敛"
-                                  f"（UNKNOWN/撤单失败/授权失效），保留状态待重启恢复重试")
+                            print(f"  └─ ⚠️ [B] 无持仓批次 {batch_id} 本轮未收敛/授权失效"
+                                  f"（UNKNOWN/撤单失败/状态迁移），保留状态待重启恢复重试")
                 elif current_pos is None:
                     print(f"  └─ ⚠️ 持仓查询失败(UNKNOWN)，保留批次状态不清理")
                 else:
@@ -10516,34 +11190,80 @@ class CryptoTrader:
             # 🔥 A1：市价平仓前撤销限价平仓单（场景C：已挂限价单 → 用户 /close）
             self._cancel_limit_close_order(target_symbol, batch_id)
 
-            # P0 Batch A（§2.1）：市价结算完成 → close_phase=2（CLOSE_SETTLING）
+            # ══ T1C-v2A §7 原子 BEGIN（§11 市价路径：普通订单 ID + 已确认市场单成交量；
+            # 禁止先单独写 close_phase=2 再建 outbox——两者必须同一次持久化）══
+            _mk_net_qty, _mk_net_cost = self._batch_net_position(target_b_data)
+            _mk_lfc = int(target_b_data.get('last_filled_count', 0) or 0)
+            _mk_ta = target_b_data.get('target_amounts') or []
+            _mk_fdl = target_b_data.get('filled_details') or []
+            _mk_gc = 0.0
             try:
-                _settle_states = self.load_all_states()
-                _settle_b = _settle_states.get(target_symbol, {}).get(batch_id, {})
-                if _settle_b:
-                    _settle_b['close_phase'] = 2
-                    self.save_batch_state(target_symbol, batch_id, _settle_b)
-            except Exception:
-                pass
+                _mk_gc = float(sum((float(_mk_ta[i]) * float(_mk_fdl[i]))
+                                   for i in range(min(_mk_lfc, len(_mk_ta), len(_mk_fdl)))))
+            except (TypeError, ValueError):
+                _mk_gc = 0.0
+            _mk_fee_rem = (float(total_entry_fee) * (_mk_net_cost / _mk_gc)
+                           if _mk_gc > 0 else 0.0)
+            _v2_rec = self._atomic_outbox_begin(
+                batch_id=batch_id, symbol=target_symbol, mode='MARKET',
+                generation=close_op_id,
+                exit_order_ref={'kind': 'regular',
+                                'order_id': str(close_order_id or close_op_id)},
+                observed_qty=confirmed_filled_amount, exit_price=actual_price,
+                expected_qty=_mk_net_qty, net_cost=_mk_net_cost,
+                entry_fee_estimate=_mk_fee_rem)
+            if not isinstance(_v2_rec, dict):
+                # BEGIN 失败：零 stats、零 clear、保留恢复能力（禁止回落旧 pnl+clear）
+                _rs_ok, _rs_why = self._set_close_reason_if_current(
+                    target_symbol, batch_id, close_op_id, 'settlement_error')
+                self.send_tg_notification(
+                    f"🚨【资金安全】市价平仓已成交但 v2A 结算事务建立失败（BEGIN 失败）。\n"
+                    f"🆔 批次: {batch_id}\n"
+                    f"💡 未写 stats、未清理批次，保留恢复能力，请人工复核或重试。\n"
+                    + ('' if _rs_ok else f"⚠️ close_reason 切换失败（{_rs_why}）"),
+                    level='critical')
+                return False, "❌ 市价平仓已成交但结算事务建立失败（BEGIN），请人工复核"
 
-            # P0 Batch B（D-B5）：平仓成功照报 + 附残单收敛提示；clear 须 converge
+            _r = _v2_rec
+            if _r.get('core_status') != 'PROVEN':
+                # §8.3：DISPUTED → 记争议、保留批次、不 clear（仓位已成交归零，账本留证）
+                self._try_finalize_outbox(batch_id, target_symbol)
+                _rs_ok, _rs_why = self._set_close_reason_if_current(
+                    target_symbol, batch_id, close_op_id, 'settlement_disputed')
+                result_msg = (
+                    f"🚨 **[市价平仓-证据冲突]**\n"
+                    f"🆔 **批次号**：`{batch_id}`\n🪙 **标的**：`{target_symbol}`\n"
+                    f"市价单已成交归零，但结算证据 DISPUTED"
+                    f"（{','.join(_r.get('dispute_reasons') or ['unknown'])}）。\n"
+                    f"账本保留批次与争议记录，不自动清理，请人工核对。"
+                    + ('' if _rs_ok else f"\n⚠️ close_reason 切换失败（{_rs_why}）"))
+                print(f"\n{result_msg}")
+                return True, result_msg
+
+            # PROVEN：估算展示（§12）+ finalizer（v2 stats → fresh proof → 授权 clear）
+            _r_net = float(_r.get('net_pnl_estimate') or 0.0)
+            _r_avg = float(_r.get('avg_price') or 0.0)
+            _r_amt = float(_r.get('amount') or 0.0)
+            _r_cap = _r_avg * _r_amt if _r_amt > 0 else 1
+            _r_pct = (_r_net / _r_cap) * 100 if _r_cap > 0 else 0.0
+            _pnl_emoji = "🟢" if _r_net >= 0 else "🔴"
             _cleanup_pending = False
-            _proof = self._converge_batch_orders_before_clear(target_symbol, batch_id)
-            if _proof is None or not self.clear_batch_state(target_symbol, batch_id, proof=_proof):
+            # §8.3：只有 CLEARED 才算收敛完成；MANUAL_REVIEW/PENDING_RETRY 均保留批次
+            if self._try_finalize_outbox(batch_id, target_symbol) != SETTLE_CLEARED:
                 _cleanup_pending = True
-
             result_msg = (
                 f"📊 **[市价平仓结算]**\n\n"
                 f"🆔 **批次号**：`{batch_id}`\n"
                 f"🪙 **标的**：`{target_symbol}`\n"
-                f"📊 **方向**：`{side}`\n"
+                f"📊 **方向**：`{_r.get('side') or side}`\n"
                 f"📊 **平仓模式**：市价单 (Taker {TAKER_FEE_RATE * 100:.2f}%)\n"
-                f"📊 **持仓**：`{confirmed_filled_amount}` (实际成交)\n"
-                f"📈 **持仓均价**：`{avg_price:.2f}` USDT\n"
-                f"💵 **平仓均价**：`{actual_price:.2f}` USDT\n"
-                f"📊 **名义盈亏**：`{actual_gross_pnl:+.2f}` USDT\n"
-                f"💸 **总手续费**：`{actual_total_fees:.4f}` USDT\n"
-                f"{pnl_emoji} **最终净盈亏**：`{actual_net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
+                f"📊 **持仓**：`{_r_amt:.6f}` (实际成交)\n"
+                f"📈 **持仓均价（不含入场费）**：`{_r_avg:.2f}` USDT\n"
+                f"💵 **平仓均价**：`{float(_r.get('exit_price') or 0.0):.2f}` USDT\n"
+                f"📊 **名义盈亏**：`{float(_r.get('gross_pnl') or 0.0):+.2f}` USDT\n"
+                f"💸 **估算手续费**：`{float(_r.get('entry_fee_estimate') or 0.0) + float(_r.get('exit_fee_estimate') or 0.0):.4f}` USDT\n"
+                f"{_pnl_emoji} **估算净盈亏**：`{_r_net:+.2f}` USDT (`{_r_pct:+.2f}%`)\n"
+                f"⏳ 手续费待异步对账（ESTIMATED，非最终权威）"
             )
             if _cleanup_pending:
                 # 🔒 v6.2（改动 6.6）：cleanup=PENDING → CAS 写 settlement_stuck
@@ -10557,14 +11277,7 @@ class CryptoTrader:
                        f"\n⚠️ close_reason 切换失败（{_rs_why}），请人工关注该批次。"))
 
             print(f"\n{result_msg}")
-
-            # 🔥 记录已实现盈亏 + 附带剩余持仓快照
-            _pnl_partial = confirmed_filled_amount < current_filled_amount - 1e-12
-            self._record_realized_pnl(batch_id, target_symbol, side, confirmed_filled_amount,
-                                      avg_price, actual_price, actual_net_pnl, "市价平仓",
-                                      pnl_partial=_pnl_partial)
             self._notify_snapshot(batch_id)
-
             return True, result_msg
 
         except Exception as e:
@@ -11308,7 +12021,7 @@ class CryptoTrader:
                     # （PnL 落盘失败/订单查询失败）保持轮询接管，绝不无条件 break
                     _ok_f, _msg_f = self._finalize_limit_full_fill(
                         symbol, batch_id, order_id, order=order)
-                    if _ok_f:
+                    if _ok_f != SETTLE_PENDING_RETRY:  # §8.3 非重试态即终态
                         break
                     print(f"  └─ ⚠️ [限价平仓监控] finalizer 未完成（{_msg_f}），"
                           f"保持轮询接管")
