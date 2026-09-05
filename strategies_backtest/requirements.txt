@@ -1,0 +1,10 @@
+# strategies_backtest 独立依赖（与实盘 requirements.txt 隔离）
+# 实盘环境无需安装；回测环境单独执行：
+#   pip install -r strategies_backtest/requirements.txt
+ccxt>=4.5.68
+python-dotenv>=1.2.2
+pandas>=2.0
+numpy>=1.24
+pyarrow>=15.0
+matplotlib>=3.8
+scipy>=1.11
