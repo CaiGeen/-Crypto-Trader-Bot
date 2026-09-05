@@ -251,6 +251,18 @@ SETTLE_MANUAL_REVIEW = 'MANUAL_REVIEW'
 SETTLE_PENDING_RETRY = 'PENDING_RETRY'
 
 
+# 🔥 统一 outbox 结构校验规则（裁定：BEGIN / resume / merge / clear **共用同一规则**）
+# 要件：dict + base_dedup_key 为非空字符串 + record 为 dict + stats_committed 为 bool。
+V2A_OUTBOX_MISSING = 'MISSING'      # 字段不存在 → EMPTY，允许 BEGIN 新建（legacy 原行为）
+V2A_OUTBOX_VALID = 'VALID'          # 结构合法
+V2A_OUTBOX_MALFORMED = 'MALFORMED'  # 字段存在但不合法 → UNKNOWN≠EMPTY，Fail-Closed
+
+# 🔥 claim_fields 白名单：只允许登记「事务认领」语义的固定字段，
+# 绝不允许调用方借 claim_fields 注入任意批次状态（防越权写盘通道）。
+V2A_CLAIM_FIELDS_WHITELIST = frozenset(
+    {'settled_by_limit_close', 'is_programmatic_cancel', 'close_phase'})
+
+
 def _settle_glyph(state):
     """结算三态 → 日志展示符号：CLEARED=✅ / MANUAL_REVIEW=🧊 / PENDING_RETRY=⚠️。"""
     if state == SETTLE_CLEARED:
@@ -1300,6 +1312,32 @@ class CryptoTrader:
         return {'schema': 2, 'base_dedup_key': base_dedup_key,
                 'settlement_id': settlement_id, 'record': record, 'evidence': evidence}
 
+    def _v2a_outbox_state(self, b):
+        """统一 outbox 结构校验（裁定 2026-09-05：BEGIN / resume / merge / clear
+        **共用同一规则**，禁止各调用点各写一套判据）。
+
+        返回三态：
+          MISSING    批次上**不存在** pending_settlement 字段 → EMPTY 语义，
+                     允许 BEGIN 新建事务（legacy 无 outbox 路径保持原行为）。
+          VALID      结构合法：dict + base_dedup_key 为非空字符串 +
+                     record 为 dict + stats_committed 为 bool。
+          MALFORMED  字段存在但任一要件不满足 → **UNKNOWN ≠ EMPTY**：
+                     一律保留原值、loud 告警、拒绝覆盖（BEGIN）与 clear。
+        """
+        if not isinstance(b, dict) or 'pending_settlement' not in b:
+            return V2A_OUTBOX_MISSING
+        ob = b.get('pending_settlement')
+        if not isinstance(ob, dict):
+            return V2A_OUTBOX_MALFORMED
+        dedup = ob.get('base_dedup_key')
+        if not isinstance(dedup, str) or not dedup:
+            return V2A_OUTBOX_MALFORMED
+        if not isinstance(ob.get('record'), dict):
+            return V2A_OUTBOX_MALFORMED
+        if not isinstance(ob.get('stats_committed'), bool):
+            return V2A_OUTBOX_MALFORMED
+        return V2A_OUTBOX_VALID
+
     def _atomic_outbox_begin(self, *, batch_id, symbol, mode, generation,
                              exit_order_ref, observed_qty, exit_price,
                              expected_qty, net_cost, entry_order_refs=None,
@@ -1340,8 +1378,24 @@ class CryptoTrader:
                       f"tp={b.get('tp_order_id')!r} op={b.get('close_op_id')!r}），拒绝结算")
                 return None
             _dedup = f'{symbol}:{_g}'
-            _existing = b.get('pending_settlement')
-            if isinstance(_existing, dict) and _existing.get('base_dedup_key'):
+            _st_ob = self._v2a_outbox_state(b)
+            if _st_ob == V2A_OUTBOX_MALFORMED:
+                # UNKNOWN ≠ EMPTY：磁盘 outbox 结构畸形 → 拒绝新事务覆盖。
+                # 旧实现只识别「有效 dict + dedup」，畸形值被当作「无事务」直接
+                # 重建 outbox，等于把不可辨认的结算现场抹掉。
+                print(f"🚨 [v2A] 批次 {batch_id} 磁盘 pending_settlement 结构畸形，"
+                      f"拒绝 BEGIN 覆盖（UNKNOWN≠EMPTY），保留现场待人工核对")
+                try:
+                    self.send_tg_notification(
+                        f"🚨【资金安全】批次 `{batch_id}`({symbol}) 磁盘 "
+                        f"pending_settlement 结构畸形，已**拒绝新建结算事务覆盖**。\n"
+                        f"💡 UNKNOWN≠EMPTY：保留现场，请人工核对后再处置。",
+                        level='critical')
+                except Exception:
+                    pass
+                return None
+            if _st_ob == V2A_OUTBOX_VALID:
+                _existing = b['pending_settlement']
                 if _existing['base_dedup_key'] != _dedup:
                     print(f"🚨 [v2A] 不同 dedup 的活动 outbox 已存在"
                           f"（disk={_existing['base_dedup_key']} new={_dedup}），拒绝新事务")
@@ -1368,6 +1422,13 @@ class CryptoTrader:
             b['pending_close'] = True
             b['close_reason'] = 'settlement_pending'
             if isinstance(claim_fields, dict) and claim_fields:
+                # 🔒 白名单：claim_fields 只允许登记「事务认领」语义的固定字段，
+                # 否则 BEGIN 会退化成一条绕过 merge 规则的任意状态写盘通道。
+                _bad_claims = set(claim_fields) - V2A_CLAIM_FIELDS_WHITELIST
+                if _bad_claims:
+                    print(f"🚨 [v2A] claim_fields 含非白名单字段 "
+                          f"{sorted(_bad_claims)}，拒绝写盘（防任意状态注入）")
+                    return None
                 # 认领字段与 outbox 同一次持久化（原子 BEGIN，无中间窗口）
                 b.update(claim_fields)
             b['pending_settlement'] = {
@@ -1381,16 +1442,103 @@ class CryptoTrader:
                 return None
             return ev['record']
 
-    def _try_finalize_outbox(self, batch_id, symbol):
+    def _reconcile_market_remaining_orders(self, symbol, batch_id, b_data,
+                                           close_op_id):
+        """MARKET 专用残单收拢（**共享 finalizer 独占调用**）。
+
+        🔥 所有权边界（裁定 2026-09-05）：正常路径与崩溃恢复路径**共用本实现**。
+        通用 `_converge_batch_orders_before_clear` 按交易所返回顺序处理全部已知
+        ID，**没有「ENTRY 未逐单确认前不得撤 SL/TP」的顺序保证**；此前该 gate 只
+        存在于 close_position_market 调用点，BEGIN 后一旦崩溃，恢复直接进入共享
+        finalizer 就丢失了这层保护。
+
+        顺序：① ENTRY 逐单确认 gate（失败 → 保持冻结、零 stats、零 clear）
+             ② 撤 TP / SL + registry 登记（仅各自 cancel 正常返回的那一张）
+             ③ 撤限价平仓单（A1：防孤儿单）
+        返回 bool：True=可继续写 stats；False=本轮终止。"""
+        # ① ENTRY 逐单确认 gate
+        _lfc = int(b_data.get('last_filled_count', 0) or 0)
+        if not self._cancel_and_verify_entry_orders(symbol, batch_id, b_data, _lfc):
+            _rs_ok, _rs_why = self._set_close_reason_if_current(
+                symbol, batch_id, close_op_id, 'market_entry_unknown')
+            try:
+                self.send_tg_notification(
+                    f"🚨【资金安全】市价平仓已成交，但 ENTRY 收敛未确认！\n"
+                    f"🆔 批次: `{batch_id}`\n"
+                    f"🛡️ SL/TP **已保留未撤**，仓位仍有保护\n"
+                    f"🚫 批次保持冻结，本轮禁止写 stats / clear\n"
+                    f"⚠️ 请立即人工核对残留开仓单与持仓！"
+                    + ('' if _rs_ok else
+                       f"\n⚠️ close_reason 切换失败（{_rs_why}），"
+                       "冻结告警可能不再周期触发"),
+                    level='critical')
+            except Exception:
+                pass
+            return False
+
+        # ② 仓位已按单确认成交 **且 ENTRY 已确认清零** → 现在才安全撤销保护单。
+        #    ID 取自磁盘批次字段（恢复路径同样可读，不依赖调用方临时快照）。
+        _tp_terminal_ok = False
+        _tp_oid = b_data.get('tp_order_id')
+        if _tp_oid:
+            try:
+                self._safe_api_call(self.exchange.cancel_order, _tp_oid, symbol,
+                                    params={'stop': True})
+                _tp_terminal_ok = True
+                print(f"  └─ 已撤销止盈单: {_tp_oid}")
+            except Exception:
+                pass
+
+        _sl_terminal_ok = False
+        _sl_oid = b_data.get('current_sl_id')
+        if _sl_oid:
+            try:
+                self._safe_api_call(self.exchange.cancel_order, _sl_oid, symbol,
+                                    params={'stop': True})
+                _sl_terminal_ok = True
+                print(f"  └─ 已撤销止损单: {_sl_oid}")
+            except Exception:
+                pass
+
+        # 只有各自 cancel 正常返回的那一张才写 PROGRAMMATIC_CANCELED。
+        # 异常（含 -2011/OrderNotFound）= 不知道它为何消失 → 不记「程序已终结」，
+        # 交 converge / 后续事实判断。
+        for _oid, _ok in ((_tp_oid, _tp_terminal_ok), (_sl_oid, _sl_terminal_ok)):
+            if not _oid or not _ok:
+                continue
+            try:
+                _ident = self._find_registry_identity_by_order_id(symbol, batch_id, _oid)
+                if _ident:
+                    self._update_registry(symbol, batch_id, _ident,
+                                          state='PROGRAMMATIC_CANCELED',
+                                          order_id=_oid, id_known=True,
+                                          terminated_reason='close_requested_canceled')
+            except Exception:
+                pass
+
+        # ③ A1：撤销限价平仓单（防孤儿单 + 幽灵线程）
+        try:
+            self._cancel_limit_close_order(symbol, batch_id)
+        except Exception:
+            pass
+        return True
+
+    def _try_finalize_outbox(self, batch_id, symbol, mode=None):
         """§8.2/§8.3 共享 finalizer：只消费持久化 outbox（不依赖触发线程临时变量）。
 
+        mode：触发本次结算的退出路径（'LIMIT' / 'SL' / 'TP' / 'MARKET'）。
+        'MARKET' 时本 finalizer **独占**执行 ENTRY 逐单确认 gate 与保护单撤销
+        （_reconcile_market_remaining_orders），正常路径与崩溃恢复路径共用同一实现。
+
         PROVEN（裁定 2026-09-05「双 converge」顺序）：
-          ① pre-stats converge：查询交易所当前状态、按需撤残单，**proof 丢弃**
-          → ② 写 v2 stats（settlement 富记录）+ 持久化 stats_committed=True
-          → ③ fresh converge：重新查询并生成**新** proof（禁止缓存/持久化复用）
-          → ④ 之后不再执行任何 mutation / 网络等待 → 立即 authorized clear
-          ① 保证即使 stats CORRUPT，残单安全处理也不被账本故障阻塞；
-          ③ 是 clear 前的当前事实证明。两次目的不同，缺一不可。
+          ① mode=='MARKET'：ENTRY 逐单确认 gate → 撤 TP/SL → 撤限价平仓单
+          → ② pre-stats converge：查询交易所当前状态、按需撤残单，**proof 丢弃**，
+              返回 None 立即 return（零 stats、零 clear）
+          → ③ 写 v2 stats（settlement 富记录）+ 持久化 stats_committed=True
+          → ④ fresh converge：重新查询并生成**新** proof（禁止缓存/持久化复用）
+          → ⑤ 之后不再执行任何 mutation / 网络等待 → 立即 authorized clear
+          ② 保证即使 stats CORRUPT，残单安全处理也不被账本故障阻塞；
+          ④ 是 clear 前的当前事实证明。两次目的不同，缺一不可。
 
         DISPUTED → 只写 v2 stats（settlement_dispute）+ stats_committed=True →
         close_reason='settlement_disputed' → 限频 critical → 不 converge、不 clear、
@@ -1408,9 +1556,10 @@ class CryptoTrader:
         b = (all_states.get(symbol) or {}).get(batch_id)
         if not isinstance(b, dict):
             return SETTLE_PENDING_RETRY
-        outbox = b.get('pending_settlement')
-        if not isinstance(outbox, dict) or not outbox.get('base_dedup_key'):
+        # 与 BEGIN / resume / merge / clear 共用同一结构判据
+        if self._v2a_outbox_state(b) != V2A_OUTBOX_VALID:
             return SETTLE_PENDING_RETRY
+        outbox = b['pending_settlement']
         _is_disputed = ((outbox.get('record') or {}).get('core_status')
                         == 'DISPUTED')
         # ① PROVEN 专属：pre-stats converge —— 查询交易所当前状态、按需撤残单，
@@ -1420,7 +1569,24 @@ class CryptoTrader:
         #    得不到安全处理（违反 v1.2 恢复时序）。
         #    DISPUTED 不进入这条清理链（保留保护单与批次，交人工核对）。
         if not _is_disputed:
-            self._converge_batch_orders_before_clear(symbol, batch_id)
+            # ① MARKET 专用：ENTRY 逐单确认 gate（**先于一切撤保护动作**）。
+            #    与 close_position_market 调用点共用 _reconcile_market_remaining_orders，
+            #    使崩溃恢复路径也具备「ENTRY 未确认前不得撤 SL/TP」的顺序保证。
+            if mode == 'MARKET':
+                _b_now = (self.load_all_states().get(symbol) or {}).get(batch_id) or {}
+                if not self._reconcile_market_remaining_orders(
+                        symbol, batch_id, _b_now, _b_now.get('close_op_id') or ''):
+                    return SETTLE_PENDING_RETRY
+
+            # ② pre-stats converge：返回值必须检查。None = 扫描未知 / 撤单失败 /
+            #    持仓未清零，此时绝不能继续写 stats——否则在事实未收敛时就留下
+            #    「已记账」证据，一旦后续 fresh converge 偶然通过，就会带着未收敛
+            #    的残单被 clear。
+            _pre_proof = self._converge_batch_orders_before_clear(symbol, batch_id)
+            if _pre_proof is None:
+                print(f"⚠️ [v2A] pre-stats 收敛未完成（UNKNOWN/撤单失败/持仓未清零），"
+                      f"零 stats、零 clear，保留 outbox 待下轮重试")
+                return SETTLE_PENDING_RETRY
 
         # ② 写 v2 stats + 持久化 stats_committed=True
         if not outbox.get('stats_committed'):
@@ -1500,8 +1666,9 @@ class CryptoTrader:
         b = (self.load_all_states().get(symbol) or {}).get(batch_id)
         if not isinstance(b, dict):
             return SETTLE_PENDING_RETRY
-        if not isinstance(b.get('pending_settlement'), dict) \
-                or not b.get('pending_settlement', {}).get('base_dedup_key'):
+        # 与 BEGIN / merge / clear 共用同一结构判据。MALFORMED 属不可辨认的结算
+        # 现场，交人工核对（不得进入 finalizer，否则会被误当「无事务」处理）。
+        if self._v2a_outbox_state(b) != V2A_OUTBOX_VALID:
             return SETTLE_PENDING_RETRY
         return self._try_finalize_outbox(batch_id, symbol)
 
@@ -2363,28 +2530,28 @@ class CryptoTrader:
             # 且核心记录非 DISPUTED。结构畸形 → Fail-Closed 拒绝 + loud 告警。
             # 仅当**字段完全不存在**时才走既有 P5h 四元授权门（legacy tuple）。
             if _reject is None:
-                if 'pending_settlement' in b_data:
+                # 与 BEGIN / resume / merge 共用同一结构判据
+                _st_ob = self._v2a_outbox_state(b_data)
+                if _st_ob == V2A_OUTBOX_MALFORMED:
+                    # UNKNOWN ≠ EMPTY：字段存在但结构不合法 → 拒绝 clear、
+                    # 保留原值、loud 告警，绝不静默当作无事务
                     _v2_outbox = b_data.get('pending_settlement')
-                    _v2_dedup = (_v2_outbox.get('base_dedup_key')
-                                 if isinstance(_v2_outbox, dict) else None)
-                    if not isinstance(_v2_dedup, str) or not _v2_dedup:
-                        # UNKNOWN ≠ EMPTY：字段存在但结构不合法 → 拒绝 clear、
-                        # 保留原值、loud 告警，绝不静默当作无事务
-                        _reject = ('v2A 清理被拒：pending_settlement 结构畸形'
-                                   f'（type={type(_v2_outbox).__name__}、'
-                                   f'dedup={_v2_dedup!r}），UNKNOWN≠EMPTY，'
-                                   '拒绝删除并保留现场')
-                        print(f"🚨 [v2A] {_reject}（批次 {batch_id}）")
-                        try:
-                            self.send_tg_notification(
-                                f"🚨【资金安全】批次 `{batch_id}`({symbol}) 的 "
-                                f"pending_settlement 结构畸形，已**拒绝清理**并保留现场。\n"
-                                f"结构：type=`{type(_v2_outbox).__name__}`、"
-                                f"dedup=`{_v2_dedup!r}`\n"
-                                f"💡 请人工核对结算事务后再处置。", level='critical')
-                        except Exception:
-                            pass
-                    elif not isinstance(authorization, str) or authorization != _v2_dedup:
+                    _reject = ('v2A 清理被拒：pending_settlement 结构畸形'
+                               f'（type={type(_v2_outbox).__name__}），UNKNOWN≠EMPTY，'
+                               '拒绝删除并保留现场')
+                    print(f"🚨 [v2A] {_reject}（批次 {batch_id}）")
+                    try:
+                        self.send_tg_notification(
+                            f"🚨【资金安全】批次 `{batch_id}`({symbol}) 的 "
+                            f"pending_settlement 结构畸形，已**拒绝清理**并保留现场。\n"
+                            f"结构：type=`{type(_v2_outbox).__name__}`\n"
+                            f"💡 请人工核对结算事务后再处置。", level='critical')
+                    except Exception:
+                        pass
+                elif _st_ob == V2A_OUTBOX_VALID:
+                    _v2_outbox = b_data['pending_settlement']
+                    _v2_dedup = _v2_outbox['base_dedup_key']
+                    if not isinstance(authorization, str) or authorization != _v2_dedup:
                         _reject = (f'v2A 清理授权失效：authorization({authorization!r}) ≠ '
                                    f'outbox base_dedup_key({_v2_dedup!r})，拒绝删除'
                                    f'（防旧路径伪造授权清批）')
@@ -2551,8 +2718,9 @@ class CryptoTrader:
         merged.pop('pending_settlement', None)
         _v2_do = disk.get('pending_settlement')
         _v2_so = snap.get('pending_settlement')
-        _v2_do_ok = isinstance(_v2_do, dict) and _v2_do.get('base_dedup_key')
-        _v2_so_ok = isinstance(_v2_so, dict) and _v2_so.get('base_dedup_key')
+        # 与 BEGIN / resume / clear 共用同一结构判据（_v2a_outbox_state）
+        _v2_do_ok = self._v2a_outbox_state(disk) == V2A_OUTBOX_VALID
+        _v2_so_ok = self._v2a_outbox_state(snap) == V2A_OUTBOX_VALID
         if _v2_do_ok and _v2_so_ok:
             if _v2_do['base_dedup_key'] == _v2_so['base_dedup_key']:
                 _v2_out = dict(_v2_so)
@@ -2572,7 +2740,7 @@ class CryptoTrader:
             merged['pending_settlement'] = _v2_do      # 规则 2/6：disk 有则保留
         elif _v2_so_ok:
             merged['pending_settlement'] = _v2_so      # 规则 1：disk 无则接受 snapshot
-        elif 'pending_settlement' in disk:
+        elif self._v2a_outbox_state(disk) == V2A_OUTBOX_MALFORMED:
             # 🔥 裁定 2026-09-05：磁盘 outbox **结构畸形**时绝不静默丢弃。
             # 旧实现 pop 之后三个分支都不命中 → 字段凭空消失 → §9 门看不见它 →
             # clear 被放行。UNKNOWN ≠ EMPTY：字段一旦存在就必须保留原值并 loud
@@ -11223,63 +11391,13 @@ class CryptoTrader:
                     level='critical')
                 return False, "❌ 市价平仓已成交但结算事务建立失败（BEGIN），请人工复核"
 
-            # ══ ReconcileRemainingOrders：BEGIN 成功之后才允许撤单 ══
-            # 🔥 v6（§二）：先撤未成交 ENTRY 并逐 ID 验证，通过后才撤保护单。
-            # 返回值必须成为 clear gate。
-            _entries_ok = self._cancel_and_verify_entry_orders(
-                target_symbol, batch_id, target_b_data, last_filled_count)
-            if not _entries_ok:
-                # 🛡️ SL/TP 仍在位，仓位保护没有丢失。
-                _rs_ok, _rs_why = self._set_close_reason_if_current(
-                    target_symbol, batch_id, close_op_id, 'market_entry_unknown')
-                self.send_tg_notification(
-                    f"🚨【资金安全】市价平仓已成交，但 ENTRY 收敛未确认！\n"
-                    f"🆔 批次: `{batch_id}`\n"
-                    f"🛡️ SL/TP **已保留未撤**，仓位仍有保护\n"
-                    f"🚫 批次保持冻结（close_phase=1），本轮禁止进入 clear\n"
-                    f"⚠️ 请立即人工核对残留开仓单与持仓！"
-                    + ('' if _rs_ok else
-                       f"\n⚠️ close_reason 切换失败（{_rs_why}），"
-                       "冻结告警可能不再周期触发"),
-                    level='critical')
-                return False, ("❌ 市价平仓已成交但 ENTRY 收敛未确认"
-                               "（SL/TP 保留，批次冻结待人工处置）")
-
-            # 仓位已按单确认成交 **且 ENTRY 已确认清零** — 现在才安全撤销保护单
-            # 🔑 ID 取自 `_txn_vars`（= claimed 快照）。
-            _tp_terminal_ok = False
-            if _txn_vars.get('tp_order_id'):
-                try:
-                    self._safe_api_call(self.exchange.cancel_order, _txn_vars['tp_order_id'],
-                                        target_symbol, params={'stop': True})
-                    _tp_terminal_ok = True
-                    print(f"  └─ 已撤销止盈单: {_txn_vars['tp_order_id']}")
-                except Exception:
-                    pass
-
-            _sl_terminal_ok = False
-            if _txn_vars.get('current_sl_id'):
-                try:
-                    self._safe_api_call(self.exchange.cancel_order, _txn_vars['current_sl_id'],
-                                        target_symbol, params={'stop': True})
-                    _sl_terminal_ok = True
-                    print(f"  └─ 已撤销止损单: {_txn_vars['current_sl_id']}")
-                except Exception:
-                    pass
-
-            # 🔒 v6.2（改动 7）：只有各自 cancel 正常返回的那一张才写
-            # PROGRAMMATIC_CANCELED。异常（含 -2011/OrderNotFound）= 不知道它为何
-            # 消失 → 不记「程序已终结」，交 converge / 后续事实判断。
-            for _oid, _ok in ((_txn_vars.get('tp_order_id'), _tp_terminal_ok),
-                              (_txn_vars.get('current_sl_id'), _sl_terminal_ok)):
-                if not _oid or not _ok:
-                    continue
-                _ident = self._find_registry_identity_by_order_id(target_symbol, batch_id, _oid)
-                if _ident:
-                    self._update_registry(target_symbol, batch_id, _ident,
-                                          state='PROGRAMMATIC_CANCELED',
-                                          order_id=_oid, id_known=True,
-                                          terminated_reason='close_requested_canceled')
+            # ══ ReconcileRemainingOrders 已收归共享 finalizer 独占 ══
+            # 🔥 裁定 2026-09-05：撤单链（ENTRY 逐单确认 gate → 撤 TP/SL → 撤限价
+            # 平仓单）不再散落在调用点，改由 _try_finalize_outbox(mode='MARKET')
+            # 统一执行。此前 BEGIN 后若立即崩溃，恢复直接进入共享 finalizer，只跑
+            # 通用 converge（按交易所返回顺序处理全部已知 ID），**没有「ENTRY 未确认
+            # 前不得撤 SL/TP」的顺序保证**——现在两条路径共用同一实现。
+            # 此处只保留调用点自身的展示数据（v2 富记录一律取 evidence）。
 
             # ══ 结算（confirmed_filled_amount 贯穿；actual_price 已在 BEGIN 前计算）══
             if side == 'BUY':
@@ -11296,15 +11414,15 @@ class CryptoTrader:
 
             pnl_emoji = "🟢" if actual_net_pnl >= 0 else "🔴"
 
-            # 🔥 A1：市价平仓前撤销限价平仓单（场景C：已挂限价单 → 用户 /close）
-            self._cancel_limit_close_order(target_symbol, batch_id)
-
+            # 🔥 A1：撤销限价平仓单（场景C：已挂限价单 → 用户 /close）
+            #    已收归 _reconcile_market_remaining_orders（共享 finalizer 独占），
+            #    此处不再重复调用，避免调用点与 finalizer 双重所有权。
             # （BEGIN 已前移至所有撤单动作之前，见上）
 
             _r = _v2_rec
             if _r.get('core_status') != 'PROVEN':
                 # §8.3：DISPUTED → 记争议、保留批次、不 clear（仓位已成交归零，账本留证）
-                self._try_finalize_outbox(batch_id, target_symbol)
+                self._try_finalize_outbox(batch_id, target_symbol, mode='MARKET')
                 _rs_ok, _rs_why = self._set_close_reason_if_current(
                     target_symbol, batch_id, close_op_id, 'settlement_disputed')
                 result_msg = (
@@ -11326,7 +11444,8 @@ class CryptoTrader:
             _pnl_emoji = "🟢" if _r_net >= 0 else "🔴"
             _cleanup_pending = False
             # §8.3：只有 CLEARED 才算收敛完成；MANUAL_REVIEW/PENDING_RETRY 均保留批次
-            if self._try_finalize_outbox(batch_id, target_symbol) != SETTLE_CLEARED:
+            if self._try_finalize_outbox(batch_id, target_symbol,
+                                         mode='MARKET') != SETTLE_CLEARED:
                 _cleanup_pending = True
             result_msg = (
                 f"📊 **[市价平仓结算]**\n\n"
@@ -11554,7 +11673,19 @@ class CryptoTrader:
                 _open_map[str(_o['id'])] = _o
         open_orders = list(_open_map.values())
         # ② D-B1 贡献扣减：symbol 持仓（绝对值）− 其他活跃批次已成交贡献
-        _side = b_data.get('side') or 'BUY'
+        # 🔥 零猜测（裁定 2026-09-05）：side 缺失/非法**不得**默认 BUY。
+        # 优先取不可变 outbox evidence 中已固化的 side（结算事务事实），
+        # 仍不可得则视为未知 → 返回 None（不收敛，绝不带着猜错的方向去 clear）。
+        _side = str(b_data.get('side') or '').upper()
+        if _side not in ('BUY', 'SELL'):
+            _obx = b_data.get('pending_settlement')
+            _evx = (_obx.get('evidence') if isinstance(_obx, dict) else None) or {}
+            _side = str((_evx or {}).get('side') or '').upper()
+        if _side not in ('BUY', 'SELL'):
+            print(f"🚨 [converge] 批次 {batch_id} side 缺失/非法，且磁盘 outbox "
+                  f"evidence 无可用 side → 禁止默认 BUY（UNKNOWN≠BUY），"
+                  f"返回 None（不收敛、不 clear）")
+            return None
         try:
             pos_amt = self._get_current_position_amt(
                 symbol, bool(b_data.get('is_hedge_mode')), side=_side)

@@ -519,36 +519,50 @@ def test_disputed_terminal_idempotent_across_restart():
 
 # ────── T9：裁定 2026-09-05 收口反例（七项行为锁定） ──────
 
-def test_market_begin_precedes_all_cancels():
-    """反例①：MARKET 路径 BEGIN 必须**先于**所有撤单动作。
+def test_market_begin_failure_yields_zero_cancels():
+    """反例①（真实行为，取代原先的 AST 顺序断言）：
+    MARKET 路径 **BEGIN 失败时撤单调用必须为 0**。
+
     旧实现把 BEGIN 放在撤 ENTRY / TP / SL / 限价平仓单**之后**——BEGIN 一旦失败
     （stats CORRUPT、持久化失败、代际冲突），保护与残单早已被移除，而报告却称
     「保留恢复能力」，事实与口径严重不符且撤单不可逆。
     裁定顺序：ExitConfirmed → AtomicOutboxBegin → ReconcileRemainingOrders。
-    直接从生产源码 AST 提取函数体，按源码行号验证先后（不依赖文档）。"""
-    import ast as _ast
-    src = open(os.path.join(_PROD_DIR, 'trader_260725.py'), encoding='utf-8').read()
-    tree = _ast.parse(src)
-    fn = next(n for n in _ast.walk(tree)
-              if isinstance(n, _ast.FunctionDef) and n.name == 'close_position_market')
-    begin_lineno = None
+
+    这里用**真实 close_position_market 生产代码**驱动（只 mock 交易所 I/O 与成交
+    确认），spy 注入 BEGIN 失败，断言 ENTRY/TP/SL/限价平仓单一次都没撤。
+    仅靠 AST 顺序断言不够——顺序对不代表失败路径真的不撤。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='v2a_'))
+    b = _lp_batch(net=0.002, reason='')
+    b['close_phase'] = 0
+    b['pending_close'] = False
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='open')
+    ex.positions = [{'symbol': SYM, 'contracts': 0.002, 'side': 'long',
+                     'positionSide': 'LONG'}]
+
+    # 交易所 I/O 桩：仅补齐 close_position_market 跑到 BEGIN 所必需的部分
+    ex.fetch_ticker = lambda symbol: {'last': 76500.0, 'close': 76500.0}
+    ex.create_order = lambda **kw: {'id': 'MK1', 'average': 76500.0}
+    t._confirm_close_filled = lambda *a, **k: ('CONFIRMED_FULL', 'ok', 0.002)
+
     cancels = []
-    for node in _ast.walk(fn):
-        if not isinstance(node, _ast.Call):
-            continue
-        fname = (node.func.id if isinstance(node.func, _ast.Name)
-                 else getattr(node.func, 'attr', None))
-        if fname == '_atomic_outbox_begin':
-            begin_lineno = node.lineno
-        elif fname in ('_cancel_and_verify_entry_orders',
-                       '_cancel_limit_close_order', 'cancel_order'):
-            cancels.append((fname, node.lineno))
-    assert begin_lineno is not None, 'close_position_market 未调用 _atomic_outbox_begin'
-    assert cancels, 'close_position_market 未找到任何撤单调用'
-    first = min(cancels, key=lambda x: x[1])
-    assert begin_lineno < first[1], (
-        f'BEGIN(L{begin_lineno}) 必须先于所有撤单；最早撤单 {first[0]} 在 L{first[1]}。'
-        f' 全部撤单={cancels}')
+    t._cancel_and_verify_entry_orders = lambda *a, **k: cancels.append('entry') or True
+    t._cancel_limit_close_order = lambda *a, **k: cancels.append('limit_close')
+    _ex_cancel = ex.cancel_order
+
+    def _spy_ex_cancel(oid, symbol=None, params=None, **k):
+        cancels.append(('exchange.cancel_order', oid))
+        return _ex_cancel(oid, symbol, params=params, **k)
+
+    ex.cancel_order = _spy_ex_cancel
+
+    # 注入 BEGIN 失败（真实失败模式：持久化失败 / 代际冲突 / stats 不可用）
+    t._atomic_outbox_begin = lambda *a, **k: None
+
+    ok, msg = t.close_position_market(BID)
+    assert not ok, f'BEGIN 失败必须整体失败（不得谎报成功）: {ok} / {msg}'
+    assert cancels == [], (
+        f'BEGIN 失败后必须**零撤单**（保护与残单完整在位），实际发生: {cancels}')
 
 
 def test_reconcile_before_stats_and_corrupt_stats_blocks_clear():
@@ -758,6 +772,128 @@ def test_limit_no_durable_phase2_without_outbox():
     assert bb.get('pending_settlement') is None, bb
 
 
+def _mk_proven_outbox(t, mode='LIMIT', gen='L1'):
+    """建立 PROVEN outbox 并返回 record（供反例复用）。"""
+    return t._atomic_outbox_begin(
+        batch_id=BID, symbol=SYM, mode=mode, generation=gen,
+        exit_order_ref={'kind': 'regular', 'order_id': 'L1'},
+        observed_qty=0.002, exit_price=76500.0,
+        expected_qty=0.002, net_cost=153.24, entry_fee_estimate=0.15)
+
+
+def test_pre_converge_none_yields_zero_stats_zero_clear():
+    """反例②-补：pre-stats converge 返回 None 时必须**零 stats、零 clear**。
+    旧实现裸调用 converge 且丢弃返回值，扫描未知/撤单失败/持仓未清零时仍继续
+    写 stats，等于在事实未收敛时就留下「已记账」证据。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='v2a_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    b['close_op_id'] = OP
+    b['limit_close_order_id'] = 'L1'
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    rec = _mk_proven_outbox(t)
+    assert isinstance(rec, dict) and rec.get('core_status') == 'PROVEN', rec
+
+    t._converge_batch_orders_before_clear = lambda s, bid: None   # 未收敛
+    written = []
+    t._record_settlement_v2 = lambda record=None, stats_file=None: (
+        written.append(record) or True)
+    st = t._try_finalize_outbox(BID, SYM)
+    assert st == trader_260725.SETTLE_PENDING_RETRY, st
+    assert written == [], f'pre-converge 未完成绝不得写 stats: {written}'
+    assert BID in _state_read(t).get(SYM, {}), '未收敛绝不得 clear'
+
+
+def test_market_recovery_entry_unknown_blocks_cancel_and_stats():
+    """反例③-补：MARKET 在 BEGIN 后立刻崩溃、恢复时 ENTRY 查询 UNKNOWN →
+    **不得撤 SL/TP、不得写 stats**。
+    背景：此前 ENTRY 逐单确认 gate 只存在于 close_position_market 调用点，崩溃
+    恢复直接进入共享 finalizer 只跑通用 converge，没有「ENTRY 未确认前不得撤
+    SL/TP」的顺序保证。现已收归 _reconcile_market_remaining_orders。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='v2a_'))
+    b = _lp_batch(net=0.002, reason='market_confirming')
+    b['close_op_id'] = OP
+    b['limit_close_order_id'] = 'L1'
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    rec = _mk_proven_outbox(t, mode='MARKET', gen=OP)
+    assert isinstance(rec, dict) and rec.get('core_status') == 'PROVEN', rec
+
+    t._cancel_and_verify_entry_orders = lambda *a, **k: False   # ENTRY UNKNOWN
+    cancels = []
+    _ex_cancel = ex.cancel_order
+
+    def _spy_cancel(oid, symbol=None, params=None, **k):
+        cancels.append(oid)
+        return _ex_cancel(oid, symbol, params=params, **k)
+
+    ex.cancel_order = _spy_cancel
+    written = []
+    t._record_settlement_v2 = lambda record=None, stats_file=None: (
+        written.append(record) or True)
+
+    st = t._try_finalize_outbox(BID, SYM, mode='MARKET')
+    assert st == trader_260725.SETTLE_PENDING_RETRY, st
+    assert cancels == [], f'ENTRY 未确认前绝不得撤 SL/TP: {cancels}'
+    assert written == [], f'ENTRY 未确认前绝不得写 stats: {written}'
+    assert BID in _state_read(t).get(SYM, {}), 'ENTRY 未确认绝不得 clear'
+
+
+def test_begin_does_not_overwrite_malformed_outbox():
+    """反例④-补：畸形 outbox 调用 BEGIN **不得被覆盖**。
+    BEGIN 此前只识别「有效 dict + dedup」，`{}`/`None`/`[]` 等被当作 EMPTY
+    直接重建——UNKNOWN 被当成 EMPTY，不可辨认的结算现场被抹掉。"""
+    t, _ = make_trader(tempfile.mkdtemp(prefix='v2a_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    b['close_op_id'] = OP
+    b['limit_close_order_id'] = 'L1'
+    for bad in ({}, {'base_dedup_key': ''}, {'base_dedup_key': None},
+                {'base_dedup_key': 123}, {'base_dedup_key': 'x'},
+                'not-a-dict', [], 123, None):
+        bb = copy.deepcopy(b)
+        bb['pending_settlement'] = bad
+        _state_write(t, _single(bb))
+        rec = _mk_proven_outbox(t)
+        assert rec is None, f'畸形 outbox 不得被 BEGIN 覆盖: bad={bad!r} -> {rec!r}'
+        after = _state_read(t)[SYM][BID].get('pending_settlement')
+        assert after == bad, f'必须保留原值（UNKNOWN≠EMPTY）: {bad!r} -> {after!r}'
+
+
+def test_converge_uses_outbox_evidence_side_not_buy_default():
+    """反例⑤-补：outbox evidence 为 SELL、批次 side 缺失 → converge **不得退成 BUY**。
+    converge 此前用 `b_data.get('side') or 'BUY'`，在 clear 证明阶段重新默认方向，
+    与已固化的结算证据冲突。已有不可变 outbox evidence 时必须取其中的 side。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='v2a_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    b['close_op_id'] = OP
+    b['limit_close_order_id'] = 'L1'
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    rec = _mk_proven_outbox(t)
+    assert isinstance(rec, dict), rec
+    # 模拟：批次 side 丢失，但不可变 outbox evidence 已固化 SELL
+    st_now = _state_read(t)
+    st_now[SYM][BID]['pending_settlement']['evidence']['side'] = 'SELL'
+    st_now[SYM][BID]['side'] = ''
+    _state_write(t, st_now)
+
+    seen = {}
+    t._get_current_position_amt = lambda symbol, hedge, side=None: (
+        seen.setdefault('side', side), 0.0)[1]
+    t._converge_batch_orders_before_clear(SYM, BID)
+    assert seen.get('side') == 'SELL', \
+        f'converge 必须取 outbox evidence 的 SELL，不得默认 BUY: {seen}'
+
+
 # ───────────────────────── 生产文件免疫 ─────────────────────────
 
 def test_production_files_untouched():
@@ -785,7 +921,11 @@ TESTS = [
     test_disputed_terminal_idempotent_across_rounds,
     test_atomic_begin_reuses_same_dedup_outbox,
     test_disputed_terminal_idempotent_across_restart,
-    test_market_begin_precedes_all_cancels,
+    test_market_begin_failure_yields_zero_cancels,
+    test_pre_converge_none_yields_zero_stats_zero_clear,
+    test_market_recovery_entry_unknown_blocks_cancel_and_stats,
+    test_begin_does_not_overwrite_malformed_outbox,
+    test_converge_uses_outbox_evidence_side_not_buy_default,
     test_reconcile_before_stats_and_corrupt_stats_blocks_clear,
     test_malformed_outbox_cannot_be_dropped_or_bypass_gate,
     test_missing_side_is_disputed_never_defaults_buy,

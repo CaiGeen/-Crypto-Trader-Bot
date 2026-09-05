@@ -51,7 +51,8 @@ def _module_assigns(tree, src, prefixes):
 
 # 共享命名空间：函数间经 global 名互相解析（与生产模块语义一致）
 NS = {'uuid': __import__('uuid'), 'time': __import__('time'), 'math': __import__('math')}
-NS.update(_module_assigns(TREE, SRC, ('_MERGE', '_PARTIAL', '_partial_resize', 'TAKER', 'MAKER', 'CONSERVATION')))
+NS.update(_module_assigns(TREE, SRC, ('_MERGE', '_PARTIAL', '_partial_resize', 'TAKER', 'MAKER', 'CONSERVATION',
+                                      'V2A', 'SETTLE')))  # T1C-v2A：outbox 结构判据与三态常量
 OWNER_FN = _extract(TREE, SRC, '_partial_resize_owner_ok', NS)
 NS['_partial_resize_owner_ok'] = OWNER_FN
 
@@ -73,7 +74,10 @@ F = {n: ex_t(n) for n in (
     '_update_registry', '_verify_and_update_registry', '_verify_order_created',
     '_build_intent', '_protection_identity', '_close_amount_guard',
     '_try_acquire_resize_inflight', '_release_resize_inflight',
-    '_maybe_runtime_resume_partial')}
+    '_maybe_runtime_resume_partial',
+    # T1C-v2A：统一 outbox 结构判据（_merge_batch_state 依赖；缺则
+    # AutoStubTrader 会返回 no-op None，导致畸形分支判据全部失配）
+    '_v2a_outbox_state')}
 H = {n: ex_h(n) for n in (
     '_confirm_close_filled', '_fetch_close_order_state', '_set_close_reason_if_current',
     '_begin_close_request_if_active', '_survey_same_side_batches',

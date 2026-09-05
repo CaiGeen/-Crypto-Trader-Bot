@@ -72,6 +72,10 @@ class PersistFake:
     def _converge_alert(self, key, msg, level='critical'):
         return CryptoTrader._converge_alert(self, key, msg, level=level)
 
+    def _v2a_outbox_state(self, b):
+        # T1C-v2A：clear_batch_state §9 门共用统一 outbox 结构判据
+        return CryptoTrader._v2a_outbox_state(self, b)
+
     def send_tg_notification(self, msg, level='info'):
         pass
 

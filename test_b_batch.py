@@ -235,7 +235,11 @@ def make_fake_b(env, ex):
              # time.sleep 打桩 → 忙等死循环（第 8 次 MagicMock 实证，同 L24 注记）
              '_atomic_outbox_begin', '_try_finalize_outbox',
              '_build_settlement_evidence', '_derive_entry_order_refs',
-             '_record_settlement_v2')
+             '_record_settlement_v2',
+             # 🔥 统一 outbox 结构校验 + MARKET 残单收拢（2026-09-05 收口新增）。
+             # 不绑定 → MagicMock：outbox 状态判据恒不等于 'VALID' → finalizer
+             # 立即 PENDING_RETRY → 监控轮询死循环（第 9 次同类实证）。
+             '_v2a_outbox_state', '_reconcile_market_remaining_orders')
     for _n in _bind:
         if hasattr(CryptoTrader, _n):
             setattr(fake, _n, (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(
