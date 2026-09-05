@@ -1319,8 +1319,9 @@ class CryptoTrader:
         返回三态：
           MISSING    批次上**不存在** pending_settlement 字段 → EMPTY 语义，
                      允许 BEGIN 新建事务（legacy 无 outbox 路径保持原行为）。
-          VALID      结构合法：dict + base_dedup_key 为非空字符串 +
-                     record 为 dict + stats_committed 为 bool。
+          VALID      结构合法：dict + schema=2 + base_dedup_key 非空字符串 +
+                     settlement_id 非空字符串 + record 为 dict + evidence 为
+                     dict（且 evidence.mode ∈ {LIMIT,SL,TP,MARKET}）+ stats_committed 为 bool。
           MALFORMED  字段存在但任一要件不满足 → **UNKNOWN ≠ EMPTY**：
                      一律保留原值、loud 告警、拒绝覆盖（BEGIN）与 clear。
         """
@@ -1329,10 +1330,21 @@ class CryptoTrader:
         ob = b.get('pending_settlement')
         if not isinstance(ob, dict):
             return V2A_OUTBOX_MALFORMED
+        if ob.get('schema') != 2:
+            return V2A_OUTBOX_MALFORMED
         dedup = ob.get('base_dedup_key')
         if not isinstance(dedup, str) or not dedup:
             return V2A_OUTBOX_MALFORMED
+        sid = ob.get('settlement_id')
+        if not isinstance(sid, str) or not sid:
+            return V2A_OUTBOX_MALFORMED
         if not isinstance(ob.get('record'), dict):
+            return V2A_OUTBOX_MALFORMED
+        ev = ob.get('evidence')
+        if not isinstance(ev, dict):
+            return V2A_OUTBOX_MALFORMED
+        ev_mode = ev.get('mode')
+        if ev_mode not in ('LIMIT', 'SL', 'TP', 'MARKET'):
             return V2A_OUTBOX_MALFORMED
         if not isinstance(ob.get('stats_committed'), bool):
             return V2A_OUTBOX_MALFORMED
@@ -1523,12 +1535,12 @@ class CryptoTrader:
             pass
         return True
 
-    def _try_finalize_outbox(self, batch_id, symbol, mode=None):
+    def _try_finalize_outbox(self, batch_id, symbol):
         """§8.2/§8.3 共享 finalizer：只消费持久化 outbox（不依赖触发线程临时变量）。
 
-        mode：触发本次结算的退出路径（'LIMIT' / 'SL' / 'TP' / 'MARKET'）。
+        mode 统一由持久化 outbox['evidence']['mode'] 派生（零易失传参）：
         'MARKET' 时本 finalizer **独占**执行 ENTRY 逐单确认 gate 与保护单撤销
-        （_reconcile_market_remaining_orders），正常路径与崩溃恢复路径共用同一实现。
+        （_reconcile_market_remaining_orders），正常路径与崩溃恢复路径共用同一事实源。
 
         PROVEN（裁定 2026-09-05「双 converge」顺序）：
           ① mode=='MARKET'：ENTRY 逐单确认 gate → 撤 TP/SL → 撤限价平仓单
@@ -1570,9 +1582,9 @@ class CryptoTrader:
         #    DISPUTED 不进入这条清理链（保留保护单与批次，交人工核对）。
         if not _is_disputed:
             # ① MARKET 专用：ENTRY 逐单确认 gate（**先于一切撤保护动作**）。
-            #    与 close_position_market 调用点共用 _reconcile_market_remaining_orders，
-            #    使崩溃恢复路径也具备「ENTRY 未确认前不得撤 SL/TP」的顺序保证。
-            if mode == 'MARKET':
+            #    mode 统一从持久化 outbox evidence 派生，崩溃恢复与正常路径完全一致。
+            _ob_mode = (outbox.get('evidence') or {}).get('mode')
+            if _ob_mode == 'MARKET':
                 _b_now = (self.load_all_states().get(symbol) or {}).get(batch_id) or {}
                 if not self._reconcile_market_remaining_orders(
                         symbol, batch_id, _b_now, _b_now.get('close_op_id') or ''):
@@ -11393,7 +11405,7 @@ class CryptoTrader:
 
             # ══ ReconcileRemainingOrders 已收归共享 finalizer 独占 ══
             # 🔥 裁定 2026-09-05：撤单链（ENTRY 逐单确认 gate → 撤 TP/SL → 撤限价
-            # 平仓单）不再散落在调用点，改由 _try_finalize_outbox(mode='MARKET')
+            # 平仓单）不再散落在调用点，改由 _try_finalize_outbox（根据 outbox.evidence 自动派生）
             # 统一执行。此前 BEGIN 后若立即崩溃，恢复直接进入共享 finalizer，只跑
             # 通用 converge（按交易所返回顺序处理全部已知 ID），**没有「ENTRY 未确认
             # 前不得撤 SL/TP」的顺序保证**——现在两条路径共用同一实现。
@@ -11422,7 +11434,7 @@ class CryptoTrader:
             _r = _v2_rec
             if _r.get('core_status') != 'PROVEN':
                 # §8.3：DISPUTED → 记争议、保留批次、不 clear（仓位已成交归零，账本留证）
-                self._try_finalize_outbox(batch_id, target_symbol, mode='MARKET')
+                self._try_finalize_outbox(batch_id, target_symbol)
                 _rs_ok, _rs_why = self._set_close_reason_if_current(
                     target_symbol, batch_id, close_op_id, 'settlement_disputed')
                 result_msg = (
@@ -11444,8 +11456,7 @@ class CryptoTrader:
             _pnl_emoji = "🟢" if _r_net >= 0 else "🔴"
             _cleanup_pending = False
             # §8.3：只有 CLEARED 才算收敛完成；MANUAL_REVIEW/PENDING_RETRY 均保留批次
-            if self._try_finalize_outbox(batch_id, target_symbol,
-                                         mode='MARKET') != SETTLE_CLEARED:
+            if self._try_finalize_outbox(batch_id, target_symbol) != SETTLE_CLEARED:
                 _cleanup_pending = True
             result_msg = (
                 f"📊 **[市价平仓结算]**\n\n"
@@ -11673,14 +11684,28 @@ class CryptoTrader:
                 _open_map[str(_o['id'])] = _o
         open_orders = list(_open_map.values())
         # ② D-B1 贡献扣减：symbol 持仓（绝对值）− 其他活跃批次已成交贡献
-        # 🔥 零猜测（裁定 2026-09-05）：side 缺失/非法**不得**默认 BUY。
-        # 优先取不可变 outbox evidence 中已固化的 side（结算事务事实），
-        # 仍不可得则视为未知 → 返回 None（不收敛，绝不带着猜错的方向去 clear）。
-        _side = str(b_data.get('side') or '').upper()
-        if _side not in ('BUY', 'SELL'):
-            _obx = b_data.get('pending_settlement')
-            _evx = (_obx.get('evidence') if isinstance(_obx, dict) else None) or {}
-            _side = str((_evx or {}).get('side') or '').upper()
+        # 🔥 零猜测（裁定 2026-09-05）：严格优先取不可变 outbox evidence 中已固化的
+        # side（结算事务事实），无 outbox（legacy 路径）才回落至批次 side。
+        # 若 outbox 与批次 side 存在合法冲突，或最终 side 非 BUY/SELL →
+        # 返回 None（不收敛、绝不带着猜错/冲突的方向去 clear）。
+        _obx = b_data.get('pending_settlement')
+        _ev_side = None
+        if isinstance(_obx, dict):
+            _ev = _obx.get('evidence')
+            if isinstance(_ev, dict):
+                _ev_side = str(_ev.get('side') or '').upper()
+                if _ev_side not in ('BUY', 'SELL'):
+                    _ev_side = None
+        _b_side = str(b_data.get('side') or '').upper()
+        if _b_side not in ('BUY', 'SELL'):
+            _b_side = None
+
+        if _ev_side is not None and _b_side is not None and _ev_side != _b_side:
+            print(f"🚨 [converge] 批次 {batch_id} 结算证据 side ({_ev_side}) 与批次 "
+                  f"side ({_b_side}) 冲突，拒绝收敛（防方向污染）")
+            return None
+
+        _side = _ev_side or _b_side
         if _side not in ('BUY', 'SELL'):
             print(f"🚨 [converge] 批次 {batch_id} side 缺失/非法，且磁盘 outbox "
                   f"evidence 无可用 side → 禁止默认 BUY（UNKNOWN≠BUY），"

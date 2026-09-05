@@ -111,6 +111,10 @@ def _finalize_mode(t, ex, mode, order_id, spec, exit_ref, side='BUY'):
     b['tp_order_id'] = 'T1'
     b['limit_close_order_id'] = 'L1'
     _state_write(t, _single(b))
+    # _reconcile_market_remaining_orders 会撤销 S1/T1/L1，需在 ex.orders 里预建
+    ex._mk('S1', otype='STOP_MARKET', amount=0.0, status='open')
+    ex._mk('T1', otype='TAKE_PROFIT_MARKET', amount=0.0, status='open')
+    ex._mk('L1', otype='LIMIT', amount=0.0, status='open', filled=0.0)
     ex._mk(order_id, **spec)
     ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long', 'positionSide': 'LONG'}]
     _net_qty, _net_cost = t._batch_net_position(b)
@@ -260,7 +264,7 @@ def _write_outbox(t, *, core_status='PROVEN', stats_committed=True, dedup=f'{SYM
     }
     b['pending_settlement'] = {
         'schema': 2, 'base_dedup_key': dedup, 'settlement_id': 'v2a_x',
-        'record': rec, 'evidence': {}, 'stats_committed': stats_committed,
+        'record': rec, 'evidence': {'mode': 'LIMIT'}, 'stats_committed': stats_committed,
     }
     _state_write(t, _single(b))
     return b
@@ -623,13 +627,46 @@ def test_reconcile_before_stats_and_corrupt_stats_blocks_clear():
 def test_malformed_outbox_cannot_be_dropped_or_bypass_gate():
     """反例④：pending_settlement **字段存在即受保护**（UNKNOWN ≠ EMPTY）。
     (a) _merge_batch_state 不得静默删除畸形磁盘 outbox；
-    (b) 畸形结构不得回落旧 P5h 四元门绕过 §9 财务授权门。"""
+    (b) 畸形结构不得回落旧 P5h 四元门绕过 §9 财务授权门。
+    覆盖全部值对象契约缺失：schema!=2、settlement_id 缺失/非空字符串、
+    evidence 缺失/非 dict、evidence.mode 非法、stats_committed 缺失/非 bool。"""
     t, _ = make_trader(tempfile.mkdtemp(prefix='v2a_'))
     b = _lp_batch(net=0.002, reason='limit_pending_normal')
     b['close_op_id'] = OP
     b['limit_close_order_id'] = 'L1'
-    for bad in ({}, {'base_dedup_key': ''}, {'base_dedup_key': None},
-                {'base_dedup_key': 123}, 'not-a-dict', [], 123, None):
+    bad_cases = [
+        {},
+        {'base_dedup_key': ''},
+        {'base_dedup_key': None},
+        {'base_dedup_key': 123},
+        # 缺 schema 或 schema!=2
+        {'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+        {'schema': 1, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+        # 缺 settlement_id 或非法
+        {'schema': 2, 'base_dedup_key': 'k', 'record': {},
+         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': '', 'record': {},
+         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+        # 缺 record 或非 dict
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': None,
+         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+        # 缺 evidence 或非 dict 或 mode 非法
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'stats_committed': False},
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'evidence': 'not_dict', 'stats_committed': False},
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'evidence': {'mode': 'UNKNOWN'}, 'stats_committed': False},
+        # stats_committed 缺失或非 bool
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'evidence': {'mode': 'LIMIT'}},
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'evidence': {'mode': 'LIMIT'}, 'stats_committed': 'not_bool'},
+        'not-a-dict', [], 123, None,
+    ]
+    for bad in bad_cases:
         bb = copy.deepcopy(b)
         bb['pending_settlement'] = bad
         # (a) 磁盘畸形 → 必须保留原值，不得凭空消失
@@ -812,7 +849,9 @@ def test_market_recovery_entry_unknown_blocks_cancel_and_stats():
     **不得撤 SL/TP、不得写 stats**。
     背景：此前 ENTRY 逐单确认 gate 只存在于 close_position_market 调用点，崩溃
     恢复直接进入共享 finalizer 只跑通用 converge，没有「ENTRY 未确认前不得撤
-    SL/TP」的顺序保证。现已收归 _reconcile_market_remaining_orders。"""
+    SL/TP」的顺序保证。现已收归 _reconcile_market_remaining_orders。
+    必须经**真实恢复入口** _resume_pending_settlement 调用（不传 mode 形参），
+    finalizer 必须从持久化 outbox 自动派生 mode='MARKET'，触发 ENTRY gate。"""
     t, ex = make_trader(tempfile.mkdtemp(prefix='v2a_'))
     b = _lp_batch(net=0.002, reason='market_confirming')
     b['close_op_id'] = OP
@@ -838,7 +877,8 @@ def test_market_recovery_entry_unknown_blocks_cancel_and_stats():
     t._record_settlement_v2 = lambda record=None, stats_file=None: (
         written.append(record) or True)
 
-    st = t._try_finalize_outbox(BID, SYM, mode='MARKET')
+    # 真实恢复入口：不传 mode 形参，mode 须从 outbox 派生
+    st = t._resume_pending_settlement(BID, SYM)
     assert st == trader_260725.SETTLE_PENDING_RETRY, st
     assert cancels == [], f'ENTRY 未确认前绝不得撤 SL/TP: {cancels}'
     assert written == [], f'ENTRY 未确认前绝不得写 stats: {written}'
@@ -848,14 +888,46 @@ def test_market_recovery_entry_unknown_blocks_cancel_and_stats():
 def test_begin_does_not_overwrite_malformed_outbox():
     """反例④-补：畸形 outbox 调用 BEGIN **不得被覆盖**。
     BEGIN 此前只识别「有效 dict + dedup」，`{}`/`None`/`[]` 等被当作 EMPTY
-    直接重建——UNKNOWN 被当成 EMPTY，不可辨认的结算现场被抹掉。"""
+    直接重建——UNKNOWN 被当成 EMPTY，不可辨认的结算现场被抹掉。
+    涵盖完整值对象校验（schema/settlement_id/evidence/stats_committed）。"""
     t, _ = make_trader(tempfile.mkdtemp(prefix='v2a_'))
     b = _lp_batch(net=0.002, reason='limit_pending_normal')
     b['close_op_id'] = OP
     b['limit_close_order_id'] = 'L1'
-    for bad in ({}, {'base_dedup_key': ''}, {'base_dedup_key': None},
-                {'base_dedup_key': 123}, {'base_dedup_key': 'x'},
-                'not-a-dict', [], 123, None):
+    bad_cases = [
+        {},
+        {'base_dedup_key': ''},
+        {'base_dedup_key': None},
+        {'base_dedup_key': 123},
+        {'base_dedup_key': 'x'},
+        # 缺 schema 或 schema!=2
+        {'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+        {'schema': 1, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+        # 缺 settlement_id 或非法
+        {'schema': 2, 'base_dedup_key': 'k', 'record': {},
+         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': '', 'record': {},
+         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+        # 缺 record 或非 dict
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': None,
+         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+        # 缺 evidence 或非 dict 或 mode 非法
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'stats_committed': False},
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'evidence': 'not_dict', 'stats_committed': False},
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'evidence': {'mode': 'UNKNOWN'}, 'stats_committed': False},
+        # stats_committed 缺失或非 bool
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'evidence': {'mode': 'LIMIT'}},
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
+         'evidence': {'mode': 'LIMIT'}, 'stats_committed': 'not_bool'},
+        'not-a-dict', [], 123, None,
+    ]
+    for bad in bad_cases:
         bb = copy.deepcopy(b)
         bb['pending_settlement'] = bad
         _state_write(t, _single(bb))
@@ -894,6 +966,32 @@ def test_converge_uses_outbox_evidence_side_not_buy_default():
         f'converge 必须取 outbox evidence 的 SELL，不得默认 BUY: {seen}'
 
 
+def test_converge_side_conflict_blocks_clear():
+    """反例⑤-补充：outbox evidence side 与批次 side 均为合法但**冲突**时，
+    converge 必须拒绝收敛（返回 None），防方向污染。
+    裁定 2026-09-05：outbox 是结算事务唯一不可变事实，批次 side 若已被结算固化，
+    后续变更必须由 outbox 说了算；若二者冲突视为不可辨认状态。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='v2a_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    b['close_op_id'] = OP
+    b['limit_close_order_id'] = 'L1'
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                    'positionSide': 'LONG'}]
+    rec = _mk_proven_outbox(t)
+    assert isinstance(rec, dict), rec
+    # outbox evidence 已固化 SELL，批次 side 被意外污染为 BUY（合法但冲突）
+    st_now = _state_read(t)
+    st_now[SYM][BID]['pending_settlement']['evidence']['side'] = 'SELL'
+    st_now[SYM][BID]['side'] = 'BUY'   # 冲突！
+    _state_write(t, st_now)
+    result = t._converge_batch_orders_before_clear(SYM, BID)
+    assert result is None, \
+        f'outbox={SELL}/batch={BUY} 冲突必须拒绝收敛: {result}'
+
+
 # ───────────────────────── 生产文件免疫 ─────────────────────────
 
 def test_production_files_untouched():
@@ -926,6 +1024,7 @@ TESTS = [
     test_market_recovery_entry_unknown_blocks_cancel_and_stats,
     test_begin_does_not_overwrite_malformed_outbox,
     test_converge_uses_outbox_evidence_side_not_buy_default,
+    test_converge_side_conflict_blocks_clear,
     test_reconcile_before_stats_and_corrupt_stats_blocks_clear,
     test_malformed_outbox_cannot_be_dropped_or_bypass_gate,
     test_missing_side_is_disputed_never_defaults_buy,
