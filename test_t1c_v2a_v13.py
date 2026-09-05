@@ -14,6 +14,7 @@
 
 所有用例经 make_trader 隔离到临时目录，不触碰生产账本（结尾生产文件免疫比对）。
 """
+import copy
 import hashlib
 import os
 import tempfile
@@ -516,6 +517,247 @@ def test_disputed_terminal_idempotent_across_restart():
     assert bb.get('close_reason') == 'settlement_disputed', bb
 
 
+# ────── T9：裁定 2026-09-05 收口反例（七项行为锁定） ──────
+
+def test_market_begin_precedes_all_cancels():
+    """反例①：MARKET 路径 BEGIN 必须**先于**所有撤单动作。
+    旧实现把 BEGIN 放在撤 ENTRY / TP / SL / 限价平仓单**之后**——BEGIN 一旦失败
+    （stats CORRUPT、持久化失败、代际冲突），保护与残单早已被移除，而报告却称
+    「保留恢复能力」，事实与口径严重不符且撤单不可逆。
+    裁定顺序：ExitConfirmed → AtomicOutboxBegin → ReconcileRemainingOrders。
+    直接从生产源码 AST 提取函数体，按源码行号验证先后（不依赖文档）。"""
+    import ast as _ast
+    src = open(os.path.join(_PROD_DIR, 'trader_260725.py'), encoding='utf-8').read()
+    tree = _ast.parse(src)
+    fn = next(n for n in _ast.walk(tree)
+              if isinstance(n, _ast.FunctionDef) and n.name == 'close_position_market')
+    begin_lineno = None
+    cancels = []
+    for node in _ast.walk(fn):
+        if not isinstance(node, _ast.Call):
+            continue
+        fname = (node.func.id if isinstance(node.func, _ast.Name)
+                 else getattr(node.func, 'attr', None))
+        if fname == '_atomic_outbox_begin':
+            begin_lineno = node.lineno
+        elif fname in ('_cancel_and_verify_entry_orders',
+                       '_cancel_limit_close_order', 'cancel_order'):
+            cancels.append((fname, node.lineno))
+    assert begin_lineno is not None, 'close_position_market 未调用 _atomic_outbox_begin'
+    assert cancels, 'close_position_market 未找到任何撤单调用'
+    first = min(cancels, key=lambda x: x[1])
+    assert begin_lineno < first[1], (
+        f'BEGIN(L{begin_lineno}) 必须先于所有撤单；最早撤单 {first[0]} 在 L{first[1]}。'
+        f' 全部撤单={cancels}')
+
+
+def test_reconcile_before_stats_and_corrupt_stats_blocks_clear():
+    """反例②：BEGIN 后崩溃恢复时，残单处理（pre-stats converge）必须发生在写
+    stats **之前**；反例③：stats CORRUPT 不妨碍残单安全处理，但仍禁止 clear。
+
+    若把 converge 放在写 stats 之后，进程在 BEGIN 后、撤单前崩溃且恢复时又遇
+    stats CORRUPT，就会在「写 stats 失败」处返回，残余订单永远得不到安全处理。"""
+    calls = []
+    t, ex = make_trader(tempfile.mkdtemp(prefix='v2a_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    b['close_op_id'] = OP
+    b['limit_close_order_id'] = 'L1'
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    # 建立 PROVEN outbox（模拟「BEGIN 成功、撤单前」的崩溃点）
+    rec = t._atomic_outbox_begin(
+        batch_id=BID, symbol=SYM, mode='LIMIT', generation='L1',
+        exit_order_ref={'kind': 'regular', 'order_id': 'L1'},
+        observed_qty=0.002, exit_price=76500.0,
+        expected_qty=0.002, net_cost=153.24, entry_fee_estimate=0.15)
+    assert isinstance(rec, dict) and rec.get('core_status') == 'PROVEN', rec
+
+    _real_conv = t._converge_batch_orders_before_clear
+    _real_stats = t._record_settlement_v2
+    _real_clear = t.clear_batch_state
+
+    def _spy_conv(s, bid):
+        calls.append('converge')
+        return {'scope': 'FULL', 'batch_id': bid, 'symbol': s,
+                'position_zero': True, 'exchange_scan': 'zero',
+                'state_ids_resolved': []}
+
+    def _spy_stats(record=None, stats_file=None):
+        calls.append('stats')
+        return _real_stats(record=record, stats_file=stats_file)
+
+    def _spy_clear(s, bid, proof=None, authorization=None):
+        calls.append('clear')
+        return _real_clear(s, bid, proof=proof, authorization=authorization)
+
+    t._converge_batch_orders_before_clear = _spy_conv
+    t._record_settlement_v2 = _spy_stats
+    t.clear_batch_state = _spy_clear
+    # 注入 stats CORRUPT
+    with open(t._stats_file, 'w', encoding='utf-8') as f:
+        f.write('{ 损坏JSON 不合法 ')
+    st = t._try_finalize_outbox(BID, SYM)
+    assert calls == ['converge', 'stats'], \
+        f'② 残单处理必须先于 stats 写入，且 CORRUPT 时不得 clear: {calls}'
+    assert st == trader_260725.SETTLE_PENDING_RETRY, st
+    assert BID in _state_read(t).get(SYM, {}), '③ stats CORRUPT 必须禁止 clear'
+
+
+def test_malformed_outbox_cannot_be_dropped_or_bypass_gate():
+    """反例④：pending_settlement **字段存在即受保护**（UNKNOWN ≠ EMPTY）。
+    (a) _merge_batch_state 不得静默删除畸形磁盘 outbox；
+    (b) 畸形结构不得回落旧 P5h 四元门绕过 §9 财务授权门。"""
+    t, _ = make_trader(tempfile.mkdtemp(prefix='v2a_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    b['close_op_id'] = OP
+    b['limit_close_order_id'] = 'L1'
+    for bad in ({}, {'base_dedup_key': ''}, {'base_dedup_key': None},
+                {'base_dedup_key': 123}, 'not-a-dict', [], 123, None):
+        bb = copy.deepcopy(b)
+        bb['pending_settlement'] = bad
+        # (a) 磁盘畸形 → 必须保留原值，不得凭空消失
+        merged = t._merge_batch_state(copy.deepcopy(bb), {})
+        assert 'pending_settlement' in merged, \
+            f'(a) 畸形磁盘 outbox 不得被 merge 删除: bad={bad!r}'
+        assert merged['pending_settlement'] == bad, \
+            f'(a) 必须保留原值: bad={bad!r} -> {merged.get("pending_settlement")!r}'
+        # (b) clear 门：给出**恰好能匹配旧 P5h 四元门**的授权也不得放行。
+        #     这是本反例的真正判别点——旧实现会把畸形 outbox 当作「无事务」而
+        #     落回 P5h 四元门，该门只比对 (close_op_id, close_reason, settled,
+        #     limit_close_order_id)，完全不看 outbox，于是畸形状态下清批被放行。
+        _state_write(t, _single(copy.deepcopy(bb)))
+        _p5h_auth = (bb.get('close_op_id') or '',
+                     bb.get('close_reason') or '',
+                     bool(bb.get('settled_by_limit_close')),
+                     bb.get('limit_close_order_id') or '')
+        ok = t.clear_batch_state(SYM, BID, proof=_VALID_PROOF,
+                                 authorization=_p5h_auth)
+        assert not ok, \
+            f'(b) 畸形 outbox 不得放行 clear（P5h 四元授权已匹配）: bad={bad!r}'
+        assert BID in _state_read(t).get(SYM, {}), '批次必须保留'
+
+
+def test_missing_side_is_disputed_never_defaults_buy():
+    """反例⑤：side 缺失/非法绝不得被伪装成 BUY（零猜测）。
+    结算证据链的 side 判定唯一来源：_atomic_outbox_begin → _build_settlement_evidence。
+    缺失或非 BUY/SELL 必须 DISPUTED，且不得写权威 net_pnl。"""
+    t, _ = make_trader(tempfile.mkdtemp(prefix='v2a_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    b['close_op_id'] = OP
+    b['limit_close_order_id'] = 'L1'
+    for bad in ('', None, 'LONG', 'SHORT', 'HOLD', 123):
+        b['side'] = bad
+        _state_write(t, _single(b))
+        rec = t._atomic_outbox_begin(
+            batch_id=BID, symbol=SYM, mode='LIMIT', generation='L1',
+            exit_order_ref={'kind': 'regular', 'order_id': 'L1'},
+            observed_qty=0.002, exit_price=76500.0,
+            expected_qty=0.002, net_cost=153.24, entry_fee_estimate=0.15)
+        assert isinstance(rec, dict), f'side={bad!r} 应能构造记录'
+        assert rec.get('core_status') == 'DISPUTED', \
+            f'side={bad!r} 非法必须 DISPUTED，不得默认 BUY: {rec}'
+        assert rec.get('side') != 'BUY', \
+            f'side={bad!r} 不得被伪装成 BUY: {rec.get("side")!r}'
+        assert rec.get('net_pnl_estimate') is None, 'DISPUTED 不得写权威 net_pnl'
+
+
+def test_entry_order_refs_are_algo_not_regular():
+    """反例⑥：ENTRY 引用必须落盘为 kind='algo'。
+    生产 ENTRY 由 create_order(type='STOP_MARKET') 创建，是 Binance 条件单
+    （registry 记 order_kind='conditional'、role='ENTRY'），查询/撤销须走 algo
+    端点；写成 'regular' 会让 v2B 查错端点。禁止用 ID 长度/前缀猜测。"""
+    t, _ = make_trader(tempfile.mkdtemp(prefix='v2a_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    b['close_op_id'] = OP
+    b['limit_close_order_id'] = 'L1'
+    b['entry_orders'] = ['E1', 'E2']
+    b['target_amounts'] = [0.001, 0.001]
+    b['filled_details'] = [76620.0, 76620.0]
+    b['last_filled_count'] = 2
+    _state_write(t, _single(b))
+    refs = t._derive_entry_order_refs(b)
+    assert len(refs) == 2, refs
+    for r in refs:
+        assert r.get('kind') == 'algo', \
+            f'ENTRY 引用必须是 algo（STOP_MARKET 条件单），实际 {r.get("kind")!r}'
+    # 落盘校验：outbox.evidence.entry_order_refs 逐条为 algo
+    rec = t._atomic_outbox_begin(
+        batch_id=BID, symbol=SYM, mode='LIMIT', generation='L1',
+        exit_order_ref={'kind': 'regular', 'order_id': 'L1'},
+        observed_qty=0.002, exit_price=76500.0,
+        expected_qty=0.002, net_cost=153.24, entry_fee_estimate=0.15)
+    assert isinstance(rec, dict), rec
+    ob = _state_read(t)[SYM][BID]['pending_settlement']
+    ev_refs = ob['evidence']['entry_order_refs']
+    assert ev_refs and all(r.get('kind') == 'algo' for r in ev_refs), \
+        f'落盘 ENTRY 引用必须全部为 algo: {ev_refs}'
+
+
+def test_limit_no_durable_phase2_without_outbox():
+    """反例⑦：LIMIT 认领字段与 outbox 必须**同一次持久化**。
+    注入 BEGIN 的持久化失败后，磁盘上绝不允许出现「close_phase=2 /
+    settled_by_limit_close=True 但无 pending_settlement」的孤儿窗口——
+    该窗口下恢复路径既认领不到事务，也无法重建证据。"""
+    t, ex = make_trader(tempfile.mkdtemp(prefix='v2a_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    b['close_op_id'] = OP
+    b['limit_close_order_id'] = 'L1'
+    assert not b.get('settled_by_limit_close'), '前置：本用例需未认领批次'
+    _state_write(t, _single(b))
+    ex._mk('L1', otype='LIMIT', amount=0.002, status='closed', filled=0.002,
+           avg=76500.0)
+    ex.positions = [{'symbol': SYM, 'contracts': 0.0, 'side': 'long',
+                     'positionSide': 'LONG'}]
+    # 正常路径：认领字段与 outbox 必须在**同一次** _persist_states 落盘。
+    # 判据不是「全程只 persist 一次」（撤单登记/stats/墓碑/clear 本就各有一次），
+    # 而是：任何一次落盘都不得出现「已认领（settled_by_limit_close / phase=2）
+    # 但没有 pending_settlement」的快照——那正是孤儿窗口的定义。
+    snaps = []
+    _real_persist = t._persist_states
+
+    def _spy_persist(all_states):
+        snaps.append(copy.deepcopy(all_states))
+        return _real_persist(all_states)
+
+    t._persist_states = _spy_persist
+    try:
+        st_ok, _ = t._finalize_limit_full_fill(SYM, BID, 'L1')
+    finally:
+        t._persist_states = _real_persist
+    assert st_ok == trader_260725.SETTLE_CLEARED, \
+        f'正常路径应结算完成（entry_orders 在册 → PROVEN）: {st_ok}'
+    assert snaps, '应至少发生一次持久化'
+    for i, sn in enumerate(snaps):
+        bb2 = (sn.get(SYM) or {}).get(BID)
+        if not isinstance(bb2, dict):
+            continue
+        claimed = (bool(bb2.get('settled_by_limit_close'))
+                   or int(bb2.get('close_phase', 0) or 0) == 2)
+        assert not (claimed and bb2.get('pending_settlement') is None), \
+            (f'第 {i + 1} 次持久化出现「已认领但无 outbox」的孤儿窗口: '
+             f'phase={bb2.get("close_phase")!r} '
+             f'settled={bb2.get("settled_by_limit_close")!r}')
+
+    # 失败路径：BEGIN 内持久化失败 → 不得留下孤儿窗口
+    _state_write(t, _single(copy.deepcopy(b)))
+    t._persist_states = lambda all_states: False
+    try:
+        st, msg = t._finalize_limit_full_fill(SYM, BID, 'L1')
+    finally:
+        t._persist_states = _real_persist
+    assert st == trader_260725.SETTLE_PENDING_RETRY, (st, msg)
+    bb = _state_read(t).get(SYM, {}).get(BID)
+    assert bb is not None
+    assert not bb.get('settled_by_limit_close'), \
+        f'BEGIN 失败后不得落 settled_by_limit_close（孤儿窗口）: {bb}'
+    assert int(bb.get('close_phase', 0) or 0) != 2, \
+        f'BEGIN 失败后不得落 durable close_phase=2（孤儿窗口）: {bb}'
+    assert bb.get('pending_settlement') is None, bb
+
+
 # ───────────────────────── 生产文件免疫 ─────────────────────────
 
 def test_production_files_untouched():
@@ -543,6 +785,12 @@ TESTS = [
     test_disputed_terminal_idempotent_across_rounds,
     test_atomic_begin_reuses_same_dedup_outbox,
     test_disputed_terminal_idempotent_across_restart,
+    test_market_begin_precedes_all_cancels,
+    test_reconcile_before_stats_and_corrupt_stats_blocks_clear,
+    test_malformed_outbox_cannot_be_dropped_or_bypass_gate,
+    test_missing_side_is_disputed_never_defaults_buy,
+    test_entry_order_refs_are_algo_not_regular,
+    test_limit_no_durable_phase2_without_outbox,
     test_production_files_untouched,
 ]
 
