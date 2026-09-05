@@ -50,3 +50,15 @@ readme.txt
 # ==========================================
 .DS_Store
 Thumbs.db
+
+# ==========================================
+# 运行时状态文件（冻结封板：防止误提交进私有仓库）
+# auth_blocked / trade_tombstones / signal_dedup 含账户状态与交易历史，
+# 虽非密钥但仍属运行时态，归档时一律排除
+# ==========================================
+auth_blocked.json
+trade_tombstones.json
+signal_dedup.json
+.notify.state.json
+.tmp_replay/
+.codegraph/
