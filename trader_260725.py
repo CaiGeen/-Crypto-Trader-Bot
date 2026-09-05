@@ -259,8 +259,9 @@ V2A_OUTBOX_MALFORMED = 'MALFORMED'  # 字段存在但不合法 → UNKNOWN≠EMP
 
 # 🔥 claim_fields 白名单：只允许登记「事务认领」语义的固定字段，
 # 绝不允许调用方借 claim_fields 注入任意批次状态（防越权写盘通道）。
+# close_phase 只能由 BEGIN 固定写成 2，不得由调用方通过 claim_fields 注入。
 V2A_CLAIM_FIELDS_WHITELIST = frozenset(
-    {'settled_by_limit_close', 'is_programmatic_cancel', 'close_phase'})
+    {'settled_by_limit_close', 'is_programmatic_cancel'})
 
 
 def _settle_glyph(state):
@@ -1273,6 +1274,7 @@ class CryptoTrader:
             'cost_basis_status': ('PROVEN' if core_status == 'PROVEN' else 'DISPUTED'),
             'pnl_status': ('ESTIMATED' if core_status == 'PROVEN' else 'DISPUTED'),
             'fee_status': 'ESTIMATED',
+            'base_dedup_key': base_dedup_key,
             'dedup_key': base_dedup_key, 'settlement_id': settlement_id,
             'batch_id': batch_id, 'symbol': symbol, 'side': side, 'mode': mode,
             'amount': (round(float(observed_qty), 6) if _obs_ok else None),
@@ -1321,7 +1323,9 @@ class CryptoTrader:
                      允许 BEGIN 新建事务（legacy 无 outbox 路径保持原行为）。
           VALID      结构合法：dict + schema=2 + base_dedup_key 非空字符串 +
                      settlement_id 非空字符串 + record 为 dict + evidence 为
-                     dict（且 evidence.mode ∈ {LIMIT,SL,TP,MARKET}）+ stats_committed 为 bool。
+                     dict（且 evidence.mode ∈ {LIMIT,SL,TP,MARKET}）+ stats_committed 为 bool
+                     + envelope/record/evidence 三方字段间一致
+                     (dedup/settlement_id/mode)。
           MALFORMED  字段存在但任一要件不满足 → **UNKNOWN ≠ EMPTY**：
                      一律保留原值、loud 告警、拒绝覆盖（BEGIN）与 clear。
         """
@@ -1347,6 +1351,17 @@ class CryptoTrader:
         if ev_mode not in ('LIMIT', 'SL', 'TP', 'MARKET'):
             return V2A_OUTBOX_MALFORMED
         if not isinstance(ob.get('stats_committed'), bool):
+            return V2A_OUTBOX_MALFORMED
+        # 字段间一致性：envelope/record/evidence 三方 base_dedup_key / settlement_id
+        # / mode 必须完全一致，否则视为不可辨认的结算现场（防把 evidence=MARKET
+        # 的账本误配 record=LIMIT 后写进 stats）。
+        _rec = ob.get('record') or {}
+        _rec_dedup = _rec.get('base_dedup_key') or _rec.get('dedup_key')
+        if dedup != _rec_dedup or dedup != ev.get('base_dedup_key'):
+            return V2A_OUTBOX_MALFORMED
+        if sid != _rec.get('settlement_id') or sid != ev.get('settlement_id'):
+            return V2A_OUTBOX_MALFORMED
+        if _rec.get('mode') != ev_mode:
             return V2A_OUTBOX_MALFORMED
         return V2A_OUTBOX_VALID
 
@@ -1430,19 +1445,26 @@ class CryptoTrader:
                 net_cost=net_cost, exit_price=exit_price, generation=_g,
                 entry_fee_estimate=entry_fee_estimate,
                 exit_fee_estimate=exit_fee_estimate)
-            b['close_phase'] = 2
-            b['pending_close'] = True
-            b['close_reason'] = 'settlement_pending'
             if isinstance(claim_fields, dict) and claim_fields:
                 # 🔒 白名单：claim_fields 只允许登记「事务认领」语义的固定字段，
+                # 且每个字段的值必须严格为布尔 True（裁定 2026-09-05），
                 # 否则 BEGIN 会退化成一条绕过 merge 规则的任意状态写盘通道。
                 _bad_claims = set(claim_fields) - V2A_CLAIM_FIELDS_WHITELIST
                 if _bad_claims:
                     print(f"🚨 [v2A] claim_fields 含非白名单字段 "
                           f"{sorted(_bad_claims)}，拒绝写盘（防任意状态注入）")
                     return None
+                for _ck, _cv in claim_fields.items():
+                    if _cv is not True:
+                        print(f"🚨 [v2A] claim_fields[{_ck!r}]={_cv!r} 非 True，"
+                              f"只允许布尔 True 认领，拒绝写盘")
+                        return None
                 # 认领字段与 outbox 同一次持久化（原子 BEGIN，无中间窗口）
                 b.update(claim_fields)
+            # BEGIN 自身状态必须固定，严禁被 claim_fields 或其他输入覆盖
+            b['close_phase'] = 2
+            b['pending_close'] = True
+            b['close_reason'] = 'settlement_pending'
             b['pending_settlement'] = {
                 'schema': 2, 'base_dedup_key': _dedup, 'settlement_id': _sid,
                 'record': ev['record'], 'evidence': ev['evidence'],
@@ -1454,21 +1476,20 @@ class CryptoTrader:
                 return None
             return ev['record']
 
-    def _reconcile_market_remaining_orders(self, symbol, batch_id, b_data,
-                                           close_op_id):
-        """MARKET 专用残单收拢（**共享 finalizer 独占调用**）。
+    def _verify_market_entry_gate(self, symbol, batch_id, b_data,
+                                        close_op_id):
+        """MARKET 专用 ENTRY 逐单确认 gate（**共享 finalizer 独占调用**）。
 
-        🔥 所有权边界（裁定 2026-09-05）：正常路径与崩溃恢复路径**共用本实现**。
-        通用 `_converge_batch_orders_before_clear` 按交易所返回顺序处理全部已知
-        ID，**没有「ENTRY 未逐单确认前不得撤 SL/TP」的顺序保证**；此前该 gate 只
-        存在于 close_position_market 调用点，BEGIN 后一旦崩溃，恢复直接进入共享
-        finalizer 就丢失了这层保护。
+        🔥 所有权边界（ChatGPT 2026-09-05 裁定）：ENTRY gate 通过后，后续 TP/SL/
+        限价平仓单的撤销完全交由通用 pre-converge 处理——
+        通用 `_converge_batch_orders_before_clear` 已有交易所双源扫描、分级处置
+        和复扫，不得在 ENTRY gate 之后保留第二套撤保护单实现。
+        否则 stats 失败后恢复路径重入时会重复执行 cancel_order，违反「mutation
+        后响应未知必须先查询再决定」的铁律。
 
-        顺序：① ENTRY 逐单确认 gate（失败 → 保持冻结、零 stats、零 clear）
-             ② 撤 TP / SL + registry 登记（仅各自 cancel 正常返回的那一张）
-             ③ 撤限价平仓单（A1：防孤儿单）
-        返回 bool：True=可继续写 stats；False=本轮终止。"""
-        # ① ENTRY 逐单确认 gate
+        返回 bool：True=ENTRY 已清零，可进入 pre-converge；False=ENTRY 未确认，
+        批次冻结、本轮禁止写 stats/clear。"""
+        # ENTRY 逐单确认 gate
         _lfc = int(b_data.get('last_filled_count', 0) or 0)
         if not self._cancel_and_verify_entry_orders(symbol, batch_id, b_data, _lfc):
             _rs_ok, _rs_why = self._set_close_reason_if_current(
@@ -1487,64 +1508,21 @@ class CryptoTrader:
             except Exception:
                 pass
             return False
-
-        # ② 仓位已按单确认成交 **且 ENTRY 已确认清零** → 现在才安全撤销保护单。
-        #    ID 取自磁盘批次字段（恢复路径同样可读，不依赖调用方临时快照）。
-        _tp_terminal_ok = False
-        _tp_oid = b_data.get('tp_order_id')
-        if _tp_oid:
-            try:
-                self._safe_api_call(self.exchange.cancel_order, _tp_oid, symbol,
-                                    params={'stop': True})
-                _tp_terminal_ok = True
-                print(f"  └─ 已撤销止盈单: {_tp_oid}")
-            except Exception:
-                pass
-
-        _sl_terminal_ok = False
-        _sl_oid = b_data.get('current_sl_id')
-        if _sl_oid:
-            try:
-                self._safe_api_call(self.exchange.cancel_order, _sl_oid, symbol,
-                                    params={'stop': True})
-                _sl_terminal_ok = True
-                print(f"  └─ 已撤销止损单: {_sl_oid}")
-            except Exception:
-                pass
-
-        # 只有各自 cancel 正常返回的那一张才写 PROGRAMMATIC_CANCELED。
-        # 异常（含 -2011/OrderNotFound）= 不知道它为何消失 → 不记「程序已终结」，
-        # 交 converge / 后续事实判断。
-        for _oid, _ok in ((_tp_oid, _tp_terminal_ok), (_sl_oid, _sl_terminal_ok)):
-            if not _oid or not _ok:
-                continue
-            try:
-                _ident = self._find_registry_identity_by_order_id(symbol, batch_id, _oid)
-                if _ident:
-                    self._update_registry(symbol, batch_id, _ident,
-                                          state='PROGRAMMATIC_CANCELED',
-                                          order_id=_oid, id_known=True,
-                                          terminated_reason='close_requested_canceled')
-            except Exception:
-                pass
-
-        # ③ A1：撤销限价平仓单（防孤儿单 + 幽灵线程）
-        try:
-            self._cancel_limit_close_order(symbol, batch_id)
-        except Exception:
-            pass
         return True
 
     def _try_finalize_outbox(self, batch_id, symbol):
         """§8.2/§8.3 共享 finalizer：只消费持久化 outbox（不依赖触发线程临时变量）。
 
         mode 统一由持久化 outbox['evidence']['mode'] 派生（零易失传参）：
-        'MARKET' 时本 finalizer **独占**执行 ENTRY 逐单确认 gate 与保护单撤销
-        （_reconcile_market_remaining_orders），正常路径与崩溃恢复路径共用同一事实源。
+        'MARKET' 时本 finalizer **独占**执行 ENTRY 逐单确认 gate
+        （_verify_market_entry_gate），保护单与限价平仓单撤销完全交由
+        通用 pre-converge 处理——不保留第二套撤单实现。
 
         PROVEN（裁定 2026-09-05「双 converge」顺序）：
-          ① mode=='MARKET'：ENTRY 逐单确认 gate → 撤 TP/SL → 撤限价平仓单
-          → ② pre-stats converge：查询交易所当前状态、按需撤残单，**proof 丢弃**，
+          ① mode=='MARKET'：ENTRY 逐单确认 gate（_verify_market_entry_gate）
+          → ② pre-stats converge：通用 _converge_batch_orders_before_clear
+              双源扫描 + 分级处置 + 复扫，负责 TP/SL/限价平仓单撤销，
+              **proof 丢弃**，
               返回 None 立即 return（零 stats、零 clear）
           → ③ 写 v2 stats（settlement 富记录）+ 持久化 stats_committed=True
           → ④ fresh converge：重新查询并生成**新** proof（禁止缓存/持久化复用）
@@ -1582,11 +1560,13 @@ class CryptoTrader:
         #    DISPUTED 不进入这条清理链（保留保护单与批次，交人工核对）。
         if not _is_disputed:
             # ① MARKET 专用：ENTRY 逐单确认 gate（**先于一切撤保护动作**）。
-            #    mode 统一从持久化 outbox evidence 派生，崩溃恢复与正常路径完全一致。
+            #    ENTRY gate 通过后，后续 TP/SL/限价平仓单撤销完全交由通用
+            #    pre-converge 处理——不得在 gate 后保留第二套撤保护单实现
+            #    （裁定 2026-09-05：否则 stats 失败后重入会重复执行 cancel_order）。
             _ob_mode = (outbox.get('evidence') or {}).get('mode')
             if _ob_mode == 'MARKET':
                 _b_now = (self.load_all_states().get(symbol) or {}).get(batch_id) or {}
-                if not self._reconcile_market_remaining_orders(
+                if not self._verify_market_entry_gate(
                         symbol, batch_id, _b_now, _b_now.get('close_op_id') or ''):
                     return SETTLE_PENDING_RETRY
 
@@ -11403,12 +11383,10 @@ class CryptoTrader:
                     level='critical')
                 return False, "❌ 市价平仓已成交但结算事务建立失败（BEGIN），请人工复核"
 
-            # ══ ReconcileRemainingOrders 已收归共享 finalizer 独占 ══
-            # 🔥 裁定 2026-09-05：撤单链（ENTRY 逐单确认 gate → 撤 TP/SL → 撤限价
-            # 平仓单）不再散落在调用点，改由 _try_finalize_outbox（根据 outbox.evidence 自动派生）
-            # 统一执行。此前 BEGIN 后若立即崩溃，恢复直接进入共享 finalizer，只跑
-            # 通用 converge（按交易所返回顺序处理全部已知 ID），**没有「ENTRY 未确认
-            # 前不得撤 SL/TP」的顺序保证**——现在两条路径共用同一实现。
+            # ══ ENTRY gate 已收归共享 finalizer（2026-09-05 新收口） ══
+            # 🔥 ENTRY 逐单确认 gate 已由 _verify_market_entry_gate 收归 _try_finalize_outbox
+            # 统一执行（ENTRY gate 通过后，TP/SL/限价平仓单由通用 pre-converge 处理，不保留
+            # 第二套撤保护单实现，防止 stats 失败后恢复重入时重复执行 cancel_order）。
             # 此处只保留调用点自身的展示数据（v2 富记录一律取 evidence）。
 
             # ══ 结算（confirmed_filled_amount 贯穿；actual_price 已在 BEGIN 前计算）══
@@ -11427,8 +11405,7 @@ class CryptoTrader:
             pnl_emoji = "🟢" if actual_net_pnl >= 0 else "🔴"
 
             # 🔥 A1：撤销限价平仓单（场景C：已挂限价单 → 用户 /close）
-            #    已收归 _reconcile_market_remaining_orders（共享 finalizer 独占），
-            #    此处不再重复调用，避免调用点与 finalizer 双重所有权。
+            #    已由 pre-converge 统一处理，此处不再重复调用。
             # （BEGIN 已前移至所有撤单动作之前，见上）
 
             _r = _v2_rec

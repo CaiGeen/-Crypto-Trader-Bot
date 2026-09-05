@@ -111,7 +111,7 @@ def _finalize_mode(t, ex, mode, order_id, spec, exit_ref, side='BUY'):
     b['tp_order_id'] = 'T1'
     b['limit_close_order_id'] = 'L1'
     _state_write(t, _single(b))
-    # _reconcile_market_remaining_orders 会撤销 S1/T1/L1，需在 ex.orders 里预建
+    # _verify_market_entry_gate 后的 pre-converge 会撤销 S1/T1/L1，需在 ex.orders 里预建
     ex._mk('S1', otype='STOP_MARKET', amount=0.0, status='open')
     ex._mk('T1', otype='TAKE_PROFIT_MARKET', amount=0.0, status='open')
     ex._mk('L1', otype='LIMIT', amount=0.0, status='open', filled=0.0)
@@ -256,15 +256,21 @@ def _write_outbox(t, *, core_status='PROVEN', stats_committed=True, dedup=f'{SYM
     b['limit_close_order_id'] = 'L1'
     b['close_phase'] = 2
     b['pending_close'] = True
+    _sid = 'v2a_x'
     rec = {
         'record_type': 'settlement_dispute' if disputed else 'settlement',
         'core_status': core_status,
         'net_pnl_estimate': None if disputed else 0.5,
-        'dedup_key': dedup, 'batch_id': BID, 'symbol': SYM,
+        'base_dedup_key': dedup, 'dedup_key': dedup,
+        'settlement_id': _sid, 'batch_id': BID, 'symbol': SYM,
+        'mode': 'LIMIT',
     }
     b['pending_settlement'] = {
-        'schema': 2, 'base_dedup_key': dedup, 'settlement_id': 'v2a_x',
-        'record': rec, 'evidence': {'mode': 'LIMIT'}, 'stats_committed': stats_committed,
+        'schema': 2, 'base_dedup_key': dedup, 'settlement_id': _sid,
+        'record': rec,
+        'evidence': {'mode': 'LIMIT', 'base_dedup_key': dedup,
+                     'settlement_id': _sid},
+        'stats_committed': stats_committed,
     }
     _state_write(t, _single(b))
     return b
@@ -629,7 +635,9 @@ def test_malformed_outbox_cannot_be_dropped_or_bypass_gate():
     (a) _merge_batch_state 不得静默删除畸形磁盘 outbox；
     (b) 畸形结构不得回落旧 P5h 四元门绕过 §9 财务授权门。
     覆盖全部值对象契约缺失：schema!=2、settlement_id 缺失/非空字符串、
-    evidence 缺失/非 dict、evidence.mode 非法、stats_committed 缺失/非 bool。"""
+    evidence 缺失/非 dict、evidence.mode 非法、stats_committed 缺失/非 bool、
+    以及 envelope/record/evidence 三方字段间一致性冲突（base_dedup_key、
+    settlement_id、mode 三项必须三方一致）。"""
     t, _ = make_trader(tempfile.mkdtemp(prefix='v2a_'))
     b = _lp_batch(net=0.002, reason='limit_pending_normal')
     b['close_op_id'] = OP
@@ -664,6 +672,19 @@ def test_malformed_outbox_cannot_be_dropped_or_bypass_gate():
          'evidence': {'mode': 'LIMIT'}},
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
          'evidence': {'mode': 'LIMIT'}, 'stats_committed': 'not_bool'},
+        # 字段间一致性冲突（envelope/record/evidence 必须三方一致）
+        {'schema': 2, 'base_dedup_key': 'k1', 'settlement_id': 's',
+         'record': {'base_dedup_key': 'k2', 'settlement_id': 's', 'mode': 'LIMIT'},
+         'evidence': {'base_dedup_key': 'k1', 'settlement_id': 's', 'mode': 'LIMIT'},
+         'stats_committed': False},
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's1',
+         'record': {'base_dedup_key': 'k', 'settlement_id': 's2', 'mode': 'LIMIT'},
+         'evidence': {'base_dedup_key': 'k', 'settlement_id': 's1', 'mode': 'LIMIT'},
+         'stats_committed': False},
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's',
+         'record': {'base_dedup_key': 'k', 'settlement_id': 's', 'mode': 'LIMIT'},
+         'evidence': {'base_dedup_key': 'k', 'settlement_id': 's', 'mode': 'MARKET'},
+         'stats_committed': False},
         'not-a-dict', [], 123, None,
     ]
     for bad in bad_cases:
@@ -849,7 +870,7 @@ def test_market_recovery_entry_unknown_blocks_cancel_and_stats():
     **不得撤 SL/TP、不得写 stats**。
     背景：此前 ENTRY 逐单确认 gate 只存在于 close_position_market 调用点，崩溃
     恢复直接进入共享 finalizer 只跑通用 converge，没有「ENTRY 未确认前不得撤
-    SL/TP」的顺序保证。现已收归 _reconcile_market_remaining_orders。
+    SL/TP」的顺序保证。现已由 _verify_market_entry_gate 统一守护。
     必须经**真实恢复入口** _resume_pending_settlement 调用（不传 mode 形参），
     finalizer 必须从持久化 outbox 自动派生 mode='MARKET'，触发 ENTRY gate。"""
     t, ex = make_trader(tempfile.mkdtemp(prefix='v2a_'))
@@ -925,6 +946,19 @@ def test_begin_does_not_overwrite_malformed_outbox():
          'evidence': {'mode': 'LIMIT'}},
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
          'evidence': {'mode': 'LIMIT'}, 'stats_committed': 'not_bool'},
+        # 字段间一致性冲突（envelope/record/evidence 必须三方一致）
+        {'schema': 2, 'base_dedup_key': 'k1', 'settlement_id': 's',
+         'record': {'base_dedup_key': 'k2', 'settlement_id': 's', 'mode': 'LIMIT'},
+         'evidence': {'base_dedup_key': 'k1', 'settlement_id': 's', 'mode': 'LIMIT'},
+         'stats_committed': False},
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's1',
+         'record': {'base_dedup_key': 'k', 'settlement_id': 's2', 'mode': 'LIMIT'},
+         'evidence': {'base_dedup_key': 'k', 'settlement_id': 's1', 'mode': 'LIMIT'},
+         'stats_committed': False},
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's',
+         'record': {'base_dedup_key': 'k', 'settlement_id': 's', 'mode': 'LIMIT'},
+         'evidence': {'base_dedup_key': 'k', 'settlement_id': 's', 'mode': 'MARKET'},
+         'stats_committed': False},
         'not-a-dict', [], 123, None,
     ]
     for bad in bad_cases:
@@ -992,6 +1026,69 @@ def test_converge_side_conflict_blocks_clear():
         f'outbox={SELL}/batch={BUY} 冲突必须拒绝收敛: {result}'
 
 
+def test_claim_fields_whitelist_and_boolean_true_strictness():
+    """项3专项：claim_fields 白名单与布尔 True 严苛性。
+    (a) 非白名单字段（如 close_phase）必须被拒绝，严禁外部注入批次状态；
+    (b) 白名单字段值不是严格 is True（False/1/0/'True'/None）必须被拒绝；
+    (c) 拒绝路径必须零落盘（磁盘保留原样，无 outbox，不被污染）；
+    (d) 正常白名单字段通过时，BEGIN 固定字段（close_phase=2）绝不被覆盖。"""
+    t, _ = make_trader(tempfile.mkdtemp(prefix='v2a_'))
+    b = _lp_batch(net=0.002, reason='limit_pending_normal')
+    b['close_op_id'] = OP
+    b['limit_close_order_id'] = 'L1'
+
+    # (a) 非白名单字段注入拒绝（含曾短暂在白名单的 close_phase）
+    for bad_claim in (
+        {'close_phase': 2},
+        {'close_phase': True},
+        {'status': 'closed'},
+        {'arbitrary_key': True},
+        {'close_phase': 2, 'settled_by_limit_close': True},
+    ):
+        _state_write(t, _single(copy.deepcopy(b)))
+        rec = t._atomic_outbox_begin(
+            batch_id=BID, symbol=SYM, mode='LIMIT', generation='L1',
+            exit_order_ref={'kind': 'regular', 'order_id': 'L1'},
+            observed_qty=0.002, exit_price=76500.0,
+            expected_qty=0.002, net_cost=153.24, entry_fee_estimate=0.15,
+            claim_fields=bad_claim)
+        assert rec is None, f'非白名单 claim_fields 必须拒绝: {bad_claim!r}'
+        bb = _state_read(t)[SYM][BID]
+        assert bb.get('pending_settlement') is None, '不得写 outbox'
+        assert int(bb.get('close_phase', 0) or 0) != 2, '不得被改 phase'
+
+    # (b) 白名单合法字段，但值非严格 True（is True，而非真值）
+    for bad_val in (False, 1, 0, 'True', '1', None, [], {}):
+        _state_write(t, _single(copy.deepcopy(b)))
+        rec = t._atomic_outbox_begin(
+            batch_id=BID, symbol=SYM, mode='LIMIT', generation='L1',
+            exit_order_ref={'kind': 'regular', 'order_id': 'L1'},
+            observed_qty=0.002, exit_price=76500.0,
+            expected_qty=0.002, net_cost=153.24, entry_fee_estimate=0.15,
+            claim_fields={'settled_by_limit_close': bad_val})
+        assert rec is None, f'claim_fields 值非严格 True 必须拒绝: {bad_val!r}'
+        bb = _state_read(t)[SYM][BID]
+        assert bb.get('pending_settlement') is None, '不得写 outbox'
+
+    # (c) 合法白名单：{'settled_by_limit_close': True, 'is_programmatic_cancel': True}
+    _state_write(t, _single(copy.deepcopy(b)))
+    rec = t._atomic_outbox_begin(
+        batch_id=BID, symbol=SYM, mode='LIMIT', generation='L1',
+        exit_order_ref={'kind': 'regular', 'order_id': 'L1'},
+        observed_qty=0.002, exit_price=76500.0,
+        expected_qty=0.002, net_cost=153.24, entry_fee_estimate=0.15,
+        claim_fields={'settled_by_limit_close': True,
+                      'is_programmatic_cancel': True})
+    assert isinstance(rec, dict), '合法 claim_fields 应成功'
+    bb = _state_read(t)[SYM][BID]
+    assert bb.get('settled_by_limit_close') is True
+    assert bb.get('is_programmatic_cancel') is True
+    # BEGIN 固定状态必须正确落盘
+    assert int(bb.get('close_phase', 0) or 0) == 2
+    assert bb.get('pending_close') is True
+    assert bb.get('close_reason') == 'settlement_pending'
+
+
 # ───────────────────────── 生产文件免疫 ─────────────────────────
 
 def test_production_files_untouched():
@@ -1030,6 +1127,7 @@ TESTS = [
     test_missing_side_is_disputed_never_defaults_buy,
     test_entry_order_refs_are_algo_not_regular,
     test_limit_no_durable_phase2_without_outbox,
+    test_claim_fields_whitelist_and_boolean_true_strictness,
     test_production_files_untouched,
 ]
 
