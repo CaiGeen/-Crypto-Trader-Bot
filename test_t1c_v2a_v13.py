@@ -172,6 +172,7 @@ def test_market_close_writes_real_v2_stats():
 # ───────────────────────── T2：DISPUTED 证据矩阵（零猜测） ─────────────────────────
 
 def _evidence_ok(t, **over):
+    """返回完整的 SettlementRecord（单一事实源，无 evidence）。"""
     base = dict(batch_id=BID, symbol=SYM, side='BUY', mode='LIMIT',
                 base_dedup_key=f'{SYM}:L1', settlement_id='v2a_x',
                 exit_order_ref={'kind': 'regular', 'order_id': 'L1'},
@@ -180,7 +181,7 @@ def _evidence_ok(t, **over):
                 expected_qty=0.002, observed_qty=0.002, net_cost=153.24,
                 exit_price=76500.0, generation='L1')
     base.update(over)
-    return t._build_settlement_evidence(**base)
+    return t._build_settlement_record(**base)
 
 
 def test_disputed_evidence_matrix_no_silent_zero():
@@ -199,7 +200,7 @@ def test_disputed_evidence_matrix_no_silent_zero():
         'generation 空': dict(generation=''),
     }
     for name, over in matrix.items():
-        rec = _evidence_ok(t, **over)['record']
+        rec = _evidence_ok(t, **over)
         assert rec.get('core_status') == 'DISPUTED', \
             f'[{name}] 应 DISPUTED: {rec}'
         assert rec.get('net_pnl_estimate') is None, \
@@ -212,7 +213,7 @@ def test_disputed_evidence_matrix_no_silent_zero():
 def test_proven_evidence_requires_all_fields():
     """T2 反例：全部资格齐备 → PROVEN 且 net_pnl_estimate 为有限浮点。"""
     t, _ = make_trader(tempfile.mkdtemp(prefix='v2a_'))
-    rec = _evidence_ok(t)['record']
+    rec = _evidence_ok(t)
     assert rec.get('core_status') == 'PROVEN', rec
     assert isinstance(rec.get('net_pnl_estimate'), float), rec
 
@@ -250,7 +251,7 @@ def test_disputed_flow_keeps_batch_and_none_pnl():
 # ───────────────────────── T4：§9 财务授权门（Fail-Closed） ─────────────────────────
 
 def _write_outbox(t, *, core_status='PROVEN', stats_committed=True, dedup=f'{SYM}:L1',
-                  disputed=False):
+                  disputed=False, mode='LIMIT'):
     b = _lp_batch(net=0.002, reason='limit_pending_normal')
     b['close_op_id'] = OP
     b['limit_close_order_id'] = 'L1'
@@ -260,16 +261,33 @@ def _write_outbox(t, *, core_status='PROVEN', stats_committed=True, dedup=f'{SYM
     rec = {
         'record_type': 'settlement_dispute' if disputed else 'settlement',
         'core_status': core_status,
+        'quantity_status': core_status,
+        'cost_basis_status': core_status,
+        'pnl_status': 'DISPUTED' if disputed else 'ESTIMATED',
+        'fee_status': 'ESTIMATED',
         'net_pnl_estimate': None if disputed else 0.5,
+        'gross_pnl': None,
         'base_dedup_key': dedup, 'dedup_key': dedup,
         'settlement_id': _sid, 'batch_id': BID, 'symbol': SYM,
-        'mode': 'LIMIT',
+        'side': 'BUY', 'mode': mode,
+        'entry_order_refs': [{'kind': 'regular', 'order_id': 'E1',
+                               'expected_qty': 0.002}],
+        'exit_order_ref': {'kind': 'regular', 'order_id': 'L1'},
+        'expected_qty': 0.002, 'observed_qty': 0.002,
+        'amount': 0.002, 'net_cost': 153.24,
+        'avg_entry': 76620.0,
+        'exit_price': 76500.0,
+        'entry_fee_estimate': 0.15, 'exit_fee_estimate': 0.15,
+        'fee_risk_basis': {'allocation_status': 'PROVEN', 'allocation_policy': 'PROVEN',
+                           'covered': True},
+        'generation': 'L1',
+        'dispute_reasons': ['test_dispute'] if disputed else [],
     }
+    if not disputed and core_status == 'PROVEN':
+        rec['net_pnl'] = 0.5
     b['pending_settlement'] = {
         'schema': 2, 'base_dedup_key': dedup, 'settlement_id': _sid,
         'record': rec,
-        'evidence': {'mode': 'LIMIT', 'base_dedup_key': dedup,
-                     'settlement_id': _sid},
         'stats_committed': stats_committed,
     }
     _state_write(t, _single(b))
@@ -352,7 +370,7 @@ def test_fee_mode_maker_for_limit_taker_for_others():
                                 ('TP', trader_260725.TAKER_FEE_RATE),
                                 ('SL', trader_260725.TAKER_FEE_RATE),
                                 ('MARKET', trader_260725.TAKER_FEE_RATE)):
-        rec = _evidence_ok(t, mode=mode)['record']
+        rec = _evidence_ok(t, mode=mode)
         assert rec.get('core_status') == 'PROVEN', rec
         assert rec.get('mode') == mode, rec
         # 复算：估算出场费 = exit_notional * 预期费率（_build_settlement_evidence 内部 _exit_rate）
@@ -428,20 +446,20 @@ def test_disputed_terminal_idempotent_across_rounds():
       ④ 不 clear（批次仍 active，close_reason='settlement_disputed'）；
       ⑤ 每轮稳定返回 SETTLE_MANUAL_REVIEW（终态 → 调用方停止重试）。"""
     t, ex = _mk_disputed_env()
-    # spy：BEGIN / evidence 构造次数——进入终态后必须完全不再发生（活锁根因）
-    _calls = {'begin': 0, 'evidence': 0}
-    _real_begin, _real_ev = t._atomic_outbox_begin, t._build_settlement_evidence
+    # spy：BEGIN / record 构造次数——进入终态后必须完全不再发生（活锁根因）
+    _calls = {'begin': 0, 'record': 0}
+    _real_begin, _real_ev = t._atomic_outbox_begin, t._build_settlement_record
 
     def _spy_begin(*a, **k):
         _calls['begin'] += 1
         return _real_begin(*a, **k)
 
     def _spy_ev(*a, **k):
-        _calls['evidence'] += 1
+        _calls['record'] += 1
         return _real_ev(*a, **k)
 
     t._atomic_outbox_begin = _spy_begin
-    t._build_settlement_evidence = _spy_ev
+    t._build_settlement_record = _spy_ev
     with mock.patch.object(t, '_derive_entry_order_refs', return_value=[]):
         st1, _ = t._finalize_limit_full_fill(SYM, BID, 'L1')
     assert st1 == trader_260725.SETTLE_MANUAL_REVIEW, st1
@@ -467,9 +485,9 @@ def test_disputed_terminal_idempotent_across_rounds():
     bb = _state_read(t).get(SYM, {}).get(BID)
     assert bb is not None and bb.get('is_active'), '④ DISPUTED 不得 clear 批次'
     assert bb.get('close_reason') == 'settlement_disputed', bb
-    # ⑥ 终态短路必须在 BEGIN 之前生效：后续轮次一次都不许再 BEGIN / 构造 evidence
+    # ⑥ 终态短路必须在 BEGIN 之前生效：后续轮次一次都不许再 BEGIN / 构造 record
     assert _calls['begin'] == 1, f'⑥ 终态后不得再调 BEGIN（会重建 outbox）: {_calls}'
-    assert _calls['evidence'] == 1, f'⑥ 终态后不得再构造 evidence: {_calls}'
+    assert _calls['record'] == 1, f'⑥ 终态后不得再构造 record: {_calls}'
 
 
 def test_atomic_begin_reuses_same_dedup_outbox():
@@ -635,9 +653,9 @@ def test_malformed_outbox_cannot_be_dropped_or_bypass_gate():
     (a) _merge_batch_state 不得静默删除畸形磁盘 outbox；
     (b) 畸形结构不得回落旧 P5h 四元门绕过 §9 财务授权门。
     覆盖全部值对象契约缺失：schema!=2、settlement_id 缺失/非空字符串、
-    evidence 缺失/非 dict、evidence.mode 非法、stats_committed 缺失/非 bool、
-    以及 envelope/record/evidence 三方字段间一致性冲突（base_dedup_key、
-    settlement_id、mode 三项必须三方一致）。"""
+    record 缺失/非 dict、record.mode 非法、stats_committed 缺失/非 bool、
+    以及 envelope/record 字段间一致性冲突（base_dedup_key、
+    settlement_id、mode 三项必须在 envelope 与 record 间一致）。"""
     t, _ = make_trader(tempfile.mkdtemp(prefix='v2a_'))
     b = _lp_batch(net=0.002, reason='limit_pending_normal')
     b['close_op_id'] = OP
@@ -649,41 +667,36 @@ def test_malformed_outbox_cannot_be_dropped_or_bypass_gate():
         {'base_dedup_key': 123},
         # 缺 schema 或 schema!=2
         {'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
-         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+         'stats_committed': False},
         {'schema': 1, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
-         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+         'stats_committed': False},
         # 缺 settlement_id 或非法
         {'schema': 2, 'base_dedup_key': 'k', 'record': {},
-         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+         'stats_committed': False},
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': '', 'record': {},
-         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+         'stats_committed': False},
         # 缺 record 或非 dict
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': None,
-         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
-        # 缺 evidence 或非 dict 或 mode 非法
-        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
          'stats_committed': False},
-        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
-         'evidence': 'not_dict', 'stats_committed': False},
-        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
-         'evidence': {'mode': 'UNKNOWN'}, 'stats_committed': False},
+        # record.mode 非法
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's',
+         'record': {'mode': 'UNKNOWN'}, 'stats_committed': False},
         # stats_committed 缺失或非 bool
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
-         'evidence': {'mode': 'LIMIT'}},
+         },
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
-         'evidence': {'mode': 'LIMIT'}, 'stats_committed': 'not_bool'},
-        # 字段间一致性冲突（envelope/record/evidence 必须三方一致）
+         'stats_committed': 'not_bool'},
+        # 字段间一致性冲突（envelope.base_dedup_key == record.base_dedup_key 校验）
         {'schema': 2, 'base_dedup_key': 'k1', 'settlement_id': 's',
          'record': {'base_dedup_key': 'k2', 'settlement_id': 's', 'mode': 'LIMIT'},
-         'evidence': {'base_dedup_key': 'k1', 'settlement_id': 's', 'mode': 'LIMIT'},
          'stats_committed': False},
+        # envelope.settlement_id == record.settlement_id 校验
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's1',
          'record': {'base_dedup_key': 'k', 'settlement_id': 's2', 'mode': 'LIMIT'},
-         'evidence': {'base_dedup_key': 'k', 'settlement_id': 's1', 'mode': 'LIMIT'},
          'stats_committed': False},
+        # envelope.base_dedup_key == record.mode 校验（跨字段一致性）
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's',
-         'record': {'base_dedup_key': 'k', 'settlement_id': 's', 'mode': 'LIMIT'},
-         'evidence': {'base_dedup_key': 'k', 'settlement_id': 's', 'mode': 'MARKET'},
+         'record': {'base_dedup_key': 'k', 'settlement_id': 's', 'mode': 'MARKET'},
          'stats_committed': False},
         'not-a-dict', [], 123, None,
     ]
@@ -763,7 +776,7 @@ def test_entry_order_refs_are_algo_not_regular():
         expected_qty=0.002, net_cost=153.24, entry_fee_estimate=0.15)
     assert isinstance(rec, dict), rec
     ob = _state_read(t)[SYM][BID]['pending_settlement']
-    ev_refs = ob['evidence']['entry_order_refs']
+    ev_refs = ob['record']['entry_order_refs']
     assert ev_refs and all(r.get('kind') == 'algo' for r in ev_refs), \
         f'落盘 ENTRY 引用必须全部为 algo: {ev_refs}'
 
@@ -910,7 +923,7 @@ def test_begin_does_not_overwrite_malformed_outbox():
     """反例④-补：畸形 outbox 调用 BEGIN **不得被覆盖**。
     BEGIN 此前只识别「有效 dict + dedup」，`{}`/`None`/`[]` 等被当作 EMPTY
     直接重建——UNKNOWN 被当成 EMPTY，不可辨认的结算现场被抹掉。
-    涵盖完整值对象校验（schema/settlement_id/evidence/stats_committed）。"""
+    涵盖完整值对象校验（schema/settlement_id/record/stats_committed）。"""
     t, _ = make_trader(tempfile.mkdtemp(prefix='v2a_'))
     b = _lp_batch(net=0.002, reason='limit_pending_normal')
     b['close_op_id'] = OP
@@ -923,41 +936,36 @@ def test_begin_does_not_overwrite_malformed_outbox():
         {'base_dedup_key': 'x'},
         # 缺 schema 或 schema!=2
         {'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
-         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+         'stats_committed': False},
         {'schema': 1, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
-         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+         'stats_committed': False},
         # 缺 settlement_id 或非法
         {'schema': 2, 'base_dedup_key': 'k', 'record': {},
-         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+         'stats_committed': False},
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': '', 'record': {},
-         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
+         'stats_committed': False},
         # 缺 record 或非 dict
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': None,
-         'evidence': {'mode': 'LIMIT'}, 'stats_committed': False},
-        # 缺 evidence 或非 dict 或 mode 非法
-        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
          'stats_committed': False},
-        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
-         'evidence': 'not_dict', 'stats_committed': False},
-        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
-         'evidence': {'mode': 'UNKNOWN'}, 'stats_committed': False},
+        # record.mode 非法
+        {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's',
+         'record': {'mode': 'UNKNOWN'}, 'stats_committed': False},
         # stats_committed 缺失或非 bool
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
-         'evidence': {'mode': 'LIMIT'}},
+         },
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's', 'record': {},
-         'evidence': {'mode': 'LIMIT'}, 'stats_committed': 'not_bool'},
-        # 字段间一致性冲突（envelope/record/evidence 必须三方一致）
+         'stats_committed': 'not_bool'},
+        # 字段间一致性冲突（envelope.base_dedup_key == record.base_dedup_key 校验）
         {'schema': 2, 'base_dedup_key': 'k1', 'settlement_id': 's',
          'record': {'base_dedup_key': 'k2', 'settlement_id': 's', 'mode': 'LIMIT'},
-         'evidence': {'base_dedup_key': 'k1', 'settlement_id': 's', 'mode': 'LIMIT'},
          'stats_committed': False},
+        # envelope.settlement_id == record.settlement_id 校验
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's1',
          'record': {'base_dedup_key': 'k', 'settlement_id': 's2', 'mode': 'LIMIT'},
-         'evidence': {'base_dedup_key': 'k', 'settlement_id': 's1', 'mode': 'LIMIT'},
          'stats_committed': False},
+        # envelope.base_dedup_key == record.mode 校验（跨字段一致性）
         {'schema': 2, 'base_dedup_key': 'k', 'settlement_id': 's',
-         'record': {'base_dedup_key': 'k', 'settlement_id': 's', 'mode': 'LIMIT'},
-         'evidence': {'base_dedup_key': 'k', 'settlement_id': 's', 'mode': 'MARKET'},
+         'record': {'base_dedup_key': 'k', 'settlement_id': 's', 'mode': 'MARKET'},
          'stats_committed': False},
         'not-a-dict', [], 123, None,
     ]
@@ -986,9 +994,9 @@ def test_converge_uses_outbox_evidence_side_not_buy_default():
                      'positionSide': 'LONG'}]
     rec = _mk_proven_outbox(t)
     assert isinstance(rec, dict), rec
-    # 模拟：批次 side 丢失，但不可变 outbox evidence 已固化 SELL
+    # 模拟：批次 side 丢失，但不可变 outbox record 已固化 SELL
     st_now = _state_read(t)
-    st_now[SYM][BID]['pending_settlement']['evidence']['side'] = 'SELL'
+    st_now[SYM][BID]['pending_settlement']['record']['side'] = 'SELL'
     st_now[SYM][BID]['side'] = ''
     _state_write(t, st_now)
 
@@ -997,7 +1005,7 @@ def test_converge_uses_outbox_evidence_side_not_buy_default():
         seen.setdefault('side', side), 0.0)[1]
     t._converge_batch_orders_before_clear(SYM, BID)
     assert seen.get('side') == 'SELL', \
-        f'converge 必须取 outbox evidence 的 SELL，不得默认 BUY: {seen}'
+        f'converge 必须取 outbox record 的 SELL，不得默认 BUY: {seen}'
 
 
 def test_converge_side_conflict_blocks_clear():
@@ -1016,9 +1024,9 @@ def test_converge_side_conflict_blocks_clear():
                     'positionSide': 'LONG'}]
     rec = _mk_proven_outbox(t)
     assert isinstance(rec, dict), rec
-    # outbox evidence 已固化 SELL，批次 side 被意外污染为 BUY（合法但冲突）
+    # outbox record 已固化 SELL，批次 side 被意外污染为 BUY（合法但冲突）
     st_now = _state_read(t)
-    st_now[SYM][BID]['pending_settlement']['evidence']['side'] = 'SELL'
+    st_now[SYM][BID]['pending_settlement']['record']['side'] = 'SELL'
     st_now[SYM][BID]['side'] = 'BUY'   # 冲突！
     _state_write(t, st_now)
     result = t._converge_batch_orders_before_clear(SYM, BID)

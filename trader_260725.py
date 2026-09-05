@@ -1071,6 +1071,21 @@ class CryptoTrader:
         alert_msg = None
         result = False
         try:
+            # ⑩ Fail-Closed：stats 写盘前先用统一语义校验器把关。
+            #    record 不通过 = 不落盘、不激活、零副作用（与 _atomic_outbox_begin
+            #    / _merge_batch_state / _try_finalize_outbox 同口径；单一事实源
+            #    集中收口后 trade_stats.json 是 record 唯一落点）。
+            if not self._validate_settlement_record(record):
+                alert_msg = ("🚨【v2A】_record_settlement_v2 拒写：record 语义校验未通过，"
+                             "已拒绝 trade_stats.json 落盘（Fail-Closed）。\n"
+                             "💡 检查 record 字段完整性：core_status/quantity_status/"
+                             "dedup_key/base_dedup_key/settlement_id/mode/费用/numeric 有限性。")
+                print(alert_msg)
+                try:
+                    self.send_tg_notification(alert_msg, level='critical')
+                except Exception:
+                    pass
+                return False
             base_dir = os.path.dirname(os.path.abspath(__file__))
             stats_file = stats_file or os.path.join(base_dir, "trade_stats.json")
             with self._state_lock:
@@ -1210,33 +1225,39 @@ class CryptoTrader:
             refs.append({'kind': 'algo', 'order_id': oid_s, 'expected_qty': qty})
         return refs
 
-    def _build_settlement_evidence(self, *, batch_id, symbol, side, mode,
-                                   base_dedup_key, settlement_id, exit_order_ref,
-                                   entry_order_refs, expected_qty, observed_qty,
-                                   net_cost, exit_price, generation,
-                                   entry_fee_estimate=None, exit_fee_estimate=None):
-        """§4 唯一结算证据对象（不可变，零猜测）。任一核心资格缺失 → DISPUTED：
-        side 非 BUY/SELL、exit_ref 缺 id/类型、expected/observed 非有限或 ≤0 或超容差、
-        net_cost 非有限或 ≤0、exit_price 非有限或 ≤0、入场引用空/不完整/逐层 qty 缺失、
-        generation 空。PROVEN 才计算 gross_pnl/net_pnl_estimate；DISPUTED 不写权威 net_pnl。
-        出场费率（§5.3）：TP/SL/MARKET 条件单 → Taker；LIMIT 普通限价 → Maker。"""
+    def _build_settlement_record(self, *, batch_id, symbol, side, mode,
+                                  base_dedup_key, settlement_id, exit_order_ref,
+                                  entry_order_refs, expected_qty, observed_qty,
+                                  net_cost, exit_price, generation,
+                                  entry_fee_estimate=None, exit_fee_estimate=None):
+        """§4 Durable SettlementRecord（ChatGPT 2026-09-05 终签）。
+
+        单一事实源：record = 唯一完整结算事实，outbox 只保留 envelope
+        (schema/base_dedup_key/settlement_id/record/stats_committed)。
+        不再维护 record + evidence 双事实源。
+
+        状态独立计算（ChatGPT 裁定 2026-09-05）：
+          _qty_proven     = _exp_ok ∧ _obs_ok ∧ |expected-observed| ≤ tol
+          _cost_proven    = _qty_proven ∧ _net_cost_ok
+          _core_proven    = _qty_proven ∧ _cost_proven ∧ _side_ok
+                            ∧ _refs_ok ∧ _exit_price_ok ∧ _generation_ok
+
+        quantity_status  与 core_status 解耦：即使 core DISPUTED，
+        若数量本身在容差内（_qty_proven）仍可标记 PROVEN，保留人工核对粒度。
+
+        PROVEN 才计算 gross_pnl/net_pnl_estimate；DISPUTED 不写权威 net_pnl。"""
         reasons = []
+
         def _bad(cond, why):
             if cond:
                 reasons.append(why)
-        _bad(side not in ('BUY', 'SELL'), 'side')
-        _bad(not (isinstance(exit_order_ref, dict)
-                  and str(exit_order_ref.get('order_id') or '').strip()
-                  and exit_order_ref.get('kind') in ('regular', 'algo')), 'exit_ref')
+
+        # 资格计算
+        _side_ok = side in ('BUY', 'SELL')
         _exp_ok = self._v2a_is_finite(expected_qty) and float(expected_qty) > 0
         _obs_ok = self._v2a_is_finite(observed_qty) and float(observed_qty) > 0
-        _bad(not _exp_ok, 'expected_qty')
-        _bad(not _obs_ok, 'observed_qty')
-        if _exp_ok and _obs_ok:
-            _tol = max(1e-9, 1e-6 * float(expected_qty))
-            _bad(abs(float(expected_qty) - float(observed_qty)) > _tol, 'qty_mismatch')
-        _bad(not (self._v2a_is_finite(net_cost) and float(net_cost) > 0), 'net_cost')
-        _bad(not (self._v2a_is_finite(exit_price) and float(exit_price) > 0), 'exit_price')
+        _net_cost_ok = self._v2a_is_finite(net_cost) and float(net_cost) > 0
+        _exit_price_ok = self._v2a_is_finite(exit_price) and float(exit_price) > 0
         _refs_ok = bool(entry_order_refs) and all(
             isinstance(r, dict)
             and r.get('kind') in ('regular', 'algo')
@@ -1244,75 +1265,121 @@ class CryptoTrader:
             and self._v2a_is_finite(r.get('expected_qty'))
             and float(r.get('expected_qty', 0) or 0) > 0
             for r in entry_order_refs)
-        _bad(not _refs_ok, 'entry_refs')
-        _bad(generation in (None, '', 0), 'generation')
-        core_status = 'PROVEN' if not reasons else 'DISPUTED'
+        _exit_ref_ok = (isinstance(exit_order_ref, dict)
+                        and bool(str(exit_order_ref.get('order_id') or '').strip())
+                        and exit_order_ref.get('kind') in ('regular', 'algo'))
+        _gen_ok = generation not in (None, '', 0)
 
+        _bad(not _side_ok, 'side')
+        _bad(not _exit_ref_ok, 'exit_ref')
+        _bad(not _exp_ok, 'expected_qty')
+        _bad(not _obs_ok, 'observed_qty')
+        _bad(not _net_cost_ok, 'net_cost')
+        _bad(not _exit_price_ok, 'exit_price')
+        _bad(not _refs_ok, 'entry_refs')
+        _bad(not _gen_ok, 'generation')
+
+        # 独立数量判据（裁定 2026-09-05：qty 与 core 解耦）
+        _qty_proven = False
+        if _exp_ok and _obs_ok:
+            _tol = max(1e-9, 1e-6 * abs(float(expected_qty)))
+            _qty_proven = abs(float(expected_qty) - float(observed_qty)) <= _tol
+            if not _qty_proven:
+                _bad(True, 'qty_mismatch')
+
+        _cost_proven = _qty_proven and _net_cost_ok
+        _core_proven = (_qty_proven and _cost_proven and _side_ok
+                        and _exit_price_ok and _refs_ok and _gen_ok
+                        and _exit_ref_ok)
+
+        core_status = 'PROVEN' if _core_proven else 'DISPUTED'
+        quantity_status = 'PROVEN' if _qty_proven else 'DISPUTED'
+        cost_basis_status = 'PROVEN' if _cost_proven else 'DISPUTED'
+        pnl_status = 'ESTIMATED' if _core_proven else 'DISPUTED'
+
+        # 数值计算（仅 PROVEN）
         avg_entry = 0.0
         gross_pnl = None
-        if core_status == 'PROVEN':
+        net_pnl_estimate = None
+        if _core_proven:
             avg_entry = float(net_cost) / float(expected_qty)
             if side == 'BUY':
                 gross_pnl = (float(exit_price) - avg_entry) * float(observed_qty)
             else:
                 gross_pnl = (avg_entry - float(exit_price)) * float(observed_qty)
-        _exit_rate = TAKER_FEE_RATE if mode in ('TP', 'SL', 'MARKET') else MAKER_FEE_RATE
-        exit_notional = float(exit_price) * float(observed_qty) if _obs_ok else 0.0
-        if exit_fee_estimate is None:
-            exit_fee_estimate = exit_notional * _exit_rate
-        if entry_fee_estimate is None:
-            entry_fee_estimate = 0.0
-        net_pnl_estimate = None
-        if core_status == 'PROVEN':
+            _exit_rate = (TAKER_FEE_RATE if mode in ('TP', 'SL', 'MARKET')
+                         else MAKER_FEE_RATE)
+            exit_notional = float(exit_price) * float(observed_qty)
+            if exit_fee_estimate is None:
+                exit_fee_estimate = exit_notional * _exit_rate
+            if entry_fee_estimate is None:
+                entry_fee_estimate = 0.0
             net_pnl_estimate = (gross_pnl - float(entry_fee_estimate)
-                                - float(exit_fee_estimate))
-        now = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
-        record = {
-            'record_type': 'settlement' if core_status == 'PROVEN' else 'settlement_dispute',
-            'core_status': core_status,
-            'quantity_status': ('PROVEN' if (_exp_ok and _obs_ok) else 'DISPUTED'),
-            'cost_basis_status': ('PROVEN' if core_status == 'PROVEN' else 'DISPUTED'),
-            'pnl_status': ('ESTIMATED' if core_status == 'PROVEN' else 'DISPUTED'),
-            'fee_status': 'ESTIMATED',
-            'base_dedup_key': base_dedup_key,
-            'dedup_key': base_dedup_key, 'settlement_id': settlement_id,
-            'batch_id': batch_id, 'symbol': symbol, 'side': side, 'mode': mode,
-            'amount': (round(float(observed_qty), 6) if _obs_ok else None),
-            'avg_price': (round(avg_entry, 6) if core_status == 'PROVEN' else None),
-            'exit_price': (round(float(exit_price), 6)
-                           if self._v2a_is_finite(exit_price) else None),
-            'gross_pnl': (round(gross_pnl, 6) if gross_pnl is not None else None),
-            'net_pnl_estimate': (round(net_pnl_estimate, 6)
-                                 if net_pnl_estimate is not None else None),
-            'time': now,
-        }
-        if core_status == 'PROVEN':
-            # legacy 兼容别名（日报/D-006 现役消费者）：PROVEN 才写，DISPUTED 永不写权威值
-            record['net_pnl'] = record['net_pnl_estimate']
+                                  - float(exit_fee_estimate))
         else:
-            record['dispute_reasons'] = reasons
-        evidence = {
-            'schema': 2, 'batch_id': batch_id, 'symbol': symbol, 'side': side,
-            'mode': mode, 'base_dedup_key': base_dedup_key,
-            'settlement_id': settlement_id, 'exit_order_ref': exit_order_ref,
+            exit_notional = 0.0
+
+        now = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
+
+        record = {
+            # Schema + 枚举
+            'schema': 2,
+            'record_type': 'settlement' if _core_proven else 'settlement_dispute',
+            'core_status': core_status,
+            'quantity_status': quantity_status,
+            'cost_basis_status': cost_basis_status,
+            'pnl_status': pnl_status,
+            'fee_status': 'ESTIMATED',
+
+            # 身份
+            'base_dedup_key': base_dedup_key,
+            'dedup_key': base_dedup_key,
+            'settlement_id': settlement_id,
+            'batch_id': batch_id,
+            'symbol': symbol,
+            'side': side,
+            'mode': mode,
+            'generation': generation,
+
+            # 引用
             'entry_order_refs': entry_order_refs,
+            'exit_order_ref': exit_order_ref,
+
+            # 数量与价格
             'expected_qty': (float(expected_qty) if _exp_ok else None),
             'observed_qty': (float(observed_qty) if _obs_ok else None),
-            'net_cost': (float(net_cost) if self._v2a_is_finite(net_cost) else None),
-            'exit_price': (float(exit_price) if self._v2a_is_finite(exit_price) else None),
-            'avg_entry': avg_entry,
+            'amount': (round(float(observed_qty), 6) if _obs_ok else None),
+            'net_cost': (float(net_cost) if _net_cost_ok else None),
+            'avg_price': (round(avg_entry, 6) if _core_proven else None),
+            'exit_price': (round(float(exit_price), 6)
+                           if _exit_price_ok else None),
+            'gross_pnl': (round(gross_pnl, 6) if gross_pnl is not None else None),
+
+            # 手续费
             'entry_fee_estimate': entry_fee_estimate,
             'exit_fee_estimate': exit_fee_estimate,
             'fee_risk_basis': {
-                'entry_notional': (float(net_cost)
-                                   if self._v2a_is_finite(net_cost) else 0.0),
+                'entry_notional': (float(net_cost) if _net_cost_ok else 0.0),
                 'exit_notional': exit_notional,
-                'allocation_policy': 'CONSERVATIVE_FULL',
+                'allocation_status': 'CONSERVATIVE_FULL',
             },
-            'generation': generation, 'created_at': now,
+
+            # PnL（PROVEN 才写权威值）
+            'net_pnl_estimate': (round(net_pnl_estimate, 6)
+                                 if net_pnl_estimate is not None else None),
+
+            # 时间戳
+            'time': now,
         }
-        return {'schema': 2, 'base_dedup_key': base_dedup_key,
-                'settlement_id': settlement_id, 'record': record, 'evidence': evidence}
+
+        if _core_proven:
+            # legacy 兼容别名（日报/D-006 现役消费者）
+            record['net_pnl'] = record['net_pnl_estimate']
+        else:
+            record['dispute_reasons'] = reasons
+
+        # 返回单一 record（已含所有 durable 字段）
+        return record
 
     def _v2a_outbox_state(self, b):
         """统一 outbox 结构校验（裁定 2026-09-05：BEGIN / resume / merge / clear
@@ -1321,11 +1388,9 @@ class CryptoTrader:
         返回三态：
           MISSING    批次上**不存在** pending_settlement 字段 → EMPTY 语义，
                      允许 BEGIN 新建事务（legacy 无 outbox 路径保持原行为）。
-          VALID      结构合法：dict + schema=2 + base_dedup_key 非空字符串 +
-                     settlement_id 非空字符串 + record 为 dict + evidence 为
-                     dict（且 evidence.mode ∈ {LIMIT,SL,TP,MARKET}）+ stats_committed 为 bool
-                     + envelope/record/evidence 三方字段间一致
-                     (dedup/settlement_id/mode)。
+          VALID      结构与语义完全合法：dict + schema=2 + base_dedup_key 非空字符串 +
+                     settlement_id 非空字符串 + stats_committed 为 bool +
+                     record 满足 _validate_settlement_record 全部语义校验。
           MALFORMED  字段存在但任一要件不满足 → **UNKNOWN ≠ EMPTY**：
                      一律保留原值、loud 告警、拒绝覆盖（BEGIN）与 clear。
         """
@@ -1344,26 +1409,127 @@ class CryptoTrader:
             return V2A_OUTBOX_MALFORMED
         if not isinstance(ob.get('record'), dict):
             return V2A_OUTBOX_MALFORMED
-        ev = ob.get('evidence')
-        if not isinstance(ev, dict):
-            return V2A_OUTBOX_MALFORMED
-        ev_mode = ev.get('mode')
-        if ev_mode not in ('LIMIT', 'SL', 'TP', 'MARKET'):
-            return V2A_OUTBOX_MALFORMED
         if not isinstance(ob.get('stats_committed'), bool):
             return V2A_OUTBOX_MALFORMED
-        # 字段间一致性：envelope/record/evidence 三方 base_dedup_key / settlement_id
-        # / mode 必须完全一致，否则视为不可辨认的结算现场（防把 evidence=MARKET
-        # 的账本误配 record=LIMIT 后写进 stats）。
-        _rec = ob.get('record') or {}
-        _rec_dedup = _rec.get('base_dedup_key') or _rec.get('dedup_key')
-        if dedup != _rec_dedup or dedup != ev.get('base_dedup_key'):
-            return V2A_OUTBOX_MALFORMED
-        if sid != _rec.get('settlement_id') or sid != ev.get('settlement_id'):
-            return V2A_OUTBOX_MALFORMED
-        if _rec.get('mode') != ev_mode:
+        # 语义与状态完整性校验（ChatGPT 2026-09-05 终签：单一事实源）
+        if not self._validate_settlement_record(ob.get('record'), envelope=ob):
             return V2A_OUTBOX_MALFORMED
         return V2A_OUTBOX_VALID
+
+    def _validate_settlement_record(self, record, *, envelope=None):
+        """§7.2 Durable SettlementRecord 语义校验器（ChatGPT 2026-09-05 裁定）。
+
+        由 BEGIN / resume / merge / clear / _record_settlement_v2 共用。
+
+        核心校验维度：
+          1. 枚举完整性：core_status / record_type / quantity_status /
+             cost_basis_status / pnl_status / fee_status / mode
+          2. 跨字段一致性：record 与 envelope 身份一致（base_dedup_key/sid/mode）
+          3. 状态组合合法性：PROVEN vs DISPUTED 各自必须满足的约束
+          4. 数值有效性：所有浮点字段有限或 None（禁止 NaN/inf）
+          5. fee_risk_basis 完整性：结构完整、数值有限且非负
+          6. dedup_key 存在性：writer 不得仅凭 base_dedup_key 放行
+
+        返回 bool：True=校验通过；False=任一要件不满足（调用方必须 Fail-Closed：
+        零 stats、零 clear、零 activation、保留 outbox、loud 告警）。
+        """
+        if not isinstance(record, dict):
+            return False
+        # 1. 枚举完整性
+        if record.get('core_status') not in ('PROVEN', 'DISPUTED'):
+            return False
+        if record.get('record_type') not in ('settlement', 'settlement_dispute'):
+            return False
+        if record.get('quantity_status') not in ('PROVEN', 'DISPUTED'):
+            return False
+        if record.get('cost_basis_status') not in ('PROVEN', 'DISPUTED'):
+            return False
+        if record.get('pnl_status') not in ('ESTIMATED', 'DISPUTED'):
+            return False
+        if record.get('fee_status') != 'ESTIMATED':
+            return False
+        if record.get('mode') not in ('LIMIT', 'SL', 'TP', 'MARKET'):
+            return False
+
+        # 2. envelope 交叉校验（当 outbox 存在时强制执行）
+        if envelope is not None:
+            if envelope.get('base_dedup_key') != record.get('base_dedup_key'):
+                return False
+            if envelope.get('settlement_id') != record.get('settlement_id'):
+                return False
+            if record.get('mode') != (envelope.get('record') or {}).get('mode'):
+                return False
+
+        # 3. PROVEN 组合约束（全部子状态必须一致）
+        if record.get('core_status') == 'PROVEN':
+            if record.get('record_type') != 'settlement':
+                return False
+            if record.get('quantity_status') != 'PROVEN':
+                return False
+            if record.get('cost_basis_status') != 'PROVEN':
+                return False
+            if record.get('pnl_status') != 'ESTIMATED':
+                return False
+            # amount 必须等于 observed_qty（整数精度）
+            _obs = record.get('observed_qty')
+            _amt = record.get('amount')
+            if _obs is not None and _amt is not None:
+                if abs(float(_obs) - float(_amt)) > 1e-9:
+                    return False
+            # net_pnl 必须存在且等于 net_pnl_estimate
+            if 'net_pnl' not in record:
+                return False
+            if record.get('net_pnl') != record.get('net_pnl_estimate'):
+                return False
+            # dispute_reasons 必须为空 list
+            if record.get('dispute_reasons') not in ([], None):
+                return False
+            # 数量精度一致（容差内）
+            _exp = record.get('expected_qty')
+            if _exp is not None and _obs is not None:
+                _tol = max(1e-9, 1e-6 * abs(float(_exp)))
+                if abs(float(_exp) - float(_obs)) > _tol:
+                    return False
+            # 严禁 NaN/inf：所有浮点字段有限或 None
+            for _fname in ('amount', 'avg_price', 'exit_price', 'gross_pnl',
+                           'net_pnl_estimate', 'net_cost', 'expected_qty',
+                           'observed_qty', 'entry_fee_estimate', 'exit_fee_estimate'):
+                _v = record.get(_fname)
+                if _v is not None and not self._v2a_is_finite(_v):
+                    return False
+
+        # 4. DISPUTED 组合约束
+        elif record.get('core_status') == 'DISPUTED':
+            if record.get('record_type') != 'settlement_dispute':
+                return False
+            if record.get('pnl_status') != 'DISPUTED':
+                return False
+            # dispute_reasons 必须为非空 list
+            _dr = record.get('dispute_reasons')
+            if not isinstance(_dr, list) or len(_dr) == 0:
+                return False
+            # 严禁 net_pnl 键（DISPUTED 永不写权威 net_pnl）
+            if 'net_pnl' in record:
+                return False
+
+        # 5. fee_risk_basis 完整性（PROVEN 和 DISPUTED 均须有效）
+        _frb = record.get('fee_risk_basis')
+        if not isinstance(_frb, dict):
+            return False
+        for _fn in ('entry_notional', 'exit_notional'):
+            _fv = _frb.get(_fn)
+            if _fv is None:
+                continue   # DISPUTED 时可能缺失
+            if not self._v2a_is_finite(_fv) or _fv < 0:
+                return False
+        if _frb.get('allocation_status') not in ('PROVEN', 'CONSERVATIVE_FULL'):
+            return False
+
+        # 6. dedup_key 存在且等于 base_dedup_key（writer 不得仅凭 base 放行）
+        if record.get('dedup_key') != record.get('base_dedup_key'):
+            return False
+
+        return True
 
     def _atomic_outbox_begin(self, *, batch_id, symbol, mode, generation,
                              exit_order_ref, observed_qty, exit_price,
@@ -1378,7 +1544,7 @@ class CryptoTrader:
         ① 重读磁盘 ② 批次仍 active ③ 退出代际校验（LIMIT=limit_close_order_id ∧ close_op
         在册；SL=current_sl_id；TP=tp_order_id；MARKET=close_op_id）        ④ dedup 分派：不同 dedup 活动 outbox 拒绝；**同 dedup 复用原事务**（返回既有
         record，不重建 outbox、不重置 stats_committed——§8.3 DISPUTED 终态不被打回）
-        ⑤ 构造完整 evidence ⑥ 同一次 _persist_states 写 close_phase=2+pending_close=
+        ⑤ 构造完整 SettlementRecord（单一事实源）⑥ 同一次 _persist_states 写 close_phase=2+pending_close=
         True+close_reason='settlement_pending'+完整 outbox ⑦ 检查返回值。
         返回 outbox['record']（含 core_status）或 None（BEGIN 失败 → 调用方必须零 stats、
         零 clear、保留恢复能力，不得继续撤保护或回落 legacy 结算）。"""
@@ -1437,7 +1603,7 @@ class CryptoTrader:
                 _refs = self._derive_entry_order_refs(b)
             _side = str(b.get('side') or '').upper()     # 无 BUY 默认；非法 → 证据 DISPUTED
             _sid = settlement_id or f'v2a_{batch_id}_{_g}'
-            ev = self._build_settlement_evidence(
+            rec = self._build_settlement_record(
                 batch_id=batch_id, symbol=symbol, side=_side, mode=mode,
                 base_dedup_key=_dedup, settlement_id=_sid,
                 exit_order_ref=exit_order_ref, entry_order_refs=_refs,
@@ -1465,16 +1631,21 @@ class CryptoTrader:
             b['close_phase'] = 2
             b['pending_close'] = True
             b['close_reason'] = 'settlement_pending'
-            b['pending_settlement'] = {
+            _ob_candidate = {
                 'schema': 2, 'base_dedup_key': _dedup, 'settlement_id': _sid,
-                'record': ev['record'], 'evidence': ev['evidence'],
+                'record': rec,
                 'stats_committed': False,
             }
+            # §7.2 语义严格校验：任何状态畸形拒绝持久化
+            if not self._validate_settlement_record(rec, envelope=_ob_candidate):
+                print(f"🚨 [v2A] 新构造 record 语义校验失败，拒绝 BEGIN 写盘")
+                return None
+            b['pending_settlement'] = _ob_candidate
             if not self._persist_states(all_states):
                 print(f"⚠️ [v2A] outbox 持久化失败（BEGIN 失败：零 stats、零 clear，"
                       f"保留恢复能力）")
                 return None
-            return ev['record']
+            return rec
 
     def _verify_market_entry_gate(self, symbol, batch_id, b_data,
                                         close_op_id):
@@ -1513,7 +1684,7 @@ class CryptoTrader:
     def _try_finalize_outbox(self, batch_id, symbol):
         """§8.2/§8.3 共享 finalizer：只消费持久化 outbox（不依赖触发线程临时变量）。
 
-        mode 统一由持久化 outbox['evidence']['mode'] 派生（零易失传参）：
+        mode 统一由持久化 outbox['record']['mode'] 派生（零易失传参）：
         'MARKET' 时本 finalizer **独占**执行 ENTRY 逐单确认 gate
         （_verify_market_entry_gate），保护单与限价平仓单撤销完全交由
         通用 pre-converge 处理——不保留第二套撤单实现。
@@ -1563,7 +1734,7 @@ class CryptoTrader:
             #    ENTRY gate 通过后，后续 TP/SL/限价平仓单撤销完全交由通用
             #    pre-converge 处理——不得在 gate 后保留第二套撤保护单实现
             #    （裁定 2026-09-05：否则 stats 失败后重入会重复执行 cancel_order）。
-            _ob_mode = (outbox.get('evidence') or {}).get('mode')
+            _ob_mode = (outbox.get('record') or {}).get('mode')
             if _ob_mode == 'MARKET':
                 _b_now = (self.load_all_states().get(symbol) or {}).get(batch_id) or {}
                 if not self._verify_market_entry_gate(
@@ -2704,7 +2875,7 @@ class CryptoTrader:
         merged['user_modified'] = bool(disk.get('user_modified')) or bool(snap.get('user_modified'))
         # —— T1C-v2A §6.2：pending_settlement = 独立 Transactional Protected Field ——
         #   1. disk 无、snap 有 → 接受 snap；2. disk 有、snap 无 → 保留 disk；
-        #   3. 同 dedup → record/evidence/settlement_id 以 disk 为准，stats_committed 仅
+        #   3. 同 dedup → record/settlement_id 以 disk 为准，stats_committed 仅
         #      False→True；4. 不同 dedup → disk 胜出（拒绝新事务）；
         #   5. 只有合法 clear 才删除；6. 陈旧线程不得以 None/缺字段/旧 snapshot 冲掉 outbox。
         merged.pop('pending_settlement', None)
@@ -2718,7 +2889,6 @@ class CryptoTrader:
                 _v2_out = dict(_v2_so)
                 _v2_out['schema'] = _v2_do.get('schema', _v2_so.get('schema', 2))
                 _v2_out['record'] = _v2_do.get('record') or _v2_so.get('record')
-                _v2_out['evidence'] = _v2_do.get('evidence') or _v2_so.get('evidence')
                 _v2_out['settlement_id'] = (_v2_do.get('settlement_id')
                                             or _v2_so.get('settlement_id'))
                 # stats_committed 只允许 False→True（磁盘已 True 不得被旧快照拉回）
@@ -5081,7 +5251,7 @@ class CryptoTrader:
         #    旧实现以 `side = (b.get('side') or 'BUY').upper()` 兜底，会把缺失或非法
         #    方向伪装成 BUY 并据此算出伪盈亏；而该结果实际无人消费（TG 文案与 v2 富
         #    记录一律取 evidence 字段 `_r.get(...)`）。
-        #    权威 side 判定只在一处：_atomic_outbox_begin → _build_settlement_evidence，
+        #    权威 side 判定只在一处：_atomic_outbox_begin → _build_settlement_record，
         #    其 side 取 `str(b.get('side') or '').upper()`——缺失或非 BUY/SELL 即
         #    DISPUTED，无任何默认值。
         # ③ T1C-v2A 原子 BEGIN（§7）：outbox 与 close_phase=2 同一次持久化。
@@ -11387,7 +11557,7 @@ class CryptoTrader:
             # 🔥 ENTRY 逐单确认 gate 已由 _verify_market_entry_gate 收归 _try_finalize_outbox
             # 统一执行（ENTRY gate 通过后，TP/SL/限价平仓单由通用 pre-converge 处理，不保留
             # 第二套撤保护单实现，防止 stats 失败后恢复重入时重复执行 cancel_order）。
-            # 此处只保留调用点自身的展示数据（v2 富记录一律取 evidence）。
+            # 此处只保留调用点自身的展示数据（v2 富记录一律取 record）。
 
             # ══ 结算（confirmed_filled_amount 贯穿；actual_price 已在 BEGIN 前计算）══
             if side == 'BUY':
@@ -11661,14 +11831,14 @@ class CryptoTrader:
                 _open_map[str(_o['id'])] = _o
         open_orders = list(_open_map.values())
         # ② D-B1 贡献扣减：symbol 持仓（绝对值）− 其他活跃批次已成交贡献
-        # 🔥 零猜测（裁定 2026-09-05）：严格优先取不可变 outbox evidence 中已固化的
+        # 🔥 零猜测（裁定 2026-09-05）：严格优先取不可变 outbox record 中已固化的
         # side（结算事务事实），无 outbox（legacy 路径）才回落至批次 side。
         # 若 outbox 与批次 side 存在合法冲突，或最终 side 非 BUY/SELL →
         # 返回 None（不收敛、绝不带着猜错/冲突的方向去 clear）。
         _obx = b_data.get('pending_settlement')
         _ev_side = None
         if isinstance(_obx, dict):
-            _ev = _obx.get('evidence')
+            _ev = _obx.get('record')
             if isinstance(_ev, dict):
                 _ev_side = str(_ev.get('side') or '').upper()
                 if _ev_side not in ('BUY', 'SELL'):
@@ -11685,7 +11855,7 @@ class CryptoTrader:
         _side = _ev_side or _b_side
         if _side not in ('BUY', 'SELL'):
             print(f"🚨 [converge] 批次 {batch_id} side 缺失/非法，且磁盘 outbox "
-                  f"evidence 无可用 side → 禁止默认 BUY（UNKNOWN≠BUY），"
+                  f"record 无可用 side → 禁止默认 BUY（UNKNOWN≠BUY），"
                   f"返回 None（不收敛、不 clear）")
             return None
         try:
