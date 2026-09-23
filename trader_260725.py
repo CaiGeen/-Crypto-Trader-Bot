@@ -5405,6 +5405,9 @@ class CryptoTrader:
                 print(f"💡 双向持仓模式，本批次方向: {params_base['positionSide']}")
 
             params_base['workingType'] = 'MARK_PRICE'
+            # 触发前保护：mark/last 偏离超过该品种 triggerProtect 阈值（如 BTCUSDT 5%）时
+            # 暂停触发、收敛后自动恢复；与 workingType=MARK_PRICE 互补，正常期零成本。
+            params_base['priceProtect'] = True
             params_base['leverage'] = signal.leverage
 
             total_required_margin = 0.0
