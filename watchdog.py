@@ -114,12 +114,20 @@ def record_process_exit(uptime: float) -> bool:
 def log_message(msg: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{timestamp}] {msg}\n"
-    print(log_entry.strip())
+    # 🔥 2026-09-23 18:29 事故 hotfix：原实现 print 在写文件之前——控制台卡死时
+    # watchdog.log 也一起丢。改为文件优先；控制台输出走解耦队列（见 monitor_process）。
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(log_entry)
     except Exception:
         pass
+    try:
+        _CONSOLE_QUEUE.put_nowait(log_entry)
+    except Exception:
+        try:
+            print(log_entry.strip())
+        except Exception:
+            pass
 
 
 # ==================== #4 交易日志落盘（2026-09-23） ====================
@@ -365,12 +373,44 @@ def run_main_process():
         return None
 
 
+# 🔥 2026-09-23 18:29 事故 hotfix（P0）：控制台输出解耦。
+#   事故链：控制台文字选中(mark 模式) → print(line) 无限阻塞 → 读线程停摆 →
+#   管道积满 → 子进程阻塞在 print(_sum) 且持有 _api_semaphore → TG/监控全灭
+#   （进程与心跳全程"健康"，巡检无法识别）。现改为：
+#   读线程只做 读管道 → 落盘 → 入队；独立 writer 线程消费队列打控制台。
+#   控制台再怎么卡，只影响"显示"，读取/落盘/守护判定永远继续。
+import queue as _queue
+
+_CONSOLE_QUEUE = _queue.Queue(maxsize=5000)
+
+
+def _console_writer_loop():
+    while True:
+        try:
+            line = _CONSOLE_QUEUE.get()
+            if line is None:
+                return
+            try:
+                print(line, end='')
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+threading.Thread(target=_console_writer_loop, daemon=True,
+                 name="console_writer").start()
+
+
 def monitor_process(process):
-    """监控主程序输出"""
+    """监控主程序输出（读线程永不执行可能阻塞的控制台写）。"""
     try:
         for line in process.stdout:
-            write_bot_log(line)      # #4：先落盘再显示（显示阻塞也不丢取证数据）
-            print(line, end='')
+            write_bot_log(line)      # #4：落盘优先（取证不依赖控制台）
+            try:                      # 入队显示；队满则丢行（文件已有全量）
+                _CONSOLE_QUEUE.put_nowait(line)
+            except Exception:
+                pass
             if "CRASH" in line or "FATAL" in line or "Unhandled exception" in line:
                 log_message("⚠️ 检测到主程序异常，准备重启")
                 return False

@@ -1985,9 +1985,11 @@ class CryptoTrader:
                     _attempt_headers = dict(getattr(self.exchange, 'last_response_headers',
                                                     None) or {})
                     _sum = _API_METRICS.record(func, _attempt_headers, ok=True)
-                    if _sum:
-                        print(_sum)
-                    return _r
+                # 🔥 2026-09-23 18:29 事故 hotfix：metrics 打印移出 semaphore 临界区——
+                # print 下游（管道/控制台）一旦阻塞，绝不能持锁传染导致全局 API/TG 冻结。
+                if _sum:
+                    print(_sum)
+                return _r
 
             except Exception as e:
                 err_str = str(e).lower()
