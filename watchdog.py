@@ -8,6 +8,7 @@ watchdog.py - 量化交易 Bot 守护进程
 3. 重启通知发送到 TG
 """
 
+import json
 import os
 import sys
 import time
@@ -22,6 +23,18 @@ import pytz
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAIN_SCRIPT = os.path.join(BASE_DIR, "bot_runner.py")
 LOG_FILE = os.path.join(BASE_DIR, "watchdog.log")
+
+# ==================== 生产运维补强（2026-09-23） ====================
+# 背景：#4 —— trader/bot_runner 全量走 print，只进控制台与 watchdog 的 PIPE 转发；
+#   窗口关闭 / 机器重启 / 终端崩溃后，交易全过程（成交、挂单、告警、限流观测）
+#   不可追溯（8-19 二次 418 事故取证时正是卡在"无落盘数据源"）。
+#   方案：watchdog 在转发子进程 stdout 的同一处顺手按天落盘——零侵入，不改 bot 代码。
+# 背景：#5 —— 需要"死人心跳"判定守护链是否活着。watchdog 每 60s 原子写
+#   .heartbeat.json；独立的 健康巡检.py 读它，陈旧即告警（正常时完全静默）。
+BOT_LOG_DIR = os.path.join(BASE_DIR, "logs")
+BOT_LOG_RETENTION_DAYS = 14        # 交易日志保留天数（防磁盘无界增长）
+HEARTBEAT_FILE = os.path.join(BASE_DIR, ".heartbeat.json")
+HEARTBEAT_INTERVAL = 60            # 心跳写入间隔（秒）
 
 # 🔥 定时重启开关
 ENABLE_SCHEDULED_RESTART = False
@@ -107,6 +120,125 @@ def log_message(msg: str):
             f.write(log_entry)
     except Exception:
         pass
+
+
+# ==================== #4 交易日志落盘（2026-09-23） ====================
+# 设计要点：
+#   ① 按天轮转 logs/bot_YYYYMMDD.log；② 逐行 flush（断电/强杀最多丢一行）；
+#   ③ 任何异常静默吞掉——观测面绝不打断监控/重启主链（与本项目"观测层零影响"一致）；
+#   ④ 只在文件侧加 [HH:MM:SS] 前缀，控制台输出保持原样（零 UI 回归）。
+_bot_log_lock = threading.Lock()
+_bot_log_fh = None
+_bot_log_day = None
+
+
+def _bot_log_path(day: str = None) -> str:
+    day = day or datetime.now().strftime("%Y%m%d")
+    return os.path.join(BOT_LOG_DIR, f"bot_{day}.log")
+
+
+def _prune_bot_logs():
+    """保留最近 BOT_LOG_RETENTION_DAYS 天（调用方须持 _bot_log_lock，失败静默）。"""
+    try:
+        cutoff = time.time() - BOT_LOG_RETENTION_DAYS * 86400
+        for name in os.listdir(BOT_LOG_DIR):
+            if not (name.startswith("bot_") and name.endswith(".log")):
+                continue
+            p = os.path.join(BOT_LOG_DIR, name)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def write_bot_log(line: str):
+    """把主程序 stdout 的一行写入当日交易日志（跨天自动切换文件）。"""
+    global _bot_log_fh, _bot_log_day
+    try:
+        day = datetime.now().strftime("%Y%m%d")
+        with _bot_log_lock:
+            if _bot_log_fh is None or _bot_log_day != day:
+                if _bot_log_fh is not None:
+                    try:
+                        _bot_log_fh.close()
+                    except Exception:
+                        pass
+                    _bot_log_fh = None
+                os.makedirs(BOT_LOG_DIR, exist_ok=True)
+                _bot_log_fh = open(_bot_log_path(day), "a",
+                                   encoding="utf-8", errors="replace")
+                _bot_log_day = day
+                _prune_bot_logs()
+            stamp = datetime.now().strftime("%H:%M:%S")
+            _bot_log_fh.write(f"[{stamp}] {str(line).rstrip(chr(10) + chr(13))}\n")
+            _bot_log_fh.flush()
+    except Exception:
+        pass
+
+
+def close_bot_log():
+    """退出前关闭句柄（best-effort，不做 fsync——日志非资金安全数据）。"""
+    global _bot_log_fh, _bot_log_day
+    try:
+        with _bot_log_lock:
+            if _bot_log_fh is not None:
+                _bot_log_fh.close()
+            _bot_log_fh = None
+            _bot_log_day = None
+    except Exception:
+        pass
+
+
+# ==================== #5 心跳文件（2026-09-23） ====================
+# 语义：.heartbeat.json 由 watchdog 每 HEARTBEAT_INTERVAL 秒原子刷新一次。
+#   文件陈旧  = 守护链已死 / 机器冻结 / 卡死（健康巡检据此告警）；
+#   stopped=true = 用户主动停止（健康巡检不告警，避免告警疲劳）。
+_heartbeat_state = {
+    "watchdog_started_at": None,
+    "bot_pid": None,
+    "bot_started_at": None,
+    "restarts": 0,
+    "last_reason": None,
+    "stopped": False,
+    "stopped_reason": None,
+}
+
+
+def write_heartbeat():
+    """原子写心跳（tmp → os.replace；失败静默，绝不干扰守护逻辑）。"""
+    try:
+        payload = dict(_heartbeat_state)
+        payload["ts"] = time.time()
+        payload["ts_str"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload["watchdog_pid"] = os.getpid()
+        proc = _current_process
+        payload["bot_alive"] = bool(proc is not None and proc.poll() is None)
+        tmp = HEARTBEAT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+            f.flush()
+        os.replace(tmp, HEARTBEAT_FILE)
+    except Exception:
+        pass
+
+
+def mark_stopped(reason: str):
+    """标记"用户主动停止"（健康巡检据此静默，避免停机后反复误报）。"""
+    try:
+        _heartbeat_state["stopped"] = True
+        _heartbeat_state["stopped_reason"] = reason
+        write_heartbeat()
+    except Exception:
+        pass
+
+
+def _heartbeat_loop():
+    while True:
+        write_heartbeat()
+        time.sleep(HEARTBEAT_INTERVAL)
 
 
 def _generate_notify_event_id() -> str:
@@ -220,6 +352,13 @@ def run_main_process():
             errors='replace'
         )
         log_message(f"✅ 主进程已启动 (PID: {process.pid})")
+        # #5：登记当前子进程（write_heartbeat / 健康巡检据此判定 bot 侧存活）
+        _heartbeat_state["bot_pid"] = process.pid
+        _heartbeat_state["bot_started_at"] = time.time()
+        # #4：每次拉起新进程都在交易日志打分隔头（便于事后按会话切分取证）
+        write_bot_log(f"===== bot_runner 启动 (PID {process.pid}) "
+                      f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====")
+        write_heartbeat()
         return process
     except Exception as e:
         log_message(f"❌ 启动主程序失败: {e}")
@@ -230,6 +369,7 @@ def monitor_process(process):
     """监控主程序输出"""
     try:
         for line in process.stdout:
+            write_bot_log(line)      # #4：先落盘再显示（显示阻塞也不丢取证数据）
             print(line, end='')
             if "CRASH" in line or "FATAL" in line or "Unhandled exception" in line:
                 log_message("⚠️ 检测到主程序异常，准备重启")
@@ -243,6 +383,9 @@ def monitor_process(process):
 # ==================== 主循环 ====================
 def main():
     make_stdout_crash_safe()  # R1: 入口级编码保护（D-004 根因1）
+    # #5：心跳线程（daemon，独立于主循环与监控线程，60s 刷新一次）
+    _heartbeat_state["watchdog_started_at"] = time.time()
+    threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat").start()
     log_message("=" * 60)
     log_message("🛡️ Watchdog 守护进程启动 (稳定版 v2.2)")
     log_message(f"📁 工作目录: {BASE_DIR}")
@@ -250,6 +393,10 @@ def main():
     log_message(f"⏱️  崩溃自动重启: ✅ 启用")
     log_message(f"⏱️  定时重启: {'✅ 启用' if ENABLE_SCHEDULED_RESTART else '❌ 禁用'}")
     log_message(f"📊 重启后汇总: {'✅ 启用' if ENABLE_SUMMARY_ON_RESTART else '❌ 禁用'}")
+    log_message(f"🧾 交易日志落盘: logs{os.sep}bot_YYYYMMDD.log（保留 "
+                f"{BOT_LOG_RETENTION_DAYS} 天）")
+    log_message(f"💓 心跳文件: .heartbeat.json（每 {HEARTBEAT_INTERVAL}s，"
+                f"供 健康巡检.py 判定存活）")
     log_message("=" * 60)
 
     while True:
@@ -310,6 +457,8 @@ def main():
                     log_message("🚫 主程序因单实例锁拒绝启动（已有其他实例在运行），watchdog 停止。")
                     log_message("   请先结束已有实例（任务管理器查 python.exe）后再启动。")
                     _kill_main_process_tree()
+                    mark_stopped("单实例锁拒绝（已有实例在运行）")
+                    close_bot_log()
                     sys.exit(0)
                 restart_reason = f"⚠️ 程序异常退出 (退出码: {process.returncode})"
                 log_message(restart_reason)
@@ -368,6 +517,9 @@ def main():
             sys.exit(1)
 
         if restart_reason:
+            _heartbeat_state["restarts"] += 1
+            _heartbeat_state["last_reason"] = restart_reason
+            write_heartbeat()
             log_message(f"🔄 重启原因: {restart_reason}")
 
             # 🔥 崩溃通知和汇总通知独立发送
@@ -420,6 +572,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log_message("👋 用户手动停止 Watchdog")
         _kill_main_process_tree()  # P0-1: 停止必须连带清理 bot_runner 进程树
+        mark_stopped("用户手动停止 Watchdog（Ctrl+C）")
+        close_bot_log()
         sys.exit(0)
     except Exception as e:
         log_message(f"❌ Watchdog 异常: {e}")
@@ -427,4 +581,5 @@ if __name__ == "__main__":
 
         traceback.print_exc()
         _kill_main_process_tree()  # P0-1: 异常退出同样清理，防孤儿
+        close_bot_log()
         sys.exit(1)

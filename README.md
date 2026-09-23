@@ -49,10 +49,17 @@
 ```
 ├── trader_260725.py      # 交易核心引擎（CryptoTrader 类）
 ├── bot_runner.py         # Telegram Bot 主程序（命令/按钮/通知）
-├── watchdog.py           # 守护进程（崩溃重启 + 可选定时重启）
+├── watchdog.py           # 守护进程（崩溃重启 + 可选定时重启 + 交易日志落盘 + 心跳）
 ├── parser.py             # JSON 信号解析器
 ├── quick_trade.py        # 独立快速挂单工具（不与 watchdog 同时运行）
 ├── main.py               # 简易入口
+├── 启动Bot.bat           # 一键启动（含 PYTHONUNBUFFERED，实时输出不被管道缓冲吞掉）
+├── 停止Bot-应急.bat      # 应急强杀进程树（按命令行过滤，不误伤无关 python 进程）
+├── 自启-启动Bot.bat      # 开机自启入口：先等本地代理就绪，再拉起 bot
+├── 健康巡检.py           # 死人心跳巡检（读 .heartbeat.json；异常才告警，正常静默）
+├── 安装开机自启.ps1      # 注册/卸载计划任务（-Uninstall 可卸载）
+├── logs/                 # 运行时：bot_YYYYMMDD.log（交易全过程）+ patrol.log（巡检）
+├── .heartbeat.json       # 运行时：watchdog 心跳（每 60s 原子刷新）
 ├── requirements.txt      # Python 依赖
 ├── .env.example          # 环境变量模板（复制为 .env 后填写）
 └── .gitignore            # 已排除密钥/日志/状态文件
@@ -217,6 +224,32 @@ python bot_runner.py
 
 ---
 
+## 🩺 生产运维加固（2026-09-23 · 实盘上线后）
+
+> 上线后全量复审识别出两个运维缺口：① 交易全过程只存在于控制台与 PIPE 转发，窗口一关或机器一重启就**无法取证**（8-19 二次 418 事故正是卡在"无落盘数据源"）；② 机器重启后无人叫醒，最长盲区可达一天（仅靠 08:05 日报"缺席"被动暗示）。已补齐下列能力，**未改动任何交易逻辑**（`watchdog.py` 为 155 行纯新增）。
+
+| # | 能力 | 实现 | 验收证据 |
+|---|------|------|----------|
+| 1 | **交易日志落盘** | watchdog 在转发子进程 stdout 的同一处按天落盘 `logs/bot_YYYYMMDD.log`；逐行 flush（断电最多丢一行）；保留 14 天自动清理 | 重启后日志持续增长，含 `READY`、批次接管、每分钟 `[限流观测]` 全过程 |
+| 2 | **心跳（死人心跳）** | watchdog 每 60s 原子写 `.heartbeat.json`（watchdog_pid / bot_pid / bot_alive / restarts / last_reason / stopped） | 每 60s 刷新且 `bot_alive=true`；用户主动停止写 `stopped=true`，避免停机后误报 |
+| 3 | **独立健康巡检** | `健康巡检.py`（纯标准库，venv 损坏也能报警）：计划任务每 15 分钟读心跳，**心跳陈旧 / bot 持续不存活 / 代理不可达**即告警；正常时完全静默（零 TG 流量） | 巡检日志每 15 分钟一条"巡检正常"；通道自检 TG经代理 / TG直连 / 邮件 三通道全 True |
+| 4 | **开机自启（先代理后 bot）** | `自启-启动Bot.bat` 先等 `127.0.0.1:7890` 就绪（最多 5 分钟）再拉起 bot；代理始终未就绪则**放弃启动并邮件告警**——避免"无代理启动 → 恢复链失败 → 持仓批次无人监控" | 计划任务 `CryptoBot-Autostart` 实测拉起成功，`schtasks /Run` 可手动触发 |
+| 5 | **告警三通道 + 去重** | 巡检告警链路：TG（经代理）→ TG（直连）→ QQ 邮件（SMTP 国内直连，代理挂掉仍可达）；同一问题 30 分钟内只告警一次 | 自检实测三通道全部送达 |
+
+```powershell
+# 任务状态 / 手动触发自启 / 重新注册或卸载（需管理员）
+schtasks /Query /TN "CryptoBot-Autostart" /FO LIST
+schtasks /Run   /TN "CryptoBot-Autostart"
+powershell -ExecutionPolicy Bypass -File "安装开机自启.ps1"
+powershell -ExecutionPolicy Bypass -File "安装开机自启.ps1" -Uninstall
+# 巡检三通道自检（结果写入 logs\patrol.log）
+.venv\Scripts\python.exe 健康巡检.py --selftest
+```
+
+> ⚠️ 关键约束：计划任务的 `ExecutionTimeLimit` 必须为 **0（无限制）**，否则 Windows 默认 3 天后会 Kill 任务、连带杀掉长驻的 bot（`安装开机自启.ps1` 已显式设置）。
+
+---
+
 ## 📌 已知限制
 
 | 限制 | 说明 |
@@ -224,6 +257,9 @@ python bot_runner.py
 | 杠杆限制 | 新币安账户 30 天内最高 20x |
 | 仅 BTCUSDT | 当前主要针对 BTC，其他品种需自行测试 |
 | JSON 持久化 | 状态文件为 JSON，高并发场景建议换 SQLite |
+| **代理出口 IP 非独享** | bot 全部流量（币安 API + TG）经 `BINANCE_PROXY` 出口，而该出口是**机场订阅节点**：权重池与同节点用户共享（自身实测仅占 ~1.7%，418 多由"邻居"打爆），且节点 IP 漂移会触发币安 API **IP 白名单不匹配 → `-2015` → AUTH_BLOCKED 盲区**（暂停全部 API）。**计划迁云后换独享固定出口**（自建 VPS） |
+| 邮件兜底延迟 | QQ SMTP 首次发送约 30s（TLS 握手 + 登录），属非实时通道；TG 为主通道 |
+| 强平价未监控 | 无 `liquidationPrice` 采集。当前参数下安全裕度充足（全仓 19.3k 权益 vs 145.8k 名义 → 强平距离 ≈12.8%，止损距离 ≈1.13%，安全系数 ≈8.8×）；若未来放大单批规模或权益降至 ~2.2k 以下需重新评估 |
 
 ---
 
