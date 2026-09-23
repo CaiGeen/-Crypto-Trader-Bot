@@ -152,20 +152,20 @@ def t05_sg2_dual_channel_and_net_position():
     # A：SL 只在条件单通道（普通通道看不到——今天实盘误拒的场景本体）
     t._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
     t.exchange = StubEx(normal=[], stop=[{'id': 'S1'}])
-    ok, msg = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.5)
+    ok, msg = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.5, 'BUY')
     assert ok is True, f'条件单通道里的 SL 必须被找到: {msg}'
 
     # 反向对照：两个通道都没有 → 拒绝（判据仍活着）
     t.exchange = StubEx(normal=[], stop=[])
-    ok, msg = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.5)
+    ok, msg = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.5, 'BUY')
     assert ok is False and '缺少有效止损单' in msg, (ok, msg)
 
     # B：partial 后净仓位累计——actual 0.5 == Σnet 0.5 → 不得假报台账不一致
     t.exchange = StubEx(normal=[], stop=[{'id': 'S1'}])
-    ok, msg = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.5)
+    ok, msg = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.5, 'BUY')
     assert ok is True, f'净仓位判据: {msg}'
     # gross 会得 1.0 > actual 0.5 → 假「台账 > 交易所」（旧实现回归哨兵）
-    ok2, msg2 = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.4)
+    ok2, msg2 = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.4, 'BUY')
     assert ok2 is False and '台账' in msg2, msg2
 
     # Fail-Closed：任一通道异常 → 拒绝
@@ -175,7 +175,7 @@ def t05_sg2_dual_channel_and_net_position():
                 raise Exception('network down')
             return []
     t.exchange = BoomEx([], [])
-    ok, msg = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.5)
+    ok, msg = types.MethodType(cov, t)('BTC/USDT:USDT', states, 0.5, 'BUY')
     assert ok is False and '条件单通道' in msg, msg
 
 

@@ -62,3 +62,15 @@ signal_dedup.json
 .notify.state.json
 .tmp_replay/
 .codegraph/
+
+# ==========================================
+# 2026-09-23 实盘演练后补充：大二进制与运行残留
+# （配合 a5f96bf 冻结封板，防 git add . 误提交）
+# ==========================================
+*.parquet
+strategies_backtest/results/*.png
+backups/
+*.err
+*.bundle
+_*.log
+

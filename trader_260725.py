@@ -3606,20 +3606,32 @@ class CryptoTrader:
         print(f"❌ 查询持仓失败，已重试 {retries} 次")
         return None
 
-    def _check_sl_coverage(self, symbol: str, all_states: dict, current_pos: float) -> tuple[bool, str]:
+    def _check_sl_coverage(self, symbol: str, all_states: dict, current_pos: float,
+                           side: str) -> tuple[bool, str]:
         """SG2: 加仓前风险闸门——任何已有仓位，只要系统无法证明其全部由有效 SL 覆盖，
         就禁止创建新的风险仓位（Fail-Closed）。
         - 只做判定不发通知（通知由调用方负责）；current_pos 由调用方单次快照传入，避免二次查询状态漂移
         - 有效 SL = current_sl_id 存在且该 id 在交易所 open_orders 中；查询失败 = UNKNOWN = 拒绝
         - 未成交批次（last_filled_count=0）无 SL 不算裸仓
         - delta≠0（含负值，名义台账与交易所不一致）一律拒绝
+        - 🔥 过渡期收口（2026-09-22）：side 必填——台账只累计本方向批次（对齐
+          _check_conservation_conflict 口径），杜绝 Hedge 模式下「LONG 持仓
+          vs LONG+SHORT 双方向台账」的误拒；side 缺失的旧批次保守计入。
         返回 (allowed, reason)。"""
+        side_u = str(side or '').upper()
+        if side_u not in ('BUY', 'SELL'):
+            raise ValueError(f'SG2 必须显式指定方向 BUY/SELL（拒绝静默双方向求和）: {side!r}')
         EPS = 1e-9
-        # ① 程序台账：已成交 active 批次的名义仓位与 SL id
+        # ① 程序台账：已成交 active 批次的名义仓位与 SL id（仅本方向）
         program_position = 0.0
         filled_batches = []  # [(batch_id, sl_id)]
         for batch_id, b_data in (all_states.get(symbol, {}) or {}).items():
             if not (isinstance(b_data, dict) and b_data.get('is_active')):
+                continue
+            # 方向过滤：反向批次的仓位不进入本方向台账（Hedge 模式双方向并存场景）；
+            # side 缺失的旧批次无法证明是反向 → 保守计入（Fail-Safe 方向）
+            _b_side = str(b_data.get('side') or '').upper()
+            if _b_side and _b_side != side_u:
                 continue
             last_filled = int(b_data.get('last_filled_count', 0) or 0)
             if last_filled <= 0:
@@ -5050,6 +5062,14 @@ class CryptoTrader:
                 known_order_ids.add(str(b_data['tp_order_id']))
             if b_data.get('current_sl_id'):
                 known_order_ids.add(str(b_data['current_sl_id']))
+            # 🔥 过渡期收口（2026-09-22）：补齐 known 集合——原实现漏了
+            # limit_close_order_id 与 registry 内订单 ID，会把程序自己的
+            # LIMIT 平仓单/已收编保护单误判为"孤儿单"。
+            if b_data.get('limit_close_order_id'):
+                known_order_ids.add(str(b_data['limit_close_order_id']))
+            for _ent in (b_data.get('protection_registry') or {}).values():
+                if isinstance(_ent, dict) and _ent.get('order_id'):
+                    known_order_ids.add(str(_ent['order_id']))
 
         # P0-F1 前置修复（ChatGPT 终审前置问题1）：双通道扫描 + Fail-Closed
         #   单通道 fetch_open_orders 看不到 algo 条件单（SL/TP），异常时 return False（放行）→ Fail-Open
@@ -5088,47 +5108,70 @@ class CryptoTrader:
                 unknown_orders.append(ord)
 
         if unknown_orders:
-            print(f"⚠️ 【未识别挂单提醒】检测到交易所存在 {len(unknown_orders)} 个不受代码管理的“孤儿挂单”！")
-            self.send_tg_notification(
-                f"⚠️ **孤儿挂单检测**\n"
-                f"🆔 标的：`{symbol}`\n"
-                f"🔢 发现 {len(unknown_orders)} 个不受代码管理的挂单\n"
-                f"🧹 程序将自动清理这些孤儿挂单。",
-                level='warning'
-            )
+            # 🔥 过渡期收口（2026-09-22，用户裁定）：unknown 订单一律不自动撤——
+            # 只分类报警 + 阻断本批次。旧逻辑"自动清理孤儿挂单"走 stop=True 条件单
+            # 端点，会精确命中用户手工 SL/TP（条件单必然匹配该通道），实盘阻断点。
+            # 分类仅供报警文案区分（两类都阻断、都不触碰）：
+            #   匹配任一批次 protection_registry intent → 疑似程序遗留单（账本丢追踪）；
+            #   否则 → 外部/手工单。intent 匹配有极小概率误中同参数手工单，
+            #   故程序遗留单同样不自动撤，撤销入口留给人工或既有恢复/收敛机制。
+            _matcher = getattr(self, '_order_matches_intent', None)
+            registry_intents = []  # [(batch_id, identity, intent)]——含非 active 批次，尽量解释来源
+            for _bid, _b in symbol_state.items():
+                if not isinstance(_b, dict):
+                    continue
+                for _ident, _ent in (_b.get('protection_registry') or {}).items():
+                    if isinstance(_ent, dict) and isinstance(_ent.get('intent'), dict):
+                        registry_intents.append((_bid, _ident, _ent['intent']))
+            program_orphans = []   # [(order, batch_id, identity)]
+            external_orders = []   # [order]
             for ord in unknown_orders:
-                print(
-                    f"   └─ Order ID: {ord['id']} | 类型: {ord['type']} | 方向: {ord['side']} | 触发/委托价: {ord.get('stopPrice') or ord.get('price')}")
+                _hit = None
+                if _matcher is not None:
+                    for _bid, _ident, _intent in registry_intents:
+                        try:
+                            if _matcher(ord, _intent, symbol):
+                                _hit = (_bid, _ident)
+                                break
+                        except Exception:
+                            continue  # 匹配异常按外部单处理（Fail-Safe：宁误报不误碰）
+                if _hit:
+                    program_orphans.append((ord, _hit[0], _hit[1]))
+                else:
+                    external_orders.append(ord)
 
-            print("🧹 自动清理孤儿挂单中...")
-            cleaned_count = 0
-            failed_count = 0
-            failed_ids = []
-            for ord in unknown_orders:
-                try:
-                    self._safe_api_call(self.exchange.cancel_order, ord['id'], symbol, params={'stop': True})
-                    print(f"  └─ ✅ 已撤销: {ord['id']}")
-                    cleaned_count += 1
-                except Exception as e:
-                    print(f"  └─ ⚠️ 撤销失败: {ord['id']} - {e}")
-                    failed_count += 1
-                    failed_ids.append(str(ord['id']))
+            def _fmt_ord(o):
+                return (f"ID:{o.get('id')} 类型:{o.get('type')} 方向:{o.get('side')} "
+                        f"数量:{o.get('amount')} 触发/委托价:{o.get('stopPrice') or o.get('price')}")
 
-            if cleaned_count > 0:
-                print(f"🧹 孤儿挂单已清理完毕 (共清理 {cleaned_count} 个)！")
-                time.sleep(0.5)
+            print(f"🚨 【未识别挂单阻断】检测到 {len(unknown_orders)} 个不属于程序账本的挂单"
+                  f"（疑似程序遗留 {len(program_orphans)} / 外部或手工 {len(external_orders)}），"
+                  f"已阻断批次 [{batch_id}]，未执行任何撤单：")
+            for o, _bid, _ident in program_orphans:
+                print(f"   └─ [疑似程序遗留] {_fmt_ord(o)} | 匹配批次 {_bid} 意图 {_ident}")
+            for o in external_orders:
+                print(f"   └─ [外部/手工] {_fmt_ord(o)}")
 
-            # 🔥 修复漏洞3：撤销失败时 Fail-Closed（原代码撤失败只 print 不阻断 → 孤儿单仍在场却放行开仓）
-            if failed_count > 0:
-                self.send_tg_notification(
-                    f"🚨【资金安全】孤儿挂单撤销失败，已阻断开仓\n"
-                    f"标的: `{symbol}`\n"
-                    f"失败 {failed_count} 个: {', '.join(failed_ids)}\n"
-                    f"请手动撤销后重试",
-                    level='critical')
-                return True  # Fail-Closed：孤儿单仍在场 → 阻断
-
-            return False
+            _tg_lines = [
+                f"🚨【资金安全】检测到未归属挂单，已阻断新批次\n",
+                f"🆔 标的：`{symbol}`\n",
+                f"🆔 被拒批次：`{batch_id}`\n",
+                f"🔢 未归属挂单 {len(unknown_orders)} 个"
+                f"（疑似程序遗留 {len(program_orphans)} / 外部或手工 {len(external_orders)}）\n",
+            ]
+            for o, _bid, _ident in program_orphans:
+                _tg_lines.append(
+                    f"🧩 程序遗留: `{o.get('id')}` {o.get('type')} {o.get('side')}"
+                    f" @ {o.get('stopPrice') or o.get('price')}（匹配批次 `{_bid}`）\n")
+            for o in external_orders:
+                _tg_lines.append(
+                    f"✋ 外部/手工: `{o.get('id')}` {o.get('type')} {o.get('side')}"
+                    f" @ {o.get('stopPrice') or o.get('price')}\n")
+            _tg_lines.append(
+                "🚫 程序未撤销/修改任何订单。请人工核查：确认无用后手动撤销再重发信号；"
+                "若属程序遗留单，可人工撤销或走既有恢复/收敛机制。")
+            self.send_tg_notification("".join(_tg_lines), level='critical')
+            return True  # Fail-Closed：任何无法证明归属的订单在场 → 阻断，绝不触碰
 
         print("✅ 防冲突校验通过：当前批次无重复，其他已存在批次运行正常。")
         return False
@@ -5136,10 +5179,13 @@ class CryptoTrader:
     def _validate_stop_losses(self, signal, current_mark_price: float) -> tuple[bool, str]:
         """
         校验所有止损价是否合理
-        只校验：做多时止损价 < 入场价，做空时止损价 > 入场价
+        校验：做多时止损价 < 入场价，做空时止损价 > 入场价；
+        🔥 过渡期收口（2026-09-22）：补阶梯单调性——BUY 时 SL 序列必须逐层不降、
+        SELL 时必须逐层不升（允许相等），否则"成交新层后上移止损"会反向放宽。
         返回: (是否通过, 错误信息)
         """
         side = signal.side.upper()
+        prev_sl = None
 
         for idx, (trigger_price, amount) in enumerate(signal.entries, 1):
             raw_sl_price = signal.stop_loss_steps[idx - 1] if idx - 1 < len(
@@ -5165,6 +5211,25 @@ class CryptoTrader:
                         f"   └─ 做空时止损价必须 > 入场价（当前 {raw_sl_price} <= {trigger_price}）"
                     )
                     return False, error_msg
+
+            # 🔥 过渡期收口（2026-09-22）：阶梯单调性校验——成交新层后 SL 只能收紧
+            # 不能放宽。旧校验只看单层 SL vs 入场价，SL 序列写反会"成交越多、止损越宽"。
+            if prev_sl is not None:
+                if side == 'BUY' and raw_sl_price < prev_sl:
+                    return False, (
+                        f"❌ 第 {idx} 层止损价倒退！\n"
+                        f"   ├─ 前一层止损: {prev_sl}\n"
+                        f"   ├─ 本层止损: {raw_sl_price}\n"
+                        f"   └─ 做多时阶梯止损必须逐层不降（SL[i] >= SL[i-1]），"
+                        f"否则成交新层后止损会向下放宽")
+                if side == 'SELL' and raw_sl_price > prev_sl:
+                    return False, (
+                        f"❌ 第 {idx} 层止损价倒退！\n"
+                        f"   ├─ 前一层止损: {prev_sl}\n"
+                        f"   ├─ 本层止损: {raw_sl_price}\n"
+                        f"   └─ 做空时阶梯止损必须逐层不升（SL[i] <= SL[i-1]），"
+                        f"否则成交新层后止损会向上放宽")
+            prev_sl = raw_sl_price
 
         return True, "✅ 所有止损价合理性校验通过！"
 
@@ -5241,9 +5306,33 @@ class CryptoTrader:
         if self._check_existing_conflicts(symbol, batch_id, all_states, _signal_fp):
             return None
 
+        # 🔥 过渡期收口（2026-09-22）：Hedge Mode 检测提前到持仓查询之前——
+        # 旧代码先以 is_hedge_mode=False 写死查持仓（双向持仓账户会取错方向仓位），
+        # 且检测失败时"默认单向持仓"继续开仓（Fail-Open）。现改为：
+        # 检测失败 → 直接阻断本批次（Fail-Closed），绝不猜测账户模式。
+        is_hedge_mode = False
+        try:
+            _pos_mode_res = self._safe_api_call(self.exchange.fapiPrivateGetPositionSideDual)
+            if not isinstance(_pos_mode_res, dict) or 'dualSidePosition' not in _pos_mode_res:
+                raise ValueError(f"持仓模式响应缺少 dualSidePosition 字段: {_pos_mode_res!r}")
+            is_hedge_mode = bool(_pos_mode_res.get('dualSidePosition'))
+            print(f"💡 检测到账户为 [{'双向持仓模式' if is_hedge_mode else '单向持仓模式'}]")
+        except Exception as e:
+            print(f"❌ 获取账户持仓模式失败: {e}，已阻断开仓（Fail-Closed，不再默认单向持仓）")
+            try:
+                self.send_tg_notification(
+                    f"🚨【资金安全】无法确认账户持仓模式（Hedge/One-way），已阻断新批次\n"
+                    f"🆔 批次：`{batch_id}`\n🪙 标的：`{symbol}`\n"
+                    f"💡 错误: {str(e)[:120]}\n"
+                    f"🚫 未执行任何下单。请检查网络/API 权限后重试。",
+                    level='critical')
+            except Exception:
+                pass
+            return None
+
         base_currency = symbol.split('/')[0] if '/' in symbol else symbol.replace('USDT', '')
 
-        current_pos = self._get_current_position_amt(symbol, is_hedge_mode=False, side=side)
+        current_pos = self._get_current_position_amt(symbol, is_hedge_mode=is_hedge_mode, side=side)
         if current_pos is None:
             print(f"❌ 无法查询当前持仓，已重试失败，请检查网络后重试")
             return None
@@ -5251,7 +5340,7 @@ class CryptoTrader:
         if current_pos > 0:
             # SG2: 加仓前风险闸门——无法证明全部已有仓位（程序批次+未归属仓位）受有效 SL
             # 保护时拒绝新批次（Fail-Closed，不变量②）。helper 只判定，此处负责告知用户。
-            allowed, sg2_reason = self._check_sl_coverage(symbol, all_states, current_pos)
+            allowed, sg2_reason = self._check_sl_coverage(symbol, all_states, current_pos, side)
             if not allowed:
                 print(f"🚫 [SG2] 拒绝加仓信号 [{batch_id}]: {sg2_reason}")
                 try:
@@ -5307,17 +5396,11 @@ class CryptoTrader:
             print(tp_msg)
 
             params_base = {}
-            is_hedge_mode = False
-            try:
-                res = self._safe_api_call(self.exchange.fapiPrivateGetPositionSideDual)
-                if res and res.get('dualSidePosition'):
-                    params_base['positionSide'] = 'LONG' if side == 'BUY' else 'SHORT'
-                    is_hedge_mode = True
-                    print(f"💡 检测到账户为 [双向持仓模式]，方向: {params_base['positionSide']}")
-                else:
-                    print("💡 检测到账户为 [单向持仓模式]")
-            except Exception as e:
-                print(f"⚠️ 获取持仓模式状态失败，默认单向持仓: {e}")
+            # is_hedge_mode 已在持仓查询前完成检测（失败即 Fail-Closed 阻断，
+            # 不会走到这里）——此处只按检测结果设置 positionSide，不再猜测。
+            if is_hedge_mode:
+                params_base['positionSide'] = 'LONG' if side == 'BUY' else 'SHORT'
+                print(f"💡 双向持仓模式，本批次方向: {params_base['positionSide']}")
 
             params_base['workingType'] = 'MARK_PRICE'
             params_base['leverage'] = signal.leverage

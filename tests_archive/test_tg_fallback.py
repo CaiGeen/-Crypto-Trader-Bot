@@ -103,14 +103,17 @@ def scenario_3():
 def scenario_4():
     """4: execute_signal 集成 -> SG2 拒绝 return None + 零下单 + 纯文本通知送达"""
     bot = FakeTgBot()
-    states = {SYMBOL: {'b1': {'is_active': True, 'last_filled_count': 0,
-                              'target_amounts': [0.01], 'current_sl_id': None}}}
+    states = {SYMBOL: {'b1': {'is_active': True, 'side': 'BUY', 'last_filled_count': 0,
+                              'target_amounts': [0.01], 'filled_details': [],
+                              'realized_reduce_amount': 0.0, 'current_sl_id': None}}}
 
     class Exchange:
         def __init__(self):
             self.create_order_calls = 0
             self.set_leverage_calls = 0
-        def fetch_open_orders(self, symbol):
+        def fapiPrivateGetPositionSideDual(self):
+            return {'dualSidePosition': 'false'}   # 过渡期收口：execute_signal 前置检测（Fail-Closed）
+        def fetch_open_orders(self, symbol, params=None):
             return []
         def set_leverage(self, lv, symbol):
             self.set_leverage_calls += 1
@@ -125,10 +128,13 @@ def scenario_4():
     fake._ready = True
     fake._not_ready_reason = ""
     fake.load_all_states = lambda: states
-    fake._check_existing_conflicts = lambda s, b, a: False
+    fake._check_existing_conflicts = lambda *a, **k: False
+    fake._compute_signal_fingerprint = lambda sig: 'fp'      # v6.3 指纹（execute_signal 前置依赖）
     fake._get_current_position_amt = lambda *a, **k: 0.03      # delta=+0.03 手工仓
     fake._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
-    fake._check_sl_coverage = lambda sym, st, pos: CryptoTrader._check_sl_coverage(fake, sym, st, pos)
+    fake._check_sl_coverage = lambda sym, st, pos, side: CryptoTrader._check_sl_coverage(fake, sym, st, pos, side)
+    fake._batch_net_position = lambda b: CryptoTrader._batch_net_position(fake, b)
+    fake._order_still_open = lambda *a, **k: False
     # D-006（2026-08-28）：绑定真实账户风控闸门三件套（execute_signal 新前置依赖，防假回归）
     fake._check_account_risk = lambda st, sig, stats_file=None: CryptoTrader._check_account_risk(fake, st, sig, stats_file)
     fake._count_active_batches = lambda st: CryptoTrader._count_active_batches(fake, st)

@@ -41,7 +41,8 @@ class FakeExchange:
         self.fail_open_orders = fail_open_orders
         self.calls = {'set_leverage': 0, 'create_order': 0, 'fetch_open_orders': 0}
 
-    def fetch_open_orders(self, symbol):
+    def fetch_open_orders(self, symbol, params=None):
+        # v6.4 P0-F1 双通道：普通 + params={'stop': True} 条件单，两通道返回同一列表即可
         self.calls['fetch_open_orders'] += 1
         if self.fail_open_orders:
             raise ConnectionError("模拟：查询挂单失败")
@@ -57,6 +58,9 @@ class FakeExchange:
         self.calls['create_order'] += 1
         return {'id': 'new_order'}
 
+    def fapiPrivateGetPositionSideDual(self):
+        return {'dualSidePosition': False}  # 过渡期收口：execute_signal 持仓查询前必查（失败即阻断）
+
 
 class HelperFake:
     """helper 单测最小 fake：只需 exchange + _safe_api_call 直通；
@@ -66,8 +70,11 @@ class HelperFake:
         self.exchange = exchange
         self._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
 
-    def _check_sl_coverage(self, symbol, all_states, current_pos):
-        return CryptoTrader._check_sl_coverage(self, symbol, all_states, current_pos)
+    def _check_sl_coverage(self, symbol, all_states, current_pos, side='BUY'):
+        return CryptoTrader._check_sl_coverage(self, symbol, all_states, current_pos, side)
+
+    def _batch_net_position(self, b_data):
+        return CryptoTrader._batch_net_position(self, b_data)
 
     # D-006（2026-08-28）：execute_signal 新前置依赖——绑定真实账户风控闸门三件套（防假回归）
     def _check_account_risk(self, all_states, signal, stats_file=None):
@@ -94,8 +101,11 @@ class ExecFake(HelperFake):
     def load_all_states(self):
         return self._states
 
-    def _check_existing_conflicts(self, symbol, batch_id, all_states):
+    def _check_existing_conflicts(self, symbol, batch_id, all_states, _fp=None):
         return False  # stub：不真正调 fetch_open_orders，保证调用计数只含 SG2
+
+    def _compute_signal_fingerprint(self, signal):
+        return 'fp_stub'  # stub：指纹幂等由 test_v63_entry_idempotency 专项覆盖
 
     def _get_current_position_amt(self, *a, **k):
         return self._current_pos
@@ -112,13 +122,14 @@ class FakeSignal:
 
 
 def make_batch(last_filled, amounts, sl_id):
-    return {'is_active': True, 'last_filled_count': last_filled,
+    # 过渡期收口：SG2 按 (symbol, side) 计量——批次必须显式带 side 才计入本方向台账
+    return {'is_active': True, 'side': 'BUY', 'last_filled_count': last_filled,
             'target_amounts': amounts, 'current_sl_id': sl_id}
 
 
 def helper(symbol, states, current_pos, open_orders=None, fail_open=False):
     ex = FakeExchange(open_orders=open_orders, fail_open_orders=fail_open)
-    return CryptoTrader._check_sl_coverage(HelperFake(ex), symbol, states, current_pos), ex
+    return CryptoTrader._check_sl_coverage(HelperFake(ex), symbol, states, current_pos, 'BUY'), ex
 
 
 # ---------------- helper 单元测试（场景 2-10） ----------------
