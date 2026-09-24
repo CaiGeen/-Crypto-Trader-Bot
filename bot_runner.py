@@ -51,7 +51,7 @@ from telegram.error import NetworkError, RetryAfter, Conflict, BadRequest
 # 导入交易核心与解析器
 from parser import parse_signal_from_json, parse_signal_from_dict
 from trader_260725 import CryptoTrader
-from health_progress import new_instance_id, write_progress, remove_batch
+from health_progress import new_instance_id, write_progress
 
 # 2. 加载环境变量
 load_dotenv()

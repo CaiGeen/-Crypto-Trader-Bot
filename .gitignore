@@ -81,5 +81,6 @@ _*.log
 logs/
 .heartbeat.json
 .patrol_alert.state.json
+.bot_health/
 *.bak
 

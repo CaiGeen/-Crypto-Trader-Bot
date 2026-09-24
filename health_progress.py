@@ -8,7 +8,6 @@ import uuid
 
 HEALTH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_health")
 CONTROL_FILE = os.path.join(HEALTH_DIR, "control.json")
-STALL_SECONDS = 900
 
 def new_instance_id():
     return uuid.uuid4().hex
