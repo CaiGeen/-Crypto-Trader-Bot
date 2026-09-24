@@ -51,6 +51,7 @@ from telegram.error import NetworkError, RetryAfter, Conflict, BadRequest
 # 导入交易核心与解析器
 from parser import parse_signal_from_json, parse_signal_from_dict
 from trader_260725 import CryptoTrader
+from health_progress import new_instance_id, write_progress, remove_batch
 
 # 2. 加载环境变量
 load_dotenv()
@@ -2731,7 +2732,10 @@ async def send_summary_notification(app: Application):
 
 
 # ==================== on_post_init ====================
+_HEALTH_INSTANCE_ID = None
+
 async def on_post_init(app: Application):
+    global _HEALTH_INSTANCE_ID
     try:
         api_key = os.getenv("BINANCE_API_KEY")
         secret = os.getenv("BINANCE_SECRET")
@@ -2740,6 +2744,8 @@ async def on_post_init(app: Application):
 
         # 🔥 记录启动时间（供 /system 查询运行时长）
         app.bot_data['bot_start_time'] = datetime.now()
+        _HEALTH_INSTANCE_ID = new_instance_id()
+        app.bot_data['health_instance_id'] = _HEALTH_INSTANCE_ID
 
         global_trader = CryptoTrader(
             api_key=api_key,
@@ -2769,6 +2775,7 @@ async def on_post_init(app: Application):
                         app.bot, ALLOWED_USER_ID,
                         summary_cb=lambda: send_summary_notification(app),
                     )
+                    write_progress('control', _HEALTH_INSTANCE_ID, sequence=int(time.time() * 1000) % 1000000000)
                 except Exception as e:
                     # 🔥 E4 修复（D-010）：兜底失败只记录，不再调用 send_summary_notification——
                     # 错误处理路径不得产生新的通知副作用（8-28 事故：通知链路故障时每 10s 刷汇总）

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
 from parser import TradeSignal, parse_signal_from_json
+from health_progress import current_instance_id, write_progress, remove_batch
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -6971,6 +6972,7 @@ class CryptoTrader:
                           layer_sl_params: list = None):
 
         # 🔥 检查并清理可能残留的监控标记
+        _health_instance = current_instance_id()
         with self._active_monitors_lock:
             if batch_id in self._active_monitors:
                 print(f"  └─ ⚠️ 批次 [{batch_id}] 监控标记残留，自动清理 (当前监控集合: {self._active_monitors})")
@@ -7078,6 +7080,10 @@ class CryptoTrader:
                     fast_poll_count -= 1
 
                 time.sleep(sleep_interval)
+                _health_instance = current_instance_id() or _health_instance
+                if _health_instance:
+                    write_progress('batch', _health_instance, batch_id, symbol,
+                                   sequence=int(time.time() * 1000) % 1000000000)
                 # 🔥 v6.4-P3（G1）：生命周期守卫——醒来后先重证生存资格，再允许任何 API。
                 # 磁盘生命周期是唯一权威：批次已被对账/清理（如 /auth_reset）→ 线程立即退出
                 # （零 API/零结算/零补挂）。UNKNOWN ≠ EMPTY：账本损坏绝不解释为「已清理」。
@@ -8945,6 +8951,10 @@ class CryptoTrader:
                     if still_pending:
                         print(f"⚠️ [批次 {batch_id}] 待补挂层 {still_pending} 未能处理，等待下一轮轮询")
 
+                if _health_instance:
+                    write_progress('batch', _health_instance, batch_id, symbol,
+                                   sequence=int(time.time() * 1000) % 1000000000)
+
         # ================================================================
         # 🔥 异常捕获 - 监控循环内部异常
         # ================================================================
@@ -8986,6 +8996,7 @@ class CryptoTrader:
             # 🔥 从活跃监控集合中移除
             with self._active_monitors_lock:
                 self._active_monitors.discard(batch_id)
+                remove_batch(_health_instance, batch_id)
                 print(f"👀 批次 [{batch_id}] 监控已移除 (剩余活跃监控数: {len(self._active_monitors)})")
 
             # 🔥 P5e（ChatGPT 四复审 P0）：finally 清理前置统一守卫——

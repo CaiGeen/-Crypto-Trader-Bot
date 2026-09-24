@@ -39,9 +39,10 @@ LOG_FILE = os.path.join(LOG_DIR, "patrol.log")
 MAX_AGE_SECONDS = int(os.getenv("PATROL_MAX_AGE_SECONDS", "300"))  # 心跳陈旧阈值
 ALERT_DEDUP_SECONDS = 1800                                         # 同问题去重窗口
 BOT_DEAD_THRESHOLD = 2        # 连续 N 次巡检 bot 不存活才告警（滤掉重启瞬窗）
-# 🔥 2026-09-23 18:29 事故新增：输出停滞阈值——bot 正常每 ~60s 必打一行（限流观测），
-# 超过该阈值仍无新行 = "进程活着但线程冻结"（此前的进程/心跳检测无法识别此形态）。
-OUTPUT_STALL_SECONDS = int(os.getenv("PATROL_OUTPUT_STALL_SECONDS", "600"))
+# 业务活性阈值：控制循环/活跃批次进度超过此值即视为冻结
+PROGRESS_STALL_SECONDS = int(os.getenv("PATROL_PROGRESS_STALL_SECONDS", "900"))
+HEALTH_DIR = os.path.join(BASE_DIR, ".bot_health")
+TRADE_STATE_FILE = os.path.join(BASE_DIR, "trade_state.json")
 
 # pythonw.exe 场景：stdout/stderr 为 None，print 会抛 AttributeError
 if sys.stdout is None:
@@ -267,36 +268,41 @@ def run_check(env: dict, dry_run: bool) -> int:
                 st["_bot_dead_count"] = 0
                 write_json(ALERT_STATE_FILE, st)
 
-    # 🔥 2026-09-23 18:29 事故新增：输出停滞检测（"进程/心跳健康但线程冻结"）。
-    #   本次事故中 watchdog 被控制台卡住 → 管道积满 → bot 阻塞在 print 且持锁 →
-    #   TG/监控全灭 3 小时，而心跳与 bot_alive 全程"正常"，原有两项检测全盲。
-    #   判据：bot_alive=true 且最新 logs/bot_*.log 超过 OUTPUT_STALL_SECONDS 无新行。
-    #   （盲区静默 AUTH_BLOCKED 期间也可能无输出，提示文案同时覆盖两种成因。）
+    # 业务进度活性：区分正常空闲与真实冻结；不再把日志 mtime 当作线程心跳。
     if hb and hb.get("bot_alive") and not hb.get("stopped"):
         try:
-            newest, newest_mtime = None, 0.0
-            if os.path.isdir(LOG_DIR):
-                for name in os.listdir(LOG_DIR):
-                    if name.startswith("bot_") and name.endswith(".log"):
-                        p = os.path.join(LOG_DIR, name)
-                        m = os.path.getmtime(p)
-                        if m > newest_mtime:
-                            newest, newest_mtime = p, m
-            if newest:
-                out_age = time.time() - newest_mtime
-                if out_age > OUTPUT_STALL_SECONDS:
-                    issues.append((
-                        "output_stalled",
-                        f"bot 输出停滞 {out_age:.0f}s（阈值 {OUTPUT_STALL_SECONDS}s）",
-                        f"进程与心跳均正常但 {os.path.basename(newest)} 长时间无新行——"
-                        "线程级冻结特征（输出阻塞持锁/死锁），或 API 盲区静默。"
-                        "现象：TG 无响应、控制台不再刷新。处置："
-                        f"taskkill /F /T /PID {hb.get('watchdog_pid')} 后 "
-                        "schtasks /Run /TN CryptoBot-Autostart 整链重启。"))
+            states = read_json(TRADE_STATE_FILE)
+            if states is None or not isinstance(states, dict):
+                raise ValueError("trade_state.json 无法解析")
+            active = []
+            for sym, batches in states.items():
+                if not isinstance(batches, dict):
+                    continue
+                for bid, data in batches.items():
+                    if isinstance(data, dict) and data.get("is_active"):
+                        active.append((sym, bid))
+            control = read_json(os.path.join(HEALTH_DIR, "control.json"))
+            if not control or not control.get("instance_id"):
+                raise ValueError("控制面进度文件缺失或损坏")
+            age = time.time() - float(control.get("ts", 0) or 0)
+            if age > PROGRESS_STALL_SECONDS:
+                issues.append(("control_stalled", f"控制循环进度停滞 {age:.0f}s（阈值 {PROGRESS_STALL_SECONDS}s）",
+                               f"instance={control.get('instance_id')}；请先查看 py-spy 与业务日志，再按应急流程重启。"))
+            else:
+                summary.append(f"控制进度新鲜 {age:.0f}s 前 | 活跃批次 {len(active)}")
+            for sym, bid in active:
+                p = read_json(os.path.join(HEALTH_DIR, f"batch_{bid}.json"))
+                if not p or p.get("instance_id") != control.get("instance_id"):
+                    issues.append(("batch_progress_missing", f"活跃批次 [{sym}/{bid}] 缺少当前实例进度",
+                                   "监控线程可能未启动、已冻结或实例切换；请人工核查，禁止假设为空闲。"))
                 else:
-                    summary.append(f"输出新鲜 {out_age:.0f}s 前")
-        except Exception:
-            pass
+                    a = time.time() - float(p.get("ts", 0) or 0)
+                    if a > PROGRESS_STALL_SECONDS:
+                        issues.append(("batch_stalled", f"批次 [{sym}/{bid}] 监控进度停滞 {a:.0f}s",
+                                       f"instance={p.get('instance_id')}；该批次存在活动状态，禁止按空闲处理。"))
+        except ValueError as e:
+            issues.append(("health_state_unknown", f"业务活性状态未知：{e}",
+                           "无法确认 bot 是否空闲；按 Fail-Safe 处理，核查 trade_state.json 与 .bot_health 后再决定是否重启。"))
 
     if proxy_url and not proxy_ready(proxy_url):
         issues.append(("proxy_down", "本地代理不可达",
