@@ -34,6 +34,7 @@ import os
 import sys
 import tempfile
 import shutil
+import time
 
 from telegram.error import BadRequest
 
@@ -599,6 +600,78 @@ def scenario_17():
         env.close()
 
 
+def scenario_18():
+    """S18 第五轮复审（阻断项）：崩溃邮件 SMTP 阻塞时**事件循环不得被卡住**。
+
+    `_process_notify_queue_once` 是运行在 Telegram 事件循环中的协程；
+    若在其中同步调用 `send_email_alert(wait=True)`（内部 join 最长 20s），
+    事件循环会被整段阻塞：命令回复、其他通知、后台线程提交到同一 loop 的
+    TG 消息（其 future.result(timeout=5)）都会停顿甚至超时。
+    判据：SMTP 故意 sleep 0.6s，期间事件循环心跳必须仍能跑 ≥5 次。
+    """
+    env = Env()
+    try:
+        eid = "20260925_110000_111111_feedface"
+        env.enqueue(eid, "crash_alert|程序异常退出: RuntimeError")
+        bot = FakeTgBot(always_fail=True)      # TG 失败 → 必走邮件分支
+        ticks = []
+
+        def _slow_email(*a, **k):
+            time.sleep(0.6)                     # 模拟 SMTP 卡顿
+            return True
+
+        async def _main():
+            task = asyncio.create_task(bot_runner._process_notify_queue_once(
+                bot, 12345,
+                state_file=env.state_file, queue_dir=env.queue_dir,
+                audit_log=env.audit_log,
+                email_cb=_slow_email))
+            for _ in range(30):
+                await asyncio.sleep(0.05)
+                ticks.append(1)
+                if task.done():
+                    break
+            await task
+
+        asyncio.run(_main())
+
+        # 同步 join 版：0.6s 阻塞期间心跳最多 ~2 次；to_thread 版：约 12 次
+        ok = len(ticks) >= 5
+        report("S18 crash_alert: SMTP阻塞不阻塞事件循环(阻断项)", ok,
+               f"(SMTP sleep 0.6s 期间事件循环心跳 {len(ticks)} 次，阈值≥5)")
+    finally:
+        env.close()
+
+
+def scenario_19():
+    """S19 第五轮复审：TG 成功但邮件未确认 → 事件按「TG 成功即完成」删除，
+    **但必须留审计证据**（否则「邮件没送达」这件事会被静默吞掉）。"""
+    env = Env()
+    try:
+        eid = "20260925_120000_111111_0badf00d"
+        env.enqueue(eid, "crash_alert|程序异常退出: RuntimeError")
+        bot = FakeTgBot()                      # TG 正常
+        email_calls = []
+
+        def _email_failed(*a, **k):
+            email_calls.append(k.get("event"))
+            return False                       # SMTP 失败
+
+        stats = run_round(bot, env, email_cb=_email_failed)
+        st = env.state().get(eid, {})
+        audit = "\n".join(env.audit_lines())
+        ok = (len(bot.sent) == 1
+              and len(email_calls) == 1
+              and env.queue_files() == []          # TG 成功 → 事件已完成
+              and st == {}                          # state 同步清理
+              and "TG_DELIVERED_EMAIL_UNCONFIRMED" in audit)  # 证据必须留痕
+        report("S19 crash_alert: TG成功+邮件未确认 → 删除但留审计", ok,
+               f"(tg={len(bot.sent)}, email={len(email_calls)}, "
+               f"队列={env.queue_files()}, 审计含证据={'TG_DELIVERED_EMAIL_UNCONFIRMED' in audit})")
+    finally:
+        env.close()
+
+
 if __name__ == '__main__':
     scenario_1()
     scenario_2()
@@ -617,6 +690,8 @@ if __name__ == '__main__':
     scenario_15()
     scenario_16()
     scenario_17()
+    scenario_18()
+    scenario_19()
     print("\n" + "#" * 60)
     failed = [n for n, p in RESULTS if not p]
     if failed:

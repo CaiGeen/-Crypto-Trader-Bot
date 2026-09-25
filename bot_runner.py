@@ -431,14 +431,31 @@ async def _process_notify_queue_once(bot, chat_id: int,
                     try:
                         # 第四轮复审（阻断项）：wait=True —— 只有 SMTP **确认送达**
                         # 才记 crash_email_sent；「线程已启动」不算送达。
-                        # 未确认 → 不落记忆，下一轮仍会重试邮件（TG 失败 3 轮后 SILENCED）。
-                        _email_res = (email_cb or send_email_alert)(
+                        #
+                        # 第五轮复审（阻断项）：本协程运行在 **Telegram 事件循环**上，
+                        # 而 wait=True 内部是 t.join(timeout=20) 的同步阻塞 ——
+                        # 直接调用会让整个事件循环停顿最长 20s（命令回复、其他通知、
+                        # 后台线程提交到同一 loop 的 TG 消息都会卡，5s 超时风险）。
+                        # 因此必须把阻塞整体移出事件循环：await asyncio.to_thread(...)
+                        _email_res = await asyncio.to_thread(
+                            (email_cb or send_email_alert),
                             f"💥 程序崩溃报警！\n\n{notify_msg}",
                             subject="💥 程序崩溃报警", event="crash", wait=True)
                         if _email_res is True:
                             st['crash_email_sent'] = True
                         else:
-                            logging.warning("⚠️ 崩溃邮件未获 SMTP 确认，不标记已发送，下轮重试")
+                            logging.warning("⚠️ 崩溃邮件未获 SMTP 确认，不标记已发送")
+                            if ok:
+                                # TG 已成功 → 本轮即删除事件文件，**邮件不会有下一轮**
+                                # （D-010 语义：TG 成功即视为事件已送达）
+                                _append_notify_audit(
+                                    event_id, 'TG_DELIVERED_EMAIL_UNCONFIRMED',
+                                    st.get('failed_attempts', 0), evidence, audit_log)
+                                logging.warning(
+                                    "⚠️ 崩溃告警：TG 已送达但邮件未获 SMTP 确认，"
+                                    "按『TG 成功即完成』结束本事件，邮件不再重试")
+                            else:
+                                logging.warning("   → TG 亦未送达，下一轮继续尝试邮件")
                     except Exception as e:
                         logging.warning(f"⚠️ 崩溃报警邮件发送异常: {e}")
                 else:
