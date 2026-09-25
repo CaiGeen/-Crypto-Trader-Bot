@@ -270,6 +270,47 @@ AUTH_BLOCKED_ERROR_PATTERNS = ("-2015", "-2014", "-1022", "invalid api-key")
 AUTH_BLOCKED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auth_blocked.json")
 NOTIFY_QUEUE_DIR_TRADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".notify_queue")
 
+# 复审 D6（第三轮）：日报投递状态持久化 —— 进程在 08:05~08:30 崩溃重启时，
+# 已确认的渠道与当日标记必须跨进程保留，否则会重复发送同一天的日报
+# （D2b 的进程内保证在重启后会失效）。语义与 .notify.state.json 一致：
+# 文件缺失/损坏 → 按无状态处理（宁可重复也不丢失，重复是偶发、丢失是必然）。
+DAILY_REPORT_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".daily_report.state.json")
+
+
+def _load_daily_report_state(path: str | None = None) -> dict:
+    """读取日报投递状态；缺失/损坏/非 dict → {}（按无状态处理，只告警不崩溃）"""
+    p = path or DAILY_REPORT_STATE_FILE
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        return {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"⚠️ [日报] 状态文件损坏，按无状态处理: {e}")
+        return {}
+
+
+def _save_daily_report_state(state: dict, path: str | None = None) -> None:
+    """原子写（tmp → flush → os.replace，仓库惯例）；best-effort，失败只告警"""
+    p = path or DAILY_REPORT_STATE_FILE
+    tmp = p + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+            f.flush()
+        os.replace(tmp, p)
+    except Exception as e:
+        print(f"⚠️ [日报] 状态文件保存失败（本轮投递结果可能在重启后丢失）: {e}")
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
 # T4：盲区休眠（监控线程收到 AuthBlockedError → 300s 纯本地等待，零 API）
 AUTH_BLIND_SLEEP_SECONDS = 300
 
@@ -316,6 +357,21 @@ def _fsync_dir(dir_path: str) -> bool:
             os.close(fd)
         except Exception:
             pass
+
+
+def _daily_report_required_channels() -> tuple:
+    """D5（第三轮复审）：**策略关闭的渠道不算投递失败**。
+
+    邮件总开关 / 日报邮件开关关闭是用户的显式策略，不是故障；否则
+    ``_send_email_alert`` 恒返回 False → 状态机永远等不到确认 → 每天 6 次重试
+    + ❌『需人工确认』误报（新增 ``DAILY_REPORT_EMAIL_ENABLED`` 时引入的降级缺陷）。
+    放在模块层而非方法：便于被调用方与测试直接复用真实策略，无需 mock self。
+    """
+    if not email_gate.email_enabled():
+        return ()
+    if not email_gate.daily_report_email_enabled():
+        return ()
+    return ("email",)
 
 
 class CryptoTrader:
@@ -471,6 +527,7 @@ class CryptoTrader:
         self._daily_report_retry_count = 0   # R0/F12：仅双渠道确认后才写日期，未确认按 5min 重试
         self._daily_report_retry_date = None     # 复审 D1：重试额度按日归属，跨日必须重置
         self._daily_report_done = {"tg": False, "email": False}  # 复审 D2b：已确认渠道不重发
+        self._daily_report_state_file = DAILY_REPORT_STATE_FILE  # 复审 D6：跨重启持久化（测试可重定向）
         threading.Thread(target=self._daily_report_loop, daemon=True).start()
 
         # 🔥 D-009 P0（ChatGPT R2/R3 批准）：账本完整性状态位（默认"可信"，Fail-Closed 起手）
@@ -1710,13 +1767,39 @@ class CryptoTrader:
             return {"tg": False if "tg" in channels else None,
                     "email": False if "email" in channels else None}
 
+    def _persist_daily_report_state(self) -> None:
+        """D6：把日报投递状态落盘（best-effort），供崩溃重启后恢复、不重复发送"""
+        _save_daily_report_state({
+            "date": self._last_daily_report_date,
+            "retry_date": self._daily_report_retry_date,
+            "retry_count": self._daily_report_retry_count,
+            "done": dict(self._daily_report_done or {}),
+        }, getattr(self, "_daily_report_state_file", None))
+
+    def _load_daily_report_state_into(self) -> None:
+        """D6：启动时恢复日报投递状态（进程在 08:05~08:30 重启不重复发送）"""
+        st = _load_daily_report_state(getattr(self, "_daily_report_state_file", None))
+        if not st:
+            return
+        date = st.get("date")
+        if isinstance(date, str) and date:
+            self._last_daily_report_date = date
+        rr = st.get("retry_date")
+        self._daily_report_retry_date = rr if isinstance(rr, str) and rr else None
+        rc = st.get("retry_count")
+        self._daily_report_retry_count = rc if isinstance(rc, int) and rc > 0 else 0
+        done = st.get("done")
+        if isinstance(done, dict):
+            self._daily_report_done = {"tg": bool(done.get("tg")),
+                                       "email": bool(done.get("email"))}
+
     def _try_daily_report_once(self, today: str) -> str:
-        """执行一次日报尝试（复审 D1/D2b：把状态机从无限循环里抽出来，便于精确验收）。
+        """执行一次日报尝试（复审 D1/D2b/D5：把状态机从无限循环里抽出来，便于精确验收）。
 
         返回：
           'idle'      当日已完成，无需动作
-          'done'      本次尝试后双渠道均确认（已标记当日）
-          'retry'     仍有渠道未确认，等待下次重试
+          'done'      本次尝试后所需渠道均确认（已标记当日）
+          'retry'     仍有**必需**渠道未确认，等待下次重试
           'exhausted' 本日重试额度（6 次）耗尽，已标记放弃（避免整日刷屏）
         """
         if self._last_daily_report_date == today:
@@ -1727,7 +1810,9 @@ class CryptoTrader:
             self._daily_report_retry_count = 0
             self._daily_report_done = {"tg": False, "email": False}
 
-        todo = tuple(c for c in ("tg", "email")
+        # D5：todo 只含「策略允许且尚未确认」的渠道
+        required = ("tg",) + _daily_report_required_channels()
+        todo = tuple(c for c in required
                      if not self._daily_report_done.get(c))
         if not todo:
             self._last_daily_report_date = today
@@ -1739,7 +1824,7 @@ class CryptoTrader:
             if result.get(ch) is True:
                 self._daily_report_done[ch] = True
 
-        if all(self._daily_report_done.get(c) for c in ("tg", "email")):
+        if all(self._daily_report_done.get(c) for c in required):
             self._last_daily_report_date = today
             self._daily_report_retry_count = 0
             return 'done'
@@ -1765,6 +1850,11 @@ class CryptoTrader:
         self._daily_report_retry_count = 0
         self._daily_report_retry_date = None          # 复审 D1：按日归属的重试额度
         self._daily_report_done = {"tg": False, "email": False}   # 复审 D2b：已确认渠道
+        # 复审 D6：先恢复上次投递状态 —— 进程在 08:05~08:30 崩溃重启时不重复发送
+        try:
+            self._load_daily_report_state_into()
+        except Exception as e:
+            print(f"⚠️ [日报] 状态恢复失败，按无状态处理: {e}")
         while True:
             try:
                 now = datetime.now(BEIJING_TZ)
@@ -1774,6 +1864,10 @@ class CryptoTrader:
                                    and now.minute % 5 == 0)
                 if in_retry_window:
                     state = self._try_daily_report_once(today)
+                    try:
+                        self._persist_daily_report_state()   # D6：每次尝试后落盘
+                    except Exception as e:
+                        print(f"⚠️ [日报] 状态落盘失败: {e}")
                     if state == 'idle':
                         time.sleep(30)
                         continue
@@ -1781,7 +1875,8 @@ class CryptoTrader:
                         print(f"✅ [日报] {today} 双渠道已确认送达")
                         time.sleep(90)   # 避免同一窗口重复发送
                         continue
-                    pending = [c for c in ("tg", "email")
+                    required = ("tg",) + _daily_report_required_channels()
+                    pending = [c for c in required
                                if not self._daily_report_done.get(c)]
                     if state == 'exhausted':
                         print(f"❌ [日报] {today} 连续 {self._daily_report_retry_count} 次"

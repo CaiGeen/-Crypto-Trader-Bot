@@ -194,6 +194,106 @@ class DailyReportDeliveryTests(unittest.TestCase):
         self.assertEqual(state, "idle")
         fake._send_daily_report.assert_not_called()
 
+    # ---------------- 第三轮复审（D5：策略关闭 ≠ 投递失败） ----------------
+
+    def test_daily_report_email_switch_off_degrades_to_tg_only(self):
+        """D5：DAILY_REPORT_EMAIL_ENABLED=false 是**策略关闭**，
+        不得被当成投递失败 → 触发 6 次重试与每天 ❌『需人工确认』误报。"""
+        fake = self._fake_for_helper(result={"tg": True, "email": False})
+        with mock.patch.object(email_gate, "daily_report_email_enabled",
+                               return_value=False):
+            state = trader_260725.CryptoTrader._try_daily_report_once(fake, "2026-09-25")
+        self.assertEqual(state, "done")
+        channels = fake._send_daily_report.call_args.kwargs.get("channels")
+        self.assertEqual(tuple(channels), ("tg",))
+        self.assertEqual(fake._last_daily_report_date, "2026-09-25")
+
+    def test_master_email_switch_off_degrades_to_tg_only(self):
+        """D5：EMAIL_ALERT_ENABLED=false（总开关）同样按策略关闭处理"""
+        fake = self._fake_for_helper(result={"tg": True, "email": False})
+        with mock.patch.object(email_gate, "email_enabled", return_value=False):
+            state = trader_260725.CryptoTrader._try_daily_report_once(fake, "2026-09-25")
+        self.assertEqual(state, "done")
+        channels = fake._send_daily_report.call_args.kwargs.get("channels")
+        self.assertEqual(tuple(channels), ("tg",))
+
+    def test_email_included_when_policy_enabled(self):
+        """反向对照：策略允许时 email 必须在 todo 中（防止过度抑制）"""
+        fake = self._fake_for_helper(result={"tg": True, "email": True})
+        with mock.patch.object(email_gate, "daily_report_email_enabled",
+                               return_value=True), \
+                mock.patch.object(email_gate, "email_enabled", return_value=True):
+            state = trader_260725.CryptoTrader._try_daily_report_once(fake, "2026-09-25")
+        self.assertEqual(state, "done")
+        channels = fake._send_daily_report.call_args.kwargs.get("channels")
+        self.assertEqual(set(channels), {"tg", "email"})
+
+
+
+class DailyReportStatePersistenceTests(unittest.TestCase):
+    """D6：日报投递状态跨进程持久化（窗口内崩溃重启不重复发送）"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, ".daily_report.state.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_state_roundtrip(self):
+        trader_260725._save_daily_report_state(
+            {"date": "2026-09-25", "retry_date": "2026-09-25",
+             "retry_count": 2, "done": {"tg": True, "email": False}}, self.path)
+        st = trader_260725._load_daily_report_state(self.path)
+        self.assertEqual(st["date"], "2026-09-25")
+        self.assertEqual(st["done"], {"tg": True, "email": False})
+        self.assertEqual(st["retry_count"], 2)
+
+    def test_corrupt_state_returns_empty(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        self.assertEqual(trader_260725._load_daily_report_state(self.path), {})
+
+    def test_missing_state_returns_empty(self):
+        self.assertEqual(
+            trader_260725._load_daily_report_state(
+                os.path.join(self.tmp.name, "nope.json")), {})
+
+    def test_restart_within_window_does_not_resend(self):
+        """核心场景：08:05 已发 → 08:10 崩溃重启 → 恢复状态后必须 idle，不得重发"""
+        trader_260725._save_daily_report_state(
+            {"date": "2026-09-25", "retry_date": "2026-09-25",
+             "retry_count": 0, "done": {"tg": True, "email": True}}, self.path)
+        ct = trader_260725.CryptoTrader
+        fake = mock.MagicMock()
+        fake._daily_report_state_file = self.path
+        fake._last_daily_report_date = None          # 进程重启：内存状态清零
+        fake._daily_report_retry_count = 0
+        fake._daily_report_retry_date = None
+        fake._daily_report_done = {"tg": False, "email": False}
+        fake._send_daily_report = mock.MagicMock()
+        # MagicMock 属性会自动生成 mock，必须显式绑定真实实现
+        fake._load_daily_report_state_into = lambda: ct._load_daily_report_state_into(fake)
+        fake._try_daily_report_once = lambda today: ct._try_daily_report_once(fake, today)
+
+        fake._load_daily_report_state_into()                      # 启动恢复
+        state = fake._try_daily_report_once("2026-09-25")
+        self.assertEqual(state, "idle")
+        fake._send_daily_report.assert_not_called()               # 不重复发送
+
+    def test_persist_after_attempt_writes_all_fields(self):
+        ct = trader_260725.CryptoTrader
+        fake = mock.MagicMock()
+        fake._daily_report_state_file = self.path
+        fake._last_daily_report_date = "2026-09-25"
+        fake._daily_report_retry_date = "2026-09-25"
+        fake._daily_report_retry_count = 3
+        fake._daily_report_done = {"tg": True, "email": False}
+        ct._persist_daily_report_state(fake)
+        st = trader_260725._load_daily_report_state(self.path)
+        self.assertEqual(st["retry_count"], 3)
+        self.assertEqual(st["done"], {"tg": True, "email": False})
+        self.assertEqual(st["date"], "2026-09-25")
 
 
 class WatchdogFatalAlertTests(unittest.TestCase):

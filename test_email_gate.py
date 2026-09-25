@@ -168,6 +168,41 @@ class EmailGateTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(reason, "no_active_positions")
 
+    # ---------------- 第三轮复审（D7：event 拼写错误必须可读） ----------------
+
+    def test_unknown_event_is_gated_and_warns(self):
+        """D7：event 拼错（如 htalth）不能只返回模糊的 no_active_positions，
+        必须在日志里可读，否则致命事件会被静默降级为持仓闸门且难以定位。"""
+        import contextlib
+        import io
+
+        self._write_state({"BTCUSDT": {"b1": {"is_active": False}}})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            allowed, reason = email_gate.should_send_email(
+                env={
+                    "EMAIL_ALERT_ENABLED": "true",
+                    "EMAIL_ALERT_ONLY_WITH_POSITION": "true",
+                },
+                state_path=self.state_path,
+                event="htalth",   # 故意拼错
+            )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "no_active_positions")
+        self.assertIn("未知 event", buf.getvalue())
+
+    def test_known_fatal_event_no_warning(self):
+        """反向对照：已知致命事件不产生未知告警（避免日志噪音）"""
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            allowed, _ = email_gate.should_send_email(
+                env={}, state_path=self.state_path, event="crash")
+        self.assertTrue(allowed)
+        self.assertNotIn("未知 event", buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

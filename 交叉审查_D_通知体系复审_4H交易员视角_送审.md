@@ -629,6 +629,10 @@ RESTART_MINUTE = 0
 
 ---
 
+
+---
+
+
 ## 12. R0 实现的对抗性复审（2026-09-25，对 `c071643`）
 
 > 范围：专挑**我自己在 R0 引入的新缺陷**（而非重述既有问题）。全部结论均有 RED/GREEN 实证。
@@ -669,4 +673,70 @@ RESTART_MINUTE = 0
 - **TG 未配置或未就绪（返回 `None`）**：日报会累计 6 次尝试后标记 `exhausted` 并打印 ❌ 日志。取舍：**不重复投递已成功的渠道、不静默丢失**，代价是日志会记录一次"未确认"。不再视为「失败重试」之外的语义。
 - **`fatal_alert` 仅由启动熔断写入**：普通崩溃仍依赖队列 + bot 存活；watchdog 自身被杀（非熔断）时只会触发 `stale_heartbeat`。
 - **`crash_email_sent` 记忆依赖 state 文件**：state 被人工删除会解除记忆（有界重复 ≤1 轮），与 D-010「宁可漏发不重复」的既有取舍一致。
+- R1（快照三态 / 取价显式化）、R2（交易所权威强平与保护单）、R3（恢复通知 / 资金费 / quiet-hours）**未动**。
+
+
+---
+
+## 13. 第三轮复审（2026-09-25，对 `c3f860a`）
+
+> 聚焦两件事：①前两轮**未验证过**的时序/降级路径；②本轮新增开关与持久化的真实行为。
+
+### 13.1 排除项：一次可能推翻整条致命告警链的时序疑虑
+
+**疑虑**：`watchdog` 熔断退出时若写了 `stopped=True`，巡检会在 `fatal_alert` 检查**之前**早退，致命告警永远不发。
+
+**验证**：`mark_stopped` 全仓仅 2 处调用 —— `watchdog.py:521`（单实例拒绝）与 `:640`（Ctrl+C 手动停止）；熔断路径 `:573-582`（`mark_fatal` → `atomic_write_notify` → `_kill_main_process_tree` → `sys.exit(1)`）**不写 `stopped`**；外层只 `except KeyboardInterrupt`，`SystemExit` 直接透传。
+
+**结论**：巡检的 `stopped` 早退不会吞掉 `fatal_alert`。**无需改动**，但该时序关系是隐式的 —— 已作为「后续不得在熔断路径补 `mark_stopped`」的约束记录在案。
+
+### 13.2 D5（P1，新增开关引入的降级缺陷）
+
+**现象**：`DAILY_REPORT_EMAIL_ENABLED=false`（以及总开关 `EMAIL_ALERT_ENABLED=false`）是用户的**显式策略**，但状态机把它当**投递失败** —— `_send_email_alert` 恒返回 `False` → 永远等不到 `done` → **每天 6 次重试 + ❌『需人工确认』误报**。
+
+**RED 实证**：`AssertionError: 'retry' != 'done'`（两个用例）。
+
+**修复**：模块级 `_daily_report_required_channels()`（策略关闭 → `()`），`_try_daily_report_once` 的 `required` 与循环的 `pending` 都按它裁决 —— **策略关闭的渠道既不进 todo、也不进 pending**，日报降级为 TG 单渠道并正常 `done`。
+
+**附带的可测性修复**：该函数最初写成**方法**，导致 `self._daily_report_required_channels()` 在 `MagicMock` 假 self 上返回 MagicMock（`tuple + MagicMock` → 空迭代）→ 测试一度出现全绿假象。改放模块层后，真实策略无需 mock self 即可复用。
+
+### 13.3 D6（P1）：日报投递状态不持久化，窗口内崩溃重启会重复发送
+
+**现象**：`_last_daily_report_date` / `_daily_report_done` / `_daily_report_retry_*` 全在内存。08:05 已送达 → 08:10 崩溃 → watchdog 拉起 → 内存清零 → **同一天日报重发一遍**（D2b 的进程内保证在重启后失效）。
+
+**修复**：
+- 新增 `DAILY_REPORT_STATE_FILE = .daily_report.state.json`，原子写（tmp → flush → `os.replace`，仓库惯例）；
+- `_persist_daily_report_state()` 在**每次尝试后**落盘；`_load_daily_report_state_into()` 在循环启动时恢复；
+- 语义对齐 `.notify.state.json`：缺失/损坏 → 按无状态处理（宁可偶发重复，不可丢失）；
+- `.gitignore` 增补 `.daily_report.state.json` 与 `.tmp`。
+
+**RED/GREEN**：核心用例「08:05 已发 → 08:10 重启 → `state == 'idle'` 且 `_send_daily_report` 未被调用」由红转绿。
+
+### 13.4 D7（P2）：event 拼写错误静默降级
+
+**现象**：`event="htalth"` 这类拼错的致命事件会静默落到持仓闸门，空仓时被吞，而日志只显示模糊的 `no_active_positions`，无法定位。
+
+**修复**：`email_gate.KNOWN_EVENTS` + 未知事件打印可读告警（**不改裁决语义**，保持向后兼容）。裁决行为不变（回归用例钉住），只让原因可读。
+
+### 13.5 测试基础设施的自我教训（第二次同类问题）
+
+上一轮发现「预设状态 + 驱动无限循环」会写出恒定绿的无效测试；本轮又出现新变体：**`MagicMock` 假 self 会让 `self.helper()` 返回 mock 而非真实行为**，导致我加 D5 修复时先造出 6 个**假红**。
+
+两次的根因一致：**被测逻辑里一旦有对 `self` 的依赖，测试替身必须显式绑定真实实现（或把该逻辑移出 `self`）。** 与 §12.2 是同一条教训的两个侧面。
+
+### 13.6 第三轮测试证据
+
+| 套件 | 结果 |
+|---|---|
+| `test_r0_notify_chains` + `test_email_gate` + `test_email_channels` + 10 个既有套件 | **52 passed** |
+| `test_notify_queue`（S1~S16） | **16/16 场景** |
+| `test_watchdog_guard` | **22/22** |
+| 脚本式回归（close_confirmation_v62 / v62_staged / position_close） | **133/133、ALL PASS、7/7** |
+| `py_compile`（7 文件） | 通过 |
+
+### 13.7 累计遗留（R0 + 两轮复审后）
+
+- `fatal_alert` 仍**只由启动熔断写入**；watchdog 被外部杀死只触发 `stale_heartbeat`；
+- `crash_email_sent` 依赖 `.notify.state.json`，人工删除会解除记忆（有界重复 ≤1 轮）；
+- 日报 `TG` 未配置/未就绪（`None`）会累计 6 次后 `exhausted`（诚实留痕，不重复投递）；
 - R1（快照三态 / 取价显式化）、R2（交易所权威强平与保护单）、R3（恢复通知 / 资金费 / quiet-hours）**未动**。

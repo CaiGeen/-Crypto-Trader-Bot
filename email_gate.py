@@ -40,6 +40,17 @@ FATAL_EVENTS = frozenset({
 # 每日结算报告：固定运营通知，不受持仓闸门约束
 DAILY_REPORT_EVENT = "daily_report"
 
+# 已知事件全集（含通用与非致命事件）。用于识别**拼写错误**的 event：
+# 致命事件拼错会静默降级为持仓闸门 → 空仓时被吞，且日志里只能看到模糊的
+# no_active_positions，难以定位。仅告警，不改变裁决语义（保持向后兼容）。
+KNOWN_EVENTS = FATAL_EVENTS | {
+    "generic",
+    DAILY_REPORT_EVENT,
+    "ip_change",
+    "selftest",
+    "unknown",
+}
+
 DEFAULT_STATE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "trade_state.json"
 )
@@ -132,6 +143,11 @@ def should_send_email(env=None, state_path: str | None = None,
         return False, "disabled"
 
     ev = str(event or "generic").strip().lower()
+    if ev not in KNOWN_EVENTS:
+        # D7：拼写错误的致命事件会静默降级为持仓闸门（空仓即被吞），
+        # 且日志只会显示 no_active_positions，难以定位 —— 必须让原因可读。
+        print(f"⚠️ [邮件闸门] 未知 event={ev!r}，按普通事件(持仓闸门)裁决；"
+              f"若属资金安全事件请补入 email_gate.FATAL_EVENTS")
     if ev in FATAL_EVENTS:
         # 致命事件：持仓与状态可读性都不参与裁决（无持仓 ≠ 无风险；状态文件坏 ≠ 无风险）
         return True, "fatal_event"
