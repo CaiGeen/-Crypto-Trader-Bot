@@ -406,6 +406,45 @@ class TombstoneEntryIntegrityTests(unittest.TestCase):
                     'not-a-dict', None, [], 42):
             self.assertFalse(valid(bad), f"必须判为非法: {bad!r}")
 
+    def test_clear_returns_false_when_ledger_unreadable(self):
+        """ChatGPT 反例三：损坏账本 → 占位 {} →「找不到批次」≠「已清理」。
+
+        load_all_states 的 docstring 明写：「损坏时返回 {}（占位，返回值在损坏态
+        下无意义）。调用方读取返回值前必须先判 _state_corrupted」。
+        clear_batch_state 违反了这条契约：b_data is None 直接 return True，
+        于是损坏账本下所有清理都谎报成功（调用方打印「清理完毕」/ 返回 finalized），
+        而磁盘上的批次状态无人知晓、也不会重试。
+        另：load_all_states 对损坏只 print 不发 TG，_persist_states 的 critical
+        在此路径根本不会被调用 → 该路径原本零告警。
+        """
+        import contextlib
+        with tempfile.TemporaryDirectory() as tmp:
+            tomb = self._write(tmp, 'tomb.json', {})
+            state = os.path.join(tmp, 'trade_state.json')
+            with open(state, 'w', encoding='utf-8') as f:
+                f.write('{broken json')          # 真实损坏账本
+            broken_bytes = open(state, 'rb').read()
+            sent = []
+            fake = self._fake(tomb, sent)
+            fake._verify_clear_proof = lambda *a, **k: None
+            buf = io.StringIO()
+            with mock.patch.object(trader_260725, 'STATE_FILE', state):
+                with contextlib.redirect_stdout(buf):
+                    rc = trader_260725.CryptoTrader.clear_batch_state(
+                        fake, self.SYMBOL, 'batch_ghost',
+                        proof={'l1_canceled': [], 'l2_canceled': []})
+                corrupted = fake._state_corrupted
+            after_bytes = open(state, 'rb').read()
+        self.assertTrue(corrupted, "前置：load_all_states 必须已置损坏标志")
+        self.assertFalse(rc, "账本不可读时 clear 必须返回 False（未知 ≠ 已清理）")
+        self.assertNotIn('清理完毕', buf.getvalue(),
+                         "账本不可读时不得打印「清理完毕」")
+        crit = [t for lv, t in sent if lv == 'critical']
+        self.assertTrue(any(('损坏' in t or '不可读' in t) for t in crit),
+                        f"必须锁外 critical 且写明账本不可读: {crit}")
+        self.assertEqual(broken_bytes, after_bytes,
+                         "损坏现场必须原样保留（不得被清理流程覆盖）")
+
     def test_prune_is_skipped_when_degraded(self):
         """DEGRADED 时不得基于不可信数据改写墓碑（避免把损坏条目静默剪掉）。"""
         with tempfile.TemporaryDirectory() as tmp:

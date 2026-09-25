@@ -2621,11 +2621,15 @@ class CryptoTrader:
         Fail-Closed：proof 缺失/非法 → 拒绝（不删 state、不写墓碑、不发
         close_phase=3，锁外 critical 告警后 return False，批次保留待下轮 converge）。
         close_phase=3（CLOSED）唯一写入点在本函数墓碑落盘内（G-B9 正则锚定）。
-        批次已不存在 → 幂等 return True（无状态可保护）。
-        返回值契约（第十三/十四轮复审收口）：``True`` **只**在「墓碑已 durable 且
-        账本删除已 durable」时返回；任一落盘失败 → return False + 锁外 critical，
-        磁盘批次原样保留供下轮重试。13 个调用方一律把 False 视为「未清理」，
-        落盘未生效却返回 True 会让他们误报批次已结束。
+        批次已不存在 → 幂等 return True（无状态可保护），**但前提是账本可读**：
+        load_all_states 损坏时返回占位 ``{}``，此时「不知道批次是否存在」绝不能
+        当成「已清理」（该 docstring 明写调用方读返回值前必须先判
+        ``_state_corrupted``）。账本不可读 → return False + 锁外 critical，
+        损坏现场原样保留，待人工恢复后再收敛。
+        返回值契约（第十三/十四/十五轮复审收口）：``True`` **只**在「账本可读 且
+        墓碑已 durable 且账本删除已 durable」时返回；任一前提不满足 → return
+        False + 锁外 critical，磁盘原样保留供下轮重试。13 个调用方一律把 False
+        视为「未清理」，落盘未生效却返回 True 会让他们误报批次已结束。
         Batch C（v2 §3）：清理即写墓碑；converged_order_ids = registry 已终态条目
         的 order_id ∪ proof.l1_canceled ∪ proof.l2_canceled（Batch B 升级）；
         幂等：墓碑已存在（重复 clear）不覆盖 cleared_at。"""
@@ -2639,12 +2643,26 @@ class CryptoTrader:
         _reject = None
         _tomb_write_fail = None   # 墓碑落盘失败 → 保留账本，拒绝删除
         _ledger_write_fail = None # 账本落盘失败 → 磁盘原样保留，拒绝报成功
+        _ledger_unreadable = None # 账本读取失败 → 未知 ≠ 已清理，拒绝幂等放行
         with self._state_lock:
             all_states = self.load_all_states()
             b_data = (all_states.get(symbol) or {}).get(batch_id)
-            if b_data is None:
-                return True  # 已清理/不存在 → 幂等成功（无状态可保护）
-            _reject = self._verify_clear_proof(symbol, batch_id, proof, b_data)
+            if getattr(self, '_state_corrupted', False) is True:
+                # 第十五轮复审 P1：load_all_states 在损坏时返回占位 {}（返回值
+                # 在损坏态下无意义），于是 b_data 恒为 None，旧实现在下一行直接
+                # return True —— 把「不知道批次是否还在」当成「已清理」，13 个
+                # 调用方随即打印清理完毕/返回 finalized，而磁盘上的账本仍是
+                # 损坏状态、无人重试。同时该路径调不到 _persist_states，而
+                # load_all_states 对损坏只 print 不发 TG → 原本零告警。
+                # 顺带置 _reject：b_data 为 None，放行下去 proof/authorization
+                # 分支会直接对 None 调 .get 而 AttributeError。
+                _ledger_unreadable = (getattr(self, '_state_corruption_detail', '')
+                                      or '未知读取错误')
+                _reject = f'账本不可读（{_ledger_unreadable}）'
+            elif b_data is None:
+                return True  # 账本可读且批次不存在 → 幂等成功（无状态可保护）
+            else:
+                _reject = self._verify_clear_proof(symbol, batch_id, proof, b_data)
             # 🔥 P5h（ChatGPT 七复审 P0-2）：删除授权与删除在同一 _state_lock 内
             # 原子绑定——授权校验若发生在锁外，"校验通过 → 取锁 → 删除"之间
             # 仍可发生 settled/manual_review/op 迁移，旧线程会删掉新状态。
@@ -2718,7 +2736,17 @@ class CryptoTrader:
                               f"墓碑已登记 close_phase=3，7 天防复活）。")
                         return True
         # 锁外拒绝告警（TG I/O 不进 _state_lock；同键 3 轮去重防刷屏）
-        if _tomb_write_fail is not None:
+        if _ledger_unreadable is not None:
+            # 告警键用全局 1 元组（不含 symbol/batch_id）：损坏的是整个账本文件，
+            # 按批次分键会让每个批次各发 3 轮，且会随清理流程的批次键修剪被误删。
+            self._converge_alert(('clear_state_unreadable',),
+                                 f"🚨【资金安全】批次 `{batch_id}`({symbol}) 清理被拒绝："
+                                 f"trade_state.json **不可读**（{_ledger_unreadable}），"
+                                 f"无法确认该批次是否仍存在。\n"
+                                 f"「不知道」≠「已清理」——本轮返回 False、不打印清理完毕、"
+                                 f"不覆盖损坏现场，磁盘原样保留，待人工恢复账本后再收敛"
+                                 f"（Fail-Closed）。", level='critical')
+        elif _tomb_write_fail is not None:
             self._converge_alert(('clear_tomb_failed', symbol, batch_id),
                                  f"🚨【资金安全】批次 `{batch_id}`({symbol}) 墓碑落盘失败，"
                                  f"已拒绝删除活跃账本（{_tomb_write_fail}）。\n"
