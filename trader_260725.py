@@ -60,10 +60,19 @@ def _partial_resize_owner_ok(b, owner_op_id):
 
 
 def _tombstone_entry_valid(entry) -> bool:
-    """墓碑条目**结构**有效性判定（2026-09-25 独立复审 P1 收口）。
+    """墓碑条目**最小结构有效性**判定（2026-09-25 独立复审 P1 收口 +
+    第十四轮口径收窄）。
 
-    仅做 isinstance(dict) 不够：``{"batch_x": {}}`` 一样能通过类型校验，而缺
-    ``cleared_at`` 的条目会被 ``float(..., 0)`` 兜底成 0 → age≈now → 远超
+    ⚠️ 边界：这是「TTL / 存在性判定所依赖字段」的校验，**不是完整 schema 校验**。
+    只强制 ``cleared_at``，**不**要求 ``close_phase`` / ``symbol`` /
+    ``converged_order_ids``：Batch B 之前写入的墓碑没有 ``close_phase``，
+    要求它会把合法历史文件判成 DEGRADED 并连带禁止新建批次。这些字段是溯源
+    审计用途，不参与 TTL、存在性或复活判定。若要升级为完整校验，必须先定义
+    旧文件的迁移/降级兼容规则（由
+    ``test_tombstone_entry_valid_boundary_and_legacy_rule`` 钉住）。
+
+    为什么仅 ``isinstance(dict)`` 不够：``{"batch_x": {}}`` 能通过类型校验，
+    而缺 ``cleared_at`` 的条目会被 ``float(..., 0)`` 兜底成 0 → age≈now → 远超
     TTL → 被判成"墓碑已过期"，于是既不告警也不 DEGRADED，全新批次直接获得
     放行（Fail-Open），且 TTL prune 还会把这条损坏证据剪掉。
 
@@ -2613,6 +2622,10 @@ class CryptoTrader:
         close_phase=3，锁外 critical 告警后 return False，批次保留待下轮 converge）。
         close_phase=3（CLOSED）唯一写入点在本函数墓碑落盘内（G-B9 正则锚定）。
         批次已不存在 → 幂等 return True（无状态可保护）。
+        返回值契约（第十三/十四轮复审收口）：``True`` **只**在「墓碑已 durable 且
+        账本删除已 durable」时返回；任一落盘失败 → return False + 锁外 critical，
+        磁盘批次原样保留供下轮重试。13 个调用方一律把 False 视为「未清理」，
+        落盘未生效却返回 True 会让他们误报批次已结束。
         Batch C（v2 §3）：清理即写墓碑；converged_order_ids = registry 已终态条目
         的 order_id ∪ proof.l1_canceled ∪ proof.l2_canceled（Batch B 升级）；
         幂等：墓碑已存在（重复 clear）不覆盖 cleared_at。"""
@@ -2624,7 +2637,8 @@ class CryptoTrader:
             self._converge_alert_counts = {k: v for k, v in _counts.items()
                                            if not (isinstance(k, tuple) and batch_id in k)}
         _reject = None
-        _tomb_write_fail = None  # 墓碑落盘失败原因（锁外 critical，与 proof 拒绝分流）
+        _tomb_write_fail = None   # 墓碑落盘失败 → 保留账本，拒绝删除
+        _ledger_write_fail = None # 账本落盘失败 → 磁盘原样保留，拒绝报成功
         with self._state_lock:
             all_states = self.load_all_states()
             b_data = (all_states.get(symbol) or {}).get(batch_id)
@@ -2680,29 +2694,50 @@ class CryptoTrader:
                     del all_states[symbol][batch_id]
                     if not all_states[symbol]:
                         del all_states[symbol]
-                    if self._persist_states(all_states) is not True:
-                        # 账本写失败：墓碑已 durable 而账本未更新 → 磁盘仍留有该批次。
-                        # 下轮 load_all_states 会重新读到它并重试清理（墓碑幂等、
-                        # 不覆盖 cleared_at），_persist_states 自身已按唯一告警源
-                        # 发出 critical，此处只补充批次级上下文。
-                        print(f"⚠️ [C2] 清理后账本落盘失败（磁盘仍保留批次 {batch_id}，"
-                              f"下轮 converge 自动重试；墓碑已登记故无复活风险）")
-                    print(f"🧹 批次 [{batch_id}] 状态归档/清理完毕（proof 门通过，"
-                          f"墓碑已登记 close_phase=3，7 天防复活）。")
-                    return True
+                    # 告警延后到锁外（与 save_batch_state 同范式，TG IO 不进状态锁）
+                    self._defer_state_corrupt_alert = True
+                    try:
+                        _ledger_ok = self._persist_states(all_states) is True
+                    finally:
+                        self._defer_state_corrupt_alert = False
+                    if not _ledger_ok:
+                        # 第十四轮复审 P1：清理链的另一半。_persist_states 是
+                        # os.replace 原子写，失败 → 磁盘批次原样保留，因此"状态
+                        # 保留、下轮重试"是可如实宣称的；反之返回 True 会让 13 个
+                        # 调用方（打印清理完成 / 返回 finalized）误报批次已结束。
+                        # 且 _persist_states 写盘失败只 print 不告警，这里必须补
+                        # 一条锁外 critical（_defer 已避免与损坏告警重复）。
+                        _ledger_write_fail = (
+                            '账本已损坏，_persist_states 拒绝覆盖写入（保护现场）'
+                            if getattr(self, '_state_corrupted', False)
+                            else 'trade_state.json 写盘失败（磁盘空间/权限）')
+                        print(f"⚠️ [C2] 批次 [{batch_id}] 清理未完成："
+                              f"{_ledger_write_fail}；磁盘批次原样保留，待下轮重试")
+                    else:
+                        print(f"🧹 批次 [{batch_id}] 状态归档/清理完毕（proof 门通过，"
+                              f"墓碑已登记 close_phase=3，7 天防复活）。")
+                        return True
         # 锁外拒绝告警（TG I/O 不进 _state_lock；同键 3 轮去重防刷屏）
-        if _tomb_write_fail is None:
-            self._converge_alert(('clear_rejected', symbol, batch_id),
-                                 f"🚨【资金安全】批次 `{batch_id}`({symbol}) 清理被 proof 门拒绝"
-                                 f"（{_reject}）。状态保留，待下轮 converge 生成收敛证明后重试"
-                                 f"（Fail-Closed，无程序侧逃生门）。", level='critical')
-        else:
+        if _tomb_write_fail is not None:
             self._converge_alert(('clear_tomb_failed', symbol, batch_id),
                                  f"🚨【资金安全】批次 `{batch_id}`({symbol}) 墓碑落盘失败，"
                                  f"已拒绝删除活跃账本（{_tomb_write_fail}）。\n"
                                  f"批次状态与资金侧核对结果均保留，待下轮 converge 重试"
                                  f"（Fail-Closed：宁可不清理，也不制造可复活的孤儿仓）。"
                                  f"请检查磁盘空间/权限。", level='critical')
+        elif _ledger_write_fail is not None:
+            self._converge_alert(('clear_ledger_failed', symbol, batch_id),
+                                 f"🚨【资金安全】批次 `{batch_id}`({symbol}) 清理未完成："
+                                 f"{_ledger_write_fail}。\n"
+                                 f"墓碑已成功登记（反复活保护在位），但删除该批次的账本"
+                                 f"写入失败——磁盘上批次**原样保留**，本轮未生效。\n"
+                                 f"下轮 converge 会自动重试（墓碑幂等、不覆盖 cleared_at）。"
+                                 f"请检查磁盘空间/权限。", level='critical')
+        else:
+            self._converge_alert(('clear_rejected', symbol, batch_id),
+                                 f"🚨【资金安全】批次 `{batch_id}`({symbol}) 清理被 proof 门拒绝"
+                                 f"（{_reject}）。状态保留，待下轮 converge 生成收敛证明后重试"
+                                 f"（Fail-Closed，无程序侧逃生门）。", level='critical')
         return False
 
     # ==================== P0 Batch C：墓碑 / 字段级 merge ====================

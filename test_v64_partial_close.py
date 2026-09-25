@@ -51,9 +51,17 @@ def _module_assigns(tree, src, prefixes):
 
 # 共享命名空间：函数间经 global 名互相解析（与生产模块语义一致）
 NS = {'uuid': __import__('uuid'), 'time': __import__('time'), 'math': __import__('math')}
-NS.update(_module_assigns(TREE, SRC, ('_MERGE', '_PARTIAL', '_partial_resize', 'TAKER', 'MAKER', 'CONSERVATION')))
+NS.update(_module_assigns(TREE, SRC, ('_MERGE', '_PARTIAL', '_partial_resize', 'TAKER',
+                                       'MAKER', 'CONSERVATION', 'TOMBSTONE')))
 OWNER_FN = _extract(TREE, SRC, '_partial_resize_owner_ok', NS)
 NS['_partial_resize_owner_ok'] = OWNER_FN
+# 第十四轮：save_batch_state 依赖模块级 _tombstone_entry_valid。合成命名空间
+# 不是 trader_260725 的 globals，不显式注入就会 NameError（实证：p3 的 r5c 假红）。
+# 这是"源码提取式测试基建"的固有耦合——生产侧每新增一个被提取函数引用的
+# 模块级名字，这里都必须同步登记。
+_tomb_valid_fn = _extract(TREE, SRC, '_tombstone_entry_valid', NS)
+assert _tomb_valid_fn is not None, '_tombstone_entry_valid 提取失败（源码结构变化）'
+NS['_tombstone_entry_valid'] = _tomb_valid_fn
 
 
 def ex_t(name):

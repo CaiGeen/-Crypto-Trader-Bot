@@ -22,6 +22,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -318,6 +319,92 @@ class TombstoneEntryIntegrityTests(unittest.TestCase):
         self.assertEqual(tomb_now, {}, "墓碑文件应保持原样")
         self.assertTrue(any(lv == 'critical' and '墓碑' in t for lv, t in sent),
                         "必须锁外 critical 告警")
+
+    def test_clear_returns_false_when_ledger_persist_fails(self):
+        """ChatGPT 反例二：墓碑写成功后账本落盘失败，clear 不得谎报成功。
+
+        13 个调用方全都把 False 当作「未清理、待下轮重试」（打印清理未完成 /
+        置 _cleanup_pending / 返回 clear_failed），而 True 会让它们报告批次已完成
+        —— 磁盘上批次其实还在。_persist_states 是 os.replace 原子写，失败时磁盘
+        保持原样，所以「状态保留」是可如实宣称的。
+        另：_persist_states 写盘失败**只 print 不告警**（损坏态才告警），这条路径
+        目前既返回谎话又零告警，必须由 clear_batch_state 自己补锁外 critical。
+        """
+        import contextlib
+        with tempfile.TemporaryDirectory() as tmp:
+            tomb = self._write(tmp, 'tomb.json', {})
+            state = self._write(tmp, 'trade_state.json',
+                                {self.SYMBOL: {'batch_z': {'is_active': True,
+                                                           'close_phase': 3}}})
+            sent = []
+            fake = self._fake(tomb, sent)
+            fake._verify_clear_proof = lambda *a, **k: None
+            real_persist = fake._persist_states
+            proof = {'l1_canceled': [], 'l2_canceled': []}
+            buf = io.StringIO()
+            with mock.patch.object(trader_260725, 'STATE_FILE', state):
+                # 第一次：墓碑写成功，账本写失败（"第二次写盘失败"）
+                fake._persist_states = lambda s: False
+                with contextlib.redirect_stdout(buf):
+                    rc1 = trader_260725.CryptoTrader.clear_batch_state(
+                        fake, self.SYMBOL, 'batch_z', proof=proof)
+                with open(state, 'r', encoding='utf-8') as f:
+                    after_fail = json.load(f)
+                # 第二次：磁盘恢复后重试，必须幂等成功
+                fake._persist_states = real_persist
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc2 = trader_260725.CryptoTrader.clear_batch_state(
+                        fake, self.SYMBOL, 'batch_z', proof=proof)
+                with open(state, 'r', encoding='utf-8') as f:
+                    after_retry = json.load(f)
+            tomb_now = json.load(open(tomb, 'r', encoding='utf-8'))
+        self.assertFalse(rc1, "账本落盘失败时 clear 必须返回 False（不得谎报成功）")
+        self.assertIn('batch_z', after_fail.get(self.SYMBOL, {}),
+                      "写盘失败 → 磁盘批次必须原样保留（重试才有对象）")
+        self.assertNotIn('清理完毕', buf.getvalue(),
+                         "落盘失败时不得打印「清理完毕」")
+        crit = [t for lv, t in sent if lv == 'critical']
+        self.assertTrue(any('账本' in t or '落盘' in t for t in crit),
+                        f"必须锁外 critical 且写明账本落盘失败: {crit}")
+        self.assertIn('batch_z', tomb_now, "墓碑应已登记（重试幂等、无复活风险）")
+        self.assertTrue(rc2, "磁盘恢复后重试必须成功")
+        self.assertNotIn('batch_z', after_retry.get(self.SYMBOL, {}))
+
+    def test_tombstone_entry_valid_boundary_and_legacy_rule(self):
+        """口径收口：_tombstone_entry_valid 是「TTL/存在性判据所需的最小结构」，
+        **不是**完整 schema 校验。
+
+        兼容规则（本轮明确定义，防止后人顺手收紧）：
+        - 必需：非空 dict + cleared_at 为有限正数（这才是 TTL 与"是否已过期"
+          判定所依赖的字段，缺了就会被兜底成 0 而误判过期）。
+        - **不要求** close_phase —— Batch B 之前写入的墓碑没有该字段，
+          test_c_batch 的夹具同样不写；要求它会把合法历史文件判成 DEGRADED，
+          连带禁止一切新建批次（把兼容问题升级成可用性事故）。
+        - **不要求** symbol / converged_order_ids / known_order_ids —— 它们是
+          溯源审计字段，不参与 TTL、存在性或复活判定，缺失不影响防线正确性。
+        若日后确实要校验这些字段，必须先给出旧文件的迁移或降级兼容方案。
+        """
+        now = time.time()
+        valid = trader_260725._tombstone_entry_valid
+        # 合法（含旧版形态）
+        self.assertTrue(valid({'cleared_at': now}), "最小可用条目必须有效")
+        self.assertTrue(valid({'symbol': self.SYMBOL, 'cleared_at': now}),
+                        "旧版（无 close_phase）条目必须有效，否则历史文件被误判 DEGRADED")
+        self.assertTrue(valid({'symbol': self.SYMBOL, 'cleared_at': now,
+                               'close_phase': 3, 'converged_order_ids': []}),
+                        "现行完整条目必须有效")
+        # 非法
+        for bad in ({},                                  # 本轮反例一
+                    {'cleared_at': 0},                   # 非正数 → age 兜底误判
+                    {'cleared_at': -1},
+                    {'cleared_at': None},
+                    {'cleared_at': 'not-a-number'},
+                    {'cleared_at': True},                # bool 是 int 子类
+                    {'cleared_at': float('nan')},
+                    {'cleared_at': float('inf')},
+                    {'symbol': self.SYMBOL},             # 缺 cleared_at
+                    'not-a-dict', None, [], 42):
+            self.assertFalse(valid(bad), f"必须判为非法: {bad!r}")
 
     def test_prune_is_skipped_when_degraded(self):
         """DEGRADED 时不得基于不可信数据改写墓碑（避免把损坏条目静默剪掉）。"""
