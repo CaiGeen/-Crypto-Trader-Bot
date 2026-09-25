@@ -1872,7 +1872,7 @@ class CryptoTrader:
                         time.sleep(30)
                         continue
                     if state == 'done':
-                        print(f"✅ [日报] {today} 双渠道已确认送达")
+                        print(f"✅ [日报] {today} 已确认送达（渠道：{', '.join(required)}）")
                         time.sleep(90)   # 避免同一窗口重复发送
                         continue
                     required = ("tg",) + _daily_report_required_channels()

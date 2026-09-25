@@ -25,6 +25,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import email_gate  # noqa: E402
+import bot_runner  # noqa: E402
 import trader_260725  # noqa: E402
 import watchdog as wd  # noqa: E402
 
@@ -89,6 +90,49 @@ class TraderEmailEventTests(unittest.TestCase):
             ok = trader_260725.CryptoTrader._send_email_alert(
                 object(), "日报", subject="测试", event="daily_report", wait=True)
         self.assertFalse(ok)
+
+    def test_tg_returns_none_when_unconfigured(self):
+        """R3：未配置 TG 时返回 None（不可判定），与 False（失败）区分
+
+        注：本用例首版误缩进在 `if __name__ == '__main__':` 之下 → pytest 从不收集，
+        却一直被我计入「通过数量」（复审发现，见报告 §14）。
+        """
+        fake = mock.MagicMock()
+        fake.tg_bot = None
+        fake.chat_id = None
+        fake.loop = None
+        self.assertIsNone(trader_260725.CryptoTrader.send_tg_notification(fake, "hi"))
+
+
+class BotRunnerEmailConfirmTests(unittest.TestCase):
+    """第四轮复审（阻断项）：bot_runner 邮件必须能返回**实际 SMTP 结果**"""
+
+    def test_crash_email_returns_true_on_confirmed_send(self):
+        server = mock.MagicMock()
+        with mock.patch.dict(os.environ, MAIL_ENV), \
+                mock.patch("smtplib.SMTP_SSL") as smtp:
+            smtp.return_value.__enter__.return_value = server
+            ok = bot_runner.send_email_alert(
+                "崩溃报警", subject="测试", event="crash", wait=True)
+        self.assertTrue(ok)
+        server.sendmail.assert_called_once()
+
+    def test_crash_email_returns_false_when_smtp_raises(self):
+        """SMTP 抛错 → 必须 False，调用方据此不得记「已发送」"""
+        with mock.patch.dict(os.environ, MAIL_ENV), \
+                mock.patch("smtplib.SMTP_SSL", side_effect=OSError("smtp down")):
+            ok = bot_runner.send_email_alert(
+                "崩溃报警", subject="测试", event="crash", wait=True)
+        self.assertFalse(ok)
+
+    def test_crash_email_false_when_gate_blocks(self):
+        with mock.patch.object(email_gate, "should_send_email",
+                               return_value=(False, "disabled")), \
+                mock.patch("smtplib.SMTP_SSL") as smtp:
+            ok = bot_runner.send_email_alert(
+                "崩溃报警", subject="测试", event="crash", wait=True)
+        self.assertFalse(ok)
+        smtp.assert_not_called()
 
 
 class _AtDatetime:
@@ -369,12 +413,3 @@ class WatchdogFatalAlertTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-    def test_tg_returns_none_when_unconfigured(self):
-        """R3：未配置 TG 时返回 None（不可判定），与 False（失败）区分"""
-        fake = mock.MagicMock()
-        fake.tg_bot = None
-        fake.chat_id = None
-        fake.loop = None
-        self.assertIsNone(trader_260725.CryptoTrader.send_tg_notification(fake, "hi"))

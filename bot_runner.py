@@ -91,7 +91,7 @@ EMAIL_SEND_LOCK = threading.Lock()
 
 
 def send_email_alert(text: str, subject: str = "交易告警",
-                     event: str = "generic") -> bool:
+                     event: str = "generic", wait: bool = False) -> bool:
     """发送 QQ 邮箱告警（独立线程异步发送，失败静默，未配置自动跳过）
 
     供 watchdog 通知通道（崩溃报警等）复用，逻辑与 trader 的 _send_email_alert 一致。
@@ -101,7 +101,13 @@ def send_email_alert(text: str, subject: str = "交易告警",
       - event ∈ email_gate.FATAL_EVENTS（如 "crash"）→ 豁免持仓闸门与状态可读性
       - event == "daily_report" → 日报独立开关
       - 其余沿用 EMAIL_ALERT_ONLY_WITH_POSITION
-    返回 True=已提交发送线程；False=被闸门拦截 / 未配置 / 提交失败。
+
+    第四轮复审（阻断项修复）：新增 wait 参数。
+      wait=False → 返回 True 仅表示**已提交发送线程**（不保证送达），调用方
+                    绝不可据此记录「已通知」。
+      wait=True  → 同步等待 SMTP 结果（SMTP timeout=10s，最长等 20s），
+                    返回 True 仅当 **SMTP 确认送达**；崩溃报警必须用此模式，
+                    否则「线程启动 + SMTP 失败」会被误记为已发送并被状态记忆吞掉。
     """
     allowed, gate_reason = email_gate.should_send_email(event=event)
     if not allowed:
@@ -114,6 +120,8 @@ def send_email_alert(text: str, subject: str = "交易告警",
     if not (mail_user and mail_code and mail_to):
         logging.info(f"⚠️ [邮件] 未配置（event={event}）")
         return False
+
+    outcome = {"ok": False}
 
     def _do_send():
         with EMAIL_SEND_LOCK:
@@ -130,16 +138,27 @@ def send_email_alert(text: str, subject: str = "交易告警",
                 with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
                     server.login(mail_user, mail_code)
                     server.sendmail(mail_user, [mail_to], msg.as_string())
+                outcome["ok"] = True
                 logging.info(f"📧 [邮件] 已发送: {subject} (event={event})")
             except Exception as e:
+                outcome["ok"] = False
                 logging.warning(f"⚠️ [邮件] 发送失败: {e} (event={event})")
 
     try:
-        threading.Thread(target=_do_send, daemon=True).start()
-        return True
+        t = threading.Thread(target=_do_send, daemon=True)
+        t.start()
     except Exception as e:
         logging.warning(f"⚠️ [邮件] 发送线程提交失败: {e} (event={event})")
         return False
+
+    if wait:
+        t.join(timeout=20)
+        if t.is_alive():
+            logging.warning(f"⚠️ [邮件] 等待确认超时(20s)，按未送达处理（event={event}）")
+            return False
+        return bool(outcome["ok"])
+    # 非 wait 模式：只代表「已提交」，不代表送达
+    return True
 
 
 # ==================== D-010 通知事件队列（Batch 1 消费侧） ====================
@@ -410,16 +429,20 @@ async def _process_notify_queue_once(bot, chat_id: int,
                 # 重复发 3 封崩溃邮件 → 通知风暴。用 state 记忆（跨重启保持）。
                 if not st.get('crash_email_sent'):
                     try:
+                        # 第四轮复审（阻断项）：wait=True —— 只有 SMTP **确认送达**
+                        # 才记 crash_email_sent；「线程已启动」不算送达。
+                        # 未确认 → 不落记忆，下一轮仍会重试邮件（TG 失败 3 轮后 SILENCED）。
                         _email_res = (email_cb or send_email_alert)(
                             f"💥 程序崩溃报警！\n\n{notify_msg}",
-                            subject="💥 程序崩溃报警", event="crash")
-                        # False=被闸门拦/未配置/提交失败 → 不落记忆，下轮可再试
-                        if _email_res is not False:
+                            subject="💥 程序崩溃报警", event="crash", wait=True)
+                        if _email_res is True:
                             st['crash_email_sent'] = True
+                        else:
+                            logging.warning("⚠️ 崩溃邮件未获 SMTP 确认，不标记已发送，下轮重试")
                     except Exception as e:
                         logging.warning(f"⚠️ 崩溃报警邮件发送异常: {e}")
                 else:
-                    logging.info("ℹ️ 崩溃邮件本事件已发送过，跳过重复投递")
+                    logging.info("ℹ️ 崩溃邮件本事件已确认送达，跳过重复投递")
                 if ok:
                     logging.info("📨 崩溃报警已发送")
                     # 崩溃后持仓汇总仍只在 TG 成功后发（汇总本身依赖 bot 内存态）

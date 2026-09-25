@@ -549,15 +549,52 @@ def scenario_16():
         bot = FakeTgBot(always_fail=True)      # TG 三轮都失败
         email_calls = []
 
+        def _email_ok(*a, **k):
+            """模拟 wait=True 且 SMTP 确认成功"""
+            email_calls.append(a)
+            return True
+
         for _ in range(3):
-            run_round(bot, env, email_cb=lambda *a, **k: email_calls.append(a))
+            run_round(bot, env, email_cb=_email_ok)
 
         st = env.state().get(eid, {})
         ok = (len(email_calls) == 1                       # 只 1 封崩溃邮件
+              and st.get('crash_email_sent') is True      # 确认送达后记忆
               and st.get("status") == "SILENCED"          # TG 仍按 3 轮静默
               and env.queue_files() == [f"{eid}.notify"])  # 证据保留
         report("S16 crash_alert: 多轮失败不重复发邮件(D2)", ok,
-               f"(email={len(email_calls)}, status={st.get('status')})")
+               f"(email={len(email_calls)}, status={st.get('status')}, "
+               f"crash_email_sent={st.get('crash_email_sent')})")
+    finally:
+        env.close()
+
+
+def scenario_17():
+    """S17 复审（ChatGPT 阻断项）：TG 连续失败 **且 SMTP 抛错** 时，
+    绝不能写 crash_email_sent=True —— 否则两路都没送达却标记「已通知」，
+    3 轮后进 SILENCED 永不重试。"""
+    env = Env()
+    try:
+        eid = "20260925_100000_111111_deadbeef"
+        env.enqueue(eid, "crash_alert|程序异常退出: RuntimeError")
+        bot = FakeTgBot(always_fail=True)          # TG 三轮全败
+        email_calls = []
+
+        def _email_failed(*a, **k):
+            email_calls.append(k.get("event"))
+            return False        # wait=True 语义：SMTP 实际失败 → 确认失败
+
+        for _ in range(3):
+            run_round(bot, env, email_cb=_email_failed)
+
+        st = env.state().get(eid, {})
+        ok = (st.get('crash_email_sent') is not True      # 关键：不得记为已发送
+              and len(email_calls) == 3                   # 每轮都应重试（未被记忆吞掉）
+              and st.get('status') == 'SILENCED'          # TG 仍按 3 轮静默
+              and env.queue_files() == [f"{eid}.notify"])  # 证据保留
+        report("S17 crash_alert: SMTP失败不得标记已发送(阻断项)", ok,
+               f"(crash_email_sent={st.get('crash_email_sent')}, "
+               f"email_calls={len(email_calls)}, status={st.get('status')})")
     finally:
         env.close()
 
@@ -579,6 +616,7 @@ if __name__ == '__main__':
     scenario_14()
     scenario_15()
     scenario_16()
+    scenario_17()
     print("\n" + "#" * 60)
     failed = [n for n, p in RESULTS if not p]
     if failed:

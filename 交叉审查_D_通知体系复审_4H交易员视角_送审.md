@@ -740,3 +740,70 @@ RESTART_MINUTE = 0
 - `crash_email_sent` 依赖 `.notify.state.json`，人工删除会解除记忆（有界重复 ≤1 轮）；
 - 日报 `TG` 未配置/未就绪（`None`）会累计 6 次后 `exhausted`（诚实留痕，不重复投递）；
 - R1（快照三态 / 取价显式化）、R2（交易所权威强平与保护单）、R3（恢复通知 / 资金费 / quiet-hours）**未动**。
+
+
+---
+
+## 14. 第四轮复审（2026-09-25，ChatGPT 独立复核 `f5349e8`）
+
+> ChatGPT 直接读取远端源码独立裁决。本轮**全部意见成立**，其中两条指向我的实质缺陷。
+
+### 14.1 逐条回应
+
+| ChatGPT 裁决 | 我的取证 | 结论 |
+|---|---|---|
+| 崩溃邮件「线程提交」被记成「已发送」 | 旧 `bot_runner.send_email_alert` 的 `return True` 仅表示线程启动；`crash_email_sent=True` 据此写入 | ✅ **成立，阻断项**，已修（§14.2） |
+| `test_tg_returns_none_when_unconfigured` 从未被收集 | 该方法缩进在 `if __name__ == '__main__':` 之下；`--collect-only` 实测 **22 tests** 且 grep 不到该用例 | ✅ **成立**：此前「52 passed」从未执行过它 |
+| D5 日志仍写「双渠道已确认送达」 | TG 单渠道完成时同一句 | ✅ 成立（措辞不准），已改为按 `required` 动态输出渠道名 |
+| D6 只解决部分重复 | 发送成功→写盘之间崩溃、写盘失败不撤销内存态 | ✅ 成立，已在 §14.4 如实声明为「不保证绝不重复」 |
+| D7 只是诊断日志 | 未知事件仍按普通事件走持仓闸门 | ✅ 成立：应为「增加诊断日志」，**不构成漏报防护** |
+| 熔断时序排除成立 | 熔断不写 `stopped`，巡检可进入告警路径 | ✅ 成立，但**仅证明能进入告警路径，不证明送达**（§14.4） |
+
+### 14.2 阻断项修复：只有 SMTP 确认才算送达
+
+**诊断比原判断更精确**：队列状态机本身是对的 —— 用「正确返回 `False`」的桩驱动 S17，得到 `crash_email_sent=None`、每轮重试 3 次、正确 `SILENCED`。**漏报的全部来源是输入不实**：真实 `send_email_alert` 当时根本没有「实际 SMTP 结果」这个能力（3 条新用例报 `TypeError: unexpected keyword 'wait'`，即证据）。
+
+**修复**：
+1. `bot_runner.send_email_alert(..., wait=False)`：文档明确「`wait=False` 的 `True` 只代表已提交线程，**不代表送达**，调用方绝不可据此记录已通知」；
+2. 崩溃分支改用 **`wait=True`**（同步等 SMTP，timeout=10s / join 上限 20s），且仅在返回值 `is True` 时写 `crash_email_sent`；
+3. 未确认 → 不落记忆 → 下一轮继续尝试（TG 三轮失败后按既有语义进 `SILENCED`，队列文件与状态保留为证据）。
+
+**新增对抗测试**：
+- `S17`：TG 连续失败 **且** SMTP 抛错 → `crash_email_sent` 不得为 `True`，每轮都重试，最终 `SILENCED` 且证据保留；
+- `S16`（改）：邮件确认成功 + TG 三轮失败 → 记忆生效，仅 1 封邮件；
+- `BotRunnerEmailConfirmTests`（3 条）：SMTP 成功 → `True`；SMTP 抛错 → `False`；闸门拦截 → `False` 且不碰 SMTP。
+
+### 14.3 测试证据修正（此前报告不准确）
+
+- `test_tg_returns_none_when_unconfigured` 已移回类内，`--collect-only` 从 **22 → 26 tests**，该用例现被真实执行；
+- 本轮 pytest 批次由 **52 → 56 passed**；
+- 后续所有「通过数量」必须以 `--collect-only` 与实际执行数一致为准，**不得再把未收集的用例计入**。
+
+### 14.4 如实声明的残留（不宣称闭环）
+
+1. **D6 的固有窗口**：日报「发送确认成功 → 状态写盘」之间崩溃，或写盘失败（只打印、不回滚内存态）→ 仍可能重复发送。这是「确认送达」与「原子记账」不可兼得的取舍；**当前口径是「不保证绝不重复」**。
+2. **D7 只是可观测性**：未知 `event` 仍走持仓闸门；拼错的致命事件在空仓时**仍可能没有邮件**。真正的防护依赖调用方写对事件名，`KNOWN_EVENTS` 只负责让错误在日志里可读。
+3. **熔断时序排除的范围**：仅证明巡检**能进入**告警路径；`watchdog_fatal` 的实际送达仍依赖 TG 双路与 SMTP 均可用，而两者在同一进程内串行，代理不可用时只剩 SMTP。
+4. **`SILENCED` 之后不自动恢复**：崩溃事件若三轮内两路皆败，后续不再自动重试，需人工介入或重启后重新评估。
+
+### 14.5 需用户拍板的新增项（B5）
+
+ChatGPT 指出：`.env.example` 仍默认开启日报邮件，而日报已豁免持仓闸门。**若原始诉求是「空仓不收日报邮件」，当前代码并未实现该偏好。**
+
+| 选项 | 效果 |
+|---|---|
+| A. 空仓也要日报邮件（当前默认） | 每日 08:05 固定留痕，机器待命状态可查 |
+| B. 空仓不发日报邮件 | 需新增 `DAILY_REPORT_EMAIL_ONLY_WITH_POSITION` 语义（或设 `DAILY_REPORT_EMAIL_ENABLED=false`，由 TG 单渠道送达） |
+
+### 14.6 第四轮测试证据
+
+| 套件 | 结果 |
+|---|---|
+| 13 个 pytest 套件 | **56 passed** |
+| `test_r0_notify_chains --collect-only` | **26 tests**（修复前 22：漏收 1 条 + 新增 3 条） |
+| `test_notify_queue`（S1~S17） | **17/17 场景** |
+| `test_watchdog_guard` | **22/22** |
+| 脚本式回归（close_confirmation_v62 / v62_staged / position_close / b2_hardlock） | **133/133、ALL PASS、7/7、PASS** |
+| `py_compile`（4 文件） | 通过 |
+
+> **结论口径修正**：经本轮修复，崩溃告警在「TG 失败 + SMTP 失败」下不再被错误标记为已送达；但**「致命告警链已闭环」这一说法仍不成立** —— 剩余的不确定性见 §14.4。
