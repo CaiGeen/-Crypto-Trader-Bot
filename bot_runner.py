@@ -89,15 +89,9 @@ NOTIFY_MAX_ATTEMPTS = 3   # v3.1 C2：每事件最多 3 轮（每轮 Markdown→
 # 🔥 QQ 邮箱发送串行锁（限制同时最多 1 个 SMTP 连接）
 EMAIL_SEND_LOCK = threading.Lock()
 
-# M1'：wait=True 的等待上限（秒）。提取为模块常量以便测试缩短；
-# 生产值保持 20s —— 单次 SMTP 操作 timeout=10s，但 connect+login+sendmail
-# 串行累计实测可达 31s，故**超时不可当作失败**（见 on_late_result 回灌）。
-EMAIL_WAIT_TIMEOUT = 20.0
-
 
 def send_email_alert(text: str, subject: str = "交易告警",
-                     event: str = "generic", wait: bool = False,
-                     dedup_key=None, on_late_result=None) -> bool:
+                     event: str = "generic", wait: bool = False) -> bool:
     """发送 QQ 邮箱告警（独立线程异步发送，失败静默，未配置自动跳过）
 
     供 watchdog 通知通道（崩溃报警等）复用，逻辑与 trader 的 _send_email_alert 一致。
@@ -109,21 +103,17 @@ def send_email_alert(text: str, subject: str = "交易告警",
       - 其余沿用 EMAIL_ALERT_ONLY_WITH_POSITION
 
     第四轮复审（阻断项修复）：新增 wait 参数。
-      wait=True  → 同步等待 SMTP 结果（SMTP timeout=10s，单次阻塞操作上限，
-                    connect+login+sendmail 累计可超 20s —— 实盘巡检路径实测一封
-                    成功邮件耗时 31s），返回 True 仅当 **SMTP 确认送达**。
+      wait=True  → 同步等待 SMTP 结果（单次阻塞操作 timeout=10s；connect+login+
+                    sendmail 串行累计实测可达 31s），返回 True 仅当 **SMTP 确认送达**；
+                    等满 20s 仍未结束 → 返回 False（按未送达处理，下一轮会重试）。
       wait=False → 返回 True 仅表示**已提交发送线程**（不保证送达），调用方
                     绝不可据此记录「已通知」。
 
-    M1'（2026-09-25，第八轮复审 / ChatGPT 复核 a8db596 阻断项修复）：
-      dedup_key    —— 调用方持有**稳定身份**时传入（崩溃队列传 event_id）；
-                       同一身份在途未结束时不再启动第二封。
-                       未传时按**内容指纹**（主题+正文哈希）判定 ——
-                       同主题但内容不同的告警**绝不**互相抑制（否则不同资金安全
-                       告警会因共用「🚨 资金安全告警」主题而丢失邮件兜底）。
-      on_late_result—— 发送线程**最终**结束时回调 ``fn(ok: bool)``。
-                       用于把「join 超时后线程才成功」的结果**回灌到事件投递状态**
-                       （否则超时判未确认 → 槽位释放后下一轮重复投递）。
+    ⚠️ 已知缺陷（第八轮复审 / ChatGPT 复核 d539da9，**本版刻意不含 M1' 修复**）：
+      ① 崩溃邮件在 join 超时后若线程迟到成功，事件状态不回灌 → 下一轮**重复投递**；
+      ② 无在途去重 → 慢 SMTP 时同事件可并发多封。
+      M1' 实现与上述两条时序的修法保存在分支 `notify-m1-timeline`（未合并、未部署）；
+      修复需第二轮（槽位状态机 + 失败轮次计账）后再评审。详见送审稿 §11-§12。
     """
     allowed, gate_reason = email_gate.should_send_email(event=event)
     if not allowed:
@@ -138,71 +128,39 @@ def send_email_alert(text: str, subject: str = "交易告警",
         return False
 
     outcome = {"ok": False}
-    # M1'：在途去重键 —— 有稳定身份用稳定身份，否则用内容指纹。
-    key = email_gate.mail_send_key(event, subject, dedup_key, text)
-
-    def _notify_late(ok: bool):
-        """把线程的**最终**结果回灌给调用方（超时后才成功的情形靠它闭环）。"""
-        if on_late_result is None:
-            return
-        try:
-            on_late_result(bool(ok))
-        except Exception as e:   # 回调异常绝不能影响发送线程本身
-            logging.warning(f"⚠️ [邮件] on_late_result 回调异常: {e} (event={event})")
 
     def _do_send():
-        try:
-            with EMAIL_SEND_LOCK:
-                try:
-                    import smtplib
-                    from email.mime.text import MIMEText
-                    from email.header import Header
-                    # 清理 Telegram Markdown 符号，邮件按纯文本显示
-                    plain = re.sub(r'[*`]', '', text)
-                    msg = MIMEText(plain, "plain", "utf-8")
-                    msg["Subject"] = Header(subject, "utf-8")
-                    msg["From"] = mail_user
-                    msg["To"] = mail_to
-                    with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
-                        server.login(mail_user, mail_code)
-                        server.sendmail(mail_user, [mail_to], msg.as_string())
-                    outcome["ok"] = True
-                    email_gate.record_mail_result(key, email_gate.MAIL_RESULT_CONFIRMED)
-                    logging.info(f"📧 [邮件] 已发送: {subject} (event={event})")
-                except Exception as e:
-                    outcome["ok"] = False
-                    email_gate.record_mail_result(key, email_gate.MAIL_RESULT_FAILED)
-                    logging.warning(f"⚠️ [邮件] 发送失败: {e} (event={event})")
-        finally:
-            # 线程真正结束才释放槽位：超时返回后仍保持占用，杜绝并发重复；
-            # 然后回灌最终结果（供事件状态闭环，见 on_late_result）
-            email_gate.release_mail_slot(key, t)
-            _notify_late(outcome["ok"])
+        with EMAIL_SEND_LOCK:
+            try:
+                import smtplib
+                from email.mime.text import MIMEText
+                from email.header import Header
+                # 清理 Telegram Markdown 符号，邮件按纯文本显示
+                plain = re.sub(r'[*`]', '', text)
+                msg = MIMEText(plain, "plain", "utf-8")
+                msg["Subject"] = Header(subject, "utf-8")
+                msg["From"] = mail_user
+                msg["To"] = mail_to
+                with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
+                    server.login(mail_user, mail_code)
+                    server.sendmail(mail_user, [mail_to], msg.as_string())
+                outcome["ok"] = True
+                logging.info(f"📧 [邮件] 已发送: {subject} (event={event})")
+            except Exception as e:
+                outcome["ok"] = False
+                logging.warning(f"⚠️ [邮件] 发送失败: {e} (event={event})")
 
-    t = threading.Thread(target=_do_send, daemon=True)
-    if not email_gate.claim_mail_slot(key, t):
-        # 前一封同一邮件仍在途 —— 本次不发送（不制造第二封）
-        email_gate.record_mail_result(key, email_gate.MAIL_RESULT_SUPPRESSED_IN_FLIGHT)
-        logging.warning(
-            f"⚠️ [邮件] 同一封邮件仍在途，本次不重复发送（event={event}, subject={subject!r}）")
-        return False
     try:
+        t = threading.Thread(target=_do_send, daemon=True)
         t.start()
     except Exception as e:
-        email_gate.release_mail_slot(key, t)
-        email_gate.record_mail_result(key, email_gate.MAIL_RESULT_FAILED)
         logging.warning(f"⚠️ [邮件] 发送线程提交失败: {e} (event={event})")
         return False
 
     if wait:
-        t.join(timeout=EMAIL_WAIT_TIMEOUT)
+        t.join(timeout=20)
         if t.is_alive():
-            # M1'：**超时 ≠ 失败**。线程仍在途 → 槽位保持占用，下一轮将被抑制；
-            # 若它随后成功，on_late_result 会把结果回灌到事件状态（闭环）。
-            email_gate.record_mail_result(key, email_gate.MAIL_RESULT_TIMEOUT_IN_FLIGHT)
-            logging.warning(
-                f"⚠️ [邮件] 等待确认超时({EMAIL_WAIT_TIMEOUT:g}s)，发送线程**仍在途**（非失败）；"
-                f"在途期间不重复发送，最终结果将回灌（event={event}）")
+            logging.warning(f"⚠️ [邮件] 等待确认超时(20s)，按未送达处理（event={event}）")
             return False
         return bool(outcome["ok"])
     # 非 wait 模式：只代表「已提交」，不代表送达
@@ -361,50 +319,6 @@ def _parse_notify_content(content: str) -> tuple:
     return 'unknown', content
 
 
-# M1'：崩溃邮件「迟到确认成功」的进程内登记表。
-# 为什么不用「回调直接改 state 文件」：回调运行在发送线程，若与队列消费轮
-# 末尾的 _save_notify_state 并发，后写者会用内存旧快照覆盖对方的更新（竞态）。
-# 改为：回调只写本表 → 下一轮消费时由队列线程读取并合并进 st 后再落盘。
-# 跨重启不保留：线程随进程消失，迟到结果本进程内才可知（属已声明的边界）。
-_LATE_CRASH_CONFIRM: dict = {}
-_LATE_CRASH_LOCK = threading.Lock()
-
-
-def _record_late_crash_confirm(event_id: str) -> None:
-    with _LATE_CRASH_LOCK:
-        _LATE_CRASH_CONFIRM[event_id] = round(time.time(), 3)
-
-
-def _consume_late_crash_confirm(event_id: str):
-    with _LATE_CRASH_LOCK:
-        return _LATE_CRASH_CONFIRM.pop(event_id, None)
-
-
-def _mark_crash_email_late(event_id: str, state_file: str | None = None):
-    """M1'：崩溃邮件发送线程**迟到成功**时的状态回灌（ChatGPT 复核 a8db596 阻断项 2）。
-
-    问题：`wait=True` 等满上限即判「未确认」，而线程可能在更晚（第 31s 量级）才成功；
-    结果只留在观测变量，事件状态 `crash_email_sent` 仍为假 → 槽位释放后
-    下一轮（10s 轮询）**重复投递同一事件**。在途去重挡不住这种「先后」重复。
-
-    处置：线程最终结束时回调本函数 → 登记到 `_LATE_CRASH_CONFIRM`；
-    队列消费轮在下一次处理该事件时读取并置 `crash_email_sent=True` 后落盘，
-    从而**不再重发**。失败则不登记（下一轮重试是正确行为）。
-    """
-    def _handler(ok: bool):
-        try:
-            if not ok:
-                logging.info(f"ℹ️ [D-010] 崩溃邮件迟到结果=失败，保持未送达以便下轮重试: {event_id}")
-                return
-            _record_late_crash_confirm(event_id)
-            logging.warning(
-                f"✅ [D-010] 崩溃邮件**迟到确认成功**，已登记（下一轮消费时回灌，"
-                f"不再重复投递）: {event_id}")
-        except Exception as e:
-            logging.warning(f"⚠️ [D-010] 崩溃邮件迟到登记失败: {e} (event={event_id})")
-    return _handler
-
-
 async def _process_notify_queue_once(bot, chat_id: int,
                                      state_file: str | None = None,
                                      queue_dir: str | None = None,
@@ -519,14 +433,6 @@ async def _process_notify_queue_once(bot, chat_id: int,
                 # 复审 D2（2026-09-25）：邮件**每个事件实例只发 1 封**。
                 # R0 首版把邮件移出 if ok 后，TG 连续失败会在 3 轮（约 10s 间隔）里
                 # 重复发 3 封崩溃邮件 → 通知风暴。用 state 记忆（跨重启保持）。
-                # M1'：先吸收发送线程的**迟到确认**（若上一轮 join 超时而线程后来成功），
-                # 置位后本轮不再发邮件 —— 这是「先后重复」的唯一闭环点。
-                _late_ts = _consume_late_crash_confirm(event_id)
-                if _late_ts and not st.get('crash_email_sent'):
-                    st['crash_email_sent'] = True
-                    st['crash_email_late_confirmed'] = _late_ts
-                    logging.warning(
-                        f"✅ [D-010] 已吸收崩溃邮件迟到确认（ts={_late_ts}），跳过重复投递: {event_id}")
                 if not st.get('crash_email_sent'):
                     try:
                         # 第四轮复审（阻断项）：wait=True —— 只有 SMTP **确认送达**
@@ -534,46 +440,23 @@ async def _process_notify_queue_once(bot, chat_id: int,
                         #
                         # 第五轮复审（阻断项）：本协程运行在 **Telegram 事件循环**上，
                         # 而 wait=True 内部是同步阻塞 —— 必须移出事件循环：asyncio.to_thread
-                        #
-                        # M1'（第八轮复审，两处阻断项）：
-                        #   dedup_key=event_id  —— 用**稳定事件 ID** 区分崩溃邮件，
-                        #     不用主题（主题对所有崩溃事件相同，且可能与其他事件撞车）。
-                        #   on_late_result      —— 线程迟到成功时回灌 crash_email_sent，
-                        #     否则「超时判未确认 → 槽位释放 → 下一轮重发」造成重复投递。
-                        _email_text = f"💥 程序崩溃报警！\n\n{notify_msg}"
                         _email_res = await asyncio.to_thread(
                             (email_cb or send_email_alert),
-                            _email_text,
-                            subject="💥 程序崩溃报警", event="crash", wait=True,
-                            dedup_key=f"crash:{event_id}",
-                            on_late_result=_mark_crash_email_late(event_id, state_file))
+                            f"💥 程序崩溃报警！\n\n{notify_msg}",
+                            subject="💥 程序崩溃报警", event="crash", wait=True)
                         if _email_res is True:
                             st['crash_email_sent'] = True
                         else:
-                            # M1'：区分「仍在途」与「真失败」—— 前者不宣告终局，等回灌
-                            _res = email_gate.mail_last_result_for(
-                                "crash", "💥 程序崩溃报警", f"crash:{event_id}", _email_text)
-                            _in_flight = _res in (
-                                email_gate.MAIL_RESULT_TIMEOUT_IN_FLIGHT,
-                                email_gate.MAIL_RESULT_SUPPRESSED_IN_FLIGHT)
-                            if _in_flight:
-                                logging.warning(
-                                    "⚠️ 崩溃邮件仍在途（超时或上一封未结束），"
-                                    "不判为未送达；最终结果将回灌到本事件")
-                            else:
-                                logging.warning("⚠️ 崩溃邮件发送失败，不标记已发送")
+                            logging.warning("⚠️ 崩溃邮件未获 SMTP 确认，不标记已发送")
                             if ok:
                                 # TG 已成功 → 本轮即删除事件文件，**邮件不会有下一轮**
                                 # （D-010 语义：TG 成功即视为事件已送达）
                                 _append_notify_audit(
-                                    event_id,
-                                    ('TG_DELIVERED_EMAIL_IN_FLIGHT' if _in_flight
-                                     else 'TG_DELIVERED_EMAIL_UNCONFIRMED'),
+                                    event_id, 'TG_DELIVERED_EMAIL_UNCONFIRMED',
                                     st.get('failed_attempts', 0), evidence, audit_log)
                                 logging.warning(
-                                    "⚠️ 崩溃告警：TG 已送达但邮件"
-                                    + ("仍在途" if _in_flight else "未获 SMTP 确认")
-                                    + "，按『TG 成功即完成』结束本事件，邮件不再重试")
+                                    "⚠️ 崩溃告警：TG 已送达但邮件未获 SMTP 确认，"
+                                    "按『TG 成功即完成』结束本事件，邮件不再重试")
                             else:
                                 logging.warning("   → TG 亦未送达，下一轮继续尝试邮件")
                     except Exception as e:

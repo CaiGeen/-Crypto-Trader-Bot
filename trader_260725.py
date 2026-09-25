@@ -69,12 +69,6 @@ BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 # QQ 邮箱发送串行锁（限制同时最多 1 个 SMTP 连接）
 EMAIL_SEND_LOCK = threading.Lock()
 
-# M1'：wait=True 的等待上限（秒），与 bot_runner 同值；提取为常量便于测试缩短。
-# 注意：单次 SMTP 操作 timeout=10s，但 connect+login+sendmail 串行累计实测可达 31s，
-# 因此**超时不可当作失败**：崩溃链已用 on_late_result 回灌；日报链的迟到回灌
-# 仍列为已知缺口（当前实盘 DAILY_REPORT_EMAIL_ENABLED=false，无实际暴露面）。
-EMAIL_WAIT_TIMEOUT = 20.0
-
 
 class ApiMetrics:
     """🔥 v6.4-P4b（Phase 2 观测层数据模型修正）：_safe_api_call 单点极薄计数。
@@ -931,8 +925,7 @@ class CryptoTrader:
     # ==================== QQ 邮箱告警（兜底通道） ====================
 
     def _send_email_alert(self, text: str, subject: str = "交易告警",
-                          event: str = "generic", wait: bool = False,
-                          dedup_key=None, on_late_result=None) -> bool:
+                          event: str = "generic", wait: bool = False) -> bool:
         """发送 QQ 邮箱告警（独立线程异步发送，失败静默，未配置自动跳过）
 
         .env 需配置：QQ_MAIL_USER / QQ_MAIL_AUTH_CODE（QQ邮箱授权码）/ QQ_MAIL_TO（可选，默认=发件人）
@@ -944,13 +937,11 @@ class CryptoTrader:
                          实盘巡检路径实测一封成功邮件耗时 31s），供日报做「渠道确认」
                          而非「提交即算送达」。
         返回 True=已确认送达（wait=True）或已提交发送线程（wait=False）；
-             False=被闸门拦截 / 未配置 / 发送失败 / 等待超时但线程仍在途 / 同一封仍在途而抑制重发。
+             False=被闸门拦截 / 未配置 / 发送失败 / 等待确认超时。
 
-        M1'（2026-09-25，第八轮复审）：与 bot_runner.send_email_alert 共用
-            email_gate 的在途槽位。未传 dedup_key 时按**内容指纹**（主题+正文哈希）判定 ——
-            所有 critical 告警共用主题「🚨 资金安全告警」，若只按主题占槽会把
-            **内容不同**的后续资金安全告警一并抑制（阻断项 1）。
-            on_late_result(ok) 在线程最终结束时回调，用于把超时后才成功的结果回灌。
+        ⚠️ 已知缺陷（第八轮复审 / ChatGPT 复核 d539da9，**本版刻意不含 M1' 修复**）：
+        无在途去重、无迟到结果回灌 —— 慢 SMTP 时同一告警可能重复投递。
+        修法与两条未闭环时序见分支 `notify-m1-timeline` 与送审稿 §11-§12。
         """
         allowed, gate_reason = email_gate.should_send_email(event=event)
         if not allowed:
@@ -965,64 +956,34 @@ class CryptoTrader:
             return False
 
         outcome = {"ok": False}
-        # M1'：在途去重键 —— 稳定身份优先，否则内容指纹（同主题不同内容不互相抑制）
-        key = email_gate.mail_send_key(event, subject, dedup_key, text)
-
-        def _notify_late(ok):
-            if on_late_result is None:
-                return
-            try:
-                on_late_result(bool(ok))
-            except Exception as e:
-                print(f"⚠️ [邮件] on_late_result 回调异常: {e} (event={event})")
 
         def _do_send():
-            try:
-                with EMAIL_SEND_LOCK:
-                    try:
-                        import smtplib
-                        from email.mime.text import MIMEText
-                        from email.header import Header
-                        # 清理 Telegram Markdown 符号，邮件按纯文本显示
-                        plain = re.sub(r'[*`]', '', text)
-                        msg = MIMEText(plain, "plain", "utf-8")
-                        msg["Subject"] = Header(subject, "utf-8")
-                        msg["From"] = mail_user
-                        msg["To"] = mail_to
-                        with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
-                            server.login(mail_user, mail_code)
-                            server.sendmail(mail_user, [mail_to], msg.as_string())
-                        outcome["ok"] = True
-                        email_gate.record_mail_result(key, email_gate.MAIL_RESULT_CONFIRMED)
-                        print(f"📧 [邮件] 已发送: {subject} (event={event})")
-                    except Exception as e:
-                        outcome["ok"] = False
-                        email_gate.record_mail_result(key, email_gate.MAIL_RESULT_FAILED)
-                        print(f"⚠️ [邮件] 发送失败: {e} (event={event})")
-            finally:
-                # 线程真正结束才释放槽位；随后回灌最终结果（超时后才成功靠它闭环）
-                email_gate.release_mail_slot(key, t)
-                _notify_late(outcome["ok"])
+            with EMAIL_SEND_LOCK:
+                try:
+                    import smtplib
+                    from email.mime.text import MIMEText
+                    from email.header import Header
+                    # 清理 Telegram Markdown 符号，邮件按纯文本显示
+                    plain = re.sub(r'[*`]', '', text)
+                    msg = MIMEText(plain, "plain", "utf-8")
+                    msg["Subject"] = Header(subject, "utf-8")
+                    msg["From"] = mail_user
+                    msg["To"] = mail_to
+                    with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
+                        server.login(mail_user, mail_code)
+                        server.sendmail(mail_user, [mail_to], msg.as_string())
+                    outcome["ok"] = True
+                    print(f"📧 [邮件] 已发送: {subject} (event={event})")
+                except Exception as e:
+                    outcome["ok"] = False
+                    print(f"⚠️ [邮件] 发送失败: {e} (event={event})")
 
         t = threading.Thread(target=_do_send, daemon=True)
-        if not email_gate.claim_mail_slot(key, t):
-            email_gate.record_mail_result(key, email_gate.MAIL_RESULT_SUPPRESSED_IN_FLIGHT)
-            print(f"⚠️ [邮件] 同一封邮件仍在途，本次不重复发送（event={event}）")
-            return False
-        try:
-            t.start()
-        except Exception as e:
-            email_gate.release_mail_slot(key, t)
-            email_gate.record_mail_result(key, email_gate.MAIL_RESULT_FAILED)
-            print(f"⚠️ [邮件] 发送线程启动失败: {e} (event={event})")
-            return False
+        t.start()
         if wait:
-            t.join(timeout=EMAIL_WAIT_TIMEOUT)
+            t.join(timeout=20)
             if t.is_alive():
-                # 超时 ≠ 失败：线程仍在途 → 槽位保持占用，下一轮将被抑制
-                email_gate.record_mail_result(key, email_gate.MAIL_RESULT_TIMEOUT_IN_FLIGHT)
-                print(f"⚠️ [邮件] 等待确认超时(20s)，发送线程**仍在途**（非失败）；"
-                      f"在途期间不重复发送（event={event}）")
+                print(f"⚠️ [邮件] 等待确认超时(20s)，按未确认处理（event={event}）")
                 return False
             return bool(outcome["ok"])
         return True
