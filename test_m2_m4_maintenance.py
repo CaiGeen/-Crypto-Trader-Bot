@@ -215,6 +215,13 @@ class TombstoneEntryIntegrityTests(unittest.TestCase):
             lambda tombstones: trader_260725.CryptoTrader._persist_tombstones(fake, tombstones))
         fake._merge_batch_state = (
             lambda disk, snap: trader_260725.CryptoTrader._merge_batch_state(fake, disk, snap))
+        # clear_batch_state 需要的簿记（缺了会被 MagicMock 吞掉 → 假绿/假红）
+        fake._collect_batch_order_ids = (
+            lambda b: trader_260725.CryptoTrader._collect_batch_order_ids(fake, b))
+        fake._verify_clear_proof = lambda *a, **k: None
+        fake._converge_alert = lambda key, msg, **k: sent.append((k.get('level', 'info'), str(msg)))
+        fake._tp_breaker_alerted = {}
+        fake._converge_alert_counts = {}
         return fake
 
     def _write(self, tmp, name, payload):
@@ -258,6 +265,59 @@ class TombstoneEntryIntegrityTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(written[self.SYMBOL]['batch_bad']['close_phase'], 2)
         self.assertTrue(fake._tombstones_degraded)
+
+    def test_empty_dict_entry_must_degrade_and_block_new_batch(self):
+        """ChatGPT 反例：{batch_x: {}} 是 dict 但无 cleared_at —— 不能靠类型校验放行。
+
+        旧实现按 cleared_at 缺失取 0 → age=now-0 远超 TTL → 当作"墓碑已过期"，
+        随后 _degraded=False 直接放行新建（Fail-Open），且 prune 会把损坏证据剪掉。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tomb = self._write(tmp, 'tomb.json', {'batch_x': {}})
+            tomb_bytes_before = open(tomb, 'rb').read()
+            state = self._write(tmp, 'trade_state.json', {})
+            sent = []
+            fake = self._fake(tomb, sent)
+            with mock.patch.object(trader_260725, 'STATE_FILE', state):
+                ok = trader_260725.CryptoTrader.save_batch_state(
+                    fake, self.SYMBOL, 'batch_x', {'is_active': True})
+                degraded = fake._tombstones_degraded
+                with open(state, 'r', encoding='utf-8') as f:
+                    written = json.load(f)
+                # 同一不可信文件下，TTL prune 不得删除损坏证据
+                trader_260725.CryptoTrader._prune_tombstones(fake)
+            tomb_bytes_after = open(tomb, 'rb').read()
+        self.assertFalse(ok, "空 dict 墓碑条目必须降级并拒绝新建（Fail-Closed）")
+        self.assertTrue(degraded)
+        self.assertEqual(written, {}, "被拒批次不得写入 trade_state.json")
+        self.assertEqual(tomb_bytes_before, tomb_bytes_after, "降级态不得改写墓碑证据")
+
+    def test_clear_keeps_ledger_when_tombstone_write_fails(self):
+        """ChatGPT 反例：墓碑写盘失败时绝不能删活跃账本（否则变成无反复活防线的孤儿仓）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tomb = self._write(tmp, 'tomb.json', {})
+            state = self._write(tmp, 'trade_state.json',
+                                {self.SYMBOL: {'batch_y': {'is_active': True,
+                                                           'close_phase': 3}}})
+            sent = []
+            fake = self._fake(tomb, sent)
+            # proof 门本身由 test_b_batch 覆盖；此处钉住的是"proof 之后、删账本之前"的
+            # 墓碑落盘失败分支，故将 proof 校验直接放行。
+            fake._verify_clear_proof = lambda *a, **k: None
+            fake._persist_tombstones = lambda t: False  # 模拟磁盘写墓碑失败
+            with mock.patch.object(trader_260725, 'STATE_FILE', state):
+                rc = trader_260725.CryptoTrader.clear_batch_state(
+                    fake, self.SYMBOL, 'batch_y',
+                    proof={'l1_canceled': [], 'l2_canceled': []})
+                with open(state, 'r', encoding='utf-8') as f:
+                    written = json.load(f)
+            tomb_now = json.load(open(tomb, 'r', encoding='utf-8'))
+        self.assertFalse(rc, "墓碑未落盘时 clear 必须返回失败")
+        self.assertIn('batch_y', written.get(self.SYMBOL, {}),
+                      "墓碑写失败必须保留活跃账本（不得出现无墓碑的孤儿清理）")
+        self.assertEqual(tomb_now, {}, "墓碑文件应保持原样")
+        self.assertTrue(any(lv == 'critical' and '墓碑' in t for lv, t in sent),
+                        "必须锁外 critical 告警")
 
     def test_prune_is_skipped_when_degraded(self):
         """DEGRADED 时不得基于不可信数据改写墓碑（避免把损坏条目静默剪掉）。"""

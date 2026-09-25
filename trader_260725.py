@@ -1,5 +1,6 @@
 # trader_260725.py
 import json
+import math
 import os
 import random
 import shutil
@@ -56,6 +57,33 @@ def _partial_resize_owner_ok(b, owner_op_id):
             and b.get('close_reason') in ('partial_resize_pending',
                                           'limit_cancel_restore_pending')
             and str(owner_op_id) == str(b.get('close_op_id') or ''))
+
+
+def _tombstone_entry_valid(entry) -> bool:
+    """墓碑条目**结构**有效性判定（2026-09-25 独立复审 P1 收口）。
+
+    仅做 isinstance(dict) 不够：``{"batch_x": {}}`` 一样能通过类型校验，而缺
+    ``cleared_at`` 的条目会被 ``float(..., 0)`` 兜底成 0 → age≈now → 远超
+    TTL → 被判成"墓碑已过期"，于是既不告警也不 DEGRADED，全新批次直接获得
+    放行（Fail-Open），且 TTL prune 还会把这条损坏证据剪掉。
+
+    有效 = 非空 dict 且 ``cleared_at`` 可解析为有限正数（epoch 秒）；
+    拒绝 bool（int 子类）、NaN、inf、缺失、非数字、非正数。
+
+    放在模块级而非方法：``self.<name>`` 在 Mock 单测夹具上会被自动创建成
+    Mock 并静默返回真值（假绿陷阱），模块级函数无法被夹具偷换。"""
+    if not isinstance(entry, dict) or not entry:
+        return False
+    _c = entry.get('cleared_at')
+    if isinstance(_c, bool):
+        return False
+    try:
+        _v = float(_c)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(_v) and _v > 0
+
+
 _MERGE_ID_MIRROR_FIELDS = ('tp_order_id', 'current_sl_id', 'limit_close_order_id')
 # C 类保护集：磁盘条目处于这些 state → 保留磁盘（未决/已锁/终态不许被旧快照降级）
 _MERGE_REGISTRY_PROTECTED_STATES = ('PENDING_CREATE', 'PENDING_VERIFY', 'NOT_CONFIRMED',
@@ -2480,9 +2508,11 @@ class CryptoTrader:
             # D-009 Q3：墓碑损坏 → DEGRADED（每次 _load_tombstones 重新判定，非粘性）
             _degraded = getattr(self, '_tombstones_degraded', False) is True
             t_entry = tombstones.get(batch_id)
-            if isinstance(t_entry, dict):
+            # 结构有效性前置（独立复审 P1）：无效条目不得走 age 兜底 →
+            # 缺 cleared_at 的条目不再被当成"已过期"而静默放行。
+            if _tombstone_entry_valid(t_entry):
                 try:
-                    _age = time.time() - float(t_entry.get('cleared_at', 0) or 0)
+                    _age = time.time() - float(t_entry.get('cleared_at') or 0)
                 except (TypeError, ValueError):
                     _age = 0.0
                 if _age < TOMBSTONE_TTL_SECONDS:
@@ -2594,6 +2624,7 @@ class CryptoTrader:
             self._converge_alert_counts = {k: v for k, v in _counts.items()
                                            if not (isinstance(k, tuple) and batch_id in k)}
         _reject = None
+        _tomb_write_fail = None  # 墓碑落盘失败原因（锁外 critical，与 proof 拒绝分流）
         with self._state_lock:
             all_states = self.load_all_states()
             b_data = (all_states.get(symbol) or {}).get(batch_id)
@@ -2614,9 +2645,14 @@ class CryptoTrader:
                                f'({tuple(authorization)} → {_cur_snap})，拒绝删除')
             if _reject is None:
                 # C2：先落墓碑再删 state（删记忆后墓碑是唯一防线，顺序不可倒）
+                # 独立复审 P1 收口：墓碑落盘是删账本的**前置硬门**——
+                # 旧实现忽略 _persist_tombstones 的布尔结果，墓碑写失败仍删除
+                # 活跃账本并 return True，留下"批次已清、反复活防线不存在"的
+                # 孤儿态（可无限复活）。现在：写失败 → 保留账本 → 返回 False。
                 try:
                     tombstones = self._load_tombstones()
-                    if not isinstance(tombstones.get(batch_id), dict):
+                    # 幂等：已有**有效**墓碑则不重复写；条目损坏则视为缺失重写
+                    if not _tombstone_entry_valid(tombstones.get(batch_id)):
                         _converged = sorted(
                             {str(ent.get('order_id'))
                              for ent in (b_data.get('protection_registry') or {}).values()
@@ -2635,21 +2671,38 @@ class CryptoTrader:
                         # 全库仅此一处对 close_phase 赋值 3）
                         _t_entry['close_phase'] = 3
                         tombstones[batch_id] = _t_entry
-                        self._persist_tombstones(tombstones)
+                        if self._persist_tombstones(tombstones) is not True:
+                            _tomb_write_fail = '墓碑原子写返回失败（磁盘/权限）'
+                    # 已有有效墓碑 → 幂等放行（无需重写）
                 except Exception as tomb_e:
-                    print(f"⚠️ [C2] 墓碑落盘失败（不阻断清理，但请人工检查）: {tomb_e}")
-                del all_states[symbol][batch_id]
-                if not all_states[symbol]:
-                    del all_states[symbol]
-                self._persist_states(all_states)
-                print(f"🧹 批次 [{batch_id}] 状态归档/清理完毕（proof 门通过，"
-                      f"墓碑已登记 close_phase=3，7 天防复活）。")
-                return True
+                    _tomb_write_fail = f'墓碑落盘异常：{tomb_e}'
+                if _tomb_write_fail is None:
+                    del all_states[symbol][batch_id]
+                    if not all_states[symbol]:
+                        del all_states[symbol]
+                    if self._persist_states(all_states) is not True:
+                        # 账本写失败：墓碑已 durable 而账本未更新 → 磁盘仍留有该批次。
+                        # 下轮 load_all_states 会重新读到它并重试清理（墓碑幂等、
+                        # 不覆盖 cleared_at），_persist_states 自身已按唯一告警源
+                        # 发出 critical，此处只补充批次级上下文。
+                        print(f"⚠️ [C2] 清理后账本落盘失败（磁盘仍保留批次 {batch_id}，"
+                              f"下轮 converge 自动重试；墓碑已登记故无复活风险）")
+                    print(f"🧹 批次 [{batch_id}] 状态归档/清理完毕（proof 门通过，"
+                          f"墓碑已登记 close_phase=3，7 天防复活）。")
+                    return True
         # 锁外拒绝告警（TG I/O 不进 _state_lock；同键 3 轮去重防刷屏）
-        self._converge_alert(('clear_rejected', symbol, batch_id),
-                             f"🚨【资金安全】批次 `{batch_id}`({symbol}) 清理被 proof 门拒绝"
-                             f"（{_reject}）。状态保留，待下轮 converge 生成收敛证明后重试"
-                             f"（Fail-Closed，无程序侧逃生门）。", level='critical')
+        if _tomb_write_fail is None:
+            self._converge_alert(('clear_rejected', symbol, batch_id),
+                                 f"🚨【资金安全】批次 `{batch_id}`({symbol}) 清理被 proof 门拒绝"
+                                 f"（{_reject}）。状态保留，待下轮 converge 生成收敛证明后重试"
+                                 f"（Fail-Closed，无程序侧逃生门）。", level='critical')
+        else:
+            self._converge_alert(('clear_tomb_failed', symbol, batch_id),
+                                 f"🚨【资金安全】批次 `{batch_id}`({symbol}) 墓碑落盘失败，"
+                                 f"已拒绝删除活跃账本（{_tomb_write_fail}）。\n"
+                                 f"批次状态与资金侧核对结果均保留，待下轮 converge 重试"
+                                 f"（Fail-Closed：宁可不清理，也不制造可复活的孤儿仓）。"
+                                 f"请检查磁盘空间/权限。", level='critical')
         return False
 
     # ==================== P0 Batch C：墓碑 / 字段级 merge ====================
@@ -2679,15 +2732,16 @@ class CryptoTrader:
             self._tombstones_degraded = True
             print(f"⚠️ [D-009] 墓碑根节点非 dict（复活防护降级，禁止新建批次）")
             return {}
-        # 条目级完整性（2026-09-25 复审 P1）：根节点是 dict **不代表内容可信**。
-        # 旧实现只对目标条目做 isinstance 判定，于是 {"batch_x": "not-a-dict"} 这类
-        # 局部损坏会被当成"没有墓碑" → 全新 batch_x 被放行复活（Fail-Open）。
-        # 现在任一条目类型非法即整体 DEGRADED；data 原样返回，**不丢弃证据**。
-        _bad_entries = [k for k, v in data.items() if not isinstance(v, dict)]
+        # 条目级完整性（2026-09-25 复审 P1 + 独立复审 P1 收口）：根节点是 dict
+        # **不代表内容可信**。旧实现只做 isinstance 判定，于是
+        # {"batch_x": "not-a-dict"} 与 {"batch_x": {}} 都会被当成"没有有效墓碑"
+        # → 全新 batch_x 被放行复活（Fail-Open），且 prune 还会剪掉证据。
+        # 现在任一条目结构非法即整体 DEGRADED；data 原样返回，**不丢弃证据**。
+        _bad_entries = [k for k, v in data.items() if not _tombstone_entry_valid(v)]
         if _bad_entries:
             self._tombstones_degraded = True
             _sample = sorted(str(k) for k in _bad_entries)[:3]
-            print(f"🚨 [D-009] 墓碑条目类型损坏（复活防护降级，禁止新建批次）: "
+            print(f"🚨 [D-009] 墓碑条目损坏（复活防护降级，禁止新建批次）: "
                   f"{len(_bad_entries)} 条非法，示例 {_sample}")
         return data
 
@@ -2726,14 +2780,22 @@ class CryptoTrader:
                 now = time.time()
                 pruned = {}
                 for bid, entry in tombstones.items():
+                    # 结构非法的条目**永不删除**（证据保留；正常情况下已被
+                    # 上方 DEGRADED 短路，此处为纵深防御）
+                    if not _tombstone_entry_valid(entry):
+                        pruned[bid] = entry
+                        continue
                     try:
-                        age = now - float((entry or {}).get('cleared_at', 0) or 0)
+                        age = now - float(entry.get('cleared_at') or 0)
                     except (TypeError, ValueError):
                         age = 0.0
                     if age < TOMBSTONE_TTL_SECONDS:
                         pruned[bid] = entry
                 if len(pruned) != len(tombstones):
-                    self._persist_tombstones(pruned)
+                    if self._persist_tombstones(pruned) is not True:
+                        print("⚠️ [C2] 墓碑 TTL 清理写盘失败（原文件保持，"
+                              "过期条目下轮重试）")
+                        return
                     print(f"🪦 [C2] 墓碑 TTL 清理：{len(tombstones) - len(pruned)} 条过期移除，"
                           f"剩余 {len(pruned)} 条")
         except Exception as e:
