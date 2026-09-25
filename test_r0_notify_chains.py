@@ -47,14 +47,6 @@ class _StopLoop(BaseException):
     """中断日报无限循环（继承 BaseException，避免被循环内 except Exception 吞掉）"""
 
 
-class _FakeDatetime:
-    """固定在 08:05 北京时间"""
-
-    @staticmethod
-    def now(tz=None):
-        return _dt.datetime(2026, 9, 25, 8, 5, 0)
-
-
 class TraderEmailEventTests(unittest.TestCase):
     """R1 / R2 / R3"""
 
@@ -99,35 +91,109 @@ class TraderEmailEventTests(unittest.TestCase):
         self.assertFalse(ok)
 
 
-class DailyReportDeliveryTests(unittest.TestCase):
-    """R4 / F12"""
+class _AtDatetime:
+    """可设定时刻（用于循环窗口守卫用例）"""
 
-    def _run_loop(self, tg_ok, mail_ok):
+    moment = None
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.moment
+
+
+class DailyReportDeliveryTests(unittest.TestCase):
+    """R4 / F12 / 复审 D1 / D2b（状态机直测 + 循环窗口守卫）"""
+
+    def _run_loop_once(self, helper_state, moment):
+        """驱动一轮循环（sleep 首次即中断），返回 fake（其 _try_daily_report_once 被替换）"""
         fake = mock.MagicMock()
-        fake._send_daily_report = mock.MagicMock(
-            return_value={"tg": tg_ok, "email": mail_ok})
-        with mock.patch.object(trader_260725, "datetime", _FakeDatetime), \
+        fake._last_daily_report_date = None
+        fake._daily_report_retry_count = 0
+        fake._daily_report_retry_date = None
+        fake._daily_report_done = {"tg": False, "email": False}
+        fake._try_daily_report_once = mock.MagicMock(return_value=helper_state)
+        _AtDatetime.moment = moment
+        with mock.patch.object(trader_260725, "datetime", _AtDatetime), \
                 mock.patch.object(trader_260725.time, "sleep", side_effect=_StopLoop):
             with self.assertRaises(_StopLoop):
                 trader_260725.CryptoTrader._daily_report_loop(fake)
         return fake
 
-    def test_no_date_mark_when_channels_unconfirmed(self):
-        """F12：TG 或邮件未确认 → 不写当日日期（否则整日不再重试）"""
-        fake = self._run_loop(tg_ok=False, mail_ok=True)
-        self.assertIsNone(fake._last_daily_report_date)
-        self.assertEqual(fake._daily_report_retry_count, 1)
-        fake._send_daily_report.assert_called_once()
+    def test_retry_window_guard(self):
+        """只有 08:05/10/15/20/25/30 才尝试；08:04 与 08:31 必须不触发"""
+        before = self._run_loop_once("done", _dt.datetime(2026, 9, 25, 8, 4, 0))
+        before._try_daily_report_once.assert_not_called()
+        after = self._run_loop_once("done", _dt.datetime(2026, 9, 25, 8, 31, 0))
+        after._try_daily_report_once.assert_not_called()
+        inside = self._run_loop_once("done", _dt.datetime(2026, 9, 25, 8, 5, 0))
+        inside._try_daily_report_once.assert_called_once_with("2026-09-25")
 
-    def test_date_marked_only_when_both_confirmed(self):
-        fake = self._run_loop(tg_ok=True, mail_ok=True)
+    def test_loop_delegates_and_marks_nothing_on_retry(self):
+        """循环只做调度：状态机返回 retry 时不得写日期"""
+        fake = self._run_loop_once("retry", _dt.datetime(2026, 9, 25, 8, 5, 0))
+        self.assertIsNone(fake._last_daily_report_date)
+        fake._try_daily_report_once.assert_called_once_with("2026-09-25")
+
+    # ---------------- 复审发现的缺陷回归（2026-09-25 自审 D1/D2b） ----------------
+    # 注：首版三条用例把状态**预设到 fake 上再驱动无限循环** —— 无效测试：
+    # 循环启动时会重置 _daily_report_retry_* / _daily_report_done（线程生命周期一次），
+    # 预设被静默抹掉，用例恒定通过（其中一条已实测恒定绿）。
+    # 改为直接验收抽出的状态机 _try_daily_report_once（确定性、无 sleep/时间依赖）。
+
+    def _fake_for_helper(self, result, done=None, count=0, retry_date=None,
+                         last_date=None):
+        fake = mock.MagicMock()
+        fake._last_daily_report_date = last_date
+        fake._daily_report_retry_count = count
+        fake._daily_report_retry_date = retry_date
+        fake._daily_report_done = dict(done or {"tg": False, "email": False})
+        fake._send_daily_report = mock.MagicMock(return_value=result)
+        return fake
+
+    def test_retry_counter_resets_on_new_day(self):
+        """D1：跨日必须重置重试额度（修复前沿用前一日残留 → 次日首次失败即放弃）"""
+        fake = self._fake_for_helper(result={"tg": False, "email": True},
+                                     count=6, retry_date="2026-09-24")
+        state = trader_260725.CryptoTrader._try_daily_report_once(fake, "2026-09-25")
+        self.assertEqual(state, "retry")
+        self.assertEqual(fake._daily_report_retry_count, 1)      # 不是 7
+        self.assertIsNone(fake._last_daily_report_date)          # 未放弃
+        self.assertEqual(fake._daily_report_retry_date, "2026-09-25")
+
+    def test_confirmed_channel_not_resent_on_retry(self):
+        """D2b：邮件已确认后重试只补 TG（修复前 25 分钟内会重复发 6 封日报邮件）"""
+        fake = self._fake_for_helper(result={"tg": False, "email": None},
+                                     done={"tg": False, "email": True},
+                                     retry_date="2026-09-25")
+        trader_260725.CryptoTrader._try_daily_report_once(fake, "2026-09-25")
+        channels = fake._send_daily_report.call_args.kwargs.get("channels")
+        self.assertEqual(tuple(channels), ("tg",))
+
+    def test_both_channels_done_marks_date_without_resend(self):
+        fake = self._fake_for_helper(result={"tg": True, "email": True},
+                                     done={"tg": True, "email": True},
+                                     retry_date="2026-09-25")
+        state = trader_260725.CryptoTrader._try_daily_report_once(fake, "2026-09-25")
+        self.assertEqual(state, "done")
+        fake._send_daily_report.assert_not_called()
         self.assertEqual(fake._last_daily_report_date, "2026-09-25")
-        self.assertEqual(fake._daily_report_retry_count, 0)
 
-    def test_mail_only_failure_blocks_mark(self):
-        """邮件单独失败也不算送达（双渠道确认口径）"""
-        fake = self._run_loop(tg_ok=True, mail_ok=False)
-        self.assertIsNone(fake._last_daily_report_date)
+    def test_retry_exhaustion_after_six_attempts(self):
+        """反向对照：额度用尽才放弃（同日第 6 次失败 → exhausted + 标记日期）"""
+        fake = self._fake_for_helper(result={"tg": False, "email": True},
+                                     retry_date="2026-09-25", count=5)
+        state = trader_260725.CryptoTrader._try_daily_report_once(fake, "2026-09-25")
+        self.assertEqual(state, "exhausted")
+        self.assertEqual(fake._daily_report_retry_count, 6)
+        self.assertEqual(fake._last_daily_report_date, "2026-09-25")
+
+    def test_idle_after_day_done(self):
+        fake = self._fake_for_helper(result={"tg": True, "email": True},
+                                     last_date="2026-09-25")
+        state = trader_260725.CryptoTrader._try_daily_report_once(fake, "2026-09-25")
+        self.assertEqual(state, "idle")
+        fake._send_daily_report.assert_not_called()
+
 
 
 class WatchdogFatalAlertTests(unittest.TestCase):

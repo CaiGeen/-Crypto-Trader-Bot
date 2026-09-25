@@ -469,6 +469,8 @@ class CryptoTrader:
         # 🔥 每日结算日报线程（daemon，每天 08:05 发送昨日结算）
         self._last_daily_report_date = None
         self._daily_report_retry_count = 0   # R0/F12：仅双渠道确认后才写日期，未确认按 5min 重试
+        self._daily_report_retry_date = None     # 复审 D1：重试额度按日归属，跨日必须重置
+        self._daily_report_done = {"tg": False, "email": False}  # 复审 D2b：已确认渠道不重发
         threading.Thread(target=self._daily_report_loop, daemon=True).start()
 
         # 🔥 D-009 P0（ChatGPT R2/R3 批准）：账本完整性状态位（默认"可信"，Fail-Closed 起手）
@@ -1622,10 +1624,15 @@ class CryptoTrader:
         except Exception:
             pass
 
-    def _send_daily_report(self, stats_file: str = None):
+    def _send_daily_report(self, stats_file: str = None,
+                           channels=("tg", "email")):
         """发送每日结算报告（昨日已实现盈亏 + 余额 + 持仓快照）。
 
-        stats_file 支持注入（测试用；默认沿用模块目录 trade_stats.json）。"""
+        stats_file 支持注入（测试用；默认沿用模块目录 trade_stats.json）。
+
+        复审 D2b（2026-09-25）：channels 指定本次尝试的渠道子集 —— 日报重试时只补
+        未确认的渠道，避免「一个渠道故障、另一个渠道在 25 分钟内重复发送 6 次」。
+        返回 {"tg": True/False/None, "email": True/False/None}（None = 本次未尝试）。"""
         try:
             # P0 Batch C（v2 §3）：日报顺带 prune 过期墓碑（TTL 7 天）
             self._prune_tombstones()
@@ -1683,20 +1690,65 @@ class CryptoTrader:
             if snapshot:
                 msg += f"\n{snapshot}"
 
-            tg_ok = self.send_tg_notification(msg)
+            tg_ok = self.send_tg_notification(msg) if "tg" in channels else None
             # 🔥 日报同步推送 QQ 邮箱（留档）
             # R0/F12：event="daily_report" 独立于持仓闸门（空仓也要留痕）；
             #         wait=True 等待 SMTP 确认，杜绝「提交即算送达」。
-            mail_ok = self._send_email_alert(
+            # 复审 D2b：channels 指定本次只补哪些渠道（已确认的渠道绝不重发）。
+            mail_ok = (self._send_email_alert(
                 msg, subject=f"每日结算报告 {report_date}",
-                event="daily_report", wait=True)
+                event="daily_report", wait=True) if "email" in channels else None)
             result = {"tg": tg_ok, "email": mail_ok}
-            if not (tg_ok is True and mail_ok is True):
-                print(f"⚠️ [日报] 渠道未全部确认 (tg={tg_ok}, email={mail_ok}) → 不标记当日已发，允许重试")
+            attempted = [c for c in channels]
+            unconfirmed = [c for c in attempted if result.get(c) is not True]
+            if unconfirmed:
+                print(f"⚠️ [日报] 本次未确认渠道 {unconfirmed} "
+                      f"(tg={tg_ok}, email={mail_ok}) → 不标记当日已发，允许重试")
             return result
         except Exception as e:
             print(f"⚠️ [日报] 发送失败: {e}")
-            return {"tg": False, "email": False}
+            return {"tg": False if "tg" in channels else None,
+                    "email": False if "email" in channels else None}
+
+    def _try_daily_report_once(self, today: str) -> str:
+        """执行一次日报尝试（复审 D1/D2b：把状态机从无限循环里抽出来，便于精确验收）。
+
+        返回：
+          'idle'      当日已完成，无需动作
+          'done'      本次尝试后双渠道均确认（已标记当日）
+          'retry'     仍有渠道未确认，等待下次重试
+          'exhausted' 本日重试额度（6 次）耗尽，已标记放弃（避免整日刷屏）
+        """
+        if self._last_daily_report_date == today:
+            return 'idle'
+        # D1：跨日重置额度与渠道确认，否则次日首次失败即被判「已耗尽」
+        if self._daily_report_retry_date != today:
+            self._daily_report_retry_date = today
+            self._daily_report_retry_count = 0
+            self._daily_report_done = {"tg": False, "email": False}
+
+        todo = tuple(c for c in ("tg", "email")
+                     if not self._daily_report_done.get(c))
+        if not todo:
+            self._last_daily_report_date = today
+            self._daily_report_retry_count = 0
+            return 'done'
+
+        result = self._send_daily_report(channels=todo)
+        for ch in todo:
+            if result.get(ch) is True:
+                self._daily_report_done[ch] = True
+
+        if all(self._daily_report_done.get(c) for c in ("tg", "email")):
+            self._last_daily_report_date = today
+            self._daily_report_retry_count = 0
+            return 'done'
+
+        self._daily_report_retry_count += 1
+        if self._daily_report_retry_count >= 6:
+            self._last_daily_report_date = today
+            return 'exhausted'
+        return 'retry'
 
     def _daily_report_loop(self):
         """每日 08:05（北京时间）自动发送昨日结算日报（daemon 线程）
@@ -1711,6 +1763,8 @@ class CryptoTrader:
         """
         self._last_daily_report_date = None
         self._daily_report_retry_count = 0
+        self._daily_report_retry_date = None          # 复审 D1：按日归属的重试额度
+        self._daily_report_done = {"tg": False, "email": False}   # 复审 D2b：已确认渠道
         while True:
             try:
                 now = datetime.now(BEIJING_TZ)
@@ -1718,22 +1772,24 @@ class CryptoTrader:
                 # 重试窗口：08:05 起每 5 分钟一次，最晚 08:30（第 6 次）
                 in_retry_window = (now.hour == 8 and 5 <= now.minute <= 30
                                    and now.minute % 5 == 0)
-                if in_retry_window and self._last_daily_report_date != today:
-                    result = self._send_daily_report()
-                    if result.get("tg") is True and result.get("email") is True:
-                        self._last_daily_report_date = today
-                        self._daily_report_retry_count = 0
+                if in_retry_window:
+                    state = self._try_daily_report_once(today)
+                    if state == 'idle':
+                        time.sleep(30)
+                        continue
+                    if state == 'done':
                         print(f"✅ [日报] {today} 双渠道已确认送达")
                         time.sleep(90)   # 避免同一窗口重复发送
+                        continue
+                    pending = [c for c in ("tg", "email")
+                               if not self._daily_report_done.get(c)]
+                    if state == 'exhausted':
+                        print(f"❌ [日报] {today} 连续 {self._daily_report_retry_count} 次"
+                              f"仍未确认 {pending}，停止重试（需人工确认；已确认渠道不会再发）")
                     else:
-                        self._daily_report_retry_count += 1
-                        n = self._daily_report_retry_count
-                        if n >= 6:
-                            self._last_daily_report_date = today
-                            print(f"❌ [日报] {today} 连续 {n} 次未获双渠道确认，停止重试（需人工确认）")
-                        else:
-                            print(f"⚠️ [日报] {today} 第 {n}/6 次尝试未全成功，5 分钟后重试")
-                        time.sleep(300)
+                        print(f"⚠️ [日报] {today} 第 {self._daily_report_retry_count}/6 次"
+                              f"未确认 {pending}，5 分钟后重试")
+                    time.sleep(300)
                     continue
                 time.sleep(30)
             except Exception as e:

@@ -405,12 +405,21 @@ async def _process_notify_queue_once(bot, chat_id: int,
                 # event="crash" 豁免持仓闸门：空仓崩溃同样必须邮件可达。
                 if not ok:
                     logging.warning("⚠️ 崩溃报警 Telegram 未送达，邮件仍独立尝试")
-                try:
-                    (email_cb or send_email_alert)(
-                        f"💥 程序崩溃报警！\n\n{notify_msg}",
-                        subject="💥 程序崩溃报警", event="crash")
-                except Exception as e:
-                    logging.warning(f"⚠️ 崩溃报警邮件发送异常: {e}")
+                # 复审 D2（2026-09-25）：邮件**每个事件实例只发 1 封**。
+                # R0 首版把邮件移出 if ok 后，TG 连续失败会在 3 轮（约 10s 间隔）里
+                # 重复发 3 封崩溃邮件 → 通知风暴。用 state 记忆（跨重启保持）。
+                if not st.get('crash_email_sent'):
+                    try:
+                        _email_res = (email_cb or send_email_alert)(
+                            f"💥 程序崩溃报警！\n\n{notify_msg}",
+                            subject="💥 程序崩溃报警", event="crash")
+                        # False=被闸门拦/未配置/提交失败 → 不落记忆，下轮可再试
+                        if _email_res is not False:
+                            st['crash_email_sent'] = True
+                    except Exception as e:
+                        logging.warning(f"⚠️ 崩溃报警邮件发送异常: {e}")
+                else:
+                    logging.info("ℹ️ 崩溃邮件本事件已发送过，跳过重复投递")
                 if ok:
                     logging.info("📨 崩溃报警已发送")
                     # 崩溃后持仓汇总仍只在 TG 成功后发（汇总本身依赖 bot 内存态）

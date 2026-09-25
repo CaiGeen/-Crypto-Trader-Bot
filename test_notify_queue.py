@@ -540,6 +540,28 @@ def scenario_15():
         env.close()
 
 
+def scenario_16():
+    """S16 复审 D2：crash_alert 在 TG 连续失败的多轮里，邮件只能发 1 封（不是 3 封）"""
+    env = Env()
+    try:
+        eid = "20260925_090000_111111_c0ffee01"
+        env.enqueue(eid, "crash_alert|程序异常退出: RuntimeError")
+        bot = FakeTgBot(always_fail=True)      # TG 三轮都失败
+        email_calls = []
+
+        for _ in range(3):
+            run_round(bot, env, email_cb=lambda *a, **k: email_calls.append(a))
+
+        st = env.state().get(eid, {})
+        ok = (len(email_calls) == 1                       # 只 1 封崩溃邮件
+              and st.get("status") == "SILENCED"          # TG 仍按 3 轮静默
+              and env.queue_files() == [f"{eid}.notify"])  # 证据保留
+        report("S16 crash_alert: 多轮失败不重复发邮件(D2)", ok,
+               f"(email={len(email_calls)}, status={st.get('status')})")
+    finally:
+        env.close()
+
+
 if __name__ == '__main__':
     scenario_1()
     scenario_2()
@@ -556,6 +578,7 @@ if __name__ == '__main__':
     scenario_13()
     scenario_14()
     scenario_15()
+    scenario_16()
     print("\n" + "#" * 60)
     failed = [n for n, p in RESULTS if not p]
     if failed:
