@@ -103,11 +103,18 @@ def send_email_alert(text: str, subject: str = "交易告警",
       - 其余沿用 EMAIL_ALERT_ONLY_WITH_POSITION
 
     第四轮复审（阻断项修复）：新增 wait 参数。
+      wait=True  → 同步等待 SMTP 结果（SMTP timeout=10s，单次阻塞操作上限，
+                    connect+login+sendmail 累计可超 20s —— 实盘巡检路径实测一封
+                    成功邮件耗时 31s），返回 True 仅当 **SMTP 确认送达**。
       wait=False → 返回 True 仅表示**已提交发送线程**（不保证送达），调用方
                     绝不可据此记录「已通知」。
-      wait=True  → 同步等待 SMTP 结果（SMTP timeout=10s，最长等 20s），
-                    返回 True 仅当 **SMTP 确认送达**；崩溃报警必须用此模式，
-                    否则「线程启动 + SMTP 失败」会被误记为已发送并被状态记忆吞掉。
+
+    M1（2026-09-25，第七轮复审）：结果三态 + 同进程在途去重
+      - 细粒度结果记在 email_gate（MAIL_RESULT_*）：confirmed / failed /
+        timeout_in_flight / suppressed_in_flight；**timeout_in_flight ≠ failed**。
+      - 同一 (event, subject) 在途未结束时，后续调用**不启动第二封**
+        （返回 False 并记 suppressed_in_flight），从根上消除重复投递。
+      - 边界：进程崩溃时在途邮件命运不可知，外部投递无法绝对不重复（不声称已解决）。
     """
     allowed, gate_reason = email_gate.should_send_email(event=event)
     if not allowed:
@@ -122,39 +129,61 @@ def send_email_alert(text: str, subject: str = "交易告警",
         return False
 
     outcome = {"ok": False}
+    # M1（2026-09-25）：在途去重键 + 槽位。同一 (event, subject) 在途未结束时
+    # **不启动第二封** —— 修复「join 超时报未确认 → 线程后来成功 → 下一轮重试 → 重复投递」。
+    key = email_gate.mail_send_key(event, subject)
 
     def _do_send():
-        with EMAIL_SEND_LOCK:
-            try:
-                import smtplib
-                from email.mime.text import MIMEText
-                from email.header import Header
-                # 清理 Telegram Markdown 符号，邮件按纯文本显示
-                plain = re.sub(r'[*`]', '', text)
-                msg = MIMEText(plain, "plain", "utf-8")
-                msg["Subject"] = Header(subject, "utf-8")
-                msg["From"] = mail_user
-                msg["To"] = mail_to
-                with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
-                    server.login(mail_user, mail_code)
-                    server.sendmail(mail_user, [mail_to], msg.as_string())
-                outcome["ok"] = True
-                logging.info(f"📧 [邮件] 已发送: {subject} (event={event})")
-            except Exception as e:
-                outcome["ok"] = False
-                logging.warning(f"⚠️ [邮件] 发送失败: {e} (event={event})")
+        try:
+            with EMAIL_SEND_LOCK:
+                try:
+                    import smtplib
+                    from email.mime.text import MIMEText
+                    from email.header import Header
+                    # 清理 Telegram Markdown 符号，邮件按纯文本显示
+                    plain = re.sub(r'[*`]', '', text)
+                    msg = MIMEText(plain, "plain", "utf-8")
+                    msg["Subject"] = Header(subject, "utf-8")
+                    msg["From"] = mail_user
+                    msg["To"] = mail_to
+                    with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
+                        server.login(mail_user, mail_code)
+                        server.sendmail(mail_user, [mail_to], msg.as_string())
+                    outcome["ok"] = True
+                    email_gate.record_mail_result(key, email_gate.MAIL_RESULT_CONFIRMED)
+                    logging.info(f"📧 [邮件] 已发送: {subject} (event={event})")
+                except Exception as e:
+                    outcome["ok"] = False
+                    email_gate.record_mail_result(key, email_gate.MAIL_RESULT_FAILED)
+                    logging.warning(f"⚠️ [邮件] 发送失败: {e} (event={event})")
+        finally:
+            # 线程真正结束才释放槽位：超时返回后仍保持占用，杜绝重复投递
+            email_gate.release_mail_slot(key, t)
 
+    t = threading.Thread(target=_do_send, daemon=True)
+    if not email_gate.claim_mail_slot(key, t):
+        # 前一封同一邮件仍在途 —— 本次不发送（不制造第二封）
+        email_gate.record_mail_result(key, email_gate.MAIL_RESULT_SUPPRESSED_IN_FLIGHT)
+        logging.warning(
+            f"⚠️ [邮件] 同一封邮件仍在途，本次不重复发送（event={event}, subject={subject!r}）")
+        return False
     try:
-        t = threading.Thread(target=_do_send, daemon=True)
         t.start()
     except Exception as e:
+        email_gate.release_mail_slot(key, t)
+        email_gate.record_mail_result(key, email_gate.MAIL_RESULT_FAILED)
         logging.warning(f"⚠️ [邮件] 发送线程提交失败: {e} (event={event})")
         return False
 
     if wait:
         t.join(timeout=20)
         if t.is_alive():
-            logging.warning(f"⚠️ [邮件] 等待确认超时(20s)，按未送达处理（event={event}）")
+            # M1：**超时 ≠ 失败**。线程仍在途 → 槽位保持占用，下一轮将被抑制，
+            # 既不重复投递，也不把「可能成功」误记为失败后立刻重发。
+            email_gate.record_mail_result(key, email_gate.MAIL_RESULT_TIMEOUT_IN_FLIGHT)
+            logging.warning(
+                f"⚠️ [邮件] 等待确认超时(20s)，发送线程**仍在途**（非失败）；"
+                f"在途期间不重复发送（event={event}）")
             return False
         return bool(outcome["ok"])
     # 非 wait 模式：只代表「已提交」，不代表送达
@@ -2921,8 +2950,34 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+def log_effective_config() -> str:
+    """M4（2026-09-25，第七轮复审）：打印**进程内真正生效**的关键配置。
+
+    为什么需要：``.env`` 只在进程启动时被 ``load_dotenv()`` 读一次，运行中改磁盘文件
+    对本进程无效（D10）。此前无法从外部确认「进程内到底生效了什么值」——
+    送审稿只能证明磁盘值与启动时间（A9 的验收缺口）。
+    本函数读的是 os.environ（与 trader 的风控闸门、email_gate 同源），
+    因此日志里的值 == 实际裁决用的值。返回单行字符串（便于测试断言）。
+    """
+    parts = [
+        f"RISK_MAX_ACTIVE_BATCHES={os.getenv('RISK_MAX_ACTIVE_BATCHES', '3（默认）')}",
+        f"RISK_MAX_ACTIVE_SYMBOLS={os.getenv('RISK_MAX_ACTIVE_SYMBOLS', '1（默认）')}",
+        f"RISK_DAILY_REALIZED_LOSS_LIMIT={os.getenv('RISK_DAILY_REALIZED_LOSS_LIMIT', '0（默认，禁用）')}",
+        f"MAX_LEVERAGE={os.getenv('MAX_LEVERAGE', '100（默认）')}",
+        f"EMAIL_ALERT_ENABLED={email_gate.email_enabled()}",
+        f"EMAIL_ALERT_ONLY_WITH_POSITION={email_gate.email_only_with_position()}",
+        f"DAILY_REPORT_EMAIL_ENABLED={email_gate.daily_report_email_enabled()}",
+        f"FATAL_EVENTS={sorted(email_gate.FATAL_EVENTS)}",
+    ]
+    line = "⚙️ [配置生效] " + " | ".join(parts)
+    logging.info(line)
+    logging.info("⚙️ [配置生效] 提醒：.env 仅在进程启动时读取，修改后必须重启本进程才生效（D10）")
+    return line
+
+
 def main():
     acquire_instance_lock()  # P0-2: 单实例锁，双实例直接拒绝启动
+    log_effective_config()   # M4：先落配置横幅，再做任何有配置依赖的动作
 
     proxy_url = os.getenv("BINANCE_PROXY")
 

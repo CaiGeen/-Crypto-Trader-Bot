@@ -933,10 +933,15 @@ class CryptoTrader:
         R0（2026-09-25，F10/F12）：
           event 事件维度 —— 致命事件（critical/auth_blocked/crash/health/...）豁免持仓闸门；
                             daily_report 由 DAILY_REPORT_EMAIL_ENABLED 独立裁决。
-          wait=True   —— 同步等待 SMTP 结果（SMTP timeout=10s，最长等 20s），
-                         供日报做「渠道确认」而非「提交即算送达」。
+          wait=True   —— 同步等待 SMTP 结果（单次阻塞操作 timeout=10s，累计可超 20s；
+                         实盘巡检路径实测一封成功邮件耗时 31s），供日报做「渠道确认」
+                         而非「提交即算送达」。
         返回 True=已确认送达（wait=True）或已提交发送线程（wait=False）；
-             False=被闸门拦截 / 未配置 / 发送失败 / 等待确认超时。
+             False=被闸门拦截 / 未配置 / 发送失败 / 等待超时但线程仍在途 / 同一封仍在途而抑制重发。
+
+        M1（2026-09-25，第七轮复审）：与 bot_runner.send_email_alert 共用
+            email_gate 的在途槽位 —— 同一 (event, subject) 在途时不再启动第二封；
+            超时与失败分为两态（timeout_in_flight / failed），避免「假未确认 → 重试 → 重复投递」。
         """
         allowed, gate_reason = email_gate.should_send_email(event=event)
         if not allowed:
@@ -951,34 +956,56 @@ class CryptoTrader:
             return False
 
         outcome = {"ok": False}
+        # M1（2026-09-25）：与 bot_runner.send_email_alert 共用 email_gate 在途槽位。
+        # 同一 (event, subject) 在途未结束时不再启动第二封；超时与失败分两态。
+        key = email_gate.mail_send_key(event, subject)
 
         def _do_send():
-            with EMAIL_SEND_LOCK:
-                try:
-                    import smtplib
-                    from email.mime.text import MIMEText
-                    from email.header import Header
-                    # 清理 Telegram Markdown 符号，邮件按纯文本显示
-                    plain = re.sub(r'[*`]', '', text)
-                    msg = MIMEText(plain, "plain", "utf-8")
-                    msg["Subject"] = Header(subject, "utf-8")
-                    msg["From"] = mail_user
-                    msg["To"] = mail_to
-                    with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
-                        server.login(mail_user, mail_code)
-                        server.sendmail(mail_user, [mail_to], msg.as_string())
-                    outcome["ok"] = True
-                    print(f"📧 [邮件] 已发送: {subject} (event={event})")
-                except Exception as e:
-                    outcome["ok"] = False
-                    print(f"⚠️ [邮件] 发送失败: {e} (event={event})")
+            try:
+                with EMAIL_SEND_LOCK:
+                    try:
+                        import smtplib
+                        from email.mime.text import MIMEText
+                        from email.header import Header
+                        # 清理 Telegram Markdown 符号，邮件按纯文本显示
+                        plain = re.sub(r'[*`]', '', text)
+                        msg = MIMEText(plain, "plain", "utf-8")
+                        msg["Subject"] = Header(subject, "utf-8")
+                        msg["From"] = mail_user
+                        msg["To"] = mail_to
+                        with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
+                            server.login(mail_user, mail_code)
+                            server.sendmail(mail_user, [mail_to], msg.as_string())
+                        outcome["ok"] = True
+                        email_gate.record_mail_result(key, email_gate.MAIL_RESULT_CONFIRMED)
+                        print(f"📧 [邮件] 已发送: {subject} (event={event})")
+                    except Exception as e:
+                        outcome["ok"] = False
+                        email_gate.record_mail_result(key, email_gate.MAIL_RESULT_FAILED)
+                        print(f"⚠️ [邮件] 发送失败: {e} (event={event})")
+            finally:
+                # 线程真正结束才释放槽位：超时返回后仍占用，杜绝重复投递
+                email_gate.release_mail_slot(key, t)
 
         t = threading.Thread(target=_do_send, daemon=True)
-        t.start()
+        if not email_gate.claim_mail_slot(key, t):
+            email_gate.record_mail_result(key, email_gate.MAIL_RESULT_SUPPRESSED_IN_FLIGHT)
+            print(f"⚠️ [邮件] 同一封邮件仍在途，本次不重复发送（event={event}）")
+            return False
+        try:
+            t.start()
+        except Exception as e:
+            email_gate.release_mail_slot(key, t)
+            email_gate.record_mail_result(key, email_gate.MAIL_RESULT_FAILED)
+            print(f"⚠️ [邮件] 发送线程启动失败: {e} (event={event})")
+            return False
         if wait:
             t.join(timeout=20)
             if t.is_alive():
-                print(f"⚠️ [邮件] 等待确认超时(20s)，按未确认处理（event={event}）")
+                # 超时 ≠ 失败：线程仍在途 → 槽位保持占用，下一轮将被抑制
+                email_gate.record_mail_result(key, email_gate.MAIL_RESULT_TIMEOUT_IN_FLIGHT)
+                print(f"⚠️ [邮件] 等待确认超时(20s)，发送线程**仍在途**（非失败）；"
+                      f"在途期间不重复发送（event={event}）")
                 return False
             return bool(outcome["ok"])
         return True
@@ -1579,8 +1606,13 @@ class CryptoTrader:
 
     def _check_account_risk(self, all_states, signal, stats_file=None):
         """D-006: 账户层风控闸门（只判定不通知——通知由 execute_signal 调用方负责，沿用 SG 门风格）。
-        限额调用时读 env 不缓存（改 .env 即时生效，无需重启）；限额 <=0 视为禁用。
-        已批准限额（2026-08-28）：批次 3 / 交易对 1 / 日亏损暂不启用（0）/ MAX_LEVERAGE 100。
+        限额调用时读 env 不缓存 —— 但注意 D10（2026-09-25，第七轮复审）：
+        读的是 **os.environ 快照**，而 `load_dotenv()` 只在进程启动时执行一次，
+        因此**改磁盘 .env 不会影响运行中进程**，必须重启 watchdog/bot_runner 才生效。
+        （健康巡检.py 是独立短进程、每次重读磁盘，故两者行为不一致。）
+        限额 <=0 视为禁用。
+        当前上限：批次 2（M3 起，见 .env RISK_MAX_ACTIVE_BATCHES=2）/ 交易对 1 /
+        日亏损暂不启用（0）/ MAX_LEVERAGE 100。
         返回 (allowed, reason)。"""
         # RISK_MAX_ACTIVE_BATCHES: 活跃批次总数达到上限即拒绝新批次
         try:
@@ -3785,10 +3817,23 @@ class CryptoTrader:
         """
         根据活跃批次数量动态计算轮询间隔
         4H级别交易：间隔更宽松，避免429
+
+        M2（2026-09-25，第七轮复审 / F6）：**消除第 3 批次起的轮询断崖**。
+        修复前：`<=2` → 10~15s，但 `<=4` → 75~100s —— 恰好把 v6.2-P0-1 判为
+        「不可接受」的裸仓窗口（成交到发现 SL/TP 缺失最长 ~80s）又请了回来，
+        且断崖点正压在 RISK_MAX_ACTIVE_BATCHES=3 上：**批次越多（越该被保护），
+        保护单补建越慢**。发现成交后的 3s 快轮询不能缩短**首次发现之前**的等待。
+        修复后分级连续，且 3 档起仍保持在 60s 以内：
+            <=2 → 10~15s（实盘验证值，不动）
+            <=4 → 20~30s
+            <=6 → 30~40s
+            >6  → 45~60s
+        取舍：API 权重随批次上升（3~4 档频率约为旧值的 3~4 倍）。
+        真正的止血阀是**活跃批次硬上限 2**（RISK_MAX_ACTIVE_BATCHES=2，
+        见 .env），本分级修复只保证「万一上限被调高，行为仍然连续可预期」。
         """
         active_count = self._get_active_batch_count()
 
-        # P1-2: 基准间隔整体上调（4H 级别交易无需 30 秒轮询），减少 API 权重消耗
         if active_count <= 2:
             # 🔥 v6.2-P0-1（实盘 2026-09-01 17:4x）：100x 下成交到发现 SL/TP 缺失的
             # 裸仓窗口最长 ~80s 不可接受 → 压到 5~15s 级。fast_poll 机制保留
@@ -3796,14 +3841,15 @@ class CryptoTrader:
             base_interval = 10.0
             jitter_range = 5.0
         elif active_count <= 4:
-            base_interval = 75.0
-            jitter_range = 25.0
+            # M2：75~100s → 20~30s（消除断崖，见上方 docstring）
+            base_interval = 20.0
+            jitter_range = 10.0
         elif active_count <= 6:
-            base_interval = 90.0
-            jitter_range = 30.0
+            base_interval = 30.0
+            jitter_range = 10.0
         else:
-            base_interval = 120.0
-            jitter_range = 40.0
+            base_interval = 45.0
+            jitter_range = 15.0
 
         return random.uniform(base_interval, base_interval + jitter_range)
 
@@ -5518,7 +5564,8 @@ class CryptoTrader:
                     f"⚠️【账户层风控拦截】批次 `{batch_id}` ({symbol})\n"
                     f"原因: {risk_reason}\n"
                     f"未执行任何下单。存量批次的止盈/止损/平仓/监控不受影响。\n"
-                    f"如确需开仓：调整 .env 限额（即时生效无需重启）或先平掉部分仓位。",
+                    f"如确需开仓：调整 .env 限额（**需重启 watchdog/bot_runner 才对运行中进程生效**，"
+                    f"D10）或先平掉部分仓位。",
                     level='warning')
             except Exception:
                 pass

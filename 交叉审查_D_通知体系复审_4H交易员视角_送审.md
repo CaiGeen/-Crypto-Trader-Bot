@@ -973,6 +973,14 @@ ChatGPT 指出：`.env.example` 仍默认开启日报邮件，而日报已豁免
 | M4 | **启动配置横幅**：打印进程内有效值（风险限额 / 杠杆 / 两个邮件开关 / `FATAL_EVENTS`）→ 永久消灭 A9 类问题 |
 | M5 | 次日 `08:05` 补验日报邮件关闭的实盘效果 |
 
+**实施状态（2026-09-25 17:1x）：M1~M4 已完成编码并全绿，**未部署**（按 ChatGPT 决定合并一次重启）。**
+新增 `test_m1_m4_maintenance.py`（9 例，全绿）；pytest 13 套件 56 passed；`test_notify_queue` 19/19；
+`watchdog_guard` 全通过；`close_confirmation_v62` 133/133；`position_close` 7/7；`v62_staged` ALL PASS；`b2_hardlock` 16/16；
+`py_compile` 通过。落地细节见送审稿 §10.3。
+
+> ⚠️ **部署注意**：实盘仍跑旧代码（cap=2 未生效）。watchdog 有崩溃自动重启 —— 若意外重启，本批次会**提前部署**；
+> 届时核对启动日志 `⚙️ [配置生效] RISK_MAX_ACTIVE_BATCHES=2` 横幅即可确认。
+
 **窗口要求**：空仓、代理就绪、避开 4H 整点收盘；单次停机约 105s（含恢复链）。
 
 ### 17.4 本轮明确不做
