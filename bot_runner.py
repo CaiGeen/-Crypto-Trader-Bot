@@ -52,6 +52,7 @@ from telegram.error import NetworkError, RetryAfter, Conflict, BadRequest
 from parser import parse_signal_from_json, parse_signal_from_dict
 from trader_260725 import CryptoTrader
 from health_progress import new_instance_id, write_progress
+import email_gate
 
 # 2. 加载环境变量
 load_dotenv()
@@ -93,7 +94,13 @@ def send_email_alert(text: str, subject: str = "交易告警") -> None:
     """发送 QQ 邮箱告警（独立线程异步发送，失败静默，未配置自动跳过）
     供 watchdog 通知通道（崩溃报警等）复用，逻辑与 trader 的 _send_email_alert 一致
     .env 需配置：QQ_MAIL_USER / QQ_MAIL_AUTH_CODE（QQ邮箱授权码）/ QQ_MAIL_TO（可选，默认=发件人）
+    可选闸门：EMAIL_ALERT_ENABLED / EMAIL_ALERT_ONLY_WITH_POSITION。
     """
+    allowed, gate_reason = email_gate.should_send_email()
+    if not allowed:
+        logging.info(f"ℹ️ [邮件] 已跳过（{gate_reason}）")
+        return
+
     mail_user = os.getenv("QQ_MAIL_USER", "").strip()
     mail_code = os.getenv("QQ_MAIL_AUTH_CODE", "").strip()
     mail_to = os.getenv("QQ_MAIL_TO", "").strip() or mail_user

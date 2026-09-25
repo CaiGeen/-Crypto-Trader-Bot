@@ -15,6 +15,7 @@ import pytz
 from dotenv import load_dotenv
 from parser import TradeSignal, parse_signal_from_json
 from health_progress import current_instance_id, write_progress, remove_batch
+import email_gate
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -859,7 +860,14 @@ class CryptoTrader:
     def _send_email_alert(self, text: str, subject: str = "交易告警") -> None:
         """发送 QQ 邮箱告警（独立线程异步发送，失败静默，未配置自动跳过）
         .env 需配置：QQ_MAIL_USER / QQ_MAIL_AUTH_CODE（QQ邮箱授权码）/ QQ_MAIL_TO（可选，默认=发件人）
+        可选闸门：EMAIL_ALERT_ENABLED 手动总开关；EMAIL_ALERT_ONLY_WITH_POSITION
+        仅在 trade_state.json 存在 is_active=true 批次时发送（状态不可读=不发邮件）。
         """
+        allowed, gate_reason = email_gate.should_send_email()
+        if not allowed:
+            print(f"ℹ️ [邮件] 已跳过（{gate_reason}）")
+            return
+
         mail_user = os.getenv("QQ_MAIL_USER", "").strip()
         mail_code = os.getenv("QQ_MAIL_AUTH_CODE", "").strip()
         mail_to = os.getenv("QQ_MAIL_TO", "").strip() or mail_user

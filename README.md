@@ -105,6 +105,10 @@ BINANCE_PROXY=http://127.0.0.1:7890
 # Telegram
 TG_BOT_TOKEN=your_telegram_bot_token
 TG_ALLOWED_USER_ID=your_telegram_user_id
+# 邮件告警开关（Telegram 不受影响）
+EMAIL_ALERT_ENABLED=true
+# true=仅在本地 trade_state.json 有活跃批次时发邮件；状态不可读时不发邮件
+EMAIL_ALERT_ONLY_WITH_POSITION=false
 ```
 
 ### 4. 启动

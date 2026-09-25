@@ -28,6 +28,8 @@ import time
 from datetime import datetime
 from urllib.parse import urlparse
 
+import email_gate
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 HEARTBEAT_FILE = os.path.join(BASE_DIR, ".heartbeat.json")
@@ -168,6 +170,13 @@ def send_tg(env: dict, text: str, use_proxy: bool) -> bool:
 
 def send_email(env: dict, subject: str, text: str) -> bool:
     """QQ 邮件兜底：SMTP 国内直连，代理不可达时仍可用。"""
+    allowed, gate_reason = email_gate.should_send_email(
+        env=env, state_path=TRADE_STATE_FILE
+    )
+    if not allowed:
+        log(f"ℹ️ 邮件已跳过（{gate_reason}）")
+        return False
+
     user = env.get("QQ_MAIL_USER", "")
     code = env.get("QQ_MAIL_AUTH_CODE", "")
     to = env.get("QQ_MAIL_TO", "") or user
