@@ -1248,4 +1248,78 @@ crash_injection 20 PASS、b2_crashsafe 18 PASS、close_confirmation 133/133。
 - `save_batch_state` 布尔契约约 30 处 TP/SL 与最终提交调用仍未消费（沿 §22.5）。
 - M5 待 2026-09-26 08:05 实盘验收。
 
+---
+
+## 24. 第十四轮：清理链成功语义 + 我自己的两处测试回归（9d9526c）
+
+ChatGPT 复审 `41bfc2c` 评 82/100，两条原反例关闭，但「整条批次清理的成功语义」不算闭环。
+
+### 24.1 它说得对，而且比它说的更严重
+
+`_persist_states()` 失败时代码只打印警告、照样打印「清理完毕」、`return True`。
+我查了 13 个调用方——**全都把 `False` 当作「未清理、下轮重试」**，所以 `True` 确实是谎话。
+
+更严重的是：`_persist_states` 的普通写盘失败**只 `print` 不告警**（只有 `_state_corrupted`
+分支才发 critical）。也就是这条路径既说谎、又没人知道。复审只点了前者。
+
+修完以后 `clear_batch_state` 的返回值契约才真正自洽：`True` **只**在「墓碑 durable
+且账本 durable」时返回，两种失败各自带一条锁外 critical、措辞按真实原因分流。
+置 `_defer_state_corrupt_alert` 避免和 `_persist_states` 自己的损坏告警重复——
+这正是 §22.2 那个反模式，不能在新分支里重演一次。
+
+### 24.2 口径问题：我选择**不加**校验
+
+它说「若要宣称完整结构校验，需先定义旧版兼容规则」。我去查了兼容边界：
+`test_c_batch` 夹具写的墓碑就没有 `close_phase`，Batch B 之前的真实墓碑也没有。
+真去校验它，合法历史文件会被判 DEGRADED 并连带禁止一切新建——把一个口径问题
+升级成可用性事故。
+
+所以定界为「TTL/存在性判据所需的最小结构」，只强制 `cleared_at`，并加一个
+13 用例的边界测试把这条兼容规则**钉死**：以后谁想收紧，必须先拿迁移方案出来。
+
+### 24.3 更该记住的：我第十三轮打断了两个测试
+
+- `test_tp_validation.py` T5c：基线 `f0a21d2`=24/24 → 我改完 23/24。
+  夹具没绑墓碑方法，MagicMock 让 `is not True` 恒成立，清理被当成落盘失败拦掉。
+- `test_v64_p3_lifecycle.py`：`NameError: _tombstone_entry_valid`。
+  这个基建用 AST 把函数源码 `exec` 进**合成命名空间**，不是 `trader_260725` 的
+  globals，我新增的模块级函数它根本看不见。
+
+**真正的教训不是这两个 bug，是我的门禁瞎了**：这两个文件在根目录 pytest 下
+收集 **0 项**（`scenario_*` 不叫 `test_*`），所以我第十三轮报的「79 passed」
+压根没碰到它们。ChatGPT 只读仓库、看不到我的运行记录，自然也发现不了。
+
+所以本轮起加了**全量脚本门禁**：逐个 `python test_*.py` 直跑根目录 48 个文件。
+这一步当场就抓到了上面两个。以后改 `clear_batch_state`/`save_batch_state`
+这类被广泛提取或被广泛调用的函数，必须跑它。
+
+### 24.4 停机窗口顺手验证了一件一直没验的事
+
+`test_orphan_guard.py` 在 Bot 运行期间**必然** rc=42——它开局就
+`acquire_instance_lock()`，而运行中的 Bot 持有
+`Global\my_crypto_bot_single_instance`。这是设计使然，不是回归。
+借这次重启的停机窗口跑了一次：**5/5 PASS，exit=0**。
+
+（顺带记一个坑：`acquire_instance_lock()` **没有返回值**，成功 = 不抛
+`SystemExit`。我一开始用返回值判断，拿到 `None` 差点误读成失败。）
+
+另外确认 `test_v64_p3_lifecycle.py` 是**基线就 3/9**：`f0a21d2` 与 `9d9526c`
+的 9 项 marker 逐条一致。那 6 项既有失败要单独批次查，不混进通知体系。
+
+### 24.5 受控重启验收（2026-09-25 23:52:25）
+
+停机前检查（活跃批次 0 / 队列 0 / 代理 200 / 工作区 clean）→ 停机窗口内先跑
+`test_orphan_guard` 5/5 → 启动。进程树 `11180→42080→38068→16724→36884`，
+`23:52:30` 系统 READY、cap=3；`23:53:25` 心跳 `bot_alive=true`、`restarts=0`、
+`fatal_alert=null`、队列 0；`watchdog.log` 无误杀；bot 日志 `23:52` 后无
+Traceback、无邮件；独立巡检 `23:54:42` 返回码 0。
+
+### 24.6 仍未闭环
+
+- 第 3 批次信号继续冻结。
+- `save_batch_state` 布尔契约约 30 处调用仍未消费。
+- `test_v64_p3_lifecycle.py` 6 项既有失败待独立排查。
+- M5 待 2026-09-26 08:05 实盘验收。
+
+
 
