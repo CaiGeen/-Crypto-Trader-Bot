@@ -194,9 +194,28 @@ _MAIL_INFLIGHT: dict = {}
 _MAIL_LAST_RESULT: dict = {}
 
 
-def mail_send_key(event, subject) -> tuple:
-    """在途去重的键：同一事件 + 同一主题视为同一封邮件。"""
-    return (str(event or "generic").strip().lower(), str(subject or ""))
+def mail_content_key(event, subject, text) -> str:
+    """内容指纹：同主题但内容不同的告警**绝不能**被判为同一封（ChatGPT 复核 a8db596 阻断项 1）。
+
+    背景：所有 ``event="critical"`` 资金安全告警共用同一主题「🚨 资金安全告警」，
+    若只按 (event, subject) 占槽，第一封在途期间会把**内容不同的**后续资金安全告警
+    一并抑制，且无补发安排 → 不同事件失去邮件兜底。
+    """
+    import hashlib
+    payload = f"{subject or ''}\n{text or ''}".encode("utf-8", "replace")
+    return "content:" + hashlib.sha1(payload).hexdigest()[:16]
+
+
+def mail_send_key(event, subject, dedup_key=None, text=None) -> tuple:
+    """在途去重的键。
+
+    - ``dedup_key`` 给了（调用方持有稳定身份，如崩溃队列的 event_id）→ 用它；
+    - 否则退回**内容指纹**（主题+正文哈希）——默认即安全：内容不同就不算同一封。
+    """
+    ev = str(event or "generic").strip().lower()
+    if dedup_key:
+        return (ev, "dk:" + str(dedup_key))
+    return (ev, mail_content_key(event, subject, text))
 
 
 def claim_mail_slot(key, thread_obj) -> bool:
@@ -234,6 +253,11 @@ def record_mail_result(key, result: str) -> None:
 def mail_last_result(key):
     with _INFLIGHT_LOCK:
         return _MAIL_LAST_RESULT.get(key)
+
+
+def mail_last_result_for(event, subject, dedup_key=None, text=None):
+    """按与发送方相同的规则取最近一次结果（供调用方区分失败/超时在途/已确认）。"""
+    return mail_last_result(mail_send_key(event, subject, dedup_key, text))
 
 
 def reset_mail_state_for_test() -> None:

@@ -30,7 +30,8 @@ MAIL_ENV = {
     "EMAIL_ALERT_ENABLED": "true",
     "EMAIL_ALERT_ONLY_WITH_POSITION": "true",
 }
-KEY = email_gate.mail_send_key("crash", "单元测试崩溃")
+# 与下方用例实际发送的正文保持一致（键 = 事件 + 内容指纹）
+KEY = email_gate.mail_send_key("crash", "单元测试崩溃", None, "x")
 
 
 class _SlowSmtp:
@@ -62,6 +63,15 @@ def _wait_slot_free(key, timeout=5.0):
         if not email_gate.mail_in_flight(key):
             return True
         time.sleep(0.05)
+    return False
+
+
+def _wait_until(pred, timeout=5.0, interval=0.05):
+    end = time.time() + timeout
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(interval)
     return False
 
 
@@ -146,14 +156,15 @@ class M2PollingCliffTests(unittest.TestCase):
                 v = self._interval(n)
                 self.assertGreaterEqual(v, lo, f"批次 {n} 低于下界")
                 self.assertLessEqual(v, hi, f"批次 {n} 高于上界")
-        # 连续性判据：相邻档位的**上界**不得出现 >2 倍断崖
-        # （旧实现 15s → 100s 为 6.7 倍，正是 F6 所指的缺陷）
-        maxes = [max(self._interval(n) for _ in range(20)) for n in range(0, 13)]
-        for n, (prev, cur) in enumerate(zip(maxes, maxes[1:])):
-            self.assertLessEqual(cur, prev * 2.0 + 1e-6,
-                                 f"批次 {n} → {n + 1} 出现断崖式跃升")
+        # 连续性判据：对**声明档位上界**做确定性检查（不用随机采样做比值，2.0× 恰在边界会抖动）
+        # 旧实现上界序列 15 → 100 → 120 → 160：2→3 档是 6.7 倍断崖，正是 F6 所指
+        ordered = [expected[n] for n in sorted(expected)]
+        for (lo1, hi1), (lo2, hi2) in zip(ordered, ordered[1:]):
+            self.assertLessEqual(hi2, hi1 * 2 + 1e-6,
+                                 f"档位 {lo1}~{hi1} → {lo2}~{hi2} 出现断崖式跃升")
         # 第 3 档起必须显著快于旧值 75~100s
-        self.assertLessEqual(max(maxes[3:]), 60.0, "第 3 档起必须快于 60s")
+        self.assertLessEqual(max(hi for n, (lo, hi) in expected.items() if n >= 3), 60.0,
+                             "第 3 档起必须快于 60s")
 
     def test_m2_source_no_longer_has_old_tiers(self):
         root = os.path.dirname(os.path.abspath(__file__))
@@ -192,6 +203,75 @@ class M4ConfigBannerTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             line = bot_runner.log_effective_config()
         self.assertIn("RISK_MAX_ACTIVE_BATCHES=3（默认）", line)
+
+
+class M1AdversarialTests(unittest.TestCase):
+    """ChatGPT 复核 a8db596 指定的 2 条对抗路径（旧 M1 的全绿并不能排除它们）"""
+
+    def setUp(self):
+        email_gate.reset_mail_state_for_test()
+        with bot_runner._LATE_CRASH_LOCK:
+            bot_runner._LATE_CRASH_CONFIRM.clear()
+
+    def tearDown(self):
+        email_gate.reset_mail_state_for_test()
+        with bot_runner._LATE_CRASH_LOCK:
+            bot_runner._LATE_CRASH_CONFIRM.clear()
+
+    def test_a1_same_subject_different_alerts_not_suppressed(self):
+        """阻断项 1：所有 critical 共用主题「🚨 资金安全告警」——
+        第一封在途时，**内容不同**的第二条资金安全告警不得被抑制。"""
+        slow = _SlowSmtp(0.6)
+        with mock.patch.dict(os.environ, MAIL_ENV), \
+                mock.patch("smtplib.SMTP_SSL", return_value=slow) as smtp:
+            r1 = trader_260725.CryptoTrader._send_email_alert(
+                object(), "🚨【资金安全】\n止损保护丢失", subject="🚨 资金安全告警",
+                event="critical", wait=False)
+            r2 = trader_260725.CryptoTrader._send_email_alert(
+                object(), "🚨【资金安全】\n余额不足阻断", subject="🚨 资金安全告警",
+                event="critical", wait=False)
+            self.assertTrue(r1)
+            self.assertTrue(r2, "不同内容的资金安全告警不得被当作重复邮件抑制")
+            self.assertTrue(_wait_until(lambda: slow.sent == 2, timeout=5),
+                            f"两封都应发出，实际 {slow.sent} 封")
+            self.assertEqual(smtp.call_count, 2)
+
+    def test_a2_timeout_then_late_success_no_resend(self):
+        """阻断项 2：join 超时后线程才成功 → 下一轮**不得**重复投递同一崩溃事件。"""
+        from test_notify_queue import Env, FakeTgBot, run_round
+        env = Env()
+        try:
+            eid = "20260925_180000_111111_5e7a1e5c"
+            env.enqueue(eid, "crash_alert|程序异常退出: RuntimeError")
+            bot = FakeTgBot(always_fail=True)      # TG 失败 → 事件保留
+            slow = _SlowSmtp(0.9)
+            with mock.patch.dict(os.environ, MAIL_ENV), \
+                    mock.patch.object(bot_runner, "EMAIL_WAIT_TIMEOUT", 0.2), \
+                    mock.patch("smtplib.SMTP_SSL", return_value=slow) as smtp:
+                run_round(bot, env)               # 第 1 轮：0.2s 超时，线程仍在途
+                st = env.state().get(eid, {})
+                self.assertFalse(st.get('crash_email_sent'),
+                                 "超时当轮不得标记已发送")
+                self.assertTrue(any(f.startswith(eid)
+                                    for f in env.queue_files()),
+                                "TG 失败时事件应保留")
+
+                # 线程稍后成功 → 登记迟到确认
+                self.assertTrue(_wait_until(lambda: slow.sent == 1, timeout=5))
+                self.assertTrue(
+                    _wait_until(lambda: eid in bot_runner._LATE_CRASH_CONFIRM, timeout=5),
+                    "迟到成功后应登记，供下一轮回灌")
+
+                run_round(bot, env)               # 第 2 轮：吸收迟到确认，不重发
+                st = env.state().get(eid, {})
+                self.assertTrue(st.get('crash_email_sent'),
+                                "迟到确认必须回灌到事件状态")
+                self.assertIn('crash_email_late_confirmed', st)
+                self.assertEqual(smtp.call_count, 1,
+                                 "迟到成功后下一轮不得重复投递同一事件")
+                self.assertEqual(slow.sent, 1)
+        finally:
+            env.close()
 
 
 if __name__ == "__main__":
