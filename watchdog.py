@@ -423,6 +423,25 @@ threading.Thread(target=_console_writer_loop, daemon=True,
                  name="console_writer").start()
 
 
+def _looks_like_crash(line: str) -> bool:
+    """子程序输出是否表明**真崩溃**（第九轮复审修复，2026-09-25）。
+
+    历史实现：`if "CRASH" in line or "FATAL" in line` —— **纯子串**匹配。
+    代价实测：M4 启动横幅里的 `FATAL_EVENTS=[...]`（含 `FATAL`）被判为崩溃 →
+    watchdog 反复杀进程重启，形成死循环（空仓、无持仓损失，但告警链被刷屏）。
+
+    修法：
+      1) 词边界匹配：`FATAL_EVENTS`、`CRASH_ALERT` 这类**标识符**不再误判
+         （`_` 属单词字符，`\\b` 不成立），而 `FATAL: ...` / `CRASH ...` 仍会命中；
+      2) 补 `Traceback (most recent call last)` —— Python 崩溃的规范标志，
+         比依赖日志措辞更可靠（真实崩溃若未打印这些词，判定也不会失效）。
+    """
+    import re
+    if "Traceback (most recent call last)" in line:
+        return True
+    return bool(re.search(r'\b(CRASH|FATAL)\b', line)) or "Unhandled exception" in line
+
+
 def monitor_process(process):
     """监控主程序输出（读线程永不执行可能阻塞的控制台写）。"""
     try:
@@ -432,7 +451,7 @@ def monitor_process(process):
                 _CONSOLE_QUEUE.put_nowait(line)
             except Exception:
                 pass
-            if "CRASH" in line or "FATAL" in line or "Unhandled exception" in line:
+            if _looks_like_crash(line):
                 log_message("⚠️ 检测到主程序异常，准备重启")
                 return False
     except Exception as e:

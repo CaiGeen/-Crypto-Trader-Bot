@@ -1,0 +1,2 @@
+2026-09-25 21:31:13,926 - root - INFO - ⚙️ [配置生效] RISK_MAX_ACTIVE_BATCHES=3 | RISK_MAX_ACTIVE_SYMBOLS=1 | RISK_DAILY_REALIZED_LOSS_LIMIT=0（默认，禁用） | MAX_LEVERAGE=100 | EMAIL_ALERT_ENABLED=True | EMAIL_ALERT_ONLY_WITH_POSITION=True | DAILY_REPORT_EMAIL_ENABLED=False | FATAL_EVENTS=['auth_blocked', 'crash', 'critical', 'health', 'liquidation_proximity', 'protection_lost', 'startup_breaker']
+2026-09-25 21:31:13,926 - root - INFO - ⚙️ [配置生效] 提醒：.env 仅在进程启动时读取，修改后必须重启本进程才生效（D10）

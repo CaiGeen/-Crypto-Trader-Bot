@@ -102,7 +102,9 @@ class M4ConfigBannerTests(unittest.TestCase):
             line = bot_runner.log_effective_config()
         self.assertIn("RISK_MAX_ACTIVE_BATCHES=2", line)
         self.assertIn("DAILY_REPORT_EMAIL_ENABLED=False", line)
-        self.assertIn("FATAL_EVENTS=", line)
+        self.assertIn("致命事件白名单=", line)   # 标签避开 watchdog 崩溃判定的 CRASH/FATAL 词
+        for ev in ("crash", "health", "critical"):
+            self.assertIn(ev, line)
         for key in ("RISK_MAX_ACTIVE_SYMBOLS", "EMAIL_ALERT_ENABLED",
                     "EMAIL_ALERT_ONLY_WITH_POSITION", "MAX_LEVERAGE"):
             self.assertIn(key, line)
@@ -139,6 +141,34 @@ class DeployableVersionGuardTests(unittest.TestCase):
             src = f.read()
         self.assertIn("已知缺陷", src)
         self.assertIn("notify-m1-timeline", src)
+
+
+class CrashDetectorHardeningTests(unittest.TestCase):
+    """第九轮复审：watchdog 崩溃判定由**子串**改为**词边界**（子串会把标识符误判为崩溃）"""
+
+    def test_identifiers_do_not_trip_detector(self):
+        import watchdog as wd
+        for line in ("INFO - FATAL_EVENTS=['crash', 'health']",
+                     "CRASH_ALERT enqueued",
+                     "📧 [邮件] 已发送: 每日结算报告",
+                     "[21:29] 🚀 Telegram Bot 监听服务已启动..."):
+            self.assertFalse(wd._looks_like_crash(line), f"误判为崩溃: {line!r}")
+
+    def test_real_crash_signals_still_trip_detector(self):
+        import watchdog as wd
+        for line in ("FATAL: unrecoverable state",
+                     "CRASH detected in monitor",
+                     "Traceback (most recent call last):",
+                     "Unhandled exception in thread"):
+            self.assertTrue(wd._looks_like_crash(line), f"漏判真崩溃: {line!r}")
+
+    def test_real_config_banner_does_not_trip_detector(self):
+        """最强护栏：M4 横幅的真实输出必须不被判为崩溃（即本次死循环的根因）"""
+        import watchdog as wd
+        line = bot_runner.log_effective_config()
+        self.assertNotIn("FATAL_EVENTS=", line, "横幅不得再含大写 FATAL_EVENTS 标签")
+        self.assertFalse(wd._looks_like_crash(line),
+                         "启动横幅被判为崩溃 → watchdog 会陷入重启死循环")
 
 
 if __name__ == "__main__":
