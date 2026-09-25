@@ -297,8 +297,10 @@ def scenario_skeleton_persist_failure_no_create():
     report('T6a/骨架落盘失败返回None', ret is None, f"(ret={ret!r})")
     report('T6a/骨架落盘失败零create_order', len(creates) == 0,
            f"(events={fake.events})")
-    report('T6a/骨架落盘失败发送critical', any('持久化失败' in t for t in critical),
-           f"(critical={critical})")
+    # 2026-09-25 告警契约调整：落盘失败告警的唯一来源是 save_batch_state（锁外、
+    # 真实原因、按键去重）。本场景把 save 打桩，故此处必须**零** critical——
+    # 调用方若再发泛化的"磁盘/权限"告警，会与 save 的具体告警重复并误导排查方向。
+    report('T6a/调用方不重复发送泛化告警', critical == [], f"(critical={critical})")
 
 
 def _recovery_fake(states, cleared):

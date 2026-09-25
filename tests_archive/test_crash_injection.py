@@ -104,6 +104,9 @@ def make_fake(create_results=None, open_normal=None, open_conditional=None,
         fake.events.append(('save', batch_id))
         fake.save_snapshots.append(copy.deepcopy(data))
         fake.states.setdefault(symbol, {})[batch_id] = copy.deepcopy(data)
+        # 2026-09-25：save_batch_state 已建立"落盘确认"契约（execute_signal 用
+        # `is not True` 硬拦），成功桩必须显式返回 True，否则会被正确地判为落盘失败。
+        return True
 
     fake.load_all_states = _load
     fake.save_batch_state = _save
@@ -117,7 +120,10 @@ def make_fake(create_results=None, open_normal=None, open_conditional=None,
         fake._commit_registry_txn = (
             lambda s, b, **k: CryptoTrader._commit_registry_txn(fake, s, b, **k))
     fake.clear_batch_state = lambda s, b: fake.states.get(s, {}).pop(b, None)
-    fake._check_existing_conflicts = lambda s, b, all_states: False
+    fake._check_existing_conflicts = lambda s, b, *args: False
+    # 2026-09-25：execute_signal 新增持仓模式 Fail-Closed 校验，缺 dualSidePosition 会
+    # 在骨架保存之前就阻断开仓（归档夹具漂移，非生产缺陷）。
+    fake._compute_signal_fingerprint = lambda sig: 'fingerprint_crash_injection'
     fake._get_current_position_amt = lambda s, is_hedge_mode=False, side=None: 0.0
     fake._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
     fake._validate_stop_losses = lambda signal, price: (True, '止损校验通过')
@@ -135,7 +141,7 @@ def make_fake(create_results=None, open_normal=None, open_conditional=None,
     ex = mock.MagicMock()
     ex.set_leverage = lambda l, s: None
     ex.fetch_ticker = lambda s=None: {'last': MARKET, 'close': MARKET}
-    ex.fapiPrivateGetPositionSideDual = lambda: {}
+    ex.fapiPrivateGetPositionSideDual = lambda: {'dualSidePosition': False}
     ex.amount_to_precision = lambda s, v: v
     ex.price_to_precision = lambda s, v: v
     ex.fetch_balance = lambda: {'USDT': {'free': 10000.0}}

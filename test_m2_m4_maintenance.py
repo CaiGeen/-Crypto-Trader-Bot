@@ -17,8 +17,11 @@
 import importlib.util
 import inspect
 import io
+import json
 import os
 import sys
+import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -148,20 +151,154 @@ class DeployableVersionGuardTests(unittest.TestCase):
 class BatchSkeletonPersistenceGateTests(unittest.TestCase):
     """Intent Before Side Effect：骨架未确认落盘时，交易所 create_order 必须为零。"""
 
-    def test_persist_failure_blocks_all_create_order(self):
+    def _fixture(self):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             'tests_archive', 'test_b2_crashsafe_entry.py')
         spec = importlib.util.spec_from_file_location('b2_crashsafe_entry_fixture', path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        return module
+
+    def test_persist_failure_blocks_all_create_order(self):
+        module = self._fixture()
         fake = module.make_fake()
         fake.save_batch_state = lambda symbol, batch_id, data: False
         with mock.patch.object(trader_260725.threading, 'Thread', module.FakeThread):
             result = trader_260725.CryptoTrader.execute_signal(fake, module.FakeSignal())
         self.assertIsNone(result)
         self.assertEqual(fake._create_n, 0)
-        self.assertTrue(any(level == 'critical' and '持久化失败' in text
-                            for level, text in fake.sent))
+
+    def test_legacy_none_return_also_blocks_create_order(self):
+        """旧 fake 成功时返回 None；在 is not True 硬门下 None 同样必须阻断（不得放宽）。"""
+        module = self._fixture()
+        fake = module.make_fake()
+        fake.save_batch_state = lambda symbol, batch_id, data: None
+        with mock.patch.object(trader_260725.threading, 'Thread', module.FakeThread):
+            result = trader_260725.CryptoTrader.execute_signal(fake, module.FakeSignal())
+        self.assertIsNone(result)
+        self.assertEqual(fake._create_n, 0)
+
+    def test_execute_signal_emits_no_generic_persist_alert(self):
+        """告警唯一源是 save_batch_state：调用方只阻断，不得再发泛化"磁盘/权限"告警。"""
+        module = self._fixture()
+        fake = module.make_fake()
+        fake.save_batch_state = lambda symbol, batch_id, data: False
+        with mock.patch.object(trader_260725.threading, 'Thread', module.FakeThread):
+            trader_260725.CryptoTrader.execute_signal(fake, module.FakeSignal())
+        self.assertEqual([t for lv, t in fake.sent if lv == 'critical'], [])
+
+
+class TombstoneEntryIntegrityTests(unittest.TestCase):
+    """2026-09-25 复审 P1：根 JSON 合法但条目类型损坏 → 不得 Fail-Open 放行复活。"""
+
+    SYMBOL = 'BTC/USDT:USDT'
+
+    def _fake(self, tomb_path, sent):
+        fake = mock.Mock()
+        fake._state_lock = threading.Lock()
+        fake.tombstone_file = tomb_path
+        fake.sent = sent
+        fake._tombstone_alerted = set()
+        fake._persist_alerted = set()
+        fake._state_corrupted = False
+        fake._state_corruption_detail = ''
+        fake.send_tg_notification = (
+            lambda text, **k: sent.append((k.get('level', 'info'), str(text))))
+        fake.load_all_states = lambda: trader_260725.CryptoTrader.load_all_states(fake)
+        fake._persist_states = (
+            lambda all_states: trader_260725.CryptoTrader._persist_states(fake, all_states))
+        # 必须绑定真实墓碑读取：MagicMock 会吞掉 _load_tombstones 与
+        # _tombstones_degraded，使"条目损坏 → DEGRADED"路径被静默跳过（假绿）。
+        fake._load_tombstones = (
+            lambda: trader_260725.CryptoTrader._load_tombstones(fake))
+        fake._persist_tombstones = (
+            lambda tombstones: trader_260725.CryptoTrader._persist_tombstones(fake, tombstones))
+        fake._merge_batch_state = (
+            lambda disk, snap: trader_260725.CryptoTrader._merge_batch_state(fake, disk, snap))
+        return fake
+
+    def _write(self, tmp, name, payload):
+        path = os.path.join(tmp, name)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False)
+        return path
+
+    def test_corrupt_entry_blocks_new_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tomb = self._write(tmp, 'tomb.json', {'batch_bad': 'not-a-dict'})
+            state = self._write(tmp, 'trade_state.json', {})
+            sent = []
+            fake = self._fake(tomb, sent)
+            with mock.patch.object(trader_260725, 'STATE_FILE', state):
+                ok = trader_260725.CryptoTrader.save_batch_state(
+                    fake, self.SYMBOL, 'batch_bad', {'is_active': True})
+                degraded = fake._tombstones_degraded
+                with open(state, 'r', encoding='utf-8') as f:
+                    written = json.load(f)
+        self.assertFalse(ok, "条目损坏时全新批次必须被拒绝（Fail-Closed）")
+        self.assertTrue(degraded)
+        self.assertEqual(written, {}, "被拒批次不得写入 trade_state.json")
+        self.assertTrue(any('batch_bad' in t and '墓碑' in t
+                            for lv, t in sent if lv == 'critical'))
+
+    def test_corrupt_entry_still_allows_existing_batch_update(self):
+        """D-009 Q3 分治：墓碑不可信只阻断新建，已存在批次的状态更新必须放行。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tomb = self._write(tmp, 'tomb.json', {'batch_bad': None})
+            state = self._write(tmp, 'trade_state.json',
+                                {self.SYMBOL: {'batch_bad': {'is_active': True,
+                                                             'close_phase': 1}}})
+            sent = []
+            fake = self._fake(tomb, sent)
+            with mock.patch.object(trader_260725, 'STATE_FILE', state):
+                ok = trader_260725.CryptoTrader.save_batch_state(
+                    fake, self.SYMBOL, 'batch_bad', {'is_active': True, 'close_phase': 2})
+                with open(state, 'r', encoding='utf-8') as f:
+                    written = json.load(f)
+        self.assertTrue(ok)
+        self.assertEqual(written[self.SYMBOL]['batch_bad']['close_phase'], 2)
+        self.assertTrue(fake._tombstones_degraded)
+
+    def test_prune_is_skipped_when_degraded(self):
+        """DEGRADED 时不得基于不可信数据改写墓碑（避免把损坏条目静默剪掉）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tomb = self._write(tmp, 'tomb.json',
+                               {'batch_bad': 'not-a-dict',
+                                'batch_old': {'cleared_at': 0}})
+            sent = []
+            fake = self._fake(tomb, sent)
+            before = os.path.getsize(tomb)
+            trader_260725.CryptoTrader._prune_tombstones(fake)
+            after_size = os.path.getsize(tomb)
+            with open(tomb, 'r', encoding='utf-8') as f:
+                after = json.load(f)
+        self.assertEqual(len(after), 2, "降级态不得改写墓碑")
+        self.assertEqual(after_size, before)
+
+    def test_persist_failure_alerts_once_with_real_reason_outside_lock(self):
+        """告警契约：唯一来源、真实原因、锁外发送、按键去重。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tomb = self._write(tmp, 'tomb.json', {})
+            state = os.path.join(tmp, 'trade_state.json')
+            with open(state, 'w', encoding='utf-8') as f:
+                f.write('{broken json')
+            sent = []
+            fake = self._fake(tomb, sent)
+            with mock.patch.object(trader_260725, 'STATE_FILE', state):
+                first = trader_260725.CryptoTrader.save_batch_state(
+                    fake, self.SYMBOL, 'batch_new', {'is_active': True})
+                second = trader_260725.CryptoTrader.save_batch_state(
+                    fake, self.SYMBOL, 'batch_new', {'is_active': True})
+                lock_free = fake._state_lock.acquire(blocking=False)
+                if lock_free:
+                    fake._state_lock.release()
+        self.assertFalse(first)
+        self.assertFalse(second)
+        crit = [t for lv, t in sent if lv == 'critical']
+        self.assertEqual(len(crit), 1, f"同一批次落盘失败只应告警一次: {crit}")
+        self.assertIn('已损坏', crit[0], "告警必须写明真实原因（账本损坏）")
+        self.assertNotIn('磁盘/权限', crit[0], "不得误导为磁盘权限问题")
+        self.assertTrue(lock_free, "告警必须在 _state_lock 释放后发送")
 
 
 class CrashDetectorHardeningTests(unittest.TestCase):

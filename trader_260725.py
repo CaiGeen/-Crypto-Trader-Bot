@@ -2427,15 +2427,19 @@ class CryptoTrader:
         if getattr(self, '_state_corrupted', False) is True:
             print(f"🚫 [D-009] 拒绝覆盖写入：trade_state.json 已损坏，"
                   f"账本内容不可信（保护现场待人工恢复）")
-            try:
-                self.send_tg_notification(
-                    f"🚨【资金安全】状态写入被拒绝（账本已损坏）\n"
-                    f"trade_state.json 读取失败，程序拒绝覆盖写入以保护现场。\n"
-                    f"错误: `{self._state_corruption_detail[:150]}`\n"
-                    f"⚠️ 系统已停止交易（READY=False）。请人工修复或重命名该文件后重启。",
-                    level='critical')
-            except Exception:
-                pass
+            # 2026-09-25 复审：save_batch_state 在持锁状态下调用本函数，若在此发 TG
+            # 会把网络 IO 带进 _state_lock（最坏阻塞数秒）。调用方可置位
+            # _defer_state_corrupt_alert，把告警推迟到锁外统一发出（不重复、不误导）。
+            if not getattr(self, '_defer_state_corrupt_alert', False):
+                try:
+                    self.send_tg_notification(
+                        f"🚨【资金安全】状态写入被拒绝（账本已损坏）\n"
+                        f"trade_state.json 读取失败，程序拒绝覆盖写入以保护现场。\n"
+                        f"错误: `{self._state_corruption_detail[:150]}`\n"
+                        f"⚠️ 系统已停止交易（READY=False）。请人工修复或重命名该文件后重启。",
+                        level='critical')
+                except Exception:
+                    pass
             return False
         try:
             if os.path.exists(STATE_FILE):
@@ -2460,6 +2464,8 @@ class CryptoTrader:
         """P0 Batch C（v2 §5 + v3 §5/§6）：状态落盘单咽喉 = 墓碑检查 + 字段级 merge。
         返回 ``True`` 仅表示 merge 后的完整状态已成功持久化；墓碑拒绝或写盘失败均返回
         ``False``。新建批次的调用方必须以该布尔值作为 ``create_order`` 前的硬门。
+        告警契约：本函数是写盘失败的**唯一**告警源（锁外、按真实原因措辞、按键去重），
+        调用方只负责阻断副作用，不得重复发送泛化告警。
         C2：见墓碑（TTL 内）→ 拒绝写入（Fail-Closed，已清理批次复活通道封死）+
             🚨 critical 告警（锁外发送，防持锁 5s TG 超时；进程内每批次一次去重）。
         C1：磁盘既有批次按七类规则 merge（A 棘轮 / G user_modified OR / B 单调账本 /
@@ -2497,7 +2503,12 @@ class CryptoTrader:
                     if isinstance(existing, dict) and existing:
                         batch_data = self._merge_batch_state(existing, batch_data)
                     all_states[symbol][batch_id] = batch_data
-                    _persisted = self._persist_states(all_states) is True
+                    # 告警延后到锁外统一发出（见 _persist_states 注释）
+                    self._defer_state_corrupt_alert = True
+                    try:
+                        _persisted = self._persist_states(all_states) is True
+                    finally:
+                        self._defer_state_corrupt_alert = False
         if _tomb_degraded_reject:
             _dkey = ('tombstone_degraded', batch_id)
             if _dkey not in getattr(self, '_tombstone_alerted', set()):
@@ -2530,8 +2541,37 @@ class CryptoTrader:
                 print(f"🪦 [C2] 墓碑拦截 save（批次 {batch_id}，复活告警已去重）")
             return False
         if not _persisted:
-            print(f"🚫 [状态持久化] 批次 `{batch_id}` ({symbol}) 未确认落盘，拒绝继续写入")
-        return _persisted
+            # 2026-09-25 复审：失败告警由本函数**唯一**发出（锁外、按原因措辞、按键去重）。
+            # 调用方 execute_signal 只负责阻断下单，不得再发泛化的"磁盘/权限"告警，
+            # 否则墓碑拒绝/账本损坏会各收到两条 critical 并被误导去查磁盘权限。
+            if getattr(self, '_state_corrupted', False) is True:
+                _reason = ("trade_state.json 已损坏，程序按 Fail-Closed 拒绝覆盖写入以保护现场"
+                           f"（{str(getattr(self, '_state_corruption_detail', '') or '')[:120]}）")
+            else:
+                _reason = "磁盘写入 / fsync / 原子替换未成功"
+            print(f"🚫 [状态持久化] 批次 `{batch_id}` ({symbol}) 未确认落盘：{_reason}")
+            _pkey = ('persist_failed', batch_id)
+            _alerted = getattr(self, '_persist_alerted', None)
+            if not isinstance(_alerted, set):
+                _alerted = set()
+                self._persist_alerted = _alerted
+            if _pkey not in _alerted:
+                try:
+                    _alerted.add(_pkey)
+                except Exception:
+                    pass
+                try:
+                    self.send_tg_notification(
+                        f"🚨【资金安全】批次状态未落盘，已阻断新建批次下单\n"
+                        f"批次：`{batch_id}`\n标的：`{symbol}`\n原因：{_reason}\n"
+                        f"⚠️ 未调用交易所 create_order。请人工修复后重试。",
+                        level='critical')
+                except Exception:
+                    pass
+            else:
+                print(f"🚫 [状态持久化] 批次 {batch_id} 落盘失败告警已去重")
+            return False
+        return True
 
     def clear_batch_state(self, symbol: str, batch_id: str, proof=None,
                           authorization=None) -> bool:
@@ -2639,6 +2679,16 @@ class CryptoTrader:
             self._tombstones_degraded = True
             print(f"⚠️ [D-009] 墓碑根节点非 dict（复活防护降级，禁止新建批次）")
             return {}
+        # 条目级完整性（2026-09-25 复审 P1）：根节点是 dict **不代表内容可信**。
+        # 旧实现只对目标条目做 isinstance 判定，于是 {"batch_x": "not-a-dict"} 这类
+        # 局部损坏会被当成"没有墓碑" → 全新 batch_x 被放行复活（Fail-Open）。
+        # 现在任一条目类型非法即整体 DEGRADED；data 原样返回，**不丢弃证据**。
+        _bad_entries = [k for k, v in data.items() if not isinstance(v, dict)]
+        if _bad_entries:
+            self._tombstones_degraded = True
+            _sample = sorted(str(k) for k in _bad_entries)[:3]
+            print(f"🚨 [D-009] 墓碑条目类型损坏（复活防护降级，禁止新建批次）: "
+                  f"{len(_bad_entries)} 条非法，示例 {_sample}")
         return data
 
     def _persist_tombstones(self, tombstones: dict) -> bool:
@@ -2667,6 +2717,11 @@ class CryptoTrader:
             with self._state_lock:
                 tombstones = self._load_tombstones()
                 if not tombstones:
+                    return
+                # DEGRADED 时禁止基于不可信数据改写墓碑（条目可能非法，TTL 不可判定）
+                if getattr(self, '_tombstones_degraded', False):
+                    print("🪦 [D-009] 墓碑 DEGRADED：跳过 TTL 清理"
+                          "（不基于不可信数据改写墓碑，请人工修复）")
                     return
                 now = time.time()
                 pruned = {}
@@ -5799,14 +5854,10 @@ class CryptoTrader:
             # Fail-Closed，绝不能继续 create_order，否则会同时突破 cap 并制造“交易所有单、
             # 本地无账本”的不可恢复窗口。
             if self.save_batch_state(symbol, batch_id, skeleton) is not True:
-                msg = (f"🚨【资金安全】批次骨架持久化失败，已阻断全部下单\n"
-                       f"批次：`{batch_id}`\n标的：`{symbol}`\n"
-                       f"未调用交易所 create_order。请修复 trade_state.json 的磁盘/权限问题后重试。")
-                print(msg)
-                try:
-                    self.send_tg_notification(msg, level='critical')
-                except Exception:
-                    pass
+                # 告警由 save_batch_state 统一发出（锁外、原因准确、按键去重）；
+                # 此处只做副作用阻断：返回 None → 零 create_order，D005 判为未完成而保守留锁。
+                print(f"🚫 [资金安全] 批次 `{batch_id}` 骨架未确认落盘，"
+                      f"已阻断全部下单（create_order=0）")
                 return None
 
             for idx, (raw_trigger_price, raw_amount) in enumerate(signal.entries):
