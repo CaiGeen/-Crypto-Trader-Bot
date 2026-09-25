@@ -1124,5 +1124,10 @@ watchdog 只启动一次、无重启循环；横幅显示 `RISK_MAX_ACTIVE_BATCH
   close confirmation 133、position close 7、staged 20、D-009 16、Batch C 23、TP 24、R12 6、
   B2 crash-safe 18，均通过。
 
-本轮代码须在空仓、代理就绪的维护窗口受控重启后才算生效；生效前不放行第 3 个活跃批次信号。
+### 21.1 受控重启验收（2026-09-25 22:15:48）
+
+`c462233` 已在本地账本空仓、代理就绪、工作区 clean 的条件下部署。新进程树
+`2552→40032→32708→15252→18044` 到达系统 READY；横幅确认 cap=3；`restarts=0`、
+`bot_alive=true`、`fatal_alert=null`，队列为 0，启动后无 watchdog 文本误杀或进程终止记录。
+本节三项修复已在真实进程内生效；M5 仍待 2026-09-26 08:05 验收。
 
