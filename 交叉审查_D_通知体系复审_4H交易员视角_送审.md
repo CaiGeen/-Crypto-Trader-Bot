@@ -894,7 +894,7 @@ ChatGPT 指出：`.env.example` 仍默认开启日报邮件，而日报已豁免
 | A4 | 启动恢复链干净 | `logs/bot_20260925.log`：`SYSTEM SAFETY CHECK` → `Binance API ✅` → `活跃批次: 0 个` → `[恢复前健康检查] 通过` → `共接管 0 个历史活跃批次` → `[启动检测] 历史任务恢复校验完成！系统 READY` |
 | A5 | 心跳存活 | `bot_alive: true`（`16:36:05` 起）、`restarts: 0`、`fatal_alert: null` |
 | A6 | **真实通道自检** | `--selftest` → `TG经代理=True TG直连=True 邮件=True`（`16:37:54`）；邮件自检用 `event="health"`，**空仓 + `EMAIL_ALERT_ONLY_WITH_POSITION=true` 下仍发出 → R0 致命豁免持仓闸门在实盘路径生效** |
-| A7 | 独立巡检计划任务 | `CryptoBot-HealthPatrol` Ready，每 15 分钟，`LastTaskResult 0`；`logs/patrol.log` 逐次 `✅ 巡检正常 … bot_alive=True 活跃批次 0` |
+| A7 | 独立巡检计划任务 | `CryptoBot-HealthPatrol` Ready，每 15 分钟，`LastTaskResult 0`；`logs/patrol.log` 逐次 `✅ 巡检正常 … bot_alive=True 活跃批次 0`。**重启后首轮（`16:44:53`）已认到新实例**：`watchdog_pid=25472 | bot_pid=36488 bot_alive=True | restarts=0 | 活跃批次 0` |
 | A8 | 停机窗口无误告警 | 窗口内无巡检运行（相邻 `16:32:07` 与下一轮 `~16:44`）；`.patrol_alert.state.json` `_bot_dead_count: 0` |
 | A9 | 日报配置已加载 | `.env` `DAILY_REPORT_EMAIL_ENABLED=false` → 日报必需渠道 `()`；进程 `16:35:05` 由 `load_dotenv()` 读入 |
 
