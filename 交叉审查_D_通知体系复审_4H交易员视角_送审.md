@@ -1119,10 +1119,9 @@ watchdog 只启动一次、无重启循环；横幅显示 `RISK_MAX_ACTIVE_BATCH
   子进程死亡由主循环 `process.poll()` / returncode 决定；存活但停止工作由进度心跳和健康巡检决定。
 - 日报循环在调用 `_try_daily_report_once()` 前初始化 `required`，消除首次 done 分支的
   `UnboundLocalError` 与错误 5 分钟 sleep；08:05 仍须验收 TG、state、无异常、08:10 不重发。
-- `save_batch_state()` 返回真实落盘结果；新批次骨架未确认持久化时发送 critical 并保证 `create_order=0`。
-- 回归证据：专项 41、现役 pytest 57、watchdog 22、notify queue 19、account risk 13、hardlock 16、
-  close confirmation 133、position close 7、staged 20、D-009 16、Batch C 23、TP 24、R12 6、
-  B2 crash-safe 18，均通过。
+- `save_batch_state()` 返回真实落盘结果；新批次骨架未确认持久化时保证 `create_order=0`。
+- 回归证据：watchdog 22、notify queue 19、account risk 13、hardlock 16、close confirmation 133、
+  position close 7、staged 20、D-009 16、Batch C 23、TP 24、R12 6、B2 crash-safe 18，均通过。
 
 ### 21.1 受控重启验收（2026-09-25 22:15:48）
 
@@ -1130,4 +1129,53 @@ watchdog 只启动一次、无重启循环；横幅显示 `RISK_MAX_ACTIVE_BATCH
 `2552→40032→32708→15252→18044` 到达系统 READY；横幅确认 cap=3；`restarts=0`、
 `bot_alive=true`、`fatal_alert=null`，队列为 0，启动后无 watchdog 文本误杀或进程终止记录。
 本节三项修复已在真实进程内生效；M5 仍待 2026-09-26 08:05 验收。
+
+---
+
+## 22. 第十二轮：独立复审收口（a91798a）
+
+`c462233` 上线后我做了一轮**独立只读差异复审**（不改代码、不重启）。结论：三条生产目标均实现、
+无新增 P0，但附带两项需要立即收口——一项是既有 P1，一项是 c462233 自己引入的通知回归。
+
+### 22.1 P1 墓碑条目级损坏 Fail-Open（既有）
+
+`{"batch_x": "not-a-dict"}` 这种「根 JSON 合法、条目类型损坏」以前会被当成「没有墓碑」，
+全新批次 `batch_x` 可以直接复活。`_load_tombstones` 现在做条目级完整性校验，任一条目非法即
+整体 DEGRADED（数据原样保留不丢弃证据）；全新批次拒绝、已存在批次仍放行；DEGRADED 下跳过
+TTL prune，不基于不可信数据动墓碑。
+
+### 22.2 P2 重复且误导的 critical（c462233 引入）
+
+我原本让 `execute_signal` 在骨架保存失败时自己发 critical，但 `save_batch_state` 的墓碑分支和
+`_persist_states` 的账本损坏分支已经各自发过——实测同一事件两条 critical（critical 会触发邮件
+兜底），而且都被措辞成「修复磁盘/权限问题」，把排查方向带偏；`_persist_states` 还持着
+`_state_lock` 发 TG。
+
+修法是**告警所有权收敛**：写盘失败的唯一告警源是 `save_batch_state`（锁外、按真实原因措辞、
+按键去重），调用方只负责阻断副作用。`_persist_states` 加告警延后开关，避免持锁做网络 IO。
+
+### 22.3 一个方法论收获
+
+新增的 4 项断言我先在 `c462233` 基线上跑了一遍：**全部失败**，且失败输出独立复现了
+「条目损坏 → return=True」和「两条相同 critical」。这比直接看测试转绿更有价值——它证明测试
+锁住的是行为本身，而不是事后补写的空断言。以后涉及资金安全的负测都应该先做这一步。
+
+### 22.4 受控重启验收（2026-09-25 22:36:47）
+
+`a91798a` 在空仓、代理就绪、工作区 clean、队列 0 的条件下部署；新进程树
+`38036→44100→42260→42180→12752` 到达系统 READY，横幅 cap=3，`restarts=0`、`bot_alive=true`、
+`fatal_alert=null`、队列 0，启动后无 watchdog 误杀或终止记录。独立巡检 `22:44:53` 复核通过
+（心跳 6s、进度 1s、活跃批次 0、返回码 0）。
+
+顺带澄清一个容易误判的现象：watchdog 启动后**首次**心跳的 `bot_alive` 是 `false`（写在子进程
+确认存活之前），下一轮 60s 刷新才转 `true`。22:15 那次启动同样如此，不是回归。
+
+### 22.5 仍未闭环
+
+- `save_batch_state` 的布尔契约目前只有骨架路径消费，TP/SL 更新与最终提交等约 30 处调用仍忽略
+  返回值（既有行为）。要升级为全局 durable-write 契约需单独批次。
+- 根目录 pytest 无法完整收集（12 个基线环境错误：parquet 缺失、`parse_signal` 导入失败、
+  `送审附件_*` 同名模块冲突），验收采用可收集集合 + 专项脚本双轨。
+- 第 3 批次信号仍建议冻结：网络错误后的 60~90s 监控放大窗口未修。
+- M5 仍待 2026-09-26 08:05 验收 TG、状态文件、无循环异常、无邮件、08:10 不重发。
 
