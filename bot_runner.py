@@ -2941,9 +2941,8 @@ def log_effective_config() -> str:
         f"EMAIL_ALERT_ENABLED={email_gate.email_enabled()}",
         f"EMAIL_ALERT_ONLY_WITH_POSITION={email_gate.email_only_with_position()}",
         f"DAILY_REPORT_EMAIL_ENABLED={email_gate.daily_report_email_enabled()}",
-        # ⚠️ 标签刻意不用大写 `FATAL_EVENTS`：watchdog.monitor_process 以
-        # 「CRASH/FATAL」**子串**判定崩溃重启，历史实现会把本行误判为崩溃
-        # （2026-09-25 实测：bot 被反复重启，见送审稿 §13）。
+        # 标签保持中文可读性；watchdog 现只记录 stdout，不再把 CRASH/FATAL 文本
+        # 当进程死亡控制信号（2026-09-25 D11 后续复审，见送审稿 §13）。
         f"致命事件白名单={sorted(email_gate.FATAL_EVENTS)}",
     ]
     line = "⚙️ [配置生效] " + " | ".join(parts)

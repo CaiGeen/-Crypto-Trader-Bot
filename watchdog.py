@@ -423,27 +423,17 @@ threading.Thread(target=_console_writer_loop, daemon=True,
                  name="console_writer").start()
 
 
-def _looks_like_crash(line: str) -> bool:
-    """子程序输出是否表明**真崩溃**（第九轮复审修复，2026-09-25）。
-
-    历史实现：`if "CRASH" in line or "FATAL" in line` —— **纯子串**匹配。
-    代价实测：M4 启动横幅里的 `FATAL_EVENTS=[...]`（含 `FATAL`）被判为崩溃 →
-    watchdog 反复杀进程重启，形成死循环（空仓、无持仓损失，但告警链被刷屏）。
-
-    修法：
-      1) 词边界匹配：`FATAL_EVENTS`、`CRASH_ALERT` 这类**标识符**不再误判
-         （`_` 属单词字符，`\\b` 不成立），而 `FATAL: ...` / `CRASH ...` 仍会命中；
-      2) 补 `Traceback (most recent call last)` —— Python 崩溃的规范标志，
-         比依赖日志措辞更可靠（真实崩溃若未打印这些词，判定也不会失效）。
-    """
-    import re
-    if "Traceback (most recent call last)" in line:
-        return True
-    return bool(re.search(r'\b(CRASH|FATAL)\b', line)) or "Unhandled exception" in line
-
-
 def monitor_process(process):
-    """监控主程序输出（读线程永不执行可能阻塞的控制台写）。"""
+    """持续排空并记录子进程输出；**不把普通日志文本当控制信号**。
+
+    D11 演进：最初用 ``"CRASH" in line`` 误杀 M4 横幅；随后改为词边界并把任意
+    ``Traceback`` 当整机崩溃，仍会误杀业务层已捕获、自己打印 traceback 后继续运行的
+    异常。stdout/stderr 在这里只是观测数据，不是进程状态。
+
+    进程是否死亡由主循环的 ``process.poll()`` / returncode 裁决；进程仍活着但停止推进，
+    则由业务进度心跳 + ``健康巡检.py`` 的 output-stalled 检测负责。读线程只负责：
+    1. 每行先落盘；2. 非阻塞投递控制台；3. EOF 后正常结束。
+    """
     try:
         for line in process.stdout:
             write_bot_log(line)      # #4：落盘优先（取证不依赖控制台）
@@ -451,12 +441,11 @@ def monitor_process(process):
                 _CONSOLE_QUEUE.put_nowait(line)
             except Exception:
                 pass
-            if _looks_like_crash(line):
-                log_message("⚠️ 检测到主程序异常，准备重启")
-                return False
     except Exception as e:
-        log_message(f"⚠️ 监控输出异常: {e}")
-        return False
+        # 读管道/日志输出失败不等于子进程死亡；只停止本读线程的观察，仍由主循环
+        # process.poll() 裁决进程状态，避免观测层再次获得杀进程权力。
+        log_message(f"⚠️ 监控输出异常（不据此重启进程）: {e}")
+        return True
     return True
 
 
@@ -502,20 +491,13 @@ def main():
         time.sleep(5)
 
         restart_reason = None
-        crashed = False
-
-        stop_monitor = threading.Event()
 
         def monitor_thread_func():
-            nonlocal crashed
+            # 输出观察线程永远不裁决进程死亡；唯一权威是下方 process.poll()/returncode。
             try:
-                if not monitor_process(process):
-                    crashed = True
-                    stop_monitor.set()
+                monitor_process(process)
             except Exception as e:
-                log_message(f"⚠️ 监控线程异常: {e}")
-                crashed = True
-                stop_monitor.set()
+                log_message(f"⚠️ 监控线程异常（不据此重启进程）: {e}")
 
         monitor_thread = threading.Thread(target=monitor_thread_func, daemon=True)
         monitor_thread.start()
@@ -526,10 +508,6 @@ def main():
             if ENABLE_SCHEDULED_RESTART and next_restart is not None and now >= next_restart:
                 restart_reason = "⏰ 定时重启"
                 log_message(f"⏰ 定时重启触发: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-                break
-
-            if crashed:
-                restart_reason = "💥 程序崩溃"
                 break
 
             if process.poll() is not None:
@@ -546,7 +524,6 @@ def main():
 
             time.sleep(1)
 
-        stop_monitor.set()
         monitor_thread.join(timeout=2)
 
         if process.poll() is None:

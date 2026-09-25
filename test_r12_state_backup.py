@@ -150,6 +150,19 @@ def scenario_4():
     report("场景4: 备份失败不阻断主保存", ok, detail)
 
 
+def scenario_persist_failure_returns_false():
+    """6: _persist_states=False 必须向调用方返回 False，供新建批次在 create_order 前硬拦。"""
+    with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, 'trade_state.json')
+        fake = PersistFake()
+        fake._persist_states = lambda all_states: False
+        with mock.patch.object(trader_260725, 'STATE_FILE', state):
+            ok = CryptoTrader.save_batch_state(
+                fake, SYMBOL, 'b_persist_failed', {'is_active': True})
+        report("场景6: 主保存失败向调用方返回 False", ok is False,
+               f"(return={ok!r}, state存在={os.path.exists(state)})")
+
+
 def scenario_5():
     """5: AST——save/clear 体内无直接持久化代码，统一走 _persist_states"""
     with open('trader_260725.py', 'r', encoding='utf-8') as f:
@@ -180,6 +193,7 @@ if __name__ == '__main__':
     scenario_2()
     scenario_3()
     scenario_4()
+    scenario_persist_failure_returns_false()
     scenario_5()
     print("\n" + "#" * 60)
     failed = [n for n, p in RESULTS if not p]

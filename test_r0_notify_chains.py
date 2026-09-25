@@ -178,6 +178,28 @@ class DailyReportDeliveryTests(unittest.TestCase):
         self.assertIsNone(fake._last_daily_report_date)
         fake._try_daily_report_once.assert_called_once_with("2026-09-25")
 
+    def test_done_path_uses_initialized_required_and_normal_sleep(self):
+        """首次成功 done：required 必须已定义，且应 sleep(90)，不能落入异常 sleep(300)。"""
+        fake = mock.MagicMock()
+        fake._last_daily_report_date = None
+        fake._daily_report_retry_count = 0
+        fake._daily_report_retry_date = None
+        fake._daily_report_done = {"tg": True, "email": False}
+        fake._try_daily_report_once = mock.MagicMock(return_value='done')
+        _AtDatetime.moment = _dt.datetime(2026, 9, 26, 8, 5, 0)
+
+        def _stop(seconds):
+            raise _StopLoop()
+
+        with mock.patch.object(trader_260725, "datetime", _AtDatetime), \
+                mock.patch.object(trader_260725, "_daily_report_required_channels", return_value=()), \
+                mock.patch.object(trader_260725.time, "sleep", side_effect=_stop) as sleep:
+            with self.assertRaises(_StopLoop):
+                trader_260725.CryptoTrader._daily_report_loop(fake)
+
+        self.assertEqual(sleep.call_args.args[0], 90)
+        fake._try_daily_report_once.assert_called_once_with("2026-09-26")
+
     # ---------------- 复审发现的缺陷回归（2026-09-25 自审 D1/D2b） ----------------
     # 注：首版三条用例把状态**预设到 fake 上再驱动无限循环** —— 无效测试：
     # 循环启动时会重置 _daily_report_retry_* / _daily_report_done（线程生命周期一次），

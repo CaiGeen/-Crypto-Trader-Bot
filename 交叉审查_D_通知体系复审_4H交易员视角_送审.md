@@ -1079,14 +1079,17 @@ M2–M4 待 ChatGPT 复核 → 通过后空仓 + 避开 4H 收盘重启，核对
 
 ### 20.1 D11（我的 M4 引入，实盘才暴露）
 
-部署后 watchdog 连续 3 次拉起 bot_runner、每次 3s 后被杀、**无 traceback**。根因：
+部署后 watchdog 连续 4 次拉起 bot_runner（21:29:22 / 21:29:41 / 21:30:03 / 21:30:25），
+每次约 3~5s 后被杀、**无 traceback**。根因：
 `watchdog.monitor_process` 以**纯子串** `if "CRASH" in line or "FATAL" in line` 判定崩溃，
 而 M4 横幅输出 `FATAL_EVENTS=[...]` **含 `FATAL`** → 横幅把自己判成崩溃 → 杀进程 → 重启 → 死循环。
 bot 本身无缺陷（前台运行正常；「看似卡住」是 stdout 重定向到文件的块缓冲假象）。
 
-修复（`a2813d8`）：① 横幅标签改中文「致命事件白名单=」；② 判定抽为 `_looks_like_crash()` 改**词边界**
-正则 `\b(CRASH|FATAL)\b`（标识符不误判、真信号仍命中）并补 `Traceback (most recent call last)`。
-回归护栏 3 例，含「M4 横幅真实输出不得被判崩溃」。
+第一版修复（`a2813d8`）：① 横幅标签改中文「致命事件白名单=」；② 判定抽为 `_looks_like_crash()` 改**词边界**
+正则 `\b(CRASH|FATAL)\b`（标识符不误判）并补 `Traceback (most recent call last)`。
+
+> 后续复审确认：已捕获业务异常同样会打印 traceback，第一版第 ② 步仍可能误杀健康进程。
+> 最终修复见 §21：watchdog 只记录输出，死亡只认 poll/returncode。
 
 > **为什么前几轮复审没抓到**：M4 只是「加一行横幅」，静态审查看不出危害；
 > 只有真重启并盯住进程/日志/告警，才暴露「输出文本被下游当作控制信号」这层隐式契约。
@@ -1095,7 +1098,8 @@ bot 本身无缺陷（前台运行正常；「看似卡住」是 stdout 重定�
 
 启动链完整到达 `系统 READY`（横幅 → 🚀 → SAFETY CHECK → API ✅ → 活跃批次 0 → 恢复前健康检查通过 → 状态恢复 0 个 → READY）；
 watchdog 只启动一次、无重启循环；横幅显示 `RISK_MAX_ACTIVE_BATCHES=3`（**进程内有效值的直接证据**，A9 缺口闭合）；
-心跳 `bot_alive: true` / `restarts: 0` / `fatal_alert: null`。停机期间空仓、无信号丢失。
+心跳 `bot_alive: true` / `restarts: 0` / `fatal_alert: null`。本地账本空仓；无持久化信号入口审计，
+不能严格宣称“停机期间无信号丢失”。遗留队列实际为 1 条 crash_alert + 3 条 summary_restart。
 
 ### 20.3 副产品：M1'' 的目标现象首次获得实盘证据
 
@@ -1106,4 +1110,19 @@ watchdog 只启动一次、无重启循环；横幅显示 `RISK_MAX_ACTIVE_BATCH
 
 写入子程序 stdout 的任何内容，都要先问「下游是否拿它做控制判断」——本项目 stdout 不是纯日志。
 新增输出型功能（横幅/自检/摘要）必须过这一关；验收必须真跑并盯住进程、日志、告警三者。
+
+---
+
+## 21. 第十一轮：开放第 3 批次前的安全修复（待部署）
+
+- `watchdog.monitor_process()` 不再解析 CRASH/FATAL/Traceback 作为控制信号；stdout/stderr 只落盘和显示。
+  子进程死亡由主循环 `process.poll()` / returncode 决定；存活但停止工作由进度心跳和健康巡检决定。
+- 日报循环在调用 `_try_daily_report_once()` 前初始化 `required`，消除首次 done 分支的
+  `UnboundLocalError` 与错误 5 分钟 sleep；08:05 仍须验收 TG、state、无异常、08:10 不重发。
+- `save_batch_state()` 返回真实落盘结果；新批次骨架未确认持久化时发送 critical 并保证 `create_order=0`。
+- 回归证据：专项 41、现役 pytest 57、watchdog 22、notify queue 19、account risk 13、hardlock 16、
+  close confirmation 133、position close 7、staged 20、D-009 16、Batch C 23、TP 24、R12 6、
+  B2 crash-safe 18，均通过。
+
+本轮代码须在空仓、代理就绪的维护窗口受控重启后才算生效；生效前不放行第 3 个活跃批次信号。
 

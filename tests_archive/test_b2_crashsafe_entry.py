@@ -88,6 +88,7 @@ def make_fake(create_results=None):
         fake.events.append(('save', batch_id))
         fake.save_snapshots.append(copy.deepcopy(data))
         fake.states.setdefault(symbol, {})[batch_id] = copy.deepcopy(data)
+        return True
 
     fake.load_all_states = _load
     fake.save_batch_state = _save
@@ -101,7 +102,9 @@ def make_fake(create_results=None):
         fake._commit_registry_txn = (
             lambda s, b, **k: CryptoTrader._commit_registry_txn(fake, s, b, **k))
     fake.clear_batch_state = lambda s, b, **k: fake.states.get(s, {}).pop(b, None)
-    fake._check_existing_conflicts = lambda s, b, all_states: False
+    fake._check_existing_conflicts = lambda s, b, *args: False
+    # 归档 fake 未绑定该 helper 时会落入 MagicMock（含内部 lock），骨架无法 JSON/deepcopy。
+    fake._compute_signal_fingerprint = lambda sig: 'fingerprint_b2_crashsafe_entry'
     fake._get_current_position_amt = lambda s, is_hedge_mode=False, side=None: 0.0
     fake._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
     fake._validate_stop_losses = lambda signal, price: (True, '止损校验通过')
@@ -119,7 +122,7 @@ def make_fake(create_results=None):
     ex = mock.MagicMock()
     ex.set_leverage = lambda l, s: None
     ex.fetch_ticker = lambda s=None: {'last': MARKET, 'close': MARKET}
-    ex.fapiPrivateGetPositionSideDual = lambda: {}
+    ex.fapiPrivateGetPositionSideDual = lambda: {'dualSidePosition': False}
     ex.amount_to_precision = lambda s, v: v
     ex.price_to_precision = lambda s, v: v
     ex.fetch_balance = lambda: {'USDT': {'free': 10000.0}}
@@ -279,6 +282,25 @@ def scenario_full_success():
     report('T6/全部ENTRY CONFIRMED', ok2, f"(states={[reg.get(entry_identity(i), {}).get('state') for i in range(3)]})")
 
 
+def scenario_skeleton_persist_failure_no_create():
+    """T6a: 骨架未确认落盘 → 告警 + 返回 None + create_order 零调用。"""
+    fake = make_fake()
+
+    def _persist_failed(symbol, batch_id, data):
+        fake.events.append(('save_failed', batch_id))
+        return False
+
+    fake.save_batch_state = _persist_failed
+    ret = run_signal(fake)
+    creates = [e for e in fake.events if e[0] == 'create']
+    critical = [text for level, text in fake.sent if level == 'critical']
+    report('T6a/骨架落盘失败返回None', ret is None, f"(ret={ret!r})")
+    report('T6a/骨架落盘失败零create_order', len(creates) == 0,
+           f"(events={fake.events})")
+    report('T6a/骨架落盘失败发送critical', any('持久化失败' in t for t in critical),
+           f"(critical={critical})")
+
+
 def _recovery_fake(states, cleared):
     fake = make_fake()
     fake.states = copy.deepcopy(states)
@@ -330,6 +352,7 @@ def main():
     scenario_skip_layer_not_persisted()
     scenario_minus2021_absent()
     scenario_full_success()
+    scenario_skeleton_persist_failure_no_create()
     scenario_recovery_guard_keeps_skeleton()
     scenario_recovery_guard_clears_terminal()
     print("=" * 60)

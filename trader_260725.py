@@ -1873,6 +1873,10 @@ class CryptoTrader:
                 in_retry_window = (now.hour == 8 and 5 <= now.minute <= 30
                                    and now.minute % 5 == 0)
                 if in_retry_window:
+                    # 先固定本轮渠道口径；_try_daily_report_once 内部也按同一口径裁决。
+                    # 旧代码直到 retry 分支才赋值，首次 done 分支日志引用 required 会抛
+                    # UnboundLocalError（发送/状态落盘虽已完成，但循环会误入异常 sleep(300)）。
+                    required = ("tg",) + _daily_report_required_channels()
                     state = self._try_daily_report_once(today)
                     try:
                         self._persist_daily_report_state()   # D6：每次尝试后落盘
@@ -1885,7 +1889,6 @@ class CryptoTrader:
                         print(f"✅ [日报] {today} 已确认送达（渠道：{', '.join(required)}）")
                         time.sleep(90)   # 避免同一窗口重复发送
                         continue
-                    required = ("tg",) + _daily_report_required_channels()
                     pending = [c for c in required
                                if not self._daily_report_done.get(c)]
                     if state == 'exhausted':
@@ -2453,8 +2456,10 @@ class CryptoTrader:
             print(f"⚠️ 保存状态文件失败: {e}")
             return False
 
-    def save_batch_state(self, symbol: str, batch_id: str, batch_data: dict):
+    def save_batch_state(self, symbol: str, batch_id: str, batch_data: dict) -> bool:
         """P0 Batch C（v2 §5 + v3 §5/§6）：状态落盘单咽喉 = 墓碑检查 + 字段级 merge。
+        返回 ``True`` 仅表示 merge 后的完整状态已成功持久化；墓碑拒绝或写盘失败均返回
+        ``False``。新建批次的调用方必须以该布尔值作为 ``create_order`` 前的硬门。
         C2：见墓碑（TTL 内）→ 拒绝写入（Fail-Closed，已清理批次复活通道封死）+
             🚨 critical 告警（锁外发送，防持锁 5s TG 超时；进程内每批次一次去重）。
         C1：磁盘既有批次按七类规则 merge（A 棘轮 / G user_modified OR / B 单调账本 /
@@ -2463,6 +2468,7 @@ class CryptoTrader:
         merge 后字段集合 = 磁盘 ∪ 快照（快照新增字段正常写入，磁盘独有字段补回）。"""
         _tomb_alert = False
         _tomb_degraded_reject = False
+        _persisted = False
         with self._state_lock:
             tombstones = self._load_tombstones()
             # D-009 Q3：墓碑损坏 → DEGRADED（每次 _load_tombstones 重新判定，非粘性）
@@ -2491,7 +2497,7 @@ class CryptoTrader:
                     if isinstance(existing, dict) and existing:
                         batch_data = self._merge_batch_state(existing, batch_data)
                     all_states[symbol][batch_id] = batch_data
-                    self._persist_states(all_states)
+                    _persisted = self._persist_states(all_states) is True
         if _tomb_degraded_reject:
             _dkey = ('tombstone_degraded', batch_id)
             if _dkey not in getattr(self, '_tombstone_alerted', set()):
@@ -2508,7 +2514,7 @@ class CryptoTrader:
                     level='critical')
             else:
                 print(f"🪦 [D-009] 墓碑 DEGRADED 拦截新建批次 {batch_id}（告警已去重）")
-            return
+            return False
         if _tomb_alert:
             if batch_id not in getattr(self, '_tombstone_alerted', set()):
                 try:
@@ -2522,6 +2528,10 @@ class CryptoTrader:
                     level='critical')
             else:
                 print(f"🪦 [C2] 墓碑拦截 save（批次 {batch_id}，复活告警已去重）")
+            return False
+        if not _persisted:
+            print(f"🚫 [状态持久化] 批次 `{batch_id}` ({symbol}) 未确认落盘，拒绝继续写入")
+        return _persisted
 
     def clear_batch_state(self, symbol: str, batch_id: str, proof=None,
                           authorization=None) -> bool:
@@ -3807,8 +3817,9 @@ class CryptoTrader:
             <=6 → 30~40s
             >6  → 45~60s
         取舍：API 权重随批次上升（3~4 档频率约为旧值的 3~4 倍）。
-        真正的止血阀是**活跃批次硬上限 2**（RISK_MAX_ACTIVE_BATCHES=2，
-        见 .env），本分级修复只保证「万一上限被调高，行为仍然连续可预期」。
+        当前实盘止血阀是**活跃批次上限 3**（RISK_MAX_ACTIVE_BATCHES=3，见 .env）；
+        本分级修复保证正常网络条件下第 3 档为 20~30s。网络错误后的 ×3 退避属于
+        独立风险，不能由本 helper 的正常档位测试代替验收。
         """
         active_count = self._get_active_batch_count()
 
@@ -5783,7 +5794,20 @@ class CryptoTrader:
                 'sl_failed_layers': [],
                 'protection_registry': skeleton_registry,
             }
-            self.save_batch_state(symbol, batch_id, skeleton)
+            # Intent Before Side Effect：批次骨架必须先成为可恢复的本地事实。
+            # save_batch_state 只有在 merge 后完整状态真正落盘时才返回 True；False/异常一律
+            # Fail-Closed，绝不能继续 create_order，否则会同时突破 cap 并制造“交易所有单、
+            # 本地无账本”的不可恢复窗口。
+            if self.save_batch_state(symbol, batch_id, skeleton) is not True:
+                msg = (f"🚨【资金安全】批次骨架持久化失败，已阻断全部下单\n"
+                       f"批次：`{batch_id}`\n标的：`{symbol}`\n"
+                       f"未调用交易所 create_order。请修复 trade_state.json 的磁盘/权限问题后重试。")
+                print(msg)
+                try:
+                    self.send_tg_notification(msg, level='critical')
+                except Exception:
+                    pass
+                return None
 
             for idx, (raw_trigger_price, raw_amount) in enumerate(signal.entries):
                 formatted_amount = float(self.exchange.amount_to_precision(symbol, raw_amount))

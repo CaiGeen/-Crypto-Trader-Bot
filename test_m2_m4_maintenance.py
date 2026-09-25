@@ -4,7 +4,7 @@
 
 本文件对应**可部署版本**（M2–M4，不含 M1'）。背景（第八轮复审 / ChatGPT 复核 d539da9）：
   M2 消除第 3 批次起的轮询断崖（F6：<=2 → 10~15s，<=4 → 原 75~100s）
-  M3 批次硬上限 2 + 修正 D10 误导文案（原称「改 .env 即时生效无需重启」，实为需重启）
+  M3 批次硬上限 3 + 修正 D10 误导文案（原称「改 .env 即时生效无需重启」，实为需重启）
   M4 启动配置横幅：打印**进程内真正生效**的值（永久解决 A9 类验收缺口）
 
 ⚠️ M1'（崩溃邮件在途去重 + 迟到回灌）**刻意不含**在内：ChatGPT 复核 d539da9 指出
@@ -14,7 +14,9 @@
 
 运行：.venv/Scripts/python.exe -m pytest test_m2_m4_maintenance.py -q
 """
+import importlib.util
 import inspect
+import io
 import os
 import sys
 import unittest
@@ -143,32 +145,79 @@ class DeployableVersionGuardTests(unittest.TestCase):
         self.assertIn("notify-m1-timeline", src)
 
 
+class BatchSkeletonPersistenceGateTests(unittest.TestCase):
+    """Intent Before Side Effect：骨架未确认落盘时，交易所 create_order 必须为零。"""
+
+    def test_persist_failure_blocks_all_create_order(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'tests_archive', 'test_b2_crashsafe_entry.py')
+        spec = importlib.util.spec_from_file_location('b2_crashsafe_entry_fixture', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        fake = module.make_fake()
+        fake.save_batch_state = lambda symbol, batch_id, data: False
+        with mock.patch.object(trader_260725.threading, 'Thread', module.FakeThread):
+            result = trader_260725.CryptoTrader.execute_signal(fake, module.FakeSignal())
+        self.assertIsNone(result)
+        self.assertEqual(fake._create_n, 0)
+        self.assertTrue(any(level == 'critical' and '持久化失败' in text
+                            for level, text in fake.sent))
+
+
 class CrashDetectorHardeningTests(unittest.TestCase):
-    """第九轮复审：watchdog 崩溃判定由**子串**改为**词边界**（子串会把标识符误判为崩溃）"""
+    """watchdog 只排空/记录输出；进程死亡由 poll/returncode，健康停滞由巡检判定。"""
 
-    def test_identifiers_do_not_trip_detector(self):
+    def test_monitor_process_drains_text_without_killing_process(self):
         import watchdog as wd
-        for line in ("INFO - FATAL_EVENTS=['crash', 'health']",
-                     "CRASH_ALERT enqueued",
-                     "📧 [邮件] 已发送: 每日结算报告",
-                     "[21:29] 🚀 Telegram Bot 监听服务已启动..."):
-            self.assertFalse(wd._looks_like_crash(line), f"误判为崩溃: {line!r}")
+        lines = (
+            "INFO - FATAL_EVENTS=['crash', 'health']\n",
+            "CRASH_ALERT enqueued\n",
+            "ERROR - 已捕获业务异常\n",
+            "Traceback (most recent call last):\n",
+            "ValueError: handled and still running\n",
+        )
+        process = mock.Mock(stdout=io.StringIO(''.join(lines)))
+        with mock.patch.object(wd, 'write_bot_log') as write_log, \
+                mock.patch.object(wd, '_CONSOLE_QUEUE') as console_queue:
+            result = wd.monitor_process(process)
+        self.assertTrue(result, "普通日志/已捕获 traceback 不得触发进程终止")
+        self.assertEqual(write_log.call_count, len(lines))
+        self.assertEqual(console_queue.put_nowait.call_count, len(lines))
 
-    def test_real_crash_signals_still_trip_detector(self):
+    def test_real_config_banner_is_recorded_without_killing_process(self):
+        """真实 M4 横幅必须完整落盘，且 monitor_process 不返回崩溃。"""
         import watchdog as wd
-        for line in ("FATAL: unrecoverable state",
-                     "CRASH detected in monitor",
-                     "Traceback (most recent call last):",
-                     "Unhandled exception in thread"):
-            self.assertTrue(wd._looks_like_crash(line), f"漏判真崩溃: {line!r}")
+        line = bot_runner.log_effective_config() + '\n'
+        process = mock.Mock(stdout=io.StringIO(line))
+        with mock.patch.object(wd, 'write_bot_log') as write_log, \
+                mock.patch.object(wd, '_CONSOLE_QUEUE'):
+            result = wd.monitor_process(process)
+        self.assertTrue(result)
+        write_log.assert_called_once_with(line)
 
-    def test_real_config_banner_does_not_trip_detector(self):
-        """最强护栏：M4 横幅的真实输出必须不被判为崩溃（即本次死循环的根因）"""
+    def test_pipe_read_error_does_not_trigger_restart(self):
+        """stdout 观察失败不能被当成进程死亡；returncode 仍由主循环裁决。"""
         import watchdog as wd
-        line = bot_runner.log_effective_config()
-        self.assertNotIn("FATAL_EVENTS=", line, "横幅不得再含大写 FATAL_EVENTS 标签")
-        self.assertFalse(wd._looks_like_crash(line),
-                         "启动横幅被判为崩溃 → watchdog 会陷入重启死循环")
+
+        class _BrokenStdout:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise OSError("simulated pipe read failure")
+
+        process = mock.Mock(stdout=_BrokenStdout())
+        with mock.patch.object(wd, 'write_bot_log'), \
+                mock.patch.object(wd, '_CONSOLE_QUEUE'), \
+                mock.patch.object(wd, 'log_message') as log_message:
+            result = wd.monitor_process(process)
+        self.assertTrue(result)
+        self.assertTrue(any('不据此重启进程' in str(c) for c in log_message.call_args_list))
+
+    def test_text_classifier_is_not_a_crash_control_signal(self):
+        """防止以后重新引入 `_looks_like_crash` 一类日志文本控制函数。"""
+        import watchdog as wd
+        self.assertFalse(hasattr(wd, '_looks_like_crash'))
 
 
 if __name__ == "__main__":
