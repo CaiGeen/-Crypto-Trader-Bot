@@ -1179,3 +1179,73 @@ TTL prune，不基于不可信数据动墓碑。
 - 第 3 批次信号仍建议冻结：网络错误后的 60~90s 监控放大窗口未修。
 - M5 仍待 2026-09-26 08:05 验收 TG、状态文件、无循环异常、无邮件、08:10 不重发。
 
+---
+
+## 23. 第十三轮：ChatGPT 反例 → 两条 P1 收口（41bfc2c）
+
+ChatGPT 复核 `a91798a` 后**否决了「墓碑 Fail-Closed 已收口」**，给出两条反例。我先复现、再修复，
+两条都在旧基线上拿到 RED——这一步又一次证明了价值：如果直接改完看转绿，很容易把
+「测试没写对」和「修复生效」混为一谈。
+
+### 23.1 反例一：`{"batch_x": {}}` 仍然 Fail-Open
+
+我上一轮的条目校验只写了 `isinstance(v, dict)`。空 dict 过关，缺 `cleared_at` 被
+`float(..., 0)` 兜底成 0 → `age = now - 0` 远超 TTL → 被当成「墓碑已过期」，
+于是不告警、不 DEGRADED，全新批次直接放行，TTL prune 还会把证据剪掉。
+
+```text
+反例1: save返回=True  degraded=False  state含batch_x=True    ← 期望 False
+```
+
+现在 `_load_tombstones` / `save_batch_state` / `clear_batch_state` / `_prune_tombstones`
+共用一个模块级 `_tombstone_entry_valid()`：非空 dict 且 `cleared_at` 为有限正数。
+
+**为什么放模块级而不是方法**：第一版我写成 `self._tombstone_entry_valid(...)`，结果在
+Mock 夹具上 `self.<name>` 被 MagicMock 自动创建、静默返回真值，5 个测试莫名其妙失败。
+模块级函数夹具偷换不掉，这类假绿/假红从根上消除。这个坑本身就是「夹具必须显式绑真实实现」
+那条纪律的又一个实例。
+
+### 23.2 反例二：墓碑写失败仍删活跃账本
+
+```text
+反例2: clear返回=True  账本已被删除                          ← 期望 False + 账本保留
+```
+
+`_persist_tombstones()` 的布尔返回值此前被直接忽略。墓碑写失败而账本删除成功 = 「批次清完了、
+反复活防线不存在」的孤儿态，比条目类型更致命。现在**墓碑落盘是删账本的前置硬门**：
+
+- 写失败/异常 → 保留账本、返回 `False`、锁外 critical（告警键 `clear_tomb_failed`，
+  与 proof 拒绝的 `clear_rejected` 分流，措辞指向磁盘空间/权限而不是 proof）；
+- 「墓碑已存在」的判定也换成结构有效性：损坏条目（含 `{}`）视为缺失并重写，
+  重写失败同样拦截；
+- 顺带补了清理后 `_persist_states` 的返回检查——失败时只打批次级上下文
+  （磁盘仍留该批次，下轮 converge 自动重试，墓碑已 durable 无复活风险），
+  因为 `_persist_states` 自己已是唯一告警源。
+
+### 23.3 回归与既有失败的甄别
+
+根目录 pytest **79 passed**（基线 77 + 2 新增）、Batch C 23/23、D-009 16/16、R12 6/6、
+crash_injection 20 PASS、b2_crashsafe 18 PASS、close_confirmation 133/133。
+
+`tests_archive/test_close_race_replay.py` 有 2 项 `UNEXPECTED-FAIL`。**没有直接归因**，
+而是 `git stash` 掉本轮改动在基线上重跑——输出完全相同（`close_position_limit` →
+`_begin_close_request_if_active` 解包不足），确认是既有测试基建问题。
+
+另外更正 §22.5：根目录收集错误实测是 **13 个**不是 12 个，基线与本轮一致（13→13），
+所以同样不是本轮引入。
+
+### 23.4 受控重启验收（2026-09-25 23:11:37）
+
+`41bfc2c` 在空仓（活跃批次 0）、`.notify_queue/` 0、代理 200、工作区 clean 下部署，
+进程树 `28860→26288→7148→11980→37160`，`23:11:42` 系统 READY、cap=3。
+`23:13:37` 心跳 `bot_alive=true`、`restarts=0`、`fatal_alert=null`；
+`watchdog.log` 自启动无误杀/终止记录；bot 日志 `23:11` 后无 Traceback、无邮件；
+独立巡检 `23:15:18` 返回码 0（心跳 41s、进度 2s、活跃批次 0）。
+
+### 23.5 仍未闭环
+
+- 第 3 批次信号继续冻结：网络错误后的 60~90s 监控放大窗口未收口，需我明确接受或另行修复。
+- `save_batch_state` 布尔契约约 30 处 TP/SL 与最终提交调用仍未消费（沿 §22.5）。
+- M5 待 2026-09-26 08:05 实盘验收。
+
+
