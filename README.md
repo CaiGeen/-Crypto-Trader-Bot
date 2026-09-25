@@ -107,8 +107,12 @@ TG_BOT_TOKEN=your_telegram_bot_token
 TG_ALLOWED_USER_ID=your_telegram_user_id
 # 邮件告警开关（Telegram 不受影响）
 EMAIL_ALERT_ENABLED=true
-# true=仅在本地 trade_state.json 有活跃批次时发邮件；状态不可读时不发邮件
+# true=仅普通事件（IP 变更等）在本地 trade_state.json 有活跃批次时发邮件；
+#      资金安全事件（critical / AUTH_BLOCKED / 崩溃 / 启动熔断 / 健康巡检）豁免本闸门；
+#      状态文件不可读时，普通事件不发，致命事件照发。
 EMAIL_ALERT_ONLY_WITH_POSITION=false
+# 每日结算报告邮件独立开关（空仓也照发）
+DAILY_REPORT_EMAIL_ENABLED=true
 ```
 
 ### 4. 启动

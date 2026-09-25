@@ -90,22 +90,30 @@ NOTIFY_MAX_ATTEMPTS = 3   # v3.1 C2：每事件最多 3 轮（每轮 Markdown→
 EMAIL_SEND_LOCK = threading.Lock()
 
 
-def send_email_alert(text: str, subject: str = "交易告警") -> None:
+def send_email_alert(text: str, subject: str = "交易告警",
+                     event: str = "generic") -> bool:
     """发送 QQ 邮箱告警（独立线程异步发送，失败静默，未配置自动跳过）
-    供 watchdog 通知通道（崩溃报警等）复用，逻辑与 trader 的 _send_email_alert 一致
+
+    供 watchdog 通知通道（崩溃报警等）复用，逻辑与 trader 的 _send_email_alert 一致。
     .env 需配置：QQ_MAIL_USER / QQ_MAIL_AUTH_CODE（QQ邮箱授权码）/ QQ_MAIL_TO（可选，默认=发件人）
-    可选闸门：EMAIL_ALERT_ENABLED / EMAIL_ALERT_ONLY_WITH_POSITION。
+
+    R0（2026-09-25）：新增 event 事件维度。
+      - event ∈ email_gate.FATAL_EVENTS（如 "crash"）→ 豁免持仓闸门与状态可读性
+      - event == "daily_report" → 日报独立开关
+      - 其余沿用 EMAIL_ALERT_ONLY_WITH_POSITION
+    返回 True=已提交发送线程；False=被闸门拦截 / 未配置 / 提交失败。
     """
-    allowed, gate_reason = email_gate.should_send_email()
+    allowed, gate_reason = email_gate.should_send_email(event=event)
     if not allowed:
-        logging.info(f"ℹ️ [邮件] 已跳过（{gate_reason}）")
-        return
+        logging.info(f"ℹ️ [邮件] 已跳过（{gate_reason}, event={event}）")
+        return False
 
     mail_user = os.getenv("QQ_MAIL_USER", "").strip()
     mail_code = os.getenv("QQ_MAIL_AUTH_CODE", "").strip()
     mail_to = os.getenv("QQ_MAIL_TO", "").strip() or mail_user
     if not (mail_user and mail_code and mail_to):
-        return
+        logging.info(f"⚠️ [邮件] 未配置（event={event}）")
+        return False
 
     def _do_send():
         with EMAIL_SEND_LOCK:
@@ -122,11 +130,16 @@ def send_email_alert(text: str, subject: str = "交易告警") -> None:
                 with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
                     server.login(mail_user, mail_code)
                     server.sendmail(mail_user, [mail_to], msg.as_string())
-                logging.info(f"📧 [邮件] 已发送: {subject}")
+                logging.info(f"📧 [邮件] 已发送: {subject} (event={event})")
             except Exception as e:
-                logging.warning(f"⚠️ [邮件] 发送失败: {e}")
+                logging.warning(f"⚠️ [邮件] 发送失败: {e} (event={event})")
 
-    threading.Thread(target=_do_send, daemon=True).start()
+    try:
+        threading.Thread(target=_do_send, daemon=True).start()
+        return True
+    except Exception as e:
+        logging.warning(f"⚠️ [邮件] 发送线程提交失败: {e} (event={event})")
+        return False
 
 
 # ==================== D-010 通知事件队列（Batch 1 消费侧） ====================
@@ -382,14 +395,25 @@ async def _process_notify_queue_once(bot, chat_id: int,
 
             ok = await _send_notify_with_fallback(bot, chat_id, text)
 
-            if ok:
-                if notify_type == 'ip_notify':
+            if notify_type == 'ip_notify':
+                if ok:
                     logging.info("📨 IP 备用通知已发送")
-                elif notify_type == 'crash_alert':
+            elif notify_type == 'crash_alert':
+                # R0 / F11（2026-09-25）：崩溃邮件**独立于 Telegram 结果**。
+                # 修复前邮件位于 `if ok:` 内 → TG 连续失败 3 轮进 SILENCED 后永不发邮件，
+                # 即「TG 挂了就没人知道程序崩了」；bot 启动熔断时更无消费进程。
+                # event="crash" 豁免持仓闸门：空仓崩溃同样必须邮件可达。
+                if not ok:
+                    logging.warning("⚠️ 崩溃报警 Telegram 未送达，邮件仍独立尝试")
+                try:
+                    (email_cb or send_email_alert)(
+                        f"💥 程序崩溃报警！\n\n{notify_msg}",
+                        subject="💥 程序崩溃报警", event="crash")
+                except Exception as e:
+                    logging.warning(f"⚠️ 崩溃报警邮件发送异常: {e}")
+                if ok:
                     logging.info("📨 崩溃报警已发送")
-                    # 🔥 崩溃报警同步推送邮箱 + 持仓汇总（成功路径一次性，与旧行为一致）
-                    (email_cb or send_email_alert)(f"💥 程序崩溃报警！\n\n{notify_msg}",
-                                                   subject="💥 程序崩溃报警")
+                    # 崩溃后持仓汇总仍只在 TG 成功后发（汇总本身依赖 bot 内存态）
                     if summary_cb is not None:
                         try:
                             await summary_cb()

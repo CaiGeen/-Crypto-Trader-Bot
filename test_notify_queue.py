@@ -506,6 +506,40 @@ def scenario_14():
         env.close()
 
 
+def scenario_15():
+    """S15 R0/F11：crash_alert 在 **TG 失败** 时邮件仍独立尝试（修复前在 if ok 内，永不发）"""
+    env = Env()
+    try:
+        eid = "20260925_080500_111111_c0ffee00"
+        env.enqueue(eid, "crash_alert|程序异常退出: RuntimeError")
+        bot = FakeTgBot(always_fail=True)          # Telegram 完全不可用
+        email_calls = []
+        summary_calls = []
+
+        async def summary_cb():
+            summary_calls.append(1)
+
+        stats = run_round(
+            bot, env, summary_cb=summary_cb,
+            email_cb=lambda *a, **k: email_calls.append((a, k)))
+
+        # 邮件必须被调用 1 次，且带 event="crash"（豁免持仓闸门）
+        email_ok = (len(email_calls) == 1
+                    and email_calls[0][1].get("event") == "crash")
+        st = env.state().get(eid, {})
+        ok = (email_ok
+              and len(summary_calls) == 0                 # 汇总仍只在 TG 成功后发
+              and bot.calls == 2                          # Markdown + 纯文本各试一次
+              and stats.get("failed_rounds") == 1         # 计 1 轮失败（可重试）
+              and env.queue_files() == [f"{eid}.notify"]  # 证据保留，未被误删
+              and st.get("status") != "SILENCED")
+        report("S15 crash_alert: TG失败时邮件仍独立送达(F11)", ok,
+               f"(email={len(email_calls)}, event={email_calls[0][1].get('event') if email_calls else None}, "
+               f"summary={len(summary_calls)}, 队列保留={env.queue_files()})")
+    finally:
+        env.close()
+
+
 if __name__ == '__main__':
     scenario_1()
     scenario_2()
@@ -521,6 +555,7 @@ if __name__ == '__main__':
     scenario_12()
     scenario_13()
     scenario_14()
+    scenario_15()
     print("\n" + "#" * 60)
     failed = [n for n, p in RESULTS if not p]
     if failed:

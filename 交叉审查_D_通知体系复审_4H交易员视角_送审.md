@@ -583,3 +583,45 @@ RESTART_MINUTE = 0
 - 复审方指出的 3 项补充，**均为我报告的真实遗漏**，其中第 1 项还纠正了我对「当前状态」的误判；已全部并入正文并升级级别。
 - 复审方对 5 项建议的修正，**2 项我方主动让步（强平表述、保护单判定）**，3 项完全采纳，其中 C3 的撤回是**我方方案的安全缺陷**，属实。
 - **双方在「先修故障链、暂缓降噪」这一优先级上完全一致**；我方无任何保留意见。
+
+
+---
+
+## 11. R0 实施记录（2026-09-25）
+
+> 按 §10.4 的 R0 阶段落地。三条故障链均**先补失败路径测试**，再改生产代码。
+
+### 11.1 改动清单
+
+| 文件 | 改动 | 对应 |
+|---|---|---|
+| `email_gate.py` | 新增 `FATAL_EVENTS` 白名单（critical/auth_blocked/crash/startup_breaker/health/liquidation_proximity/protection_lost）、`DAILY_REPORT_EVENT`；`should_send_email` 增加 `event` 形参，三层裁决：总开关 → 致命豁免 → 日报独立开关 → 普通持仓闸门；新增 `DAILY_REPORT_EMAIL_ENABLED` | F10 |
+| `健康巡检.py` | `send_email(..., event=)`；`alert()` 与开机自启告警固定 `event="health"`；读到心跳 `fatal_alert` 时新增 `watchdog_fatal` 告警项 | F10 / F11 |
+| `bot_runner.py` | `send_email_alert(..., event=)` 返回提交结果；**crash_alert 邮件移出 `if ok:`** —— TG 失败/静默时仍独立尝试，且带 `event="crash"`；崩溃后汇总仍仅在 TG 成功后发 | F11 |
+| `watchdog.py` | 心跳新增 `fatal_alert` 字段 + `mark_fatal()`；启动熔断分支在写队列之外**额外落心跳**，供独立巡检出告警 | F11 |
+| `trader_260725.py` | `send_tg_notification` 返回 `True/False/None`（None=未配置，不可判定）；`_send_email_alert(..., event=, wait=)` 支持致命豁免与**同步等待确认**；critical 邮件带 `event="critical"`；日报邮件带 `event="daily_report", wait=True`；`_send_daily_report` 返回渠道结果；`_daily_report_loop` 改为**双渠道确认才写日期**，否则 5 分钟重试（上限 6 次） | F12 |
+| `.env.example` / `README.md` | 补 `DAILY_REPORT_EMAIL_ENABLED` 与事件维度语义说明 | F10 |
+| 测试 | `test_email_gate.py` +6 例；`test_notify_queue.py` +S15；新增 `test_r0_notify_chains.py`（R1~R8） | — |
+
+### 11.2 测试证据
+
+| 套件 | 结果 |
+|---|---|
+| `test_r0_notify_chains.py` + `test_email_gate.py` + `test_email_channels.py` | **28 passed** |
+| `test_notify_queue.py`（含新增 S15：TG 全失败时邮件仍发出且带 event=crash） | **15/15 场景通过** |
+| `test_watchdog_guard.py` | **22/22 PASS**（首次失败为 GBK 控制台打印 `✅` 的环境问题，非代码；加 `PYTHONIOENCODING=utf-8` 后全绿） |
+| 回归批次（g3_converge / r10 / tg_reply_fallback / recover_semantics / v62_green / v64_p3 / v64_partial / account_risk / auth_blocked / health_progress） | **10 passed** |
+| 脚本式回归（close_confirmation_v62 / v62_staged_integration / b2_hardlock / position_close_confirmation） | **133/133、20/20、16/16、7/7** |
+| `py_compile`（5 个改动文件） | 通过 |
+
+### 11.3 上线影响与遗留
+
+**⚠️ 变更需重启 `watchdog.py` + `bot_runner.py` 才生效**（两者都是长驻进程；巡检是计划任务，每次运行自然加载新代码）。
+
+**重启风险已解除**：R0-① 落地后，磁盘上的 `EMAIL_ALERT_ONLY_WITH_POSITION=true` 即使生效，**致命事件（崩溃 / 鉴权封锁 / 启动熔断 / 健康巡检）与日报都会正常发邮件**——即 §0 提示的「重启后全闭」陷阱已被本次改动消除。新增配置 `DAILY_REPORT_EMAIL_ENABLED` 缺省 `true`，无需在 `.env` 中补写。
+
+**本次未覆盖（留待 R1/R2）**：
+- 快照三态渲染（F3）、取价失败显式化（F5-b）——R1；
+- 交易所权威强平价 / 保护单核对（F4、F6 修正版）——R2；
+- 恢复通知、静默摘要、资金费对账、quiet-hours ——R3；
+- `fatal_alert` 目前**只由启动熔断写入**；崩溃等场景仍依赖队列 + bot 存活。

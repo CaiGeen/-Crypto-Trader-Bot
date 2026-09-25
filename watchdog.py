@@ -212,6 +212,7 @@ _heartbeat_state = {
     "last_reason": None,
     "stopped": False,
     "stopped_reason": None,
+    "fatal_alert": None,   # R0/F11：致命故障（启动熔断等）落盘，由独立巡检进程告警
 }
 
 
@@ -238,6 +239,26 @@ def mark_stopped(reason: str):
     try:
         _heartbeat_state["stopped"] = True
         _heartbeat_state["stopped_reason"] = reason
+        write_heartbeat()
+    except Exception:
+        pass
+
+
+def mark_fatal(reason: str):
+    """标记**致命故障**（R0 / F11，2026-09-25）：健康巡检据此独立告警。
+
+    背景：启动熔断时 watchdog 自身 sys.exit(1) 退出，bot_runner 从未成功启动 →
+    .notify_queue 无消费进程 → 队列里的 crash_alert 永远不会发出，
+    「邮件兜底依赖 bot 内存态」的旧设计在此场景下彻底失效。
+    本函数把致命信息落到心跳文件，由**独立进程**（健康巡检，计划任务每 15 分钟）
+    读取并发 alert(event="health")，该通道不依赖 bot 是否活着。
+    """
+    try:
+        _heartbeat_state["fatal_alert"] = {
+            "reason": reason,
+            "ts": time.time(),
+            "ts_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
         write_heartbeat()
     except Exception:
         pass
@@ -549,10 +570,14 @@ def main():
         if record_process_exit(time.monotonic() - proc_start):
             log_message(f"🛑 [启动熔断] 主程序连续 {MAX_INIT_FAILURES} 次在 {INIT_FAILURE_WINDOW} 秒内退出，"
                         f"停止自动重启（最后原因: {restart_reason}），请人工排查！")
-            atomic_write_notify(
-                f"crash_alert|🚨【资金安全】🛑 Watchdog 启动熔断：主程序连续 "
+            breaker_msg = (
+                f"🚨【资金安全】🛑 Watchdog 启动熔断：主程序连续 "
                 f"{MAX_INIT_FAILURES} 次在 {INIT_FAILURE_WINDOW} 秒内退出，已停止自动重启。"
                 f"最后原因: {restart_reason}。请人工排查后再启动。")
+            atomic_write_notify(f"crash_alert|{breaker_msg}")
+            # R0 / F11：bot_runner 未成功启动 → 队列无人消费；致命信息必须落心跳，
+            # 由独立巡检进程发 alert(event="health")，不依赖 bot 存活。
+            mark_fatal(breaker_msg)
             _kill_main_process_tree()
             sys.exit(1)
 

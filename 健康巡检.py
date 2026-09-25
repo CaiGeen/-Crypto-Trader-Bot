@@ -168,10 +168,15 @@ def send_tg(env: dict, text: str, use_proxy: bool) -> bool:
         return False
 
 
-def send_email(env: dict, subject: str, text: str) -> bool:
-    """QQ 邮件兜底：SMTP 国内直连，代理不可达时仍可用。"""
+def send_email(env: dict, subject: str, text: str, event: str = "generic") -> bool:
+    """QQ 邮件兜底：SMTP 国内直连，代理不可达时仍可用。
+
+    R0（2026-09-25，F10 修复）：健康巡检告警传 event="health" → 豁免持仓闸门。
+    修复前：巡检每次运行重读磁盘 .env，磁盘 EMAIL_ALERT_ONLY_WITH_POSITION=true 且
+    空仓时，TG 双路全失败的最后一层邮件兜底会被静默吞掉（无持仓 ≠ 无风险）。
+    """
     allowed, gate_reason = email_gate.should_send_email(
-        env=env, state_path=TRADE_STATE_FILE
+        env=env, state_path=TRADE_STATE_FILE, event=event
     )
     if not allowed:
         log(f"ℹ️ 邮件已跳过（{gate_reason}）")
@@ -219,7 +224,8 @@ def alert(env: dict, key: str, title: str, detail: str, dry_run: bool) -> None:
     if not sent:
         sent = send_tg(env, text, use_proxy=False)
     if not sent:
-        sent = send_email(env, "🚨 Bot 健康巡检异常", text)
+        # R0：巡检告警属资金安全事件，邮件兜底不受持仓闸门限制（空仓期同样必须可达）
+        sent = send_email(env, "🚨 Bot 健康巡检异常", text, event="health")
     if sent:
         state[key] = now
         write_json(ALERT_STATE_FILE, state)
@@ -253,6 +259,19 @@ def run_check(env: dict, dry_run: bool) -> int:
             log(f"ℹ️ 巡检: 状态=已主动停止（{hb.get('stopped_reason')}）→ 不告警 ; "
                 + " ; ".join(summary))
             return 0
+        # R0 / F11（2026-09-25）：Watchdog 启动熔断等致命故障写入心跳 fatal_alert。
+        # 该场景 bot_runner 从未成功启动 → .notify_queue 无消费进程 → 队列里的
+        # crash_alert 永不发；由**本独立进程**承担告警（不依赖 bot 存活），
+        # 且走 alert(event="health") → 邮件豁免持仓闸门。
+        fatal = hb.get("fatal_alert")
+        if isinstance(fatal, dict) and fatal.get("reason"):
+            issues.append((
+                "watchdog_fatal",
+                "Watchdog 已停止自动重启（致命故障）",
+                f"{fatal.get('reason')}\n"
+                f"发生时间: {fatal.get('ts_str', '未知')}\n"
+                f"watchdog_pid={hb.get('watchdog_pid')} bot_pid={hb.get('bot_pid')}。"
+                "自动重启已停止，交易所侧条件单仍有效但程序不再自愈；请人工排查后重新启动。"))
         if age > MAX_AGE_SECONDS:
             issues.append(("stale_heartbeat",
                            f"心跳陈旧 {age:.0f}s（阈值 {MAX_AGE_SECONDS}s）",
@@ -350,7 +369,8 @@ def main(argv) -> int:
             return 0
         sent = send_tg(env, text, use_proxy=False)
         if not sent:
-            send_email(env, "🚨 Bot 开机自启被跳过", text)
+            # R0：开机自启被跳过 = 交易能力缺失，邮件兜底豁免持仓闸门
+            send_email(env, "🚨 Bot 开机自启被跳过", text, event="health")
         st = read_json(ALERT_STATE_FILE) or {}
         st["autostart_skipped"] = time.time()
         write_json(ALERT_STATE_FILE, st)

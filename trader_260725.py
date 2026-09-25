@@ -468,6 +468,7 @@ class CryptoTrader:
 
         # 🔥 每日结算日报线程（daemon，每天 08:05 发送昨日结算）
         self._last_daily_report_date = None
+        self._daily_report_retry_count = 0   # R0/F12：仅双渠道确认后才写日期，未确认按 5min 重试
         threading.Thread(target=self._daily_report_loop, daemon=True).start()
 
         # 🔥 D-009 P0（ChatGPT R2/R3 批准）：账本完整性状态位（默认"可信"，Fail-Closed 起手）
@@ -816,7 +817,8 @@ class CryptoTrader:
         if level == 'critical':
             text = f"🚨【资金安全】\n{text}"
             # 🔥 资金安全告警同步推送 QQ 邮箱（兜底通道，独立线程异步发送，失败不影响 TG）
-            self._send_email_alert(text, subject="🚨 资金安全告警")
+            # R0：event="critical" 豁免持仓闸门 —— 空仓期出现资金安全告警同样必须邮件可达
+            self._send_email_alert(text, subject="🚨 资金安全告警", event="critical")
         elif level == 'warning':
             text = f"⚠️【需关注】\n{text}"
         if self.tg_bot and self.chat_id and self.loop:
@@ -832,8 +834,10 @@ class CryptoTrader:
                 )
                 # 等待发送完成，避免静默失败
                 future.result(timeout=5)
+                return True
             except asyncio.TimeoutError:
                 print(f"⚠️ [TG通知] 发送超时 (5秒)")
+                return False
             except BadRequest as e:
                 # 🔥 Markdown/Entity 解析失败等请求级错误（如批次号奇数下划线）→ 同一消息降级纯文本重发
                 # 一次，保证告警必达（不变量⑧ Fail-not-Silent）。类型判定，不依赖错误文案。
@@ -848,32 +852,46 @@ class CryptoTrader:
                     )
                     future.result(timeout=5)
                     print(f"ℹ️ [TG通知] Markdown 解析失败({str(e)[:60]})，已降级纯文本发送")
+                    return True
                 except Exception as e2:
                     print(f"⚠️ [TG通知] 纯文本重发失败: {e2}")
+                    return False
             except Exception as e:
                 print(f"⚠️ [TG通知] 发送失败: {e}")
+                return False
         else:
             print(f"⚠️ [TG通知] 缺少必要参数，无法发送")
+            return None   # None=未配置，无法判定投递结果（≠ 失败，调用方需区别对待）
 
     # ==================== QQ 邮箱告警（兜底通道） ====================
 
-    def _send_email_alert(self, text: str, subject: str = "交易告警") -> None:
+    def _send_email_alert(self, text: str, subject: str = "交易告警",
+                          event: str = "generic", wait: bool = False) -> bool:
         """发送 QQ 邮箱告警（独立线程异步发送，失败静默，未配置自动跳过）
+
         .env 需配置：QQ_MAIL_USER / QQ_MAIL_AUTH_CODE（QQ邮箱授权码）/ QQ_MAIL_TO（可选，默认=发件人）
-        可选闸门：EMAIL_ALERT_ENABLED 手动总开关；EMAIL_ALERT_ONLY_WITH_POSITION
-        仅在 trade_state.json 存在 is_active=true 批次时发送（状态不可读=不发邮件）。
+
+        R0（2026-09-25，F10/F12）：
+          event 事件维度 —— 致命事件（critical/auth_blocked/crash/health/...）豁免持仓闸门；
+                            daily_report 由 DAILY_REPORT_EMAIL_ENABLED 独立裁决。
+          wait=True   —— 同步等待 SMTP 结果（SMTP timeout=10s，最长等 20s），
+                         供日报做「渠道确认」而非「提交即算送达」。
+        返回 True=已确认送达（wait=True）或已提交发送线程（wait=False）；
+             False=被闸门拦截 / 未配置 / 发送失败 / 等待确认超时。
         """
-        allowed, gate_reason = email_gate.should_send_email()
+        allowed, gate_reason = email_gate.should_send_email(event=event)
         if not allowed:
-            print(f"ℹ️ [邮件] 已跳过（{gate_reason}）")
-            return
+            print(f"ℹ️ [邮件] 已跳过（{gate_reason}, event={event}）")
+            return False
 
         mail_user = os.getenv("QQ_MAIL_USER", "").strip()
         mail_code = os.getenv("QQ_MAIL_AUTH_CODE", "").strip()
         mail_to = os.getenv("QQ_MAIL_TO", "").strip() or mail_user
         if not (mail_user and mail_code and mail_to):
-            print("⚠️ [邮件] 未配置 QQ_MAIL_USER/AUTH_CODE，跳过邮件发送")
-            return
+            print(f"⚠️ [邮件] 未配置 QQ_MAIL_USER/AUTH_CODE，跳过邮件发送（event={event}）")
+            return False
+
+        outcome = {"ok": False}
 
         def _do_send():
             with EMAIL_SEND_LOCK:
@@ -890,11 +908,21 @@ class CryptoTrader:
                     with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
                         server.login(mail_user, mail_code)
                         server.sendmail(mail_user, [mail_to], msg.as_string())
-                    print(f"📧 [邮件] 已发送: {subject}")
+                    outcome["ok"] = True
+                    print(f"📧 [邮件] 已发送: {subject} (event={event})")
                 except Exception as e:
-                    print(f"⚠️ [邮件] 发送失败: {e}")
+                    outcome["ok"] = False
+                    print(f"⚠️ [邮件] 发送失败: {e} (event={event})")
 
-        threading.Thread(target=_do_send, daemon=True).start()
+        t = threading.Thread(target=_do_send, daemon=True)
+        t.start()
+        if wait:
+            t.join(timeout=20)
+            if t.is_alive():
+                print(f"⚠️ [邮件] 等待确认超时(20s)，按未确认处理（event={event}）")
+                return False
+            return bool(outcome["ok"])
+        return True
 
     # ==================== 盈亏记录 / 持仓快照 / 每日日报 ====================
 
@@ -1655,26 +1683,59 @@ class CryptoTrader:
             if snapshot:
                 msg += f"\n{snapshot}"
 
-            self.send_tg_notification(msg)
+            tg_ok = self.send_tg_notification(msg)
             # 🔥 日报同步推送 QQ 邮箱（留档）
-            self._send_email_alert(msg, subject=f"每日结算报告 {report_date}")
+            # R0/F12：event="daily_report" 独立于持仓闸门（空仓也要留痕）；
+            #         wait=True 等待 SMTP 确认，杜绝「提交即算送达」。
+            mail_ok = self._send_email_alert(
+                msg, subject=f"每日结算报告 {report_date}",
+                event="daily_report", wait=True)
+            result = {"tg": tg_ok, "email": mail_ok}
+            if not (tg_ok is True and mail_ok is True):
+                print(f"⚠️ [日报] 渠道未全部确认 (tg={tg_ok}, email={mail_ok}) → 不标记当日已发，允许重试")
+            return result
         except Exception as e:
             print(f"⚠️ [日报] 发送失败: {e}")
+            return {"tg": False, "email": False}
 
     def _daily_report_loop(self):
-        """每日 08:05（北京时间）自动发送昨日结算日报（daemon 线程）"""
+        """每日 08:05（北京时间）自动发送昨日结算日报（daemon 线程）
+
+        R0 / F12（2026-09-25）：**双渠道确认后才算已发**。
+          - 修复前：调用 _send_daily_report() 后无条件写 _last_daily_report_date，
+            而 TG 失败仅 print、邮件为 daemon 线程异步提交 → 「尝试过」被当成「已送达」，
+            两路皆失败时当日不再重试，日报整天丢失且无痕迹。
+          - 修复后：Telegram 与邮件都返回 True 才标记当日已发；
+            否则不写日期，按 5 分钟间隔重试（08:05/10/15/20/25/30 共 6 次上限），
+            耗尽后标记并打印 ERROR 留痕，避免整日刷屏。
+        """
         self._last_daily_report_date = None
+        self._daily_report_retry_count = 0
         while True:
             try:
                 now = datetime.now(BEIJING_TZ)
                 today = now.strftime("%Y-%m-%d")
-                if (now.hour == 8 and now.minute == 5
-                        and self._last_daily_report_date != today):
-                    self._send_daily_report()
-                    self._last_daily_report_date = today
-                    time.sleep(90)  # 避免同一窗口重复发送
-                else:
-                    time.sleep(30)
+                # 重试窗口：08:05 起每 5 分钟一次，最晚 08:30（第 6 次）
+                in_retry_window = (now.hour == 8 and 5 <= now.minute <= 30
+                                   and now.minute % 5 == 0)
+                if in_retry_window and self._last_daily_report_date != today:
+                    result = self._send_daily_report()
+                    if result.get("tg") is True and result.get("email") is True:
+                        self._last_daily_report_date = today
+                        self._daily_report_retry_count = 0
+                        print(f"✅ [日报] {today} 双渠道已确认送达")
+                        time.sleep(90)   # 避免同一窗口重复发送
+                    else:
+                        self._daily_report_retry_count += 1
+                        n = self._daily_report_retry_count
+                        if n >= 6:
+                            self._last_daily_report_date = today
+                            print(f"❌ [日报] {today} 连续 {n} 次未获双渠道确认，停止重试（需人工确认）")
+                        else:
+                            print(f"⚠️ [日报] {today} 第 {n}/6 次尝试未全成功，5 分钟后重试")
+                        time.sleep(300)
+                    continue
+                time.sleep(30)
             except Exception as e:
                 print(f"⚠️ [日报] 循环异常: {e}")
                 time.sleep(300)

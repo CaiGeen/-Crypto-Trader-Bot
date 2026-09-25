@@ -83,6 +83,91 @@ class EmailGateTests(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertEqual(reason, "position_gate_disabled")
 
+    # ---------------- R0 事件维度（2026-09-25，F10） ----------------
+
+    def test_fatal_event_bypasses_no_position(self):
+        """F10：空仓时致命事件（crash/health/critical）仍必须放行邮件"""
+        self._write_state({"BTCUSDT": {"b1": {"is_active": False}}})
+        for ev in ("crash", "health", "critical", "auth_blocked", "startup_breaker"):
+            allowed, reason = email_gate.should_send_email(
+                env={
+                    "EMAIL_ALERT_ENABLED": "true",
+                    "EMAIL_ALERT_ONLY_WITH_POSITION": "true",
+                },
+                state_path=self.state_path,
+                event=ev,
+            )
+            self.assertTrue(allowed, f"event={ev} 应豁免持仓闸门")
+            self.assertEqual(reason, "fatal_event", f"event={ev}")
+
+    def test_fatal_event_bypasses_unreadable_state(self):
+        """状态文件损坏时致命事件同样放行（无持仓 ≠ 无风险，状态坏 ≠ 无风险）"""
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        allowed, reason = email_gate.should_send_email(
+            env={
+                "EMAIL_ALERT_ENABLED": "true",
+                "EMAIL_ALERT_ONLY_WITH_POSITION": "true",
+            },
+            state_path=self.state_path,
+            event="health",
+        )
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "fatal_event")
+
+    def test_master_switch_still_blocks_fatal_event(self):
+        """总开关优先级最高：EMAIL_ALERT_ENABLED=false 时致命事件也不发（保留人工总闸）"""
+        allowed, reason = email_gate.should_send_email(
+            env={
+                "EMAIL_ALERT_ENABLED": "false",
+                "EMAIL_ALERT_ONLY_WITH_POSITION": "true",
+            },
+            state_path=self.state_path,
+            event="crash",
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "disabled")
+
+    def test_daily_report_independent_of_position_gate(self):
+        """F12：日报由独立开关裁决，空仓也要留痕"""
+        self._write_state({"BTCUSDT": {"b1": {"is_active": False}}})
+        allowed, reason = email_gate.should_send_email(
+            env={
+                "EMAIL_ALERT_ENABLED": "true",
+                "EMAIL_ALERT_ONLY_WITH_POSITION": "true",
+            },
+            state_path=self.state_path,
+            event="daily_report",
+        )
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "daily_report")
+
+    def test_daily_report_switch_off(self):
+        self._write_state({"BTCUSDT": {"b1": {"is_active": True}}})
+        allowed, reason = email_gate.should_send_email(
+            env={
+                "EMAIL_ALERT_ENABLED": "true",
+                "DAILY_REPORT_EMAIL_ENABLED": "false",
+            },
+            state_path=self.state_path,
+            event="daily_report",
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "daily_report_disabled")
+
+    def test_generic_event_keeps_position_gate(self):
+        """回归：普通事件（generic）行为不变，仍受持仓闸门约束"""
+        self._write_state({"BTCUSDT": {"b1": {"is_active": False}}})
+        allowed, reason = email_gate.should_send_email(
+            env={
+                "EMAIL_ALERT_ENABLED": "true",
+                "EMAIL_ALERT_ONLY_WITH_POSITION": "true",
+            },
+            state_path=self.state_path,
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "no_active_positions")
+
 
 if __name__ == "__main__":
     unittest.main()
