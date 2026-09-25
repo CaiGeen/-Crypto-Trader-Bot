@@ -70,15 +70,28 @@ class M3D10WordingTests(unittest.TestCase):
             src = f.read()
         self.assertIn("需重启 watchdog/bot_runner 才对运行中进程生效", src)
 
-    def test_m3_batch_cap_is_2_in_live_env_file(self):
-        """实盘 `.env`（不入库）必须把上限显式写为 2，而不是依赖默认值 3"""
+    def test_m3_batch_cap_matches_live_env_file(self):
+        """实盘 `.env`（不入库）必须**显式**写出批次上限，而不是依赖默认值。
+
+        上限值 = 3（用户 2026-09-25 定）：M2 消除了第 3 批次的轮询断崖后，
+        3 档为 20~30s，不再承担「保护单补建窗口过长」的代价。
+        若日后改为 4 或其他值，**必须同步改这里的断言**，否则配置与测试脱节。
+        """
         env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
         self.assertTrue(os.path.exists(env_path), "实盘 .env 不存在，无法核对上限")
         with open(env_path, encoding="utf-8") as f:
             lines = [ln.strip() for ln in f
                      if ln.strip().startswith("RISK_MAX_ACTIVE_BATCHES")]
         self.assertTrue(lines, ".env 未显式设置 RISK_MAX_ACTIVE_BATCHES（会退回默认 3）")
-        self.assertEqual(lines[0].split("=", 1)[1].strip(), "2")
+        self.assertEqual(lines[0].split("=", 1)[1].strip(), "3")
+
+    def test_m3_batch_cap_3_still_fast_enough(self):
+        """上限=3 的前提是 M2 已让 3 档保持 20~30s（否则等于退回断崖）"""
+        fake = mock.Mock()
+        fake._get_active_batch_count.return_value = 3
+        for _ in range(20):
+            v = trader_260725.CryptoTrader._calculate_monitoring_interval(fake)
+            self.assertLessEqual(v, 30.0, "3 档轮询必须 <=30s")
 
 
 class M4ConfigBannerTests(unittest.TestCase):

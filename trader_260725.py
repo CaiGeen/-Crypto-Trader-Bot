@@ -1589,7 +1589,7 @@ class CryptoTrader:
         因此**改磁盘 .env 不会影响运行中进程**，必须重启 watchdog/bot_runner 才生效。
         （健康巡检.py 是独立短进程、每次重读磁盘，故两者行为不一致。）
         限额 <=0 视为禁用。
-        当前上限：批次 2（M3 起，见 .env RISK_MAX_ACTIVE_BATCHES=2）/ 交易对 1 /
+        当前上限：批次 3（用户 2026-09-25 定，见 .env RISK_MAX_ACTIVE_BATCHES=3）/ 交易对 1 /
         日亏损暂不启用（0）/ MAX_LEVERAGE 100。
         返回 (allowed, reason)。"""
         # RISK_MAX_ACTIVE_BATCHES: 活跃批次总数达到上限即拒绝新批次
