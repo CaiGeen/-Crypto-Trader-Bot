@@ -2416,7 +2416,11 @@ class CryptoTrader:
         三种"空"的安全含义完全不同，旧实现把它们全部塌缩成 {}：
           ① 文件不存在    → 首次启动，确实没有历史批次        （可正常 READY）
           ② 合法 {} / dict → 所有批次已清理完毕               （可正常 READY）
-          ③ 读取失败/根非 dict → 账本损坏                     （Fail-Closed，禁止 READY）
+          ③ 读取失败 / 根非 dict / **内部节点类型非法**
+                          → 账本损坏                         （Fail-Closed，禁止 READY）
+
+        补充：根是 dict 不代表内容可信——账本不变量是 {symbol: {batch_id: dict}}，
+        **内部节点类型非法同样归入 ③**（校验实现见函数末尾，第十六轮复审 P1）。
 
         ③ 的正确语义是"不知道有哪些批次"，绝不是"没有批次"。若按 ① 处理，
         进程会以空账本启动 → 不接管任何历史批次 → 交易所上的真实持仓变成
@@ -2442,6 +2446,33 @@ class CryptoTrader:
             self._state_corruption_detail = f"根节点类型非法: {type(data).__name__}"
             print(f"🚨 [D-009] trade_state.json 根节点非 dict（账本损坏，Fail-Closed）")
             return {}
+        # 第十六轮复审 P1：**根节点是 dict 不代表内容可信**——与墓碑条目级校验
+        # （_load_tombstones 2026-09-25）是同一性质的问题，只是位置换到了账本。
+        # 账本不变量是 {symbol: {batch_id: dict}}，旧实现只验根节点，于是两种
+        # 反例都被当成"合法账本"放行：
+        #   {"SYM": []}  → ([] or {}) → {} → None → clear_batch_state 判「批次
+        #                  不存在」→ return True（谎报已清理）；且标志为 False，
+        #                  _persist_states 也会照常覆盖写入，把损坏现场抹掉
+        #   {"SYM": "x"} → "x".get(batch_id) → AttributeError 抛在 _state_lock 内
+        # 两者的语义都是「不知道有哪些批次」，按 D-009 三态分离，与 JSON 解析失败
+        # 同等处理（置标志 + 返回占位 {}，调用方一律 Fail-Closed）。
+        for _sym, _node in data.items():
+            if not isinstance(_node, dict):
+                self._state_corrupted = True
+                self._state_corruption_detail = (
+                    f"交易对节点类型非法: {_sym!r} -> {type(_node).__name__}")
+                print(f"🚨 [D-009] trade_state.json 交易对节点非 dict"
+                      f"（账本损坏，Fail-Closed）: {_sym!r} -> {type(_node).__name__}")
+                return {}
+            for _bid, _bd in _node.items():
+                if not isinstance(_bd, dict):
+                    self._state_corrupted = True
+                    self._state_corruption_detail = (
+                        f"批次节点类型非法: {_sym!r}/{_bid!r} -> {type(_bd).__name__}")
+                    print(f"🚨 [D-009] trade_state.json 批次节点非 dict"
+                          f"（账本损坏，Fail-Closed）: {_sym!r}/{_bid!r} "
+                          f"-> {type(_bd).__name__}")
+                    return {}
         return data
 
     def _persist_states(self, all_states: dict) -> bool:

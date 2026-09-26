@@ -445,6 +445,62 @@ class TombstoneEntryIntegrityTests(unittest.TestCase):
         self.assertEqual(broken_bytes, after_bytes,
                          "损坏现场必须原样保留（不得被清理流程覆盖）")
 
+    def test_clear_rejects_valid_json_with_corrupt_inner_structure(self):
+        """ChatGPT 第十六轮反例：**合法 JSON** 但内部结构损坏 ≠ 账本可读。
+
+        load_all_states 只校验根节点是 dict，所以以下文件都不会置
+        _state_corrupted：
+          {"BTC/USDT:USDT": []}                       → ([] or {}) → {} → None
+                                                         → 「找不到批次」→ return True（谎报）
+          {"BTC/USDT:USDT": "x"}                      → "x".get(batch_id)
+                                                         → AttributeError（锁内崩溃）
+          {"BTC/USDT:USDT": {"b1": 123}}              → b_data=123 交给 proof 门
+        三者都是「不知道有哪些批次」，必须与 JSON 解析失败同等对待（D-009 语义）。
+        """
+        import contextlib
+        shapes = {
+            'symbol_is_empty_list': {"BTC/USDT:USDT": []},
+            'symbol_is_str':        {"BTC/USDT:USDT": "x"},
+            'batch_node_is_int':    {"BTC/USDT:USDT": {"b1": 123}},
+        }
+        for name, payload in shapes.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tomb = self._write(tmp, 'tomb.json', {})
+                    state = os.path.join(tmp, 'trade_state.json')
+                    with open(state, 'w', encoding='utf-8') as f:
+                        json.dump(payload, f)
+                    before = open(state, 'rb').read()
+                    sent = []
+                    fake = self._fake(tomb, sent)
+                    fake._verify_clear_proof = lambda *a, **k: None
+                    buf = io.StringIO()
+                    err = None
+                    try:
+                        with mock.patch.object(trader_260725, 'STATE_FILE', state):
+                            with contextlib.redirect_stdout(buf):
+                                rc = trader_260725.CryptoTrader.clear_batch_state(
+                                    fake, self.SYMBOL, 'b1',
+                                    proof={'l1_canceled': [], 'l2_canceled': []})
+                    except Exception as e:
+                        rc, err = None, f'{type(e).__name__}: {e}'
+                    after = open(state, 'rb').read()
+                self.assertIsNone(
+                    err, f'{name}: 清理在 _state_lock 内抛异常（结构损坏直接放行）: {err}')
+                self.assertFalse(
+                    rc, f'{name}: 结构损坏时必须返回 False，'
+                        f'不得把「节点读不出来」当成「批次不存在」')
+                # 直接钉住契约本身：False 必须来自 load_all_states 的损坏标志，
+                # 而不是碰巧走进了别的分支。
+                self.assertIs(fake._state_corrupted, True,
+                              f'{name}: load_all_states 必须置 _state_corrupted')
+                detail = fake._state_corruption_detail
+                self.assertIsInstance(detail, str, f'{name}: 必须给出具体损坏原因')
+                self.assertTrue(detail.strip(),
+                                f'{name}: 损坏原因不得为空字符串')
+                self.assertNotIn('清理完毕', buf.getvalue(), f'{name}: 不得打印清理完毕')
+                self.assertEqual(before, after, f'{name}: 损坏现场必须原样保留')
+
     def test_prune_is_skipped_when_degraded(self):
         """DEGRADED 时不得基于不可信数据改写墓碑（避免把损坏条目静默剪掉）。"""
         with tempfile.TemporaryDirectory() as tmp:
