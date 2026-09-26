@@ -213,6 +213,9 @@ def make_fake_b(env, ex):
              '_persist_states', '_load_tombstones', '_persist_tombstones',
              '_prune_tombstones', '_merge_batch_state', '_collect_batch_order_ids',
              '_update_registry', '_commit_registry_txn',
+             # C1/G1（契约 §24.3）：创建路径改走 _update_registry_checked，其内部调
+             # _update_registry_locked。漏绑 → 自动 mock → 不写 states / 门禁恒拦（假红）
+             '_update_registry_locked', '_update_registry_checked',
              '_find_registry_identity_by_order_id', '_order_matches_intent',
              '_get_current_position_amt', '_registry_has_unresolved_entries',
              # P0 Batch B 新 helper（RED 阶段缺失 → MagicMock → FAIL，即 RED 信号）

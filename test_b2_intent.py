@@ -48,6 +48,14 @@ def _make_base_fake():
 def _bind_helpers(fake, states):
     fake.load_all_states = lambda: states
     fake._update_registry = lambda s, b, i, **f: CryptoTrader._update_registry(fake, s, b, i, **f)
+
+    # C1/G1（契约 §24.3）：创建路径改走 _update_registry_checked，
+    # 其内部调 _update_registry_locked。两条必须绑真实实现（同上 MagicMock 坑）：
+    # 漏绑 → 自动 mock → 不写 states / `is not True` 恒成立 → 门禁恒拦下单。
+    fake._update_registry_locked = (
+        lambda s, b, i, **f: CryptoTrader._update_registry_locked(fake, s, b, i, **f))
+    fake._update_registry_checked = (
+        lambda s, b, i, **f: CryptoTrader._update_registry_checked(fake, s, b, i, **f))
     fake._recheck_registry_self_heal = lambda s, b: CryptoTrader._recheck_registry_self_heal(fake, s, b)
     if hasattr(CryptoTrader, '_build_intent'):
         fake._build_intent = lambda **kw: CryptoTrader._build_intent(fake, **kw)

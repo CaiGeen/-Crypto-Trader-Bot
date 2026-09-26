@@ -66,6 +66,10 @@ class MemStateStore:
     def persist(self, all_states):
         with self._lock:
             self._data = dict(all_states)
+        # G1 门禁（契约 §24.3）读 `_persist_states` 的返回值判定「本次是否已落盘」。
+        # 本 fake 确实写入成功 → 必须返回 True；隐式返回 None 会被判为**写入失败**，
+        # 一旦有用例走到 G1 门禁就会被 Fail-Closed 拦下单（隐性假红）。
+        return True
 
 
 class FakeExchange:
@@ -133,7 +137,11 @@ def make_fake(store, ex):
     for name in ('_load_tombstones', '_persist_tombstones', '_prune_tombstones',
                  '_collect_batch_order_ids', '_merge_batch_state'):
         _bind_real(fake, name)
-    for name in ('_update_registry', '_assert_create_allowed', '_final_pre_create_check',
+    for name in ('_update_registry',
+                 # C1/G1（契约 §24.3）：创建路径改走 _update_registry_checked（内部调
+                 # _update_registry_locked）。漏绑 → 自动 mock → 不写 states / 门禁恒拦（假红）
+                 '_update_registry_locked', '_update_registry_checked',
+                 '_assert_create_allowed', '_final_pre_create_check',
                  '_commit_protection_with_g3', '_g3a_converge_race_order',
                  '_g3_cancel_race_order', '_g3_log_position_recheck',
                  '_find_registry_identity_by_order_id', '_adjudicate_recreate_before_repair',

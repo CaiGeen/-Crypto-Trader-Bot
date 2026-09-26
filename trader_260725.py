@@ -3684,16 +3684,20 @@ class CryptoTrader:
             if not allowed:
                 print(f"  └─ 🚫 [仲裁] 跳过用户改止损: {gate_reason}")
                 return False, f"🚫 止损单创建被仲裁拦截：{gate_reason}"
-            # B2-2: 意图先落盘（崩溃安全 Create）+ intent 指纹
-            self._update_registry(target_symbol, batch_id, sl_identity, state='PENDING_CREATE',
-                                  id_known=False, order_kind='conditional', role='SL',
-                                  layer=sl_layer, side=sl_side_ident,
-                                  intent=self._build_intent(
-                                      symbol=target_symbol, side=sl_side,
-                                      qty=current_filled_amount,
-                                      order_type='STOP_MARKET',
-                                      stop_price=formatted_sl_price,
-                                      reduce_only=sl_params.get('reduceOnly')))
+            # C1/G1（契约 §24.3）：意图先落盘并**逐次确认本次结果**——未确认 → Fail-Closed 零下单
+            if self._update_registry_checked(
+                    target_symbol, batch_id, sl_identity, state='PENDING_CREATE',
+                    id_known=False, order_kind='conditional', role='SL',
+                    layer=sl_layer, side=sl_side_ident,
+                    intent=self._build_intent(
+                        symbol=target_symbol, side=sl_side,
+                        qty=current_filled_amount,
+                        order_type='STOP_MARKET',
+                        stop_price=formatted_sl_price,
+                        reduce_only=sl_params.get('reduceOnly'))) is not True:
+                # critical 已在 _update_registry_checked 内于锁外发出（C4），此处只记日志
+                print("  └─ 🚫 [G1] 意图未写入磁盘，已阻止创建新止损单（保护单未挂出）")
+                return False, "🚫 止损单创建被拦截：意图未写入磁盘（保护单未创建，交易所侧不会有该单，请检查状态文件）"
             new_sl_order = self._safe_api_call(
                 self.exchange.create_order,
                 symbol=target_symbol,
@@ -3907,16 +3911,20 @@ class CryptoTrader:
             if not allowed:
                 print(f"  └─ 🚫 [仲裁] 跳过保本损: {gate_reason}")
                 return False, f"🚫 保本损止损单创建被仲裁拦截：{gate_reason}"
-            # B2-2: 意图先落盘（崩溃安全 Create）+ intent 指纹
-            self._update_registry(symbol, batch_id, sl_identity, state='PENDING_CREATE',
-                                  id_known=False, order_kind='conditional', role='SL',
-                                  layer=sl_layer, side=sl_side_ident,
-                                  intent=self._build_intent(
-                                      symbol=symbol, side=sl_side,
-                                      qty=current_filled_amount,
-                                      order_type='STOP_MARKET',
-                                      stop_price=formatted_sl_price,
-                                      reduce_only=sl_params.get('reduceOnly')))
+            # C1/G1（契约 §24.3）：意图先落盘并**逐次确认本次结果**——未确认 → Fail-Closed 零下单
+            if self._update_registry_checked(
+                    symbol, batch_id, sl_identity, state='PENDING_CREATE',
+                    id_known=False, order_kind='conditional', role='SL',
+                    layer=sl_layer, side=sl_side_ident,
+                    intent=self._build_intent(
+                        symbol=symbol, side=sl_side,
+                        qty=current_filled_amount,
+                        order_type='STOP_MARKET',
+                        stop_price=formatted_sl_price,
+                        reduce_only=sl_params.get('reduceOnly'))) is not True:
+                # critical 已在 _update_registry_checked 内于锁外发出（C4），此处只记日志
+                print("  └─ 🚫 [G1] 意图未写入磁盘，已阻止创建保本损止损单")
+                return False, "🚫 保本损止损单创建被拦截：意图未写入磁盘（保护单未创建，交易所侧不会有该单，请检查状态文件）"
 
             # 创建新止损单
             new_sl_order = self._safe_api_call(
@@ -6559,12 +6567,19 @@ class CryptoTrader:
                 return True
         return False
 
-    def _update_registry(self, symbol, batch_id, identity, state=None, order_id=None,
-                         id_known=None, order_kind=None, role=None, layer=None, side=None,
-                         intent=None, fail_count_incr=None, hard_locked=None,
-                         terminated_reason=None):
+    def _update_registry_locked(self, symbol, batch_id, identity, state=None, order_id=None,
+                                id_known=None, order_kind=None, role=None, layer=None, side=None,
+                                intent=None, fail_count_incr=None, hard_locked=None,
+                                terminated_reason=None):
         """B1/P0-2: 保护单 registry 落盘（规格 §5.2）—— protection_registry[identity] 状态条目。
         每次更新刷新 updated_at。
+        P0 写盘门禁（契约 §24.3 C1）：本函数是锁内主体的**唯一实现**，返回
+        ``(new_fail_count, persisted_ok)``——``persisted_ok`` 为 True 当且仅当本次修改
+        已由 _persist_states 确认落盘；批次缺失/终态守卫拒绝/写入失败一律 False。
+        两条薄包装各取所需：_update_registry 保持原返回类型（约 60 处调用方契约不动），
+        _update_registry_checked 取 persisted_ok 供创建路径 Fail-Closed。
+        ⚠️ 不可用进程内共享标志替代返回值：批次线程共享同一实例，锁内置标志、
+        调用方锁外读取会被别的写入覆盖（A 失败 → B 成功覆盖 → A 读到成功，照样下单）。
         B2-2: intent 不可变（ChatGPT③）——首次写入后不覆盖，防后期参数漂移
         导致自愈匹配失败/错收编。
         B2-4: fail_count_incr 递增条目级 fail_count 并返回新值（HARD_LOCK 判定源，§5.4）；
@@ -6584,14 +6599,14 @@ class CryptoTrader:
             latest_all = self.load_all_states()
             b = latest_all.get(symbol, {}).get(batch_id)
             if b is None:
-                return None
+                return None, False
             reg = b.setdefault('protection_registry', {})
             entry = reg.setdefault(identity, {})
             if (entry.get('state') == 'PROGRAMMATIC_CANCELED'
                     and state is not None and state != 'PROGRAMMATIC_CANCELED'):
                 print(f"  └─ 🚫 [终态守卫] identity `{identity}` 已 PROGRAMMATIC_CANCELED，"
                       f"拒绝回写 state={state}（订单终态不可转出）")
-                return None
+                return None, False
             if state is not None:
                 entry['state'] = state
             if order_id is not None:
@@ -6618,8 +6633,59 @@ class CryptoTrader:
                 entry['terminated_reason'] = terminated_reason
             entry['updated_at'] = time.time()
             # 直写持锁持久化（绕过 C 类 merge；批次被 clear 则上面 b is None 已拦截）
-            self._persist_states(latest_all)
-        return new_fail_count
+            # C1：显式取返回值——「无异常」≠「已落盘」（账本损坏拒写 / 写入异常均返回 False）
+            persisted_ok = self._persist_states(latest_all) is True
+        return new_fail_count, persisted_ok
+
+    def _update_registry(self, symbol, batch_id, identity, state=None, order_id=None,
+                         id_known=None, order_kind=None, role=None, layer=None, side=None,
+                         intent=None, fail_count_incr=None, hard_locked=None,
+                         terminated_reason=None):
+        """保护单 registry 落盘——**原返回契约不变**：返回 new_fail_count
+        （未递增 fail_count 时为 None），批次缺失/终态拒绝为 None。
+        ⚠️ 本返回值**不反映写盘是否成功**（约 60 处既有调用方依赖此语义）。
+        创建路径若需「本次写入是否已确认落盘」，改调 _update_registry_checked。
+        实现见 _update_registry_locked（唯一锁内主体）。"""
+        return self._update_registry_locked(
+            symbol, batch_id, identity, state=state, order_id=order_id, id_known=id_known,
+            order_kind=order_kind, role=role, layer=layer, side=side, intent=intent,
+            fail_count_incr=fail_count_incr, hard_locked=hard_locked,
+            terminated_reason=terminated_reason)[0]
+
+    def _update_registry_checked(self, symbol, batch_id, identity, state=None, order_id=None,
+                                 id_known=None, order_kind=None, role=None, layer=None,
+                                 side=None, intent=None, fail_count_incr=None,
+                                 hard_locked=None, terminated_reason=None):
+        """契约 §24.3 C1 / G1：创建路径专用——返回**本次意图写盘是否已确认落盘**。
+
+        True 当且仅当 _persist_states 返回 True；批次缺失、终态守卫拒绝、账本损坏拒写、
+        写入异常一律返回 False（Fail-Closed，调用方必须 `is not True` → 零 create_order）。
+
+        锁外告警（§24.3 C4）：_update_registry_locked 返回时已释放 _state_lock，
+        本函数体内再无持锁网络 IO（TG 最坏阻塞数秒，见 L2498-2500）。告警按键
+        (identity, state) 去重，复用 _converge_alert（同键 3 轮后静默，防 API 熔断）。
+        ⚠️ 告警本身失败不得改变门禁结论——try 包住只打印，返回值不受影响。"""
+        _new_fail_count, persisted_ok = self._update_registry_locked(
+            symbol, batch_id, identity, state=state, order_id=order_id, id_known=id_known,
+            order_kind=order_kind, role=role, layer=layer, side=side, intent=intent,
+            fail_count_incr=fail_count_incr, hard_locked=hard_locked,
+            terminated_reason=terminated_reason)
+        if persisted_ok is not True:
+            try:
+                self._converge_alert(
+                    ('intent_persist_failed', identity, state),
+                    f"保护单**意图未写入磁盘**，程序已阻止后续下单（Fail-Closed）\n"
+                    f"批次：`{batch_id}`\n"
+                    f"identity：`{identity}`\n"
+                    f"目标状态：`{state}`\n"
+                    f"✅ 该单**未创建**，交易所侧不会有对应订单\n"
+                    f"❌ 但状态文件写入失败——保护单将无法创建，**等于本层无保护**\n"
+                    f"🛠 请立即检查磁盘/`trade_state.json` 是否可写（损坏或只读），"
+                    f"修复前本批次的保护挂单都会被拦下",
+                    level='critical')
+            except Exception as _alert_e:
+                print(f"⚠️ [G1] 意图落盘告警发送失败（门禁结论不受影响）: {_alert_e}")
+        return persisted_ok
 
     def _commit_registry_txn(self, symbol, batch_id, reg_entries=None, batch_fields=None):
         """P0 Batch C 选项1（ChatGPT 批准 2026-08-29，严格限定 4 函数调用面）：
@@ -8076,18 +8142,21 @@ class CryptoTrader:
                                         f"⚠️ 部分减仓后止损换挂被仲裁拦截（旧单保留）\n"
                                         f"🆔 批次：`{batch_id}`\n📌 {gate_reason}",
                                         level='warning')
+                                elif self._update_registry_checked(symbol, batch_id, sl_identity, state='PENDING_CREATE',
+                                                                   id_known=False, order_kind='conditional', role='SL',
+                                                                   layer=sl_idx, side=sl_side_ident,
+                                                                   intent=self._build_intent(
+                                                                       symbol=symbol,
+                                                                       side='sell' if side == 'BUY' else 'buy',
+                                                                       qty=batch_filled_amount,
+                                                                       order_type='STOP_MARKET',
+                                                                       stop_price=formatted_sl_price,
+                                                                       reduce_only=sl_params.get('reduceOnly'))) is not True:
+                                    # C1/G1（契约 §24.3）：意图写盘未确认 → Fail-Closed 零下单。
+                                    # critical 已在 _update_registry_checked 内于锁外发出（C4）
+                                    print("  └─ 🚫 [G1] 意图未写入磁盘，已阻止换挂新止损单（旧止损单保留）")
                                 else:
-                                    # B2-2: 意图先落盘（崩溃安全 Create）+ intent 指纹
-                                    self._update_registry(symbol, batch_id, sl_identity, state='PENDING_CREATE',
-                                                          id_known=False, order_kind='conditional', role='SL',
-                                                          layer=sl_idx, side=sl_side_ident,
-                                                          intent=self._build_intent(
-                                                              symbol=symbol,
-                                                              side='sell' if side == 'BUY' else 'buy',
-                                                              qty=batch_filled_amount,
-                                                              order_type='STOP_MARKET',
-                                                              stop_price=formatted_sl_price,
-                                                              reduce_only=sl_params.get('reduceOnly')))
+                                    # B2-2：意图已落盘（写入与本次结果判定并入上方 elif 条件）→ 崩溃安全 Create
                                     new_sl_order = self._safe_api_call(
                                         self.exchange.create_order,
                                         symbol=symbol,
@@ -8914,20 +8983,23 @@ class CryptoTrader:
                                                 level='warning')
                                         current_sl_id = None
                                         sl_success = False
+                                    elif self._update_registry_checked(symbol, batch_id, sl_identity,
+                                                                       state='PENDING_CREATE', id_known=False,
+                                                                       order_kind='conditional', role='SL',
+                                                                       layer=batch_filled_count - 1,
+                                                                       side=params_base.get('positionSide',
+                                                                                            'LONG' if side == 'BUY' else 'SHORT'),
+                                                                       intent=self._build_intent(
+                                                                           symbol=symbol, side=sl_side,
+                                                                           qty=batch_filled_amount,
+                                                                           order_type='STOP_MARKET',
+                                                                           stop_price=sl_params.get('stopPrice'),
+                                                                           reduce_only=sl_params.get('reduceOnly'))) is not True:
+                                        # C1/G1（契约 §24.3）：意图写盘未确认 → Fail-Closed 零下单。
+                                        # critical 已在 _update_registry_checked 内于锁外发出（C4）
+                                        print("  └─ 🚫 [G1] 意图未写入磁盘，已阻止创建分层止损单")
                                     else:
-                                        # B2-2: 意图先落盘（崩溃安全）+ intent 指纹
-                                        self._update_registry(symbol, batch_id, sl_identity,
-                                                              state='PENDING_CREATE', id_known=False,
-                                                              order_kind='conditional', role='SL',
-                                                              layer=batch_filled_count - 1,
-                                                              side=params_base.get('positionSide',
-                                                                                   'LONG' if side == 'BUY' else 'SHORT'),
-                                                              intent=self._build_intent(
-                                                                  symbol=symbol, side=sl_side,
-                                                                  qty=batch_filled_amount,
-                                                                  order_type='STOP_MARKET',
-                                                                  stop_price=sl_params.get('stopPrice'),
-                                                                  reduce_only=sl_params.get('reduceOnly')))
+                                        # B2-2：意图已落盘（写入与本次结果判定并入上方 elif 条件）→ 崩溃安全 Create
                                         new_sl_order = self._safe_api_call(
                                             self.exchange.create_order,
                                             symbol=symbol,
@@ -9077,20 +9149,23 @@ class CryptoTrader:
                                                         f"💡 程序不重复挂单，等待自愈重查确认；请关注持仓保护状态！",
                                                         level='critical')
                                                 sl_success = False
+                                            elif self._update_registry_checked(symbol, batch_id, recovery_identity,
+                                                                               state='PENDING_CREATE', id_known=False,
+                                                                               order_kind='conditional', role='SL',
+                                                                               layer=batch_filled_count - 1,
+                                                                               side=params_base.get('positionSide',
+                                                                                                    'LONG' if side == 'BUY' else 'SHORT'),
+                                                                               intent=self._build_intent(
+                                                                                   symbol=symbol, side=sl_side,
+                                                                                   qty=old_sl_amount,
+                                                                                   order_type='STOP_MARKET',
+                                                                                   stop_price=recovery_params.get('stopPrice'),
+                                                                                   reduce_only=recovery_params.get('reduceOnly'))) is not True:
+                                                # C1/G1（契约 §24.3）：意图写盘未确认 → Fail-Closed 零下单。
+                                                # critical 已在 _update_registry_checked 内于锁外发出（C4）
+                                                print("  └─ 🚫 [G1] 意图未写入磁盘，已阻止补挂恢复止损单（旧止损单可能已不在）")
                                             else:
-                                                # B2-2: 意图先落盘（崩溃安全）+ intent 指纹
-                                                self._update_registry(symbol, batch_id, recovery_identity,
-                                                                      state='PENDING_CREATE', id_known=False,
-                                                                      order_kind='conditional', role='SL',
-                                                                      layer=batch_filled_count - 1,
-                                                                      side=params_base.get('positionSide',
-                                                                                           'LONG' if side == 'BUY' else 'SHORT'),
-                                                                      intent=self._build_intent(
-                                                                          symbol=symbol, side=sl_side,
-                                                                          qty=old_sl_amount,
-                                                                          order_type='STOP_MARKET',
-                                                                          stop_price=recovery_params.get('stopPrice'),
-                                                                          reduce_only=recovery_params.get('reduceOnly')))
+                                                # B2-2：意图已落盘（写入与本次结果判定并入上方 elif 条件）→ 崩溃安全 Create
                                                 recovery_order = self._safe_api_call(
                                                     self.exchange.create_order,
                                                     symbol=symbol,
@@ -9672,18 +9747,21 @@ class CryptoTrader:
                                 f"📌 {gate_reason}\n"
                                 f"💡 程序不重复挂单，等待自愈重查确认",
                                 level='warning')
+                    elif self._update_registry_checked(symbol, batch_id, identity, state='PENDING_CREATE',
+                                                       id_known=False, order_kind='conditional', role='SL',
+                                                       layer=idx, side=position_side,
+                                                       intent=self._build_intent(
+                                                           symbol=sl_params['symbol'],
+                                                           side=sl_params['side'],
+                                                           qty=sl_params['amount'],
+                                                           order_type=sl_params['type'],
+                                                           stop_price=sl_params['params'].get('stopPrice'),
+                                                           reduce_only=sl_params['params'].get('reduceOnly'))) is not True:
+                        # C1/G1（契约 §24.3）：意图写盘未确认 → Fail-Closed 零下单。
+                        # critical 已在 _update_registry_checked 内于锁外发出（C4）
+                        print("  └─ 🚫 [G1] 意图未写入磁盘，已阻止创建首次止损单")
                     else:
-                        # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知 + intent 指纹（B2-2）
-                        self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
-                                              id_known=False, order_kind='conditional', role='SL',
-                                              layer=idx, side=position_side,
-                                              intent=self._build_intent(
-                                                  symbol=sl_params['symbol'],
-                                                  side=sl_params['side'],
-                                                  qty=sl_params['amount'],
-                                                  order_type=sl_params['type'],
-                                                  stop_price=sl_params['params'].get('stopPrice'),
-                                                  reduce_only=sl_params['params'].get('reduceOnly')))
+                        # B2-2：意图已落盘（写入与本次结果判定并入上方 elif 条件）→ 崩溃安全 Create
                         new_sl_order = self._safe_api_call(
                             self.exchange.create_order,
                             symbol=sl_params['symbol'],
@@ -9832,18 +9910,21 @@ class CryptoTrader:
                                 f"📌 {gate_reason}\n"
                                 f"💡 程序不重复挂单，等待自愈重查确认",
                                 level='warning')
+                    elif self._update_registry_checked(symbol, batch_id, identity, state='PENDING_CREATE',
+                                                       id_known=False, order_kind='conditional', role='SL',
+                                                       layer=idx, side=position_side,
+                                                       intent=self._build_intent(
+                                                           symbol=symbol,
+                                                           side=sl_side,
+                                                           qty=batch_filled_amount,
+                                                           order_type='STOP_MARKET',
+                                                           stop_price=sl_params.get('stopPrice'),
+                                                           reduce_only=sl_params.get('reduceOnly'))) is not True:
+                        # C1/G1（契约 §24.3）：意图写盘未确认 → Fail-Closed 零下单。
+                        # critical 已在 _update_registry_checked 内于锁外发出（C4）
+                        print("  └─ 🚫 [G1] 意图未写入磁盘，已阻止创建兜底止损单")
                     else:
-                        # B1: 意图先落盘（崩溃安全 Create）—— 订单 ID 未知 + intent 指纹（B2-2）
-                        self._update_registry(symbol, batch_id, identity, state='PENDING_CREATE',
-                                              id_known=False, order_kind='conditional', role='SL',
-                                              layer=idx, side=position_side,
-                                              intent=self._build_intent(
-                                                  symbol=symbol,
-                                                  side=sl_side,
-                                                  qty=batch_filled_amount,
-                                                  order_type='STOP_MARKET',
-                                                  stop_price=sl_params.get('stopPrice'),
-                                                  reduce_only=sl_params.get('reduceOnly')))
+                        # B2-2：意图已落盘（写入与本次结果判定并入上方 elif 条件）→ 崩溃安全 Create
                         new_sl_order = self._safe_api_call(
                             self.exchange.create_order,
                             symbol=symbol,

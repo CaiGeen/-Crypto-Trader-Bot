@@ -54,6 +54,13 @@ def _make_base_fake():
 def _bind_helpers(fake, states):
     fake.load_all_states = lambda: states
     fake._update_registry = lambda s, b, i, **f: CryptoTrader._update_registry(fake, s, b, i, **f)
+    # C1/G1（契约 §24.3）：创建路径改走 _update_registry_checked，它内部调 _update_registry_locked。
+    # 两条都必须绑真实实现（同第 58 行坑）：漏绑 → 自动 mock 返回 MagicMock →
+    # `is not True` 恒成立 → G1 门禁在本 fake 上恒拦下单，T5/T6/T9 假红。
+    fake._update_registry_locked = (
+        lambda s, b, i, **f: CryptoTrader._update_registry_locked(fake, s, b, i, **f))
+    fake._update_registry_checked = (
+        lambda s, b, i, **f: CryptoTrader._update_registry_checked(fake, s, b, i, **f))
     fake._recheck_registry_self_heal = lambda s, b: CryptoTrader._recheck_registry_self_heal(fake, s, b)
     # ⚠️ MagicMock 坑（同 test_sg4）：fake 是 MagicMock，未显式绑定的方法会退化为自动 mock
     # （调用返回 MagicMock，不执行真实语义 → verify 恒 success / classify 恒 failed）。
@@ -71,7 +78,10 @@ def _bind_helpers(fake, states):
     #（同 _assert_create_allowed 的既有坑，第 5 次实证；G3b/G3a/反查同绑防后续路径触达）。
     import threading as _th
     fake._state_lock = _th.Lock()          # 生产同款非重入锁（L153）
-    fake._persist_states = lambda all_s: None   # states 为共享引用，无需落盘
+    # states 为共享引用，本 fake 不做真实落盘——但 **必须返回 True**：
+    # G1 门禁读 `_persist_states` 的返回值（无异常 ≠ 已落盘），返回 None 会被判为
+    # 「写入失败」→ Fail-Closed 拦下单 → T5/T6/T9 假红。此处语义 = 「模拟落盘成功」。
+    fake._persist_states = lambda all_s: True
     for _n in ('_final_pre_create_check', '_commit_protection_with_g3',
                '_g3a_converge_race_order', '_g3_cancel_race_order',
                '_g3_log_position_recheck', '_find_registry_identity_by_order_id',

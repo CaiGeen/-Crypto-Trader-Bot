@@ -8,25 +8,29 @@
 不变量只有注释、没有代码强制**，而入场路径有（L6012 `save_batch_state(...) is not True`
 → Fail-Closed、零 `create_order`）。
 
-- **T3 / L9677**：首次挂止损前先 `_update_registry(state='PENDING_CREATE', intent=...)`，
-  但 `_update_registry` 内部 L6621 **不检查** `_persist_states()` 返回值，调用方也不检查
+- **T3 / 首次+兜底 SL**：挂止损前先 `_update_registry(state='PENDING_CREATE', intent=...)`，
+  但 `_update_registry` 内部**不检查** `_persist_states()` 返回值，调用方也不检查
   → 意图写盘失败时**仍然 `create_order`**，磁盘上没有可靠锚点。
-- **T4 / L6395**：`_commit_protection_with_g3` 在持锁段内直写 `entry['state']='CONFIRMED'`
+  ✅ **C1/G1 已落地**：7 个 SL 创建入口改走 `_update_registry_checked`，见下 N1/N1a。
+- **T4 / `_commit_protection_with_g3`**：在持锁段内直写 `entry['state']='CONFIRMED'`
   后 `self._persist_states(all_states)`（**不检查返回**）→ 写盘失败仍 `return 'committed'`。
+  ⏳ **C2/G2 尚未落地**，T4 仍为表征测试。
 
-## 本文件的性质：**characterization（表征）测试，不是 RED**
+## 本文件的性质：**混合**——G1 已落地（负测），G2 未落地（仍表征）
 
-> ⚠️ **本文件全绿 = 缺陷被成功复现，不代表保护链通过验收。**
-> 门禁日志里 `test_protection_write_gates.py PASS rc=0` 这一行**不可**读成
-> 「止损写盘安全已验证」——恰恰相反，它钉住的是当前两处门禁缺失的行为。
-> 真正的验收要等定点修复落地、并把本文件改写成检验期望行为的负测之后。
+### ✅ N1 / N1a：G1 负测（检验**期望行为**，全绿 = G1 生效）
 
-断言的是**代码当前实际行为**，因此全绿。这是刻意选择：根目录 `test_*.py` 非 0 退出会被
-`run_test_gate.py` 记为 `FAIL` / `BASELINE-FAIL`，留一批永久红测试只会污染门禁语义。
-修法设计时（前置问题见送审文档：运行期如何禁止重建 + 重启后如何对账）再补 RED 负测。
+- **N1** 注入意图写盘失败 → **零 STOP_MARKET `create_order`** + 锁外 critical + 磁盘无 `PENDING_CREATE` 锚点。
+  ⚠️ 计数**只看 STOP_MARKET**：TP 创建走的是未门禁的独立路径（契约 §24.2 登记为相邻缺陷），
+  本测会把「意图写盘失败但 TP 仍被创建」如实打印出来，但不作为 N1 的失败依据。
+- **N1a** 结构断言：**7 个 SL 创建入口全部**走 `_update_registry_checked`（防后续新增入口绕过门禁）。
 
-因此每条断言都写成「当前行为 = X（缺陷）」并在名称里标注，修复后这些断言会失败，
-提醒同步更新——这是有意的变更探测器，不是回归。
+### ⏳ T4 / T3d：仍是表征测试（检验**缺陷**，全绿 = G2 缺陷仍在）
+
+C2/G2 尚未实现，故 T4 仍钉住「确认写盘失败仍返回 committed」。
+**C2 落地后 T4 断言会失败**，届时按 §24.4 改写为 N2 / N2a / N3。
+
+> ⚠️ **不能只凭本文件 rc=0 判定「止损写盘安全已验证」**——它现在只证明 G1 生效。
 
 ## 注入方式
 
@@ -48,6 +52,7 @@ helper 绑定清单沿用 `test_b1_state_machine.py` 的 `_bind_helpers`（含�
 
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -142,6 +147,15 @@ def _make_fake(state_path, states):
     fake.load_all_states = lambda: states
     fake._persist_states = lambda all_s: CryptoTrader._persist_states(fake, all_s)
     fake._update_registry = lambda s, b, i, **f: CryptoTrader._update_registry(fake, s, b, i, **f)
+    # ⚠️ C1/G1 三条包装**必须**绑真实实现（第 8 次 MagicMock 陷阱）：
+    # 漏绑 → MagicMock 返回值不是 True → `is not True` 恒成立 → 门禁在**无注入**时也拦下单，
+    # 对照组会假红、负测会假绿。_converge_alert 是告警唯一出口，不绑则 critical 记不进 fake.sent。
+    fake._update_registry_locked = (
+        lambda s, b, i, **f: CryptoTrader._update_registry_locked(fake, s, b, i, **f))
+    fake._update_registry_checked = (
+        lambda s, b, i, **f: CryptoTrader._update_registry_checked(fake, s, b, i, **f))
+    fake._converge_alert = (
+        lambda key, msg, level='critical': CryptoTrader._converge_alert(fake, key, msg, level=level))
 
     for name in ("_protection_identity", "_build_intent", "_order_matches_intent",
                  "_assert_create_allowed", "_final_pre_create_check",
@@ -174,10 +188,11 @@ def _params_base():
 
 
 # --------------------------------------------------------------------------
-# T3：意图写盘失败（L9677）→ 是否仍 create_order / 磁盘是否留下锚点
+# N1（G1 负测）：意图写盘失败 → 零 STOP_MARKET 下单 / 锁外 critical / 磁盘无锚点
 # --------------------------------------------------------------------------
 
-def check_t3_intent_write_failure_still_creates_order():
+def check_n1_intent_write_failure_blocks_create():
+    """N1（契约 §24.4）：注入意图写盘失败，期望 G1 门禁 Fail-Closed 零下单。"""
     d, state_path = _fresh_state_file()
     try:
         _seed_batch(state_path)
@@ -189,32 +204,69 @@ def check_t3_intent_write_failure_still_creates_order():
                 fake, SYMBOL, BATCH, 0, 0.43, _tp_params(), _layer_sl_params(),
                 False, _params_base(), [55000.0])
 
-        created = fake.exchange.create_order.called
+        # ⚠️ 只统计止损单：TP 创建走未门禁的独立路径（§24.2 相邻缺陷），不计入本测
+        sl_creates = [c for c in fake.exchange.create_order.call_args_list
+                      if c.kwargs.get("type") == "STOP_MARKET"]
+        all_types = [c.kwargs.get("type") for c in fake.exchange.create_order.call_args_list]
         disk = _read_disk(state_path)
         reg = disk.get(SYMBOL, {}).get(BATCH, {}).get("protection_registry", {})
         anchored = any(v.get("state") == "PENDING_CREATE" for v in reg.values())
-
-        # 当前实际行为 = 缺陷：意图没落盘，交易所照收单
-        report(
-            "T3a 意图写盘失败时仍 create_order（当前行为=缺陷）",
-            created is True,
-            f"create_order 被调用={created}；磁盘 PENDING_CREATE 锚点存在={anchored}。"
-            f"期望（修复后）= 不调用，且必须先有锚点")
+        crit = [m for lvl, m in fake.sent if lvl == "critical"]
+        gate_ran = any("意图未写入磁盘" in m for m in crit)
 
         report(
-            "T3b 意图写盘失败 → 磁盘无可靠锚点（当前行为=缺陷）",
+            "N1a 意图写盘失败 → 零 STOP_MARKET create_order（G1 Fail-Closed）",
+            len(sl_creates) == 0,
+            f"STOP_MARKET 下单={len(sl_creates)} 次；全部下单类型={all_types}。"
+            f"⚠️ 若出现 TAKE_PROFIT_MARKET，属 §24.2 已登记的 TP 相邻缺陷，不计入本测")
+
+        report(
+            "N1b 意图写盘失败 → 已发锁外 critical（且证明门禁确实执行到）",
+            gate_ran,
+            f"critical 记录={crit}（须含『意图未写入磁盘』——否则是门禁根本没跑到的假绿）")
+
+        report(
+            "N1c 意图写盘失败 → 磁盘无 PENDING_CREATE 锚点（写入确实失败）",
             anchored is False,
-            f"protection_registry={ {k: v.get('state') for k, v in reg.items()} }；"
-            f"无锚点即『交易所有单、本地无账本』窗口（L6010 注释要防的正是这个）")
-
-        report(
-            "T3c 该分支未发出 critical 告警（仅限本路径，不等于全系统无告警）",
-            not any(lvl == "critical" for lvl, _ in fake.sent),
-            f"send_tg_notification 记录={fake.sent}（期望修复后有资金安全 critical）。"
-            f"⚠️ 口径：本项只覆盖**该保护单创建路径**；未驱动新开仓信号验证风险闸门、"
-            f"未覆盖独立巡检（健康巡检.py），**全系统告警结论未验证**")
+            f"protection_registry={ {k: v.get('state') for k, v in reg.items()} }")
     finally:
         _restore_state_file()
+
+
+# --------------------------------------------------------------------------
+# N1a（结构）：7 个 SL 创建入口必须全部走 checked，防止新增入口绕过门禁
+# --------------------------------------------------------------------------
+
+def check_n1a_all_sl_entrances_gated():
+    """静态断言：所有 `role='SL'` 的 `state='PENDING_CREATE'` 写入都必须经
+    `_update_registry_checked`。逐点驱动 `_start_monitoring` 深层分支成本极高
+    （该路径有 5 个已记录的 MagicMock 陷阱），故用结构断言覆盖全部 7 处，
+    行为正确性由 N1（首次/兜底）实证。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trader_260725.py")
+    lines = open(path, encoding="utf-8").read().split("\n")
+    gated, bad = 0, []
+    for i, s in enumerate(lines, 1):
+        if "state='PENDING_CREATE'" not in s:
+            continue
+        block = "\n".join(lines[i - 1:i + 12])
+        if "role='SL'" not in block:
+            continue
+        caller = None
+        for j in range(i - 1, max(i - 8, 0), -1):
+            m = re.search(r"self\._update_registry(_checked)?\(", lines[j])
+            if m:
+                caller = m.group(0)
+                break
+        if caller == "self._update_registry_checked(":
+            gated += 1
+        else:
+            bad.append("L%d(%s)" % (i, caller))
+
+    report(
+        "N1a 全部 role='SL' 意图写入都走 _update_registry_checked（当前应 7 处）",
+        not bad and gated == 7,
+        f"已门禁={gated}；未门禁={bad}。任一 SL 入口绕过门禁即失败；"
+        f"新增 SL 入口也会因 gated != 7 而被逼审")
 
 
 # --------------------------------------------------------------------------
@@ -333,7 +385,8 @@ def check_control_persist_works_without_injection():
 
 CHECKS = [
     check_control_persist_works_without_injection,
-    check_t3_intent_write_failure_still_creates_order,
+    check_n1_intent_write_failure_blocks_create,
+    check_n1a_all_sl_entrances_gated,
     check_t3_restart_cannot_reconcile_orphan_sl,
     check_t4_confirm_write_failure_still_returns_committed,
 ]

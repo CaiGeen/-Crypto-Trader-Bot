@@ -236,11 +236,16 @@ def make_fake(states, open_orders):
     # G3b/G3a 链同绑（_persist_states 桩 + states 共享引用，registry 语义由 B2 套件覆盖）。
     import threading as _th
     fake._state_lock = _th.Lock()          # 生产同款非重入锁
-    fake._persist_states = lambda all_s: None
+    fake._persist_states = lambda all_s: True  # G1 门禁读返回值；None 会被判为写入失败
+                                          # → Fail-Closed 恢复单也拦 → 假红
     for _n in ('_final_pre_create_check', '_commit_protection_with_g3',
                '_g3a_converge_race_order', '_g3_cancel_race_order',
                '_g3_log_position_recheck', '_find_registry_identity_by_order_id',
                '_verify_and_update_registry',
+               # C1/G1（契约 §24.3）：恢复单创建前先过 _update_registry_checked（其内部调
+               # _update_registry_locked）。漏绑 → 自动 mock → `is not True` 恒成立 →
+               # G1 门禁把恢复单也拦下 → 「C/恢复创建STOP_MARKET」假红。
+               '_update_registry_locked', '_update_registry_checked',
                # P5f：finally 清理授权（返回二元组）——未绑定时 MagicMock 解包抛
                # ValueError，驱动用例直接崩（同 _assert_create_allowed 坑）
                '_finally_cleanup_decision', '_cleanup_authorization_still_valid'):
