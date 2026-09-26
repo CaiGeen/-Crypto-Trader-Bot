@@ -16,6 +16,11 @@
 
 ## 本文件的性质：**characterization（表征）测试，不是 RED**
 
+> ⚠️ **本文件全绿 = 缺陷被成功复现，不代表保护链通过验收。**
+> 门禁日志里 `test_protection_write_gates.py PASS rc=0` 这一行**不可**读成
+> 「止损写盘安全已验证」——恰恰相反，它钉住的是当前两处门禁缺失的行为。
+> 真正的验收要等定点修复落地、并把本文件改写成检验期望行为的负测之后。
+
 断言的是**代码当前实际行为**，因此全绿。这是刻意选择：根目录 `test_*.py` 非 0 退出会被
 `run_test_gate.py` 记为 `FAIL` / `BASELINE-FAIL`，留一批永久红测试只会污染门禁语义。
 修法设计时（前置问题见送审文档：运行期如何禁止重建 + 重启后如何对账）再补 RED 负测。
@@ -203,9 +208,11 @@ def check_t3_intent_write_failure_still_creates_order():
             f"无锚点即『交易所有单、本地无账本』窗口（L6010 注释要防的正是这个）")
 
         report(
-            "T3c 意图写盘失败 → 全链路无 critical 告警",
+            "T3c 该分支未发出 critical 告警（仅限本路径，不等于全系统无告警）",
             not any(lvl == "critical" for lvl, _ in fake.sent),
-            f"send_tg_notification 记录={fake.sent}（期望修复后有资金安全 critical）")
+            f"send_tg_notification 记录={fake.sent}（期望修复后有资金安全 critical）。"
+            f"⚠️ 口径：本项只覆盖**该保护单创建路径**；未驱动新开仓信号验证风险闸门、"
+            f"未覆盖独立巡检（健康巡检.py），**全系统告警结论未验证**")
     finally:
         _restore_state_file()
 
@@ -287,9 +294,10 @@ def check_t4_confirm_write_failure_still_returns_committed():
             f"『交易所有单、本地无账本』窗口")
 
         report(
-            "T4c 确认写盘失败 → 无 critical 告警",
+            "T4c 该确认路径未发出 critical 告警（仅限本路径，不等于全系统无告警）",
             not any(lvl == "critical" for lvl, _ in fake.sent),
-            f"send_tg_notification 记录={fake.sent}")
+            f"send_tg_notification 记录={fake.sent}。⚠️ 口径同 T3c：只覆盖该确认路径，"
+            f"全系统告警结论未验证")
     finally:
         _restore_state_file()
 
@@ -310,11 +318,15 @@ def check_control_persist_works_without_injection():
         disk = _read_disk(state_path)
         reg = disk.get(SYMBOL, {}).get(BATCH, {}).get("protection_registry", {})
         states_seen = [v.get("state") for v in reg.values()]
+        # 严格钉住「PENDING_CREATE → CONFIRMED」完整链：registry 每个 identity 只有一条、
+        # 原地覆盖（L6619 只刷新 updated_at），所以成功链的**终态**必须是 CONFIRMED。
+        # 早期版本写成 `PENDING_CREATE or CONFIRMED`，那太松——停在 PENDING_CREATE
+        # 也算过，而那正是 T4 注入后的状态。
         report(
-            "C1 对照组：不注入故障时 PENDING_CREATE 确实落盘（证明注入有效）",
-            "PENDING_CREATE" in states_seen or "CONFIRMED" in states_seen,
-            f"registry 各条 state={states_seen}，create_order 调用="
-            f"{fake.exchange.create_order.call_count} 次")
+            "C1 对照组：无注入时 PENDING_CREATE → CONFIRMED 完整链落盘（证明注入有效）",
+            states_seen == ["CONFIRMED"],
+            f"registry 各条 state={states_seen}（期望恰为 ['CONFIRMED']：意图已推进到确认），"
+            f"create_order 调用={fake.exchange.create_order.call_count} 次")
     finally:
         _restore_state_file()
 
