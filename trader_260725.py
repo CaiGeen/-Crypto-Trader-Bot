@@ -6333,6 +6333,20 @@ class CryptoTrader:
                 # create 已发生但批次已进入平仓/已清理 → G3a 收敛（锁外，可发 API）
                 self._g3a_converge_race_order(symbol, batch_id, identity, order_id,
                                               order_kind=order_kind, desc=desc)
+            elif isinstance(g3, tuple) and len(g3) == 2 and g3[0] == 'persist_failed':
+                # C2 消费点①（契约 §24.3）：确认写盘未确认 → **不得** `return 'success'`。
+                # 本函数在锁外（_commit_protection_with_g3 已释放 _state_lock），
+                # 故由这里发 critical；措辞必须写明「交易所可能已有该单」供人工对账。
+                self.send_tg_notification(
+                    f"🚨【资金安全】保护单确认未落盘（PERSIST_FAILED）\n"
+                    f"🆔 批次：`{batch_id}` / `{symbol}`\n"
+                    f"📌 {desc}（identity `{identity}`）\n"
+                    f"📋 订单：`{g3[1]}`\n"
+                    f"⚠️ 该单已在交易所创建并 verify 成功，但**本地确认写盘未成功**\n"
+                    f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
+                    f"🛠️ 请人工核实并补记，避免重复挂单！",
+                    level='critical')
+                return 'persist_failed'
             return 'success'
         elif verify_result == 'not_found':
             self._update_registry(symbol, batch_id, identity, state='NOT_CONFIRMED',
@@ -6377,9 +6391,18 @@ class CryptoTrader:
         关闭线程写 close_phase=1 同样必须先拿 _state_lock 才能落盘 → 二者串行化，
         复核与 Commit 之间无线程穿插点（现状 _update_registry 锁外复核 TOCTOU 终结）。
         返回：
-          'committed'    → 批次存活且未进入平仓 → registry 已写 CONFIRMED 并落盘
+          'committed'    → 批次存活且未进入平仓 → registry 已写 CONFIRMED **且本次已落盘**
           'g3_triggered' → 批次缺失/已进入平仓（close_phase≥1 或 legacy pending_close）
                            → 未写 CONFIRMED；调用方须转 _g3a_converge_race_order 收敛
+          ('persist_failed', order_id)
+                         → **C2 第三态（契约 §24.3）**：确认写盘**未确认**。锁内已把
+                           CONFIRMED 写进本次 load 的副本，但 _persist_states 未返回 True
+                           → 磁盘仍停在 PENDING_CREATE（磁盘重读仍非 CONFIRMED）。
+                           **不得**当 'committed' 处置。携带 order_id：交易所可能已有该单，
+                           供锁外 critical 告警与人工对账使用。
+        ⚠️ **四个调用点必须逐一显式处理第三态**——只改返回值、不改消费点，第三态会被
+           依次当成：站点1 直接 `return 'success'`、站点2/3/4 落入 `else` 成功簿记
+           （站点3/4 还会 `_gate_alert_clear` 连既有告警额度一起清掉）。
         边界：锁内零交易所 API；_state_lock 非重入 → 禁止调用 save_batch_state/
         _update_registry（内部再取锁会死锁），直接操作 dict + _persist_states（L1249 契约）。"""
         with self._state_lock:
@@ -6400,7 +6423,11 @@ class CryptoTrader:
             if order_kind:
                 entry['order_kind'] = order_kind
             entry['updated_at'] = time.time()
-            self._persist_states(all_states)
+            # C2（契约 §24.3）：确认写盘必须**逐次**拿到本次结果——"无异常" ≠ "已落盘"。
+            # 此处若丢弃返回值，写盘失败仍返回 'committed'，四个消费点会把
+            # 『交易所有单、账本无记录』当成功处置（含 _gate_alert_clear 清掉告警额度）。
+            if self._persist_states(all_states) is not True:
+                return ('persist_failed', order_id)
             return 'committed'
 
     def _g3_cancel_race_order(self, symbol, order_id, order_kind='conditional') -> bool:
@@ -7500,6 +7527,15 @@ class CryptoTrader:
                     f"⚠️ 网络异常，无法确认该订单是否已在交易所创建\n"
                     f"💡 程序【未记录】此订单（不 Commit），也不会自动补单\n"
                     f"🛠️ 请到交易所核实是否存在该订单，避免重复挂单！")
+        if verify_result == 'persist_failed':
+            # C2（契约 §24.3）：第三态必须有**自己的**文案。落到下面的 NOT_FOUND 分支会
+            # 发出「交易所返回订单不存在」——与事实**相反**（该单已 verify 成功并存在），
+            # 会误导人工判断为无需处理，正是本契约要消除的风险。
+            return (f"🚨 **保护单确认未落盘（PERSIST_FAILED）**\n"
+                    f"📌 {desc} ID `{order_id}` ({symbol})\n"
+                    f"⚠️ 该单已在交易所创建并 verify 成功，但本地确认写盘未成功\n"
+                    f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
+                    f"🛠️ 请人工核实并补记，避免重复挂单！")
         return (f"❌ **订单创建验证失败（NOT_FOUND）**\n"
                 f"📌 {desc} ID `{order_id}` ({symbol})\n"
                 f"⚠️ 交易所返回订单不存在，程序【未记录】此订单（不 Commit）。")
@@ -9808,6 +9844,17 @@ class CryptoTrader:
                                 self._g3a_converge_race_order(
                                     symbol, batch_id, identity, new_sl_order['id'], 'conditional',
                                     desc='预生成止损单')
+                            elif isinstance(_g3, tuple) and len(_g3) == 2 and _g3[0] == 'persist_failed':
+                                # C2 消费点②（契约 §24.3）：**不得**落入 else 成功簿记
+                                # （不写 current_sl_id、不从 pending 移除、不打印「已挂出」）。
+                                self.send_tg_notification(
+                                    f"🚨【资金安全】预生成止损单确认未落盘（PERSIST_FAILED）\n"
+                                    f"🆔 批次：`{batch_id}` / `{symbol}`\n"
+                                    f"📋 订单：`{_g3[1]}`\n"
+                                    f"⚠️ 该单已在交易所创建并 verify 成功，但本地确认写盘未成功\n"
+                                    f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
+                                    f"🛠️ 请人工核实并补记，避免重复挂单！",
+                                    level='critical')
                             else:
                                 sl_price = sl_params['params']['stopPrice']
                                 latest_b_data['current_sl_id'] = new_sl_order['id']
@@ -9971,6 +10018,18 @@ class CryptoTrader:
                                 self._g3a_converge_race_order(
                                     symbol, batch_id, identity, new_sl_order['id'], 'conditional',
                                     desc='兜底止损单')
+                            elif isinstance(_g3, tuple) and len(_g3) == 2 and _g3[0] == 'persist_failed':
+                                # C2 消费点③（契约 §24.3）：**不得**落入 else——否则会
+                                # `_gate_alert_clear(identity)` 把**既有** FAILED 告警额度一并清掉，
+                                # 还会写 current_sl_id、打印「止损单已挂出(兜底)」。
+                                self.send_tg_notification(
+                                    f"🚨【资金安全】兜底止损单确认未落盘（PERSIST_FAILED）\n"
+                                    f"🆔 批次：`{batch_id}` / `{symbol}`\n"
+                                    f"📋 订单：`{_g3[1]}`\n"
+                                    f"⚠️ 该单已在交易所创建并 verify 成功，但本地确认写盘未成功\n"
+                                    f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
+                                    f"🛠️ 请人工核实并补记，避免重复挂单！",
+                                    level='critical')
                             else:
                                 # ChatGPT 终审（2026-08-20）：兜底 SL 成功挂出 = 真正恢复 →
                                 # 恢复 FAILED 告警 3 次额度（L4885 直发点同 identity 去重计数）
@@ -10134,6 +10193,18 @@ class CryptoTrader:
                             self._g3a_converge_race_order(
                                 symbol, batch_id, identity, new_tp_order['id'], 'conditional',
                                 desc='预生成止盈单')
+                        elif isinstance(_g3, tuple) and len(_g3) == 2 and _g3[0] == 'persist_failed':
+                            # C2 消费点④（契约 §24.3，**不能因 TP 属 §24.2 相邻缺陷而漏**）：
+                            # 共用的 G3 返回值改了，本点必须同样**不落入 else**——否则会
+                            # `_gate_alert_clear(identity)`、写 tp_order_id、打印「已挂出」。
+                            self.send_tg_notification(
+                                f"🚨【资金安全】预生成止盈单确认未落盘（PERSIST_FAILED）\n"
+                                f"🆔 批次：`{batch_id}` / `{symbol}`\n"
+                                f"📋 订单：`{_g3[1]}`\n"
+                                f"⚠️ 该单已在交易所创建并 verify 成功，但本地确认写盘未成功\n"
+                                f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
+                                f"🛠️ 请人工核实并补记，避免重复挂单！",
+                                level='critical')
                         else:
                             # ChatGPT 终审（2026-08-20）：预生成 TP 成功挂出 = 真正恢复 → 恢复 FAILED 告警额度
                             self._gate_alert_clear(identity)
