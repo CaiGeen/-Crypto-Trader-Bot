@@ -1419,7 +1419,109 @@ SMTP 被 mock 了、但 `log()` 没被 mock，于是那句一模一样的成功�
 - 第 3 批次信号继续冻结（网络错误后 60~90s 监控放大窗口未收口）。
 - `save_batch_state` 布尔契约约 30 处调用仍未消费。
 - `test_v64_p3_lifecycle.py` 6 项既有失败待独立排查。
-- 测试污染生产 `patrol.log` + 测试无隔离（§25.4 / §25.5）——待另起批次。
+- 测试污染生产 `patrol.log` + 测试无隔离（§25.4 / §25.5）——**第十六轮已修，见 §26**。
+
+---
+
+## 26. 第十六轮：ChatGPT 78/100，三条全部成立
+
+### 26.1 P1：`{"BTC/USDT:USDT": []}` 也能通过"根是 dict"的校验
+
+ChatGPT 给的是能从源码直接推出来的反例，我先 RED 复现，结果比它说的更糟：
+
+| 载荷 | 旧实现 |
+| --- | --- |
+| `{"BTC/USDT:USDT": []}` | **`return True`** —— `([] or {})` → `{}` → `None` → "批次不存在"，谎报已清理 |
+| `{"BTC/USDT:USDT": "x"}` | **`AttributeError` 抛在 `_state_lock` 里** —— 锁内崩溃，比误报更严重 |
+| `{"BTC/USDT:USDT": {"b1": 123}}` | 靠墓碑写入的 `try/except` 兜底返回 `False`，不是有意设计 |
+
+修复不打在 `clear_batch_state` 局部，而是打在**唯一读取入口 `load_all_states`**：
+把不变量 `{symbol: {batch_id: dict}}` 校验到两层，任一层类型非法就置
+`_state_corrupted=True` + 返回占位 `{}`。这样第十五轮那条 Fail-Closed（`clear` 返回
+`False` + 锁外 critical + 磁盘原样、`_persist_states` 拒绝覆盖）**自动覆盖新反例**，
+同时保护 `save` / `recover` / `finalize` 等所有调用方。
+
+不是新分支，是把已有的契约补完整。修复后 26/26。
+
+**爆炸半径**：全库唯一 symbol 节点写入是 `all_states[symbol] = {}`；6 处测试 payload
+全是合法两层结构；`bot_runner:2743` / `trader:5353` 早已把损坏标志接进
+`recover=False → _ready=False`，内层损坏走的是同一条既有 Fail-Closed。
+
+### 26.2 P2：门禁"PASS"这个词被滥用了
+
+两点都对：`BASELINE-FAIL` / `NOT-VERIFIED` 不影响最后打印裸 `PASS`；基线脚本
+**只要仍返回 1 就算过**，失败项从 6 涨到 8 也照样过——对一个恒返回 1 的脚本，
+退出码比对等于没校验。
+
+`run_test_gate.py` 改成：
+
+- **结论三态**：`ALL-GREEN`（四项全 0）/ `COMPLETED-WITH-EXCEPTIONS —— 运行完成，但不是全绿` / `FAIL`。
+  任何情况下都不再有孤立的 `PASS`。
+- **`BASELINE-DRIFT`（致命）**：登记 `p3` 应打印 `GREEN: 3/9` 并从 stdout 实测比对。
+  **变好也判漂移**——说明基线该摘除；变坏说明真回归。
+
+### 26.3 P3：测试在生产日志里留了一段和真告警一字不差的字
+
+8 个调用 `patrol.send_email / alert / run_check` 的测试点现在**全部 patch `patrol.log`**，
+同时保留原断言意图（"确实记录了成功"，只是记到被 patch 的 log 上）。
+
+实测：单跑两个污染源文件前后 `logs/patrol.log` 字节数 `69446 → 69446`；
+整轮门禁跑完仍 `69446`。
+
+**存量没删**（改生产日志属破坏性动作，需授权）：全文件 142 行测试标记，
+2026-09-26 当日 20 行。
+
+**同时补上结构性隔离**：门禁新增"生产哨兵"，跑前跑后对生产状态文件做内容指纹比对，
+变了就 rc=1，**与测试是否通过无关**；并对运行中的 Bot 做进程提示。哨兵选型逐个实测过
+写频率——`.notify.state.json` / `.bot_health\control.json` 每 10s 被生产写、
+`.patrol_alert.state.json` 每轮巡检写，都不能用；最终只保留
+`trade_state.json` + `.daily_report.state.json` + patrol.log 测试标记行。
+哨兵本身有正/反向证据：故意改一个文件能抓到，不改不会误报。
+
+顺带撤回 §18.4 里"`.notify_queue/` 前后均 0"那条——**该目录根本不存在**，
+`os.listdir` 恒抛异常被吞成 0，那不是隔离证据。
+
+### 26.4 M5 被质疑"证据不足"，逐条补到源码层
+
+| 质疑 | 补证 |
+| --- | --- |
+| `trade_state.json` mtime 证明不了日报状态 | 直接给 `.daily_report.state.json` 内容 `{"date":"2026-09-26",...,"done":{"tg":true}}`，它就是状态机自己记的"今日已发" |
+| 08:30:51 是不是测试写的 | **生产写的**：`_daily_report_loop` 在 `08:05..08:30 每 5 分钟`每次尝试后都 `_persist_daily_report_state()`。反证：单跑 5 个嫌疑测试 mtime 均未变 |
+| 不重发不能只看日志缺行 | **机制保证**：`_try_daily_report_once` 首行 `if self._last_daily_report_date == today: return 'idle'`；`_load_daily_report_state_into()` 会把 `date` 还原回来 → **重启后也不重发**。全日 `[日报]` 仅 08:05:28 一行 |
+| 没有 `TG 告警` 行不足以排除邮件 | 三条独立路径：`DAILY_REPORT_EMAIL_ENABLED=False` → `required=("tg")`，**邮件通道从未被尝试**；`通道自检=0`、`开机自启=0`；巡检 `fail/ERROR/⚠` 各 0 + `restarts=0` + `fatal_alert=null` → 无 health 事件可绕过持仓闸门 |
+
+**仍 NOT VERIFIED**：邮箱读不到，"未收到邮件"无法独立复核。
+
+### 26.5 顺带查出一条新问题（未修）
+
+`bot_runner.py:2855-2865` 把 `_process_notify_queue_once()` 和
+`write_progress('control', ...)` 放进同一个 `except`，都打印
+`⚠️ 处理通知队列失败`。今日 08:31:51 / 08:55:00 两条其实是
+`.bot_health\control.json` 原子替换 `WinError 5`——**通知队列其实处理成功了**，
+日志却把人往队列问题上引；反过来真·队列失败也无法与进度写失败区分。
+09-23/24/25 各 0 次、今日新增 2 次，**成因未定位**，不猜。通知未丢失
+（队列处理在前、进度写在后，异常被吞只降级成一条 warning）。
+
+### 26.6 门禁实测（可由单次运行复现）
+
+`python run_test_gate.py` → rc=0，日志 `logs/gate_round16_final.log`：
+
+- pytest **83 passed, 3 subtests**，exit=0
+- 脚本式 50 项 **PASS 48 / BASELINE-FAIL 1 / NOT-VERIFIED 1 / BASELINE-DRIFT 0 / FAIL 0**
+- 结论 **`COMPLETED-WITH-EXCEPTIONS —— 运行完成，但不是全绿`**（不再有裸 `PASS`）
+- **生产哨兵**：`trade_state.json` `(14245, 308e87f3…)`、`.daily_report.state.json`
+  `(106, e4043f6d…)`、`patrol.log` 测试标记 `142` → 前后**全部未变**
+- 检测到生产 Bot 在跑：`pid=[38636, 33968, 42176, 46752]`
+- `p3` 实测 `GREEN: 3/9`，与 `BASELINE_GREEN=(3,9)` 一致 → 无漂移
+
+### 26.7 仍未闭环
+
+- 第 3 批次信号继续冻结（网络错误后 60~90s 监控放大窗口未收口）。
+- `save_batch_state` 布尔契约约 30 处调用仍未消费。
+- `test_v64_p3_lifecycle.py` 6 项既有失败待独立排查。
+- **§26.1 的修复尚未生效于运行中的 Bot**（进程 08:20:18 启动，早于本次编辑），需重启加载。
+- patrol.log 存量 142 行测试标记待授权清理。
+- `control.json` 的 `WinError 5` 成因待查（截至 09:31 未复现，仍为 2 条）。
 
 
 
