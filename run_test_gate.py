@@ -18,20 +18,42 @@
 
 ## 输出口径（禁止再出现"全绿"这种含糊说法）
 
-  PASS         退出码 0
-  BASELINE-FAIL 退出码 1，且已登记为"基线即如此"（有基线实测支撑）
-  NOT-VERIFIED 退出码 42，Bot 运行中持互斥体所致，需停机窗口补验
-  FAIL         退出码不在预期集合内 —— 真回归
+  PASS           退出码 0
+  BASELINE-FAIL  退出码 1，且已登记为"基线即如此"（有基线实测支撑）
+  NOT-VERIFIED   退出码 42，Bot 运行中持互斥体所致，需停机窗口补验
+  BASELINE-DRIFT 退出码在预期集合内，但**失败项组成**与登记基线不符 —— 必须处理
+  FAIL           退出码不在预期集合内 —— 真回归
 
-  汇总行同时给出 4 个计数。"PASS 48 / FAIL 0" 不等于"全绿"，
-  NOT-VERIFIED 必须单独列出来。
+  汇总行同时给出 5 个计数。"PASS 48 / FAIL 0" 不等于"全绿"，
+  BASELINE-FAIL 与 NOT-VERIFIED 必须单独列出来。
+
+## 进程退出码（第十七轮 ChatGPT P1：不能只靠文字，退出码也必须能区分）
+
+  0 = ALL-GREEN                    全部退出码 0，无任何待验证项
+  1 = FAIL                         真回归 / 基线漂移 / 生产哨兵变化 / --strict 下未验证
+  2 = COMPLETED-WITH-EXCEPTIONS    运行完成，仅含**已登记**的基线失败与待验证项，无回归
+  3 = REFUSED                      生产 Bot 运行中且未给 --allow-live，本次**未执行任何测试**
+
+  这样"只看退出码"的发布脚本把 0 当成功、把 1 当失败、把 2 当"需要人确认"、
+  把 3 当"根本没跑"，不再出现"文字说未全绿、退出码却是 0"的歧义。
 
 ## 用法
 
-  python run_test_gate.py              # 完整门禁（含 pytest 收集集 + 49 个脚本）
-  python run_test_gate.py --strict     # NOT-VERIFIED 也判为失败（停机窗口内用）
-  python run_test_gate.py --scripts    # 只跑脚本式测试
-  python run_test_gate.py --pytest     # 只跑 pytest 收集集
+  python run_test_gate.py                  # 完整门禁（Bot 运行中会被拒绝执行）
+  python run_test_gate.py --allow-live     # 明确接受"测试与生产并存"风险后照常跑
+  python run_test_gate.py --strict         # NOT-VERIFIED 也判为失败（停机窗口内用）
+  python run_test_gate.py --scripts        # 只跑脚本式测试
+  python run_test_gate.py --pytest         # 只跑 pytest 收集集
+
+## 这个门禁**不是**隔离（第十七轮 P3，收窄上一轮的失实表述）
+
+  生产哨兵是**事后检测**：跑完后比对两个状态文件的内容指纹与巡检日志里的测试标记行数。
+  它**不是**隔离，已知边界：
+    - 判 FAIL 时文件写入或外发**已经发生**了，它只是让你知道；
+    - 未列入哨兵清单的文件不在检测范围；
+    - 先改后改回原内容的短暂写入检测不到；
+    - 测试直接外发（不落任何状态文件）完全检测不到。
+  真正的隔离是"临时状态目录 + 独立外发通道"，见 UPGRADE_TRIGGER。
 """
 
 import hashlib
@@ -84,17 +106,39 @@ BASELINE_FAIL = {'test_v64_p3_lifecycle.py'}
 STOP_WINDOW = {'test_orphan_guard.py'}
 
 # 仅比对退出码是**不够的**：p3 恒返回 1，失败项从 6 个涨到 8 个照样被接受。
-# 这里额外登记它应打印的 `GREEN: n/m` 行，通过数一变就判 BASELINE-DRIFT（致命）——
-# 变好说明基线该摘除，变坏说明真回归，两个方向都必须暴露。
+# 仅比对 `GREEN: n/m` 的**数量**也不够（第十七轮 ChatGPT P2 指出）：
+#   原本通过的 3 项里坏 1 项、原本失败的另 1 项恰好修好 → 仍是 3/9，数量看不出来。
+# 因此基线按**逐项失败身份**登记，任何一项的通过/失败状态改变都判 BASELINE-DRIFT。
 BASELINE_GREEN = {
     'test_v64_p3_lifecycle.py': (3, 9),
 }
 GREEN_RE = re.compile(r'GREEN:\s*(\d+)\s*/\s*(\d+)')
 
-# ------------------------------------------------- 生产哨兵（测试隔离，第十六轮 P3）
-# ChatGPT 指出门禁无条件直跑根目录 test_*.py，与生产 Bot 无隔离。
-# 进程检测只是**代理**，真正要守的不变量是"测试没有改动生产状态"，
-# 所以这里直接对文件内容做指纹前后比对——变了就判 FAIL，与测试结果无关。
+# 逐项失败身份基线。
+# 基线依据：2026-09-26 在 `5d3ab5d`（与 `f0a21d2`/`9d9526c` 逐项一致）上实测
+#   `python test_v64_p3_lifecycle.py` → rc=1、`GREEN: 3/9`、下面 6 项打印
+#   `❌ <name>: <reason>`，其余 3 项打印 `✅ <name>`。
+# 改动这个集合必须同时更新基线依据，否则视为未经验证的放宽。
+BASELINE_FAIL_SET = {
+    'test_v64_p3_lifecycle.py': frozenset({
+        'r1_clear_during_sleep_zero_side_effect',
+        'r3_zombie_no_protection_repair',
+        'r4_corrupted_is_not_empty',
+        'r5_settlement_report_exactly_once',
+        'r7_settlement_uses_net_qty_not_gross',
+        'r6_normal_batch_unchanged',
+    }),
+}
+# 逐行形态：`✅ <name>`（通过）/ `❌ <name>: <reason>`（失败）。
+# 直接锚定 ✅/❌ 两个标记字符，`GREEN: n/m` 汇总行因此天然不会被误判成用例行。
+# `_base_env()` 已设 PYTHONIOENCODING=utf-8，且本文件以 utf-8 解码 stdout，
+# 故标记字符可原样匹配（2026-09-26 实测字节无损）。
+CASE_LINE_RE = re.compile(r'^\s*([✅❌])\s+(\w+)(:\s.*)?$')
+
+# ------------------------------------------------- 生产哨兵（**事后检测，不是隔离**）
+# 第十六轮 P3 引入，第十七轮 P3 收窄表述：这里做的是"跑完之后告诉你有没有变"，
+# 不是"测试根本碰不到生产"。判 FAIL 时写入或外发**已经发生**。
+# 真正的隔离需要临时状态目录 + 独立外发通道（见文件头 UPGRADE_TRIGGER）。
 #
 # 选哨兵的口径是「真实存在 + 正常情况下整轮门禁期间不被写」，实测（2026-09-26）：
 #   trade_state.json         仅批次状态变化时写 → 稳定
@@ -200,6 +244,29 @@ def discover_scripts():
                   if f.startswith('test_') and f.endswith('.py'))
 
 
+def _parse_failed_cases(stdout: str):
+    """解析脚本式测试的**逐项结果**，返回失败用例名集合；一行都没匹配到返回 None。
+
+    形态见 test_v64_p3_lifecycle.py:526/529/531：
+        print(f'✅ {fn.__name__}')                      # 通过
+        print(f'❌ {fn.__name__}: {e}')                 # 断言失败
+        print(f'❌ {fn.__name__}: {type(e).__name__}: …')  # 抛异常
+
+    返回 None 表示"解析不出逐项身份"，调用方必须当作漂移处理 ——
+    宁可误报一次让人去看，也不能在看不见组成的情况下声称"组成未变"。
+    """
+    failed = set()
+    seen = 0
+    for line in (stdout or '').splitlines():
+        m = CASE_LINE_RE.match(line)
+        if not m:
+            continue
+        seen += 1
+        if m.group(1) == '❌':
+            failed.add(m.group(2))
+    return failed if seen else None
+
+
 def run_scripts(strict=False, timeout=600):
     """逐个以 python 直跑根目录 test_*.py —— 这些文件在 pytest 下收集 0 项
     （脚本式，scenario_* 不叫 test_*），只有这样才真正被执行到。"""
@@ -221,7 +288,10 @@ def run_scripts(strict=False, timeout=600):
 
         allowed = EXPECTED.get(name, {0})
         drift = None
-        if name in BASELINE_GREEN and rc in allowed:
+        # `| {0}`：rc=0 也必须进基线校验。否则 p3 一旦全绿（rc=0 不在 {1} 里）
+        # 会被直接判 PASS，§19.2 声称的"变好也必须暴露"在这条路上就不成立。
+        # rc=2/-9 等仍走原有 FAIL 分支，分类不因本次放宽而改变。
+        if name in BASELINE_GREEN and rc in (allowed | {0}):
             m = GREEN_RE.search(stdout)
             if m:
                 got = (int(m.group(1)), int(m.group(2)))
@@ -231,6 +301,22 @@ def run_scripts(strict=False, timeout=600):
                              f'实际 {got[0]}/{got[1]}')
             else:
                 drift = '基线 GREEN 行未找到（脚本输出格式变更，基线登记失效）'
+            # 第十七轮 P2：数量相同 **不等于** 组成相同 —— 原本通过的坏 1 项、
+            # 原本失败的修好 1 项，仍是 3/9，纯计数完全看不出来。逐项比对失败身份。
+            if drift is None and name in BASELINE_FAIL_SET:
+                got_fail = _parse_failed_cases(stdout)
+                if got_fail is None:
+                    drift = '逐项结果解析失败（stdout 无 `✅ <name>` / `❌ <name>: <reason>` 行）'
+                else:
+                    exp_fail = BASELINE_FAIL_SET[name]
+                    newly = sorted(got_fail - exp_fail)
+                    fixed = sorted(exp_fail - got_fail)
+                    if newly or fixed:
+                        drift = '失败项组成变了：'
+                        if newly:
+                            drift += f'新增失败 {newly}；'
+                        if fixed:
+                            drift += f'转为通过 {fixed}；'
 
         if drift is not None:
             status, fatal = 'BASELINE-DRIFT', True
@@ -291,13 +377,33 @@ def main():
     argv = set(sys.argv[1:])
     do_all = not (argv & {'--scripts', '--pytest'})
     strict = '--strict' in argv
+    allow_live = '--allow-live' in argv
 
+    # ---- 第十七轮 P3：生产 Bot 运行时默认**拒绝执行**（不是警告，是拒绝）----
+    # 上一轮只打印一行 ⚠ 然后照跑，等于把"是否接受风险"的决定权隐式拿走。
+    # 这里的事实是：生产哨兵**只能事后发现**，判 FAIL 时写入或外发已经发生，
+    # 未列入清单的文件与"改了再改回"也检测不到。所以默认不跑，显式同意才跑。
+    # KNOWN_LIMITATION: 这仍是"人工同意"而非隔离。
+    # UPGRADE_TRIGGER: 要真正隔离，需给测试提供临时状态目录 + 独立外发通道，
+    #                 使测试在默认情况下**没有能力**触碰生产文件与真实外发。
     live = _live_bot_pids()
+    if live and not allow_live:
+        print('=' * 70)
+        print(f'⛔ 门禁拒绝执行：检测到生产 Bot 运行中（pid={live}）。')
+        print('   这不是隔离——生产哨兵只能在**全部测试跑完之后**比对指纹，')
+        print('   判 FAIL 时文件写入或外发已经发生；未列入清单的文件、')
+        print('   以及"改了又改回原样"的短暂写入，都在检测范围之外。')
+        print('   继续请二选一：')
+        print('     1) 先停机，再跑门禁（推荐，此时 test_orphan_guard 也能拿到 rc=0）；')
+        print('     2) 追加 --allow-live，明确接受"测试与生产并存"的风险。')
+        print('   本次未执行任何测试。')
+        print('=' * 70)
+        return 3
+
     before = _snapshot()
     if live:
-        print(f'⚠ 检测到生产 Bot 运行中（pid={live}）。进程检测只是提示，'
-              f'真正生效的是下面的**生产哨兵前后指纹比对** —— 改动即 FAIL，'
-              f'与测试是否通过无关。')
+        print(f'⚠ --allow-live：已明确接受测试与生产并存（pid={live}）。'
+              f'下方生产哨兵是**事后检测**，不是隔离。')
     print()
 
     overall = True
@@ -312,7 +418,7 @@ def main():
         ok, counts = run_scripts(strict=strict)
         overall = overall and ok
 
-    # -------- 生产哨兵（第十六轮 P3）：测试隔离的结构性保证 --------
+    # -------- 生产哨兵（第十六轮 P3，第十七轮收窄表述）：**事后检测**，非隔离 --------
     after = _snapshot()
     state_bad = [f'{k}: {before[k]} -> {after.get(k)}'
                  for k in PRODUCTION_SENTINELS
@@ -327,12 +433,12 @@ def main():
                              or counts.get('NOT-VERIFIED')
                              or counts.get('BASELINE-DRIFT'))
     if not overall or sentinel_bad:
-        verdict = 'FAIL'
+        verdict, exit_code = 'FAIL', 1
     elif exceptions:
-        verdict = ('COMPLETED-WITH-EXCEPTIONS —— 运行完成，'
-                   '但**不是全绿**（存在下述未通过项）')
+        verdict, exit_code = ('COMPLETED-WITH-EXCEPTIONS —— 运行完成，'
+                              '但**不是全绿**（存在下述未通过项）'), 2
     else:
-        verdict = 'ALL-GREEN —— 全部退出码 0，无待验证项'
+        verdict, exit_code = 'ALL-GREEN —— 全部退出码 0，无待验证项', 0
     print(f'门禁结论：{verdict}{"（strict）" if strict else ""}')
     if state_bad:
         print('✘ 运行期间生产状态文件发生变化（与测试通过与否无关；'
@@ -345,11 +451,13 @@ def main():
         for s in log_bad:
             print('   - ' + s)
     if not sentinel_bad:
-        print(f'✔ 生产哨兵未被改动：{", ".join(before.keys())}')
+        print(f'✔ 生产哨兵（事后检测）未发现改动：{", ".join(before.keys())}')
+    # 第十七轮 P1：文字说了"未全绿"，退出码却还是 0 —— 只看 rc 的发布脚本会
+    # 把它当成功。现在 rc 与结论一一对应，且与"根本没跑"（3）区分开。
+    print(f'进程退出码：{exit_code}  '
+          f'(0=ALL-GREEN | 1=FAIL | 2=仅含已登记的基线失败/待验证 | 3=被拒绝未执行)')
     print('=' * 70)
-    if sentinel_bad:
-        return 1
-    return 0 if overall else 1
+    return exit_code
 
 
 if __name__ == '__main__':
