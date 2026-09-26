@@ -425,7 +425,8 @@ class WatchdogFatalAlertTests(unittest.TestCase):
             json.dump({"BTCUSDT": {"b1": {"is_active": False}}}, f)
         server = mock.MagicMock()
         with mock.patch.object(patrol, "TRADE_STATE_FILE", state), \
-                mock.patch("smtplib.SMTP_SSL") as smtp:
+                mock.patch("smtplib.SMTP_SSL") as smtp, \
+                mock.patch.object(patrol, "log"):
             smtp.return_value.__enter__.return_value = server
             ok = patrol.send_email(dict(MAIL_ENV), "巡检异常", "text", event="health")
         self.assertTrue(ok)

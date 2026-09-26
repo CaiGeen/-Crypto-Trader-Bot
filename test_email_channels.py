@@ -38,10 +38,12 @@ class EmailChannelGateTests(unittest.TestCase):
         env = self._env(EMAIL_ALERT_ENABLED="false")
         with mock.patch.object(
             email_gate, "should_send_email", return_value=(False, "disabled")
-        ) as gate, mock.patch("smtplib.SMTP_SSL") as smtp:
+        ) as gate, mock.patch("smtplib.SMTP_SSL") as smtp, \
+                mock.patch.object(patrol, "log") as plog:
             self.assertFalse(patrol.send_email(env, "subject", "text"))
         gate.assert_called_once()
         smtp.assert_not_called()
+        self.assertTrue(plog.called, "闸门跳过也应记录，但必须记到被 patch 的 log()")
 
     def test_patrol_email_skipped_without_active_position(self):
         env = self._env()
@@ -49,7 +51,8 @@ class EmailChannelGateTests(unittest.TestCase):
             json.dump({"BTCUSDT": {"b1": {"is_active": False}}}, f)
         with mock.patch.object(
             patrol, "TRADE_STATE_FILE", self.state_path
-        ), mock.patch("smtplib.SMTP_SSL") as smtp:
+        ), mock.patch("smtplib.SMTP_SSL") as smtp, \
+                mock.patch.object(patrol, "log"):
             self.assertFalse(patrol.send_email(env, "subject", "text"))
         smtp.assert_not_called()
 
@@ -60,11 +63,18 @@ class EmailChannelGateTests(unittest.TestCase):
 
         server = mock.MagicMock()
         with mock.patch.object(patrol, "TRADE_STATE_FILE", self.state_path), \
-                mock.patch("smtplib.SMTP_SSL") as smtp:
+                mock.patch("smtplib.SMTP_SSL") as smtp, \
+                mock.patch.object(patrol, "log") as plog:
             smtp.return_value.__enter__.return_value = server
             self.assertTrue(patrol.send_email(env, "subject", "text"))
         smtp.assert_called_once()
         server.sendmail.assert_called_once()
+        # 第十六轮复审 P3：patrol.log() 会**追加进生产 logs/patrol.log**，于是这条与
+        # 真实告警一字不差的「邮件告警已发送」曾被写进生产观测日志，运维无法分辨
+        # 测试噪声与真事件。patch log() 既阻断污染，又用断言保留原验证意图。
+        logged = [str(a[0]) for a in plog.call_args_list if a[0]]
+        self.assertTrue(any("邮件告警已发送" in m for m in logged),
+                        f"发送路径必须记录成功，但应记到被 patch 的 log: {logged}")
 
     def test_telegram_fallback_still_runs_when_email_gated(self):
         env = self._env(EMAIL_ALERT_ENABLED="false")
