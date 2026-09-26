@@ -32,14 +32,15 @@
   0 = ALL-GREEN                    全部退出码 0，无任何待验证项
   1 = FAIL                         真回归 / 基线漂移 / 生产哨兵变化 / --strict 下未验证
   2 = COMPLETED-WITH-EXCEPTIONS    运行完成，仅含**已登记**的基线失败与待验证项，无回归
-  3 = REFUSED                      生产 Bot 运行中且未给 --allow-live，本次**未执行任何测试**
+  3 = REFUSED                      生产 Bot 运行中**或探测不确定**且未给 --allow-live，
+                                   本次**未执行任何测试**
 
   这样"只看退出码"的发布脚本把 0 当成功、把 1 当失败、把 2 当"需要人确认"、
   把 3 当"根本没跑"，不再出现"文字说未全绿、退出码却是 0"的歧义。
 
 ## 用法
 
-  python run_test_gate.py                  # 完整门禁（Bot 运行中会被拒绝执行）
+  python run_test_gate.py                  # 完整门禁（Bot 运行中、或探测不确定 → 拒绝执行）
   python run_test_gate.py --allow-live     # 明确接受"测试与生产并存"风险后照常跑
   python run_test_gate.py --strict         # NOT-VERIFIED 也判为失败（停机窗口内用）
   python run_test_gate.py --scripts        # 只跑脚本式测试
@@ -57,6 +58,7 @@
 """
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -159,21 +161,119 @@ PATROL_TEST_MARKERS = (
 )
 
 
-def _live_bot_pids():
-    """检测是否有 bot_runner/watchdog 在运行（仅用于提示，不作为安全边界）。"""
+# ------------------------------------------------ 生产 Bot 进程探测（三态，Fail-Closed）
+# 第十七轮 ChatGPT P1（2026-09-26）：旧实现是 **Fail-Open** ——
+#   `except Exception: return []` 把 powershell 超时 / 不存在 / WMI 故障统统变成
+#   「没有 Bot」；「非零退出码 + 空 stdout」也落到 `[]`；查询还只认 `Name='python.exe'`。
+#   于是准确口径只是「**成功探测到进程时**才拒绝」，而不是「探测不确定时也拒绝」。
+# 现在三态，且**不确定按最坏情况处理**：
+#   LIVE_RUNNING  探测成功且命中 ≥1 个进程
+#   LIVE_NONE     探测成功**且明确确认**零命中（必须收到 NO_MATCH 哨兵，缺一不可）
+#   LIVE_UNKNOWN  探测不可用 / 输出不可解析 / 自相矛盾 → 与 RUNNING 同样拒绝执行（rc=3）
+#
+# 口径要点：**「没有输出」永远不等于「没有 Bot」**。所以脚本对两种结论都显式表态：
+# 命中打 `PID <pid> <name>`，确认零命中打 `NO_MATCH`；CIM 故障或一条记录都取不到 → 非零退出。
+#
+# KNOWN_LIMITATION: 仍靠命令行里的 `bot_runner.py` / `watchdog.py` 字样识别生产进程。
+#   误报方向是安全的（多拒绝一次，人看一眼 pid+进程名即可判断），且 --allow-live 可越过；
+#   真正的结构保证要靠 `acquire_instance_lock()` 用的具名互斥体（跨进程可见、不受命令行影响）。
+# UPGRADE_TRIGGER: 任何一次「门禁拒绝执行但实际没有生产 Bot」或「生产在跑却探测成 NONE」
+#                  的现场案例，即改为以具名互斥体为唯一判据。
+LIVE_RUNNING, LIVE_NONE, LIVE_UNKNOWN = 'RUNNING', 'NONE', 'UNKNOWN'
+
+_LIVE_PROBE_PS = """
+$ErrorActionPreference='Stop';
+try {
+  $shells = @('powershell.exe','pwsh.exe','cmd.exe','conhost.exe');
+  $all = @(Get-CimInstance Win32_Process);
+  if ($all.Count -eq 0) { exit 1 };
+  $hit = @($all | Where-Object {
+      ($_.ProcessId -ne $PID) -and ($shells -notcontains $_.Name) -and
+      ($_.CommandLine -like '*bot_runner.py*' -or $_.CommandLine -like '*watchdog.py*')
+  });
+  if ($hit.Count -eq 0) { Write-Output 'NO_MATCH' }
+  else { $hit | ForEach-Object { Write-Output ('PID ' + $_.ProcessId + ' ' + $_.Name) } }
+  exit 0
+} catch { exit 1 }
+"""
+
+# 心跳是**独立于进程查询**的第二信号（由 watchdog 每 60s 写入）。
+# 用途只有一处：进程查询说「零命中」而心跳在新鲜窗口内说 `bot_alive=true`
+# → 两个信号矛盾 → 说明探测不可信 → 按 UNKNOWN 拒绝。
+HEARTBEAT_FILE = os.path.join(ROOT, '.heartbeat.json')
+HEARTBEAT_FRESH_S = 150   # 60s 写一次，留 2 个周期的容差
+
+
+def detect_live_bot(timeout=25):
+    """三态探测生产 Bot 进程。返回 `(state, procs, reason)`。
+
+    procs: `[(pid, name), ...]`，仅 LIVE_RUNNING 时非空；reason 仅非 RUNNING 时有意义。
+    """
     if os.name != 'nt':
-        return []
+        return (LIVE_UNKNOWN, [],
+                f'非 Windows 平台（os.name={os.name}），CIM 进程探测不可用')
     try:
-        import subprocess
-        out = subprocess.run(
-            ['powershell', '-NoProfile', '-Command',
-             "(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-             "Where-Object { $_.CommandLine -like '*bot_runner.py*' -or "
-             "$_.CommandLine -like '*watchdog.py*' }).ProcessId"],
-            capture_output=True, text=True, timeout=25)
-        return [int(p) for p in out.stdout.split() if p.strip().isdigit()]
-    except Exception:
-        return []
+        proc = subprocess.run(
+            ['powershell', '-NoProfile', '-NonInteractive', '-Command', _LIVE_PROBE_PS],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return LIVE_UNKNOWN, [], f'powershell 探测超时（{timeout}s），进程清单不可得'
+    except OSError as e:
+        return LIVE_UNKNOWN, [], f'powershell 无法启动：{type(e).__name__}: {e}'
+
+    if proc.returncode != 0:
+        err = ' '.join((proc.stderr or '').split())[:120]
+        return (LIVE_UNKNOWN, [],
+                f'powershell 退出码 {proc.returncode}' + (f'，stderr: {err}' if err else ''))
+
+    procs, saw_no_match = [], False
+    for raw in (proc.stdout or '').splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line == 'NO_MATCH':
+            saw_no_match = True
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == 'PID' and parts[1].isdigit():
+            procs.append((int(parts[1]), parts[2] if len(parts) > 2 else '?'))
+            continue
+        return LIVE_UNKNOWN, [], f'探测输出无法解析：{line[:80]!r}'
+
+    if procs and saw_no_match:
+        return LIVE_UNKNOWN, [], '探测输出自相矛盾（同时给出 PID 与 NO_MATCH）'
+    if procs:
+        return LIVE_RUNNING, procs, ''
+    if saw_no_match:
+        return LIVE_NONE, [], ''
+    return LIVE_UNKNOWN, [], '探测输出为空（**空输出不等于没有 Bot**）'
+
+
+def _heartbeat_bot_alive():
+    """心跳能否证明 Bot 在跑：`True` / `False` / `None`（无可用信息，含心跳陈旧）。"""
+    try:
+        with open(HEARTBEAT_FILE, encoding='utf-8') as f:
+            hb = json.load(f)
+        age = time.time() - float(hb['ts'])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if age > HEARTBEAT_FRESH_S:
+        return None        # 陈旧心跳既不能证明活着、也不能证明死了
+    return bool(hb.get('bot_alive'))
+
+
+def live_bot_guard_state():
+    """合并进程探测与心跳佐证，返回 `(state, procs, reason)`。"""
+    state, procs, reason = detect_live_bot()
+    hb = _heartbeat_bot_alive()
+    if state == LIVE_NONE and hb is True:
+        return (LIVE_UNKNOWN, [],
+                f'进程查询确认零命中，但 {os.path.basename(HEARTBEAT_FILE)} 在 '
+                f'{HEARTBEAT_FRESH_S}s 内报 bot_alive=true —— 两个信号矛盾，探测不可信')
+    if state == LIVE_UNKNOWN:
+        reason += f'（心跳佐证：{"报活" if hb else "无/未报活"}）'
+    return state, procs, reason
 
 
 def _snapshot():
@@ -386,10 +486,17 @@ def main():
     # KNOWN_LIMITATION: 这仍是"人工同意"而非隔离。
     # UPGRADE_TRIGGER: 要真正隔离，需给测试提供临时状态目录 + 独立外发通道，
     #                 使测试在默认情况下**没有能力**触碰生产文件与真实外发。
-    live = _live_bot_pids()
-    if live and not allow_live:
+    state, procs, reason = live_bot_guard_state()
+    procs_text = ', '.join(f'pid={p}({n})' for p, n in procs)
+    if state != LIVE_NONE and not allow_live:
         print('=' * 70)
-        print(f'⛔ 门禁拒绝执行：检测到生产 Bot 运行中（pid={live}）。')
+        if state == LIVE_RUNNING:
+            print(f'⛔ 门禁拒绝执行：检测到生产 Bot 运行中（{procs_text}）。')
+        else:
+            # 第十七轮 P1：探测不出来 ≠ 没有 Bot。旧实现在这里 Fail-Open（照跑测试）。
+            print(f'⛔ 门禁拒绝执行：**无法确定**生产 Bot 是否在运行 —— {reason}')
+            print('   按最坏情况处理（Fail-Closed）：请先自行确认无 bot_runner/watchdog 在跑，')
+            print('   再追加 --allow-live；修好探测（powershell / WMI）后重跑更佳。')
         print('   这不是隔离——生产哨兵只能在**全部测试跑完之后**比对指纹，')
         print('   判 FAIL 时文件写入或外发已经发生；未列入清单的文件、')
         print('   以及"改了又改回原样"的短暂写入，都在检测范围之外。')
@@ -401,9 +508,12 @@ def main():
         return 3
 
     before = _snapshot()
-    if live:
-        print(f'⚠ --allow-live：已明确接受测试与生产并存（pid={live}）。'
+    if state == LIVE_RUNNING:
+        print(f'⚠ --allow-live：已明确接受测试与生产并存（{procs_text}）。'
               f'下方生产哨兵是**事后检测**，不是隔离。')
+    elif state == LIVE_UNKNOWN:
+        print(f'⚠ --allow-live：进程探测**不确定**（{reason}），已按明确同意执行。')
+        print('   ⚠ 本次**无法确认**生产 Bot 是否在运行，请先自行确认再依赖本轮结论。')
     print()
 
     overall = True
@@ -455,7 +565,8 @@ def main():
     # 第十七轮 P1：文字说了"未全绿"，退出码却还是 0 —— 只看 rc 的发布脚本会
     # 把它当成功。现在 rc 与结论一一对应，且与"根本没跑"（3）区分开。
     print(f'进程退出码：{exit_code}  '
-          f'(0=ALL-GREEN | 1=FAIL | 2=仅含已登记的基线失败/待验证 | 3=被拒绝未执行)')
+          f'(0=ALL-GREEN | 1=FAIL | 2=仅含已登记的基线失败/待验证 | '
+          f'3=被拒绝未执行[生产在跑或探测不确定])')
     print('=' * 70)
     return exit_code
 

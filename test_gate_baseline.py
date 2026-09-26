@@ -24,9 +24,12 @@
 """
 
 import io
+import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 import types
 from contextlib import redirect_stdout
 
@@ -151,12 +154,178 @@ def check_registered_baseline_matches_reality():
     assert proc.returncode == 1, '基线脚本 rc 应为 1，实测 %s' % proc.returncode
 
 
+# ==================== 生产 Bot 进程探测：三态 / Fail-Closed ====================
+# 第十七轮 ChatGPT P1：旧 `_live_bot_pids()` 在 powershell 超时、不存在、非零退出、
+# 空 stdout 四种情况下统统返回 `[]`，`main()` 把它读成「没有 Bot」→ **照跑测试**。
+# 也就是说旧口径只有「成功探测到进程时才拒绝」。下面把「不确定必须拒绝」钉成用例。
+
+def _fake_proc(rc=0, out='', err=''):
+    return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+
+
+def _probe_with(run):
+    """用假的 subprocess.run 跑 `live_bot_guard_state()`（心跳佐证屏蔽，避免本机生产干扰）。"""
+    real_run, real_hb = g.subprocess.run, g._heartbeat_bot_alive
+    g.subprocess.run = run
+    g._heartbeat_bot_alive = lambda: None
+    try:
+        return g.live_bot_guard_state()
+    finally:
+        g.subprocess.run, g._heartbeat_bot_alive = real_run, real_hb
+
+
+def check_probe_failures_are_unknown():
+    """四条旧 fail-open 路径 + 两条不可解析输出，全部必须判 UNKNOWN。"""
+    def timeout(*a, **k):
+        raise subprocess.TimeoutExpired('powershell', 25)
+
+    def missing(*a, **k):
+        raise FileNotFoundError(2, 'powershell 不存在')
+
+    for label, run in (
+        ('powershell 超时', timeout),
+        ('powershell 不存在', missing),
+        ('非零退出码 + 空 stdout', lambda *a, **k: _fake_proc(rc=1, out='')),
+        ('零退出码 + 空 stdout', lambda *a, **k: _fake_proc(rc=0, out='')),
+        ('未预期输出', lambda *a, **k: _fake_proc(rc=0, out='some noise\n')),
+        ('PID 字段损坏', lambda *a, **k: _fake_proc(rc=0, out='PID not-a-number python.exe\n')),
+    ):
+        state, procs, reason = _probe_with(run)
+        assert state == g.LIVE_UNKNOWN, f'{label} 不得被当作「没有 Bot」（实测 {state}）'
+        assert not procs and reason, f'{label} 应给出原因且不带进程'
+
+
+def check_probe_decisive_answers():
+    """只有显式 NO_MATCH 才算 NONE；PID 行按 (pid, 进程名) 解析；自相矛盾算不确定。"""
+    assert _probe_with(lambda *a, **k: _fake_proc(rc=0, out='NO_MATCH\n'))[0] == g.LIVE_NONE, \
+        '显式 NO_MATCH 应判 NONE'
+    state, procs, _ = _probe_with(lambda *a, **k: _fake_proc(
+        rc=0, out='PID 111 python.exe\r\nPID 222 pythonw.exe\r\n'))
+    assert state == g.LIVE_RUNNING, '命中应判 RUNNING'
+    assert procs == [(111, 'python.exe'), (222, 'pythonw.exe')], f'进程解析错：{procs}'
+    assert _probe_with(lambda *a, **k: _fake_proc(
+        rc=0, out='PID 111 python.exe\nNO_MATCH\n'))[0] == g.LIVE_UNKNOWN, \
+        '自相矛盾的输出必须判不确定'
+
+
+def check_heartbeat_overrides_impossible_none():
+    """进程查询说零命中、心跳刚报 bot_alive=true → 探测不可信 → UNKNOWN（不得放行）。"""
+    real_det, real_hb = g.detect_live_bot, g._heartbeat_bot_alive
+    g.detect_live_bot = lambda *a, **k: (g.LIVE_NONE, [], '')
+    g._heartbeat_bot_alive = lambda: True
+    try:
+        state, _, reason = g.live_bot_guard_state()
+        assert state == g.LIVE_UNKNOWN and '矛盾' in reason, \
+            f'两信号矛盾应判不确定，实测 {state} / {reason}'
+    finally:
+        g.detect_live_bot, g._heartbeat_bot_alive = real_det, real_hb
+
+
+def check_heartbeat_reads():
+    """心跳读取：缺失/损坏/陈旧一律「无信息」，不得抛异常、也不得反证「没在跑」。"""
+    real = g.HEARTBEAT_FILE
+    path = os.path.join(tempfile.mkdtemp(), 'hb.json')
+    g.HEARTBEAT_FILE = path
+    try:
+        assert g._heartbeat_bot_alive() is None, '心跳文件不存在 → 无信息'
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'ts': time.time(), 'bot_alive': True}, f)
+        assert g._heartbeat_bot_alive() is True, '新鲜心跳 + bot_alive=true → 报活'
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'ts': time.time(), 'bot_alive': False}, f)
+        assert g._heartbeat_bot_alive() is False, '新鲜心跳 + bot_alive=false → 未报活'
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'ts': time.time() - 10000, 'bot_alive': True}, f)
+        assert g._heartbeat_bot_alive() is None, '心跳陈旧必须视为无信息（不能证明活着）'
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('{ broken')
+        assert g._heartbeat_bot_alive() is None, '心跳损坏 → 无信息，不得抛异常'
+    finally:
+        g.HEARTBEAT_FILE = real
+
+
+def check_probe_decisive_against_real_powershell():
+    """真跑 powershell 验证探测脚本本身（打桩测不出脚本写错、哨兵拼错、CIM 类名错）。
+
+    正常脚本只要求**给出决定性结论**（RUNNING 或 NONE，不得 UNKNOWN）——
+    生产在跑与否取决于环境，两种都算对；四种坏输出必须 UNKNOWN。
+    """
+    normal = g._LIVE_PROBE_PS
+    try:
+        state, procs, reason = g.detect_live_bot(timeout=30)
+        assert state in (g.LIVE_RUNNING, g.LIVE_NONE), \
+            f'探测脚本应给出决定性结论，实测 UNKNOWN：{reason}'
+        if state == g.LIVE_RUNNING:
+            assert procs and all(isinstance(p, int) and n for p, n in procs), \
+                f'RUNNING 必须带 (pid, 进程名)：{procs}'
+        for label, ps in (
+            ('未预期输出', "$ErrorActionPreference='Stop'; Write-Output 'some noise'"),
+            ('零输出', 'exit 0'),
+            ('非零退出 + 空 stdout', 'exit 1'),
+            ('CIM 类不存在', "$ErrorActionPreference='Stop'; "
+                            "(Get-CimInstance Win32_NoSuchClass).ProcessId"),
+        ):
+            g._LIVE_PROBE_PS = ps
+            assert g.detect_live_bot(timeout=30)[0] == g.LIVE_UNKNOWN, \
+                f'真 powershell {label} 必须判不确定'
+    finally:
+        g._LIVE_PROBE_PS = normal
+
+
+def _run_main(argv, state, procs=(), reason='合成'):
+    """在合成探测结论下跑 `main()` → (rc, 打印文本, 实际执行了哪些测试段)。"""
+    real = (g.live_bot_guard_state, g.run_pytest, g.run_scripts, g._snapshot, sys.argv)
+    ran = []
+    g.live_bot_guard_state = lambda: (state, list(procs), reason)
+    g.run_pytest = lambda *a, **k: (ran.append('pytest'), (True, 0))[1]
+    g.run_scripts = lambda *a, **k: (ran.append('scripts'), (True, {}))[1]
+    g._snapshot = lambda: {}
+    sys.argv = ['run_test_gate.py'] + list(argv)
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = g.main()
+    finally:
+        g.live_bot_guard_state, g.run_pytest, g.run_scripts, g._snapshot = real[:4]
+        sys.argv = real[4]
+    return rc, buf.getvalue(), ran
+
+
+def check_main_refuses_on_unknown_and_running():
+    """rc=3 且**一次测试都不跑**：生产在跑（原有）+ 探测不确定（本轮补的 Fail-Closed）。"""
+    rc, text, ran = _run_main([], g.LIVE_UNKNOWN, reason='powershell 探测超时（25s）')
+    assert rc == 3, f'探测不确定必须 rc=3，实测 {rc}'
+    assert ran == [], f'探测不确定时不得执行任何测试，实测跑了 {ran}'
+    assert '无法确定' in text and '未执行任何测试' in text, text
+
+    rc, text, ran = _run_main([], g.LIVE_RUNNING, procs=[(45740, 'python.exe')])
+    assert rc == 3 and ran == [], f'生产在跑必须 rc=3 且不跑测试，实测 {rc}/{ran}'
+    assert 'pid=45740(python.exe)' in text, '拒绝信息必须给出 pid 与进程名（便于甄别误报）'
+
+
+def check_main_proceeds_only_when_confirmed_none():
+    """确认零命中 → 照常跑；--allow-live 在不确定时放行但必须显式声明「无法确认」。"""
+    rc, _, ran = _run_main([], g.LIVE_NONE)
+    assert rc == 0 and ran == ['pytest', 'scripts'], f'确认零命中应照常跑，实测 {rc}/{ran}'
+
+    rc, text, ran = _run_main(['--allow-live'], g.LIVE_UNKNOWN, reason='powershell 退出码 1')
+    assert ran == ['pytest', 'scripts'], '--allow-live 是明确同意，应放行'
+    assert '无法确认' in text, '--allow-live 在不确定时必须显式声明无法确认生产状态'
+
+
 CHECKS = [
     check_parse_edge_cases,
     check_composition_beats_count,
     check_count_still_caught,
     check_rc_zero_exposes_improvement,
     check_unexpected_rc_is_fail,
+    check_probe_failures_are_unknown,
+    check_probe_decisive_answers,
+    check_probe_decisive_against_real_powershell,
+    check_heartbeat_overrides_impossible_none,
+    check_heartbeat_reads,
+    check_main_refuses_on_unknown_and_running,
+    check_main_proceeds_only_when_confirmed_none,
     check_registered_baseline_matches_reality,
 ]
 

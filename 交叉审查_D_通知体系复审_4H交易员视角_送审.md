@@ -1616,3 +1616,49 @@ p3 一旦**全绿 rc=0** 就跳过整个基线校验直接 `PASS`，§19.2 的"�
 
 
 
+---
+
+## 28. 第十八轮：D12 —— 门禁进程探测的 Fail-Open 收口
+
+> 完整版见送审稿 §18。
+
+### 28.1 缺陷成立，且比裁定的描述多一条
+
+第十七轮 ChatGPT P1 指 `_live_bot_pids()` 在 powershell 超时/异常/非零退出+空 stdout 时返回 `[]`，
+`main()` 读成「没有 Bot」→ 照跑测试。复核成立，另有第 4 条：**非 Windows 直接返回 `[]`**；
+第 5 条：查询只认 `Name='python.exe'`。根因是**把「查不出来」与「确认没有」编码成同一个值**。
+
+### 28.2 修法
+
+- 三态 `RUNNING / NONE / UNKNOWN`，`main()` 只放行 `NONE`，`UNKNOWN` 与 `RUNNING` 同样 **rc=3 拒绝**。
+- **空 stdout 不再是「没有 Bot」的证据**：脚本必须显式打 `PID <pid> <名>` 或 `NO_MATCH`；
+  CIM 异常或一条记录都取不到 → 非零退出 → `UNKNOWN`。未预期文本 / 自相矛盾 → `UNKNOWN`（不猜）。
+- 不再限定进程名，改为「排除外壳类进程与自身后按命令行匹配」，覆盖 `pythonw/py/改名解释器`。
+- **第二信号**：心跳 150s 内报 `bot_alive=true` 而进程查询说零命中 → 矛盾 → `UNKNOWN` 拒绝；
+  心跳陈旧/损坏/缺失 = 无信息，**不反证**「没在跑」。
+- `KNOWN_LIMITATION`：仍靠命令行字样识别；`UPGRADE_TRIGGER`：出现误判现场即改用
+  `acquire_instance_lock()` 的**具名互斥体**作唯一判据。
+
+### 28.3 证据
+
+- `test_gate_baseline.py` **13/13**（原 6 + 新 7，含「真跑 powershell」的一条）。
+- 真 subprocess 五态 5/5：正常 → `RUNNING`；未预期输出 / 零输出 / 非零+空 stdout / CIM 类不存在 → 全 `UNKNOWN`。
+- 端到端：生产在跑 → `⛔ 拒绝执行…pid=36404(python.exe), pid=10864, pid=32656, pid=19056`，**rc=3**，
+  四个 pid 与第十七轮 §20 记录逐字相同（覆盖面未缩窄）；
+  把 `PATH` 改成不存在目录（旧实现 fail-open 的第 2 条路）→ **rc=3**「无法确定 + 心跳佐证：报活」，
+  **旧实现在这里会把 51 个脚本全跑一遍**。
+- 整轮门禁 `--allow-live` 日志 `logs/gate_round18.log`：pytest `exit=0`；脚本式 51 项
+  `PASS 49 / BASELINE-FAIL 1 / NOT-VERIFIED 1 / BASELINE-DRIFT 0 / FAIL 0`（与第十七轮同分布，无回归）、
+  结论 `COMPLETED-WITH-EXCEPTIONS`、**rc=2**；事后复算哨兵指纹与第十六/十七轮**逐字节相同**
+  （`trade_state.json (14245, 308e87f3…)`、`.daily_report.state.json (106, e4043f6d…)`、patrol 测试标记 142 行）。
+
+### 28.4 `--allow-live` 语义被拓宽了一点（需要同知道）
+
+它现在也代表「**接受探测不确定**」。因此 `UNKNOWN` 时额外打印
+「本次**无法确认**生产 Bot 是否在运行，请先自行确认」，避免被误读成「已确认没有生产进程」。
+
+### 28.5 下一步
+
+停机窗口跑 `run_test_gate.py`（不带 `--allow-live`）以消掉 `NOT-VERIFIED` 并验证真实 `NONE` 分支——**需停机授权**。
+第 3 个活跃批次信号继续冻结。
+
