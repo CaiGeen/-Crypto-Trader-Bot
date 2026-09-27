@@ -4,8 +4,10 @@
 
 本文件对应**可部署版本**（M2–M4，不含 M1'）。背景（第八轮复审 / ChatGPT 复核 d539da9）：
   M2 消除第 3 批次起的轮询断崖（F6：<=2 → 10~15s，<=4 → 原 75~100s）
-  M3 批次上限与实盘 `.env` **联动**（2026-09-27 改法：不变量 + 行为断言，
-     不再把 `"3"` 钉死在入库测试里 → 调上限只改 .env 即可）
+  M3 风控键**配置检查**（2026-09-27，按 ChatGPT 复审收口）：
+     两个 RISK_* 键必须**存在且可解析**（防 trader L1634-1641 静默回落假生效）；
+     **不钉数值区间、也不从 .env 推导任何时间保证** —— 调批次/品种上限只改 .env；
+     仅保留一条**明确标注为「当前需求、非永久安全不变量」**的 BATCHES >= 3 下限。
      + 修正 D10 误导文案（原称「改 .env 即时生效无需重启」，实为需重启）
   M4 启动配置横幅：打印**进程内真正生效**的值（永久解决 A9 类验收缺口）
 
@@ -78,74 +80,115 @@ class M3D10WordingTests(unittest.TestCase):
             src = f.read()
         self.assertIn("需重启 watchdog/bot_runner 才对运行中进程生效", src)
 
-    # ── M3 批次上限：与实盘 `.env` **联动**（2026-09-27 改法，用户拍板）─────────
-    # 原实现 `assertEqual(..., "3")` 把**不入库、每机可不同**的 `.env` 值钉死在
-    # **入库**的测试里 → 调一次上限必须同步改测试，否则门禁 EXIT=1。
-    # 改为「不变量 + 行为」两层断言：用户**只改 .env 即可**，
-    # 但 0/负数/非整数/低于 3/档位过慢 仍会被响亮拦下。
+    # ── M3 风控键配置检查：与实盘 `.env` 联动（2026-09-27，按 ChatGPT 复审收口）──
+    # 首版 9cc930a 两处已撤，记录在此防重犯：
+    #   ① `WINDOW_LIMIT=45` 重新造出一个**隐形上限** —— 批次 7 / 9 过不了门禁，
+    #      与「上限可按需求增减」相悖；`<3` 也被写成了永久安全不变量。
+    #   ② 把「正常路径轮询间隔 <=45s」**误称为**「裸仓发现窗口上限」，超出口径：
+    #        trader L7807    sleep_interval = _calculate_monitoring_interval() ← 只测了这条
+    #        trader L7808-10 连续网络错误 → x3（封顶 300s）
+    #        trader L7811-12 3s 快轮询只在**发现成交之后**，缩短不了首次发现之前的等待
+    #        另有 sleep 之后的 API 耗时；下调上限时已有活跃批次可能已超新上限
+    #   ⇒ 本文件**不再从某台机器的 .env 推导任何时间保证**。
+    #
+    # 分工（互不替代）：
+    #   配置检查（本处）  → 两个键**存在且可解析**，防静默回落造成「写了没生效」
+    #   轮询档位行为      → M2PollingCliffTests，与 .env 无关，独立固定（真正的时间保证）
+    #   容量              → 不设门禁，见用例 docstring 的复核提示
     #
     # 留痕：`.env` 不入库（.gitignore:4），值变更靠**部署步骤 0 记 SHA256 +
     #       步骤 5 判据 ⑥ 复核**留痕，不在本测试里另开日志。
-    WINDOW_LIMIT = 45.0
-    # 裸仓发现窗口上限（秒）。45s 拦住 `>6` 档（45~60s）→ 等价于「上限最多到 6」。
-    #   想更严 → 30（上限最多到 4）；想放开档位 → 60。
-    #   **改它是决策、不是修 bug**，请与 `.env` 一并评审。
 
-    def _live_batch_cap(self) -> int:
-        """读实盘 `.env` 的批次上限并解析为 int；任何异常形态直接 fail。"""
+    def _env_raw(self, key: str) -> str:
+        """取实盘 `.env` 中 `key` 的原始值；文件缺失或键缺失都直接 fail。"""
         env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-        self.assertTrue(os.path.exists(env_path), "实盘 .env 不存在，无法核对上限")
+        self.assertTrue(os.path.exists(env_path), f"实盘 .env 不存在，无法核对 {key}")
+        raw = None
         with open(env_path, encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f
-                     if ln.strip().startswith("RISK_MAX_ACTIVE_BATCHES")]
-        self.assertTrue(lines, ".env 未显式设置 RISK_MAX_ACTIVE_BATCHES（会退回默认 3）")
-        raw = lines[0].split("=", 1)[1].strip()
+            for ln in f:
+                s = ln.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                if k.strip() == key:
+                    raw = v.strip()
+                    break
+        self.assertIsNotNone(
+            raw, f".env 未显式设置 {key} → 代码会退回默认值，配置不生效")
+        # 复刻 python-dotenv 的去引号行为，避免 `"4"` 被误判为不可解析（假红）
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+            raw = raw[1:-1]
+        return raw
+
+    def _runtime_int(self, key: str, default: int):
+        """逐字复刻 trader L1633-1641 的解析，返回 (原始串, 运行时取值, 是否回落)。
+
+        让「测试认为可解析」与「运行时实际取到的值」成为**同一件事**，
+        而不是两套各自为政的判断。
+        """
+        raw = self._env_raw(key)
         try:
-            return int(raw)
-        except ValueError:
-            # 非整数必须响：trader L1634-1636 会**静默回落默认 3**，
-            # 届时「.env 写了 99、进程跑 3」而无人知晓（配置假生效）。
-            self.fail(f"RISK_MAX_ACTIVE_BATCHES={raw!r} 不是整数 → "
-                      f"运行时静默回落 3，配置与实际不符（假生效）")
+            return raw, int(raw), False
+        except (TypeError, ValueError):
+            return raw, default, True
 
-    def test_m3_batch_cap_is_sane(self):
-        """不变量层：改 `.env` **不必改本测试**，但三类非法值仍被拦。
+    def test_m3_risk_keys_parse_without_silent_fallback(self):
+        """**配置检查**：两个风控键必须存在且可解析 —— 这是唯一的硬判据。
 
-        - 非整数 → 代码侧静默回落 3（见 `_live_batch_cap`）
-        - <= 0   → trader L1628「限额 <=0 视为禁用」= **整个账户层闸门被关掉**
-        - < 3    → 违反既定约束「至少 3 个活跃批次」，且批次数不得被当作安全参数
+        为什么只查「解析得动」、不查数值区间：
+          - 解析失败会**静默回落**（`trader L1634-1641`：BATCHES→3、SYMBOLS→1），
+            届时「.env 写了 9 / 2，进程仍按 3 / 1 跑」且零提示 = **配置假生效**；
+            这是真缺陷，且两个键**都**有。
+          - 数值取多少是**每机可不同的需求**，不该钉进入库测试 ——
+            那正是 9cc930a 之前 `== "3"` 的老毛病。
+        ⇒ 调**批次上限**或**品种上限**都只需改 `.env` + 重启，**不必改本测试**。
+
+        明确**不**由本测试保证的事：
+          - **不证明「成交 → 首次发现 <= N 秒」**。真实延迟还含网络失败 x3
+            （`trader L7808-7810`）、sleep 之后的 API 耗时，以及下调上限时
+            已有活跃批次可能已超新上限。轮询档位本身由 `M2PollingCliffTests`
+            **独立**固定（读的是实现、不是 .env）。
+          - **不证明运行进程已加载**：`load_dotenv()` 只在启动执行一次（D10），
+            生效证据是重启后 `bot_runner.log_effective_config()` 横幅同名键值；
+            `健康巡检.py` 每次重读磁盘（F10 机制）。
+
+        容量提示（**不是门禁，不拦任何值**）：批次 >= 7 落入 45~60s 档，
+        **尚未压测**，调高前请复核；档位行为与 .env 无关，已由 M2 固定。
         """
-        cap = self._live_batch_cap()
-        self.assertGreater(cap, 0,
-                           "0/负数 = 关闭账户层闸门"
-                           "（trader L1628「限额 <=0 视为禁用」），禁止")
-        self.assertGreaterEqual(cap, 3,
-                                "既定约束：至少 3 个活跃批次；"
-                                "批次数不得被当作安全参数")
+        for key, default in (("RISK_MAX_ACTIVE_BATCHES", 3),
+                             ("RISK_MAX_ACTIVE_SYMBOLS", 1)):
+            raw, _value, fell_back = self._runtime_int(key, default)
+            self.assertFalse(
+                fell_back,
+                f"{key}={raw!r} 无法解析 → 运行时静默回落 {default}，"
+                f"进程将按 {default} 而非 {raw} 执行（配置假生效）。"
+                f"请把值改成整数，**不是放宽本断言**。")
 
-    def test_m3_configured_cap_still_fast_enough(self):
-        """行为层：用 `.env` 的**真实上限**跑轮询分档，断言裸仓发现窗口够快。
+    def test_m3_batch_floor_matches_current_requirement(self):
+        """**需求约束（非安全不变量）**：`RISK_MAX_ACTIVE_BATCHES >= 3`。
 
-        本测试保护的是「成交 → 首次发现 SL/TP 缺失」的窗口
-        （v6.2-P0-1 判定 ~80s 不可接受），**不是数字 3**。因此：
-          - `.env` 调成 4 / 6   → 自动跟随通过，**无需改测试**；
-          - 上限进到 `>6` 档    → 被 `WINDOW_LIMIT` 拦下；
-          - 将来分档实现改变     → 本断言自动跟随，不会与实现脱节。
+        来源：用户 2026-09-25 定的当前需求「至少 3 个活跃批次」，
+        且批次数不得被当作安全参数使用。
 
-        ⚠️ 本测试只证明**磁盘 `.env` 自洽，不证明运行进程已加载** ——
-        `load_dotenv()` 只在启动时执行一次（D10），改完不重启则主程序仍用旧值、
-        而 `健康巡检.py` 每次重读磁盘用新值 = 两侧行为不一致（F10 机制）。
-        **生效证据是重启后 `bot_runner.log_effective_config()` 横幅里的同名键值。**
+        ⚠️ 这是**全文件唯一**仍需与 `.env` 同步的断言，且**只在下调时触发**：
+           上调 3→4→9→… 不受任何限制、无需改测试。
+           若需求本身变更（例如改为 2），**须与 `.env` 一并评审后**同步修改本断言
+           —— 这一处是**有意保留**的「必须有人看一眼」的位置，不是遗漏。
+
+        为什么不再单列 `<=0`：`trader L1628/L1654` 把 `<=0` 定义为**禁用闸门**，
+        是受支持的运行时语义（`test_account_risk.py:171` 钉为设计）；
+        此处只从「当前需求 >= 3」一个口径拦它，不叠加第二条理由。
         """
-        cap = self._live_batch_cap()
-        fake = mock.Mock()
-        fake._get_active_batch_count.return_value = cap
-        for _ in range(20):
-            v = trader_260725.CryptoTrader._calculate_monitoring_interval(fake)
-            self.assertLessEqual(
-                v, self.WINDOW_LIMIT,
-                f"上限={cap} 时裸仓发现窗口可达 {v:.1f}s > {self.WINDOW_LIMIT}s —— "
-                f"应调整轮询分档或下调 .env 上限，**不是放宽本断言**")
+        raw, cap, fell_back = self._runtime_int("RISK_MAX_ACTIVE_BATCHES", 3)
+        if fell_back:
+            # 解析失败由配置检查用例负责报；此处跳过数值比较，
+            # 避免同一件事报两次、且报出误导性的「< 3」。
+            self.skipTest(f"{raw!r} 不可解析，数值判据见配置检查用例")
+        self.assertGreaterEqual(
+            cap, 3,
+            f"RISK_MAX_ACTIVE_BATCHES={cap} 低于当前需求下限 3"
+            f"（用户 2026-09-25 定）。若这是**有意**变更需求，"
+            f"请连同 .env 一并评审后修改本断言；调高上限无需改测试。")
 
 
 class M4ConfigBannerTests(unittest.TestCase):
