@@ -1,12 +1,15 @@
 # 部署执行记录与门禁 EXIT=1 根因 —— 送审 ChatGPT（2026-09-27）
 
-> **现场状态（截至本文件写入）**：
+> **现场状态（截至本文件更新）**：
 > - 生产 `G:\my-crypto-bot` `HEAD = b595156`（**已回滚到部署前基线**，`trader` blob 与 `b595156` 完全一致）
-> - **Bot 处于停机状态**（0 进程），心跳 `stopped=true` → `CryptoBot-HealthPatrol` 静默
+> - **Bot 已按 §4⑤ 重启恢复运行**（2026-09-27 **15:27:53**，4 进程，`READY`，`stopped=false`，
+>   `bot_alive=true`，`restarts=0`；`活跃批次 0`、`Binance API ✅`）—— 回滚收尾已完成，不再长期停机
 > - **空仓、交易所无入场挂单**（执行前由操作者人工在交易所确认）
 > - 账本 `trade_state.json` 全程未被改动：**14245 bytes / mtime 2026-09-23 23:07:05**
 > - 双快照完好：`G:\_deploy_backup\20260927_135730\{01_pre_stop, 02_post_stop}`
-> - 本轮**已按清单执行 → 门禁 EXIT=1 被阻断 → 按 §4 回滚**，未上线、未重启成功
+> - 本轮**已按清单执行 → 门禁 EXIT=1 被阻断 → 按 §4 回滚 → §4⑤ 重启验收通过**，**未上线**
+> - **定点修复已完成**（见 §9），worktree 门禁 `EXIT=2 / FAIL 0`；`$TARGET` 现为 `2b4f89c`
+> - ⚠️ **步骤 0 判据已修订，待清单复审③ 确认后才能用于下一个部署窗口**
 
 ---
 
@@ -194,9 +197,106 @@ test_v64_partial_close.py  SHA256 相同
 
 ---
 
-## 8. 当前需要人工决策的一件事
+## 8. 恢复运行（已完成）
 
-**Bot 仍停机**（空仓、无敞口、巡检静默，**无资金风险，但也没有交易能力**）。
-是否恢复运行，由操作者决定：
-- 恢复 = 双击 `G:\my-crypto-bot\启动Bot.bat`（当前 `HEAD = b595156`、门禁 `EXIT=2`，属已知良好状态）
-- 或保持停机等待第 7 节裁定
+**操作者已于 15:27 重启，§4⑤ 收尾完成** —— 见下节验收。不再长期停机。
+
+- 恢复 = 双击 `G:\my-crypto-bot\启动Bot.bat`（`HEAD = b595156`、门禁 `EXIT=2`，属已知良好状态）
+- ChatGPT 明确：**不必为等六个问题的答案而继续停机**，`stopped=true` 让巡检静默**不能当作正常待步**。
+
+### §4⑤ / 步骤 6 启动验收（2026-09-27 15:27）
+
+| 判据 | 结果 |
+| --- | --- |
+| 进程 | 4 个（watchdog 43448/27444 + bot_runner 46568/18688），`start=15:27:53` ✅ |
+| READY | `[15:27:58] ✅ [启动检测] 历史任务恢复校验完成！系统 READY` ✅ |
+| 安全检查 | `MAX_LEVERAGE 100x ✅` / `Binance API ✅` / **`活跃批次 0`** ✅ |
+| 心跳 | `stopped=false`、`bot_alive=true`、`restarts=0` ✅ |
+| HEAD / 代码 | `b595156`，`trader` blob `fe0861c4…` 与基线一致 ✅ |
+| 账本 | `14245 / 2026-09-23 23:07:05` 未变 ✅ |
+
+---
+
+## 9. ChatGPT 裁定 + 定点修复执行记录
+
+### 9.1 ChatGPT 对 §7 六问的裁定
+
+1. **定性认可**：这是**本轮触发的测试回归 + 既有测试路径缺陷**，**不能登记成基线失败**。
+   同时**明确**：**不能仅凭真实类有该方法就宣称新代码的运行路径已验证。**
+2. **修正它自己的复审口径**：它此前接受 worktree 门禁结果时**没核对这两个脚本实际读取的源码路径**，
+   因而**高估了"全绿"对待部署代码的证明力** —— 是**它的审核遗漏**，不只是执行侧的问题。
+3. **Q3 哨兵**：**暂不加**全库"硬编码路径扫描哨兵"，理由是"已知盲区就在这两个脚本"，
+   先修路径和保真度即可。 → ⚠️ **该前提不成立，见 9.2。**
+4. **Q4 修法**：绑**真实** `_update_registry_locked` 及实际调用所需 helper，
+   沿用现有读写状态桩，**不写 `return None` 空实现**。
+5. **Q6 重开窗口**：修测 → 隔离 worktree 重跑确认断言确实执行 → 跑门禁 →
+   **通过后重新选择空仓窗口、重新核对交易所敞口再部署**。
+
+### 9.2 ⚠️ 对 ChatGPT Q3 前提的更正：盲区是 **4 文件 10 处**，不是 2 个脚本
+
+全库扫描 `G:\my-crypto-bot\` 硬编码（所有 `test_*.py`）：
+
+| 文件 | 处数 | 内容 | 本次处置 |
+| --- | --- | --- | --- |
+| `test_v64_partial_close.py` | 3 | L18-20 `TRADER_PATH`/`HELPER_PATH`/`BOTRUNNER_PATH` | ✅ 改 `__file__` 相对 |
+| `test_v64_diag_fixes.py` | 2 | L15-16 `TRADER_PATH`/`BOTRUNNER_PATH` | ✅ 改 `__file__` 相对 |
+| `test_p5_closecancel.py` | 4 | L412/685/710/874 内联 `open(r'G:\my-crypto-bot\trader_260725.py')` | ✅ 改 `SRC_PATH` |
+| `test_close_confirmation_v3.py` | 1 | L26 `sys.path.insert(.venv\Lib\site-packages)` | ⏸ **另一类，未改** |
+
+- `test_p5_closecancel.py` 最能说明危害：它 `import trader_260725`（读 **CWD**）却 `open`
+  **生产源码** —— **同一个测试里两份代码**。
+- L26 那处指向的是**第三方库目录**（两目录共用同一 `.venv`），**不参与源码选取，不会造成假绿**，
+  故本次不动，**留给裁定**。
+- **未加扫描哨兵**（遵从 ChatGPT 决定），但**本次是人工全库扫描**，不是抽样。
+
+### 9.3 修复 1：路径改读本仓库
+
+`_HERE = os.path.dirname(os.path.abspath(__file__))` 拼接，`test_p5_closecancel.py` 提为模块级 `SRC_PATH`。
+**生产侧行为不变**（`_HERE` 即生产目录）；worktree 侧从此读 worktree。
+
+### 9.4 修复 2：绑真实实现，不写空实现
+
+`1fbb546`(C1/G1) 把 `_update_registry`（trader L6812）改成**委托** `_update_registry_locked`（L6742），
+而桩 `BINDS` 名单只有前者 → 委托即 `AttributeError`。
+
+真实实现只依赖 **`self._state_lock` / `load_all_states` / `既有 `_persist_states` / `time`** ——
+**四样桩里全都现成**（`make_trader` L163/L194/L198、`NS` L57），故直接把**真实实现**加进 `F` 名单，
+走既有 `types.MethodType` 绑定循环（L212-213），读写仍走桩的状态桩。
+**没有写空实现** —— 与 Q4 一致。
+
+### 9.5 修复 3：重跑验证（worktree，**读的是 worktree 分支代码**）
+
+```
+TRADER_PATH = G:\my-crypto-bot-wt\trader_260725.py    ← 已不再指向生产
+test_v64_partial_close.py   2/5 → 5/5      rc=0
+test_v64_p1_resize.py       6/10 → 10/10   rc=0
+test_v64_diag_fixes.py           6/6       rc=0
+test_p5_closecancel.py           37/37     rc=0
+
+run_test_gate.py --allow-live（worktree 预检，Bot 在跑）
+EXIT=2 | pytest exit=0 | PASS 51 | BASELINE-FAIL 1 | NOT-VERIFIED 1 | FAIL 0
+（NOT-VERIFIED 1 = test_orphan_guard 需停机窗口，非回归）
+```
+
+**红→绿对照**（去掉绑定即回到 6/10）证明**断言是活的，不是空转** —— 对应 ChatGPT「确认原有
+逐项断言确实执行」的要求。
+
+提交：`738e1ca..2b4f89c`（3 文件 +23/−10），已 push。
+
+### 9.6 ⚠️ 新发现：步骤 0 判据会误杀（待清单复审③ 确认）
+
+清单原判据「`a07ac6e..$TARGET` **非 `.md` 计数 = 0**，否则中止」。修复提交 `2b4f89c` 是 `.py`：
+
+```
+a07ac6e..2b4f89c 共 7 文件 = 4 *.md + 3 test_*.py
+非 .md 计数 = 3                    → 旧判据会「中止部署」❌（误杀）
+非 .md 且非 test_*.py = 0          → 真正要守的条件 ✅
+运行时文件逐项（trader/bot_runner/watchdog/健康巡检/
+run_test_gate/*.bat/.env/.gitignore）= 0 ✅（同口径实测）
+```
+
+**已改清单**（步骤 0 命令 + 注记 + §7 摘要 + §8 记录，共 4 处），原则是
+**改判据而非绕过判据**：本意守住"不夹带生产代码改动"，测试文件不进运行时。
+
+> **本项为判据级修改，按前例属"需送审"范畴，故登记为清单复审③，待 ChatGPT 确认后
+> 方可用于下一个部署窗口。** 在此之前**不开启新部署窗口**。
