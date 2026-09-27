@@ -4,7 +4,9 @@
 
 本文件对应**可部署版本**（M2–M4，不含 M1'）。背景（第八轮复审 / ChatGPT 复核 d539da9）：
   M2 消除第 3 批次起的轮询断崖（F6：<=2 → 10~15s，<=4 → 原 75~100s）
-  M3 批次硬上限 3 + 修正 D10 误导文案（原称「改 .env 即时生效无需重启」，实为需重启）
+  M3 批次上限与实盘 `.env` **联动**（2026-09-27 改法：不变量 + 行为断言，
+     不再把 `"3"` 钉死在入库测试里 → 调上限只改 .env 即可）
+     + 修正 D10 误导文案（原称「改 .env 即时生效无需重启」，实为需重启）
   M4 启动配置横幅：打印**进程内真正生效**的值（永久解决 A9 类验收缺口）
 
 ⚠️ M1'（崩溃邮件在途去重 + 迟到回灌）**刻意不含**在内：ChatGPT 复核 d539da9 指出
@@ -76,28 +78,74 @@ class M3D10WordingTests(unittest.TestCase):
             src = f.read()
         self.assertIn("需重启 watchdog/bot_runner 才对运行中进程生效", src)
 
-    def test_m3_batch_cap_matches_live_env_file(self):
-        """实盘 `.env`（不入库）必须**显式**写出批次上限，而不是依赖默认值。
+    # ── M3 批次上限：与实盘 `.env` **联动**（2026-09-27 改法，用户拍板）─────────
+    # 原实现 `assertEqual(..., "3")` 把**不入库、每机可不同**的 `.env` 值钉死在
+    # **入库**的测试里 → 调一次上限必须同步改测试，否则门禁 EXIT=1。
+    # 改为「不变量 + 行为」两层断言：用户**只改 .env 即可**，
+    # 但 0/负数/非整数/低于 3/档位过慢 仍会被响亮拦下。
+    #
+    # 留痕：`.env` 不入库（.gitignore:4），值变更靠**部署步骤 0 记 SHA256 +
+    #       步骤 5 判据 ⑥ 复核**留痕，不在本测试里另开日志。
+    WINDOW_LIMIT = 45.0
+    # 裸仓发现窗口上限（秒）。45s 拦住 `>6` 档（45~60s）→ 等价于「上限最多到 6」。
+    #   想更严 → 30（上限最多到 4）；想放开档位 → 60。
+    #   **改它是决策、不是修 bug**，请与 `.env` 一并评审。
 
-        上限值 = 3（用户 2026-09-25 定）：M2 消除了第 3 批次的轮询断崖后，
-        3 档为 20~30s，不再承担「保护单补建窗口过长」的代价。
-        若日后改为 4 或其他值，**必须同步改这里的断言**，否则配置与测试脱节。
-        """
+    def _live_batch_cap(self) -> int:
+        """读实盘 `.env` 的批次上限并解析为 int；任何异常形态直接 fail。"""
         env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
         self.assertTrue(os.path.exists(env_path), "实盘 .env 不存在，无法核对上限")
         with open(env_path, encoding="utf-8") as f:
             lines = [ln.strip() for ln in f
                      if ln.strip().startswith("RISK_MAX_ACTIVE_BATCHES")]
         self.assertTrue(lines, ".env 未显式设置 RISK_MAX_ACTIVE_BATCHES（会退回默认 3）")
-        self.assertEqual(lines[0].split("=", 1)[1].strip(), "3")
+        raw = lines[0].split("=", 1)[1].strip()
+        try:
+            return int(raw)
+        except ValueError:
+            # 非整数必须响：trader L1634-1636 会**静默回落默认 3**，
+            # 届时「.env 写了 99、进程跑 3」而无人知晓（配置假生效）。
+            self.fail(f"RISK_MAX_ACTIVE_BATCHES={raw!r} 不是整数 → "
+                      f"运行时静默回落 3，配置与实际不符（假生效）")
 
-    def test_m3_batch_cap_3_still_fast_enough(self):
-        """上限=3 的前提是 M2 已让 3 档保持 20~30s（否则等于退回断崖）"""
+    def test_m3_batch_cap_is_sane(self):
+        """不变量层：改 `.env` **不必改本测试**，但三类非法值仍被拦。
+
+        - 非整数 → 代码侧静默回落 3（见 `_live_batch_cap`）
+        - <= 0   → trader L1628「限额 <=0 视为禁用」= **整个账户层闸门被关掉**
+        - < 3    → 违反既定约束「至少 3 个活跃批次」，且批次数不得被当作安全参数
+        """
+        cap = self._live_batch_cap()
+        self.assertGreater(cap, 0,
+                           "0/负数 = 关闭账户层闸门"
+                           "（trader L1628「限额 <=0 视为禁用」），禁止")
+        self.assertGreaterEqual(cap, 3,
+                                "既定约束：至少 3 个活跃批次；"
+                                "批次数不得被当作安全参数")
+
+    def test_m3_configured_cap_still_fast_enough(self):
+        """行为层：用 `.env` 的**真实上限**跑轮询分档，断言裸仓发现窗口够快。
+
+        本测试保护的是「成交 → 首次发现 SL/TP 缺失」的窗口
+        （v6.2-P0-1 判定 ~80s 不可接受），**不是数字 3**。因此：
+          - `.env` 调成 4 / 6   → 自动跟随通过，**无需改测试**；
+          - 上限进到 `>6` 档    → 被 `WINDOW_LIMIT` 拦下；
+          - 将来分档实现改变     → 本断言自动跟随，不会与实现脱节。
+
+        ⚠️ 本测试只证明**磁盘 `.env` 自洽，不证明运行进程已加载** ——
+        `load_dotenv()` 只在启动时执行一次（D10），改完不重启则主程序仍用旧值、
+        而 `健康巡检.py` 每次重读磁盘用新值 = 两侧行为不一致（F10 机制）。
+        **生效证据是重启后 `bot_runner.log_effective_config()` 横幅里的同名键值。**
+        """
+        cap = self._live_batch_cap()
         fake = mock.Mock()
-        fake._get_active_batch_count.return_value = 3
+        fake._get_active_batch_count.return_value = cap
         for _ in range(20):
             v = trader_260725.CryptoTrader._calculate_monitoring_interval(fake)
-            self.assertLessEqual(v, 30.0, "3 档轮询必须 <=30s")
+            self.assertLessEqual(
+                v, self.WINDOW_LIMIT,
+                f"上限={cap} 时裸仓发现窗口可达 {v:.1f}s > {self.WINDOW_LIMIT}s —— "
+                f"应调整轮询分档或下调 .env 上限，**不是放宽本断言**")
 
 
 class M4ConfigBannerTests(unittest.TestCase):
