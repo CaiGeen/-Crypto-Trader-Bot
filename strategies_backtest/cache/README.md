@@ -8,3 +8,17 @@
 仅保留研究脚本（`.py`）与结果产物（`.csv`/`.json` 等文本）。
 
 如需恢复缓存：运行对应回测数据拉取脚本即可重建本目录内容。
+
+## 标记价数据（增量更新）
+
+`BTCUSDT_<周期>_mark.parquet` 由 `../fetch_markprice.py` 写入（币安 `/fapi/v1/markPriceKlines` 口径，
+**不是**最新成交价——`BTCUSDT_4h.parquet` 才是成交价）。断点续传，重复执行同一条命令即可增量更新：
+
+```powershell
+cd ..\strategies_backtest
+python fetch_markprice.py 4h --csv --xlsx
+```
+
+其他脚本请用 `config.BacktestConfig().mark_cache_path(tf)` 取路径，勿硬编码文件名。
+详见 `../PROJECT_OVERVIEW.md` §11.7。
+

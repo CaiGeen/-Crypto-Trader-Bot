@@ -18,12 +18,12 @@ def load_data(source):
     if source == "latest":
         from data_loader import load_klines
         df_4h = load_klines(cfg)
-        df_1m = pd.read_parquet(cache / "BTCUSDTUSDT_1m.parquet")
-        daily_df = pd.read_parquet(cache / "BTCUSDT_1d.parquet")
+        df_1m = pd.read_parquet(cfg.canonical_cache_path("1m"))
+        daily_df = pd.read_parquet(cfg.canonical_cache_path("1d"))
     else:
-        df_4h = pd.read_parquet(cache / "BTCUSDTUSDT_4h_mark.parquet")
-        df_1m = pd.read_parquet(cache / "BTCUSDT_1m_mark.parquet")
-        daily_df = pd.read_parquet(cache / "BTCUSDT_1d_mark.parquet")
+        df_4h = pd.read_parquet(cfg.mark_cache_path("4h"))
+        df_1m = pd.read_parquet(cfg.mark_cache_path("1m"))
+        daily_df = pd.read_parquet(cfg.mark_cache_path("1d"))
         for df in (df_4h, df_1m, daily_df):
             for col in ["open", "high", "low", "close", "volume"]:
                 if col in df.columns: df[col] = df[col].astype(float)

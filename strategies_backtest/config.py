@@ -53,6 +53,14 @@ class BacktestConfig:
         tf = timeframe or self.timeframe
         return self.base_dir / self.cache_dir / f"{self.cache_stem(market)}_{tf}.parquet"
 
+    def mark_cache_path(self, timeframe: str | None = None) -> Path:
+        """标记价K线缓存：BTCUSDT_4h_mark.parquet（/fapi/v1/markPriceKlines 口径，非最新成交价）。
+
+        由 fetch_markprice.py 写入；其他脚本请用本方法取路径，勿硬编码文件名。
+        """
+        tf = timeframe or self.timeframe
+        return self.base_dir / self.cache_dir / f"{self.cache_stem()}_{tf}_mark.parquet"
+
     def legacy_cache_path(self, timeframe: str | None = None) -> Path:
         """旧错误命名：BTC/USDT:USDT 去分隔符 → BTCUSDTUSDT_4h.parquet。"""
         tf = timeframe or self.timeframe

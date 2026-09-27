@@ -681,14 +681,27 @@ dev[4,6):     均1.79(72单)    均0.84(76单)
 
 ### 11.7 数据缓存更新
 
+> **增量更新命令**（断点续传，重复执行同一条即可；缓存路径统一由 `config.BacktestConfig.mark_cache_path()` 解析）：
+>
+> ```powershell
+> cd strategies_backtest
+> python fetch_markprice.py 4h --csv --xlsx     # 标记价4h，增量更新 parquet + 导出 csv/xlsx
+> ```
+>
+> 落盘产物：`cache/BTCUSDT_4h_mark.parquet`（规范缓存，UTC）、`.csv` / `.xlsx`（可选导出，含北京时间UTC+8列）。
+> 仅存已收盘K，未收盘K下次续传补上。csv/xlsx 时间列注明时区（`open_time_UTC+0` / `open_time_北京UTC+8`），`open_time_ms` 保留原始 epoch 毫秒。
+
 | 文件 | 内容 | 说明 |
 |------|------|------|
-| `BTCUSDTUSDT_4h_mark.parquet` | 标记价4H（14614根） | 2019-12-23起，主回测数据 |
-| `BTCUSDT_1m_mark.parquet` | 标记价1m（350.7万根） | 1m消歧 |
-| `BTCUSDT_1d_mark.parquet` | 标记价1d（2437根） | 日线EMA70 |
+| `BTCUSDT_4h_mark.parquet` | 标记价4H（14820根，2026-09-27） | 2019-12-23 08:00 UTC 起（= 北京时间 16:00），主回测数据 |
+| `BTCUSDT_4h_mark.csv` / `.xlsx` | 同上，表格版 | 额外含北京时间UTC+8列，Excel 直开 |
+| `BTCUSDT_1m_mark.parquet` | 标记价1m（350.7万根） | 1m消歧，需重新拉取（`fetch_markprice.py 1m`） |
+| `BTCUSDT_1d_mark.parquet` | 标记价1d（2437根） | 日线EMA70，需重新拉取（`fetch_markprice.py 1d`） |
 | `funding_BTCUSDT.csv` | 资金费率（7619条） | 8h周期 |
 | `metrics_oi_BTCUSDT.parquet` | OI数据（62.7万条） | 5min周期 |
 | `tier_v4_rdf.parquet` | 771行交易记录 | 含所有分档维度字段 |
+
+> ⚠️ 历史脚本 `mark_price_check.py` / `compare_latest_vs_mark.py` 仍引用旧命名 `BTCUSDTUSDT_4h_mark.parquet`（2026-09-08 命名规范化前的遗留），且依赖已剥离的 1m/1d mark 缓存，直接运行会失败。迁移时改用 `BacktestConfig().mark_cache_path(tf)` 即可。
 
 ### 11.8 本次新建脚本
 
@@ -696,7 +709,7 @@ dev[4,6):     均1.79(72单)    均0.84(76单)
 |------|------|
 | `report_scheme_a.py` | 方案A完整报告（最新价） |
 | `compare_latest_vs_mark.py` | 标记价vs最新价对比，含`run_scheme_a()`通用函数 |
-| `fetch_markprice.py` | 拉取标记价K线（断点续传+分批+重试） |
+| `fetch_markprice.py` | 拉取标记价K线（断点续传+分批+重试+可选csv/xlsx导出）。**增量更新入口，见 §11.7** |
 | `data_audit.py` | 数据完整性+交叉性审计 |
 | `position_tier_v2.py` | 分档分析v2（入场时已知条件） |
 | `position_tier_v3.py` | EMA20/60/120密集度分析 |

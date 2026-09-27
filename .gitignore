@@ -68,6 +68,8 @@ signal_dedup.json
 # （配合 a5f96bf 冻结封板，防 git add . 误提交）
 # ==========================================
 *.parquet
+strategies_backtest/cache/*_mark.csv
+strategies_backtest/cache/*_mark.xlsx
 strategies_backtest/results/*.png
 backups/
 *.err

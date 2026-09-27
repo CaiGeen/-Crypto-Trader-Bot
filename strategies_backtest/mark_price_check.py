@@ -4,7 +4,7 @@
   - 实盘 trader.py 挂单 workingType='MARK_PRICE'（触发判定用标记价，触发后市价成交≈最新价）。
   - data_loader.fetch_ohlcv 未带 price 参数 → /fapi/v1/klines 默认最新成交价。
 本脚本：
-  1. 拉全历史 4H 标记价K线（/fapi/v1/markPriceKlines）存 cache/BTCUSDTUSDT_4h_mark.parquet
+  1. 拉全历史 4H 标记价K线（/fapi/v1/markPriceKlines）存 cfg.mark_cache_path("4h")
   2. 逐K对比 high/low/close 差异（bps），并实测证明缓存=最新价而非标记价
   3. 在标记价上完整重跑 6K信号+KAMA终结波段逻辑，与现数据集逐段对比
 """
@@ -23,7 +23,7 @@ from signal_detector import detect_breakout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 cfg = BacktestConfig()
-mark_path = os.path.join(HERE, "cache", "BTCUSDTUSDT_4h_mark.parquet")
+mark_path = cfg.mark_cache_path("4h")
 
 if os.path.exists(mark_path):
     mk = pd.read_parquet(mark_path)
@@ -49,7 +49,7 @@ else:
     mk.to_parquet(mark_path, index=False)
     print(f"标记价K线: 新拉取 {len(mk)} 根")
 
-last = pd.read_parquet(os.path.join(HERE, "cache", "BTCUSDTUSDT_4h.parquet"))
+last = pd.read_parquet(cfg.canonical_cache_path("4h"))
 m_ = mk.merge(last, on="open_time_ms", suffixes=("_mk", "_ls"))
 print(f"对齐后 {len(m_)} 根: 标记价 {pd.to_datetime(mk['open_time_ms'].iloc[0], unit='ms')} 起，"
       f"最新价 {pd.to_datetime(last['open_time_ms'].iloc[0], unit='ms')} 起")
