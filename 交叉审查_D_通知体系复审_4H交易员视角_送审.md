@@ -1765,7 +1765,11 @@ docstring 自己写明「`True` 仅表示已成功持久化；新批次调用方
 >
 > 📌 本轮**顺带证实一项门禁盲区**：脚本式测试若 `main()` 恒 rc=0，门禁只看 rc → **看不到
 > 逐项失败**。`test_b2_verify_semantics` 的 T1 正是这种情况（基线 `883ec7e` 实跑即红，
-> 见 R0 §24.5）。该项已修，但**盲区本身仍在**（未列入本批次范围）。
+> 见 R0 §24.5）。
+> ✅ **该盲区已于复审④收口（2026-09-27）**：该脚本 `main()` 改为失败返回非零 +
+> `raise SystemExit(main())`，并**用故意失败实测过门禁报红**（`X FAIL rc=1`、
+> `FAIL 1`、进程退出码 1）→ 见 §31.4。范围**刻意收窄**到这一个已确认有盲区的脚本，
+> **不扩成 53 个脚本改造**。
 
 1. **意图门禁缺失（原 L9677）**：意图落盘结果无人检查（裸 `_update_registry`）→ 失败后**仍 `create_order`**，
    磁盘 `protection_registry={}` **零锚点**；重启后 `_recheck_registry_self_heal` 调
@@ -1847,11 +1851,121 @@ C1~C5 条款，N1~N3 + N3b + 对照组 + 回归的验收标准，单批次落地
   **只覆盖两条**（首次意图门禁 + 确认第三态），另两条（`_commit_registry_txn` 现 def **L6717**、
   `execute_signal` 批次提交现 **L6170**）已**单独登记**待各自审计。
   ⚠️ 落地 ≠ 验收通过：**T3d 仍为表征测试**，重启收编（§24.6）与轮询静默（R1/R2）**仍未闭环**。
-  🙋 **一项待复审裁定**：未知 G3 形态我返回 `'unknown'`，其下游文案「网络异常」与真实成因
-  不贴切（生产不可达，故未另立新状态）——见 R0 §24.5「第 3 步」末条。
+  ✅ **未知 G3 形态文案已裁定（复审④）**：不另造状态、不改九处调用方，**在文档中限定为
+  防御分支**（AST 枚举之外的返回值生产不可达）——不再作为待裁定项。
+  ✅ **复审④新发现的「账本读取损坏误撤保护单」已修**（第四态 + N8/N8a/N8b），见 **§31**。
 - 条件入场单占资语义：扩第 2 品种前核对。
 - 保护发现时延的实测分布：埋点方案待重设计（先确认时间字段语义 + 枚举全部 CONFIRMED 写入路径）。
 - 6~9 批次的容量压测：到量再做。
 - patrol.log 存量 142 行测试标记：待授权清理。
 - `control.json` 的 `WinError 5` 成因：未定位。
+
+## 31. 第二十一轮：账本读取损坏误撤保护单（复审④，**未部署**）
+
+### 31.1 ChatGPT 复审 `1142156` 的结论
+
+| 项 | 裁定 |
+| --- | --- |
+| 复审②（8 处双告警 / 反事实理由） | **已修，通过** |
+| 复审③（4 站点显式 `== 'committed'` 判据） | **已修，通过** |
+| 未知 G3 形态是否另造状态 | **不另造状态、不改九处调用方**，在文档中**限定为防御分支** |
+| C1/C2 批次修复 | 可作**独立改进保留** |
+| **新发现** | G3 账本重读损坏 → 占位 `{}` → `b is None` → `'g3_triggered'` → G3a 撤掉刚创建且 open 的保护单 |
+| 部署前必须先做 | ① 该时序的**故障注入窄负测 + 正常竞态对照** ② **脚本退出码收口** |
+
+### 31.2 缺陷链条与**来源归因**
+
+```
+意图写盘成功 → create_order 成功 → _verify_order_created 返回 'success'
+  → _commit_protection_with_g3 锁内 load_all_states()  ← 这里读取损坏
+       _state_corrupted=True，返回**占位 {}**
+  → b = {}.get(symbol, {}).get(batch_id)  →  None
+  → if b is None: return 'g3_triggered'          ← 「不知道有哪些批次」被当成「批次已清理」
+  → 调用方转 _g3a_converge_race_order → fetch 得 open → cancel_order   ← 误撤有效保护单
+```
+
+> 📌 **来源：生产基线 `b595156` 既有缺陷，不是 `1142156` 引入的回归。** 本机程序化取证：
+>
+> - `b595156:trader_260725.py` 中 `load_all_states` **已有**三态契约
+>   （`置位 self._state_corrupted=True 并返回` 占位），而 `_commit_protection_with_g3`
+>   **同时**已存在 `if b is None:` + `return 'g3_triggered'`，且**函数体内无任何
+>   `_state_corrupted` 判据** → 缺陷链两端当时就并存。
+> - `git show 1142156 -- trader_260725.py` 的**新增行**中，触及
+>   `load_all_states` / `if b is None` / `_g3a_converge_race_order(` 的条数 = **0**。
+>
+> 该探针是一次性临时脚本，已执行后删除；上面两行结论是它的原样输出口径。
+
+### 31.3 修法（第四态，**刻意窄**）
+
+- **新增第四态 `'ledger_unreadable'`**。裁决顺序改为
+  **① `_state_corrupted` ② 关闭态 ③ 可信账本无批次 ④ 提交**——① 与 ③ 的下游动作相反
+  （① 禁撤单、③ 必须进 G3a 收敛），**必须在读取后先区分，不能都用 `b is None` 裁决**。
+- **不冒充 `persist_failed`**（复审方明确禁止）：两态修复动作不同——本态要先修
+  `trade_state.json` 再人工对账，`persist_failed` 是补记 CONFIRMED。
+- **不把所有 `g3_triggered` 改成禁止撤单**：只改账本不可读这一支。若一刀切，
+  正常竞态收敛会被一起砍掉——对照组 `N8a-2` 专盯这一条。
+- **四个 G3 消费站点逐一显式接管**（沿用 C2「四处都发 critical」的所有权模型，
+  均在 `_state_lock` 释放后发出）：站点1 统一入口 `elif g3 == 'ledger_unreadable':`
+  → critical → `return 'ledger_unreadable'`（**不再 `return 'success'`**）；
+  站点 2/3/4 各插同名 `elif` → critical + 跳过成功簿记（零缩进重排，`else:` 体未动）。
+- **8 个上层调用点必须同步改，否则会引入新缺陷**：统一入口一旦返回新状态，
+  3 处带 `return` 的调用方会补发第二条 `warning` 并返回反事实理由、5 处监控路径同样补发
+  → 正是复审②要消除的**同一事件双告警**。故 3 处各插独立分支（返回准确理由、不发通知），
+  5 处守卫改为 `if verify_result not in ('persist_failed', 'ledger_unreadable'):`；
+  `_verify_failure_msg` 加兜底分支（与既有 `persist_failed` 分支同性质：正常到不了，
+  防新调用点漏加守卫时发出与事实**相反**的「交易所返回订单不存在」）。
+- **N6a 相对原版加强（如实登记）**：原版只认 `if verify_result == 'persist_failed':`
+  一种写法，守卫形态一改就整体失配 → 改为**按语义**扫描「向上 26 行内
+  `if verify_result ...` 提及了哪几个状态」，两态缺一即报。
+
+### 31.4 门禁退出码收口（**范围刻意收窄**）
+
+`test_b2_verify_semantics.py` 的 `main()` 此前**无返回值** + `if __name__ == '__main__': main()`
+→ **断言全挂也恒 rc=0**，而门禁对脚本式**只看退出码** → 「脚本式 FAIL 0」**不能证明该文件全绿**。
+
+- 修法：`main()` 失败返回 `1`，`__main__` 改 `raise SystemExit(main())`。
+- **用故意失败实测过门禁能报红**：把 T4 断言改成恒假 → 门禁打印
+  `X FAIL rc=1 test_b2_verify_semantics.py`、`FAIL 1`、**进程退出码 1**；
+  还原后复跑 → `FAIL 0`、退出码 2（与改前基线一致）。
+- **刻意不扩成 53 个脚本的全面改造**（复审④裁定：只修这个已确认有盲区的脚本）。
+
+### 31.5 测试证据
+
+**N8（注入组）/ N8a（对照组）共用同一驱动，唯一差异是账本可信度**：
+
+| 组 | 账本 | G3 里 `b is None` | 期望行为 | 实测 |
+| --- | --- | --- | --- | --- |
+| **N8 注入** | 写坏（非法 JSON）→ `_state_corrupted=True`、返回占位 `{}` | **True** | `cancel_order=0`、不进 G3a、返回 `'ledger_unreadable'`、锁外恰 1 条 critical | ✅ `N8-1`..`N8-5` 全过 |
+| **N8a 对照** | 合法 `{}`（**可信**、批次确已清理） | **True** | 原有 G3a 竞态收敛**照常执行**，返回 `'success'` | ✅ `N8a-1`..`N8a-3` 全过 |
+
+两组 `b is None` **都为 True**，行为差异只能来自 `_state_corrupted` 的区分——
+这就是「两种情况不能都用 `b is None` 裁决」的判别对。`N8b` 另用结构断言把
+「`_state_corrupted` 判据必须排在 `if b is None:` 之前」钉进源码顺序。
+
+**先红后绿实证**：把 `_state_corrupted` 判据改成永假 →
+
+```
+[FAIL] N8-2  cancel_order 调用=1 次；G3a 调用=1 次（期望均 0）
+[FAIL] N8-3  返回='success'（期望 'ledger_unreadable'）
+[FAIL] N8-4  通知级别=[]；发送时 _state_lock.locked=[]（期望恰 1 条 critical 且 False）
+[PASS] N8a-2 cancel_order 调用=1 次   ← 对照组仍绿，不是「一刀切禁撤单」
+保护单写盘门禁注入测试: 32/35 通过   rc=1
+```
+
+恢复后 **35/35、rc=0**。
+
+**门禁**：`run_test_gate.py --allow-live`（`Start-Process -Wait -PassThru` 取真实退出码）
+→ 脚本式 53 项 **FAIL 0**（PASS 51 / BASELINE-FAIL 1 已登记 / NOT-VERIFIED 1 需停机窗口）、
+pytest `exit=0`、**进程退出码 2**（与改前基线一致）。
+`test_g3_converge` **28/28**、`test_monitor_poll_recovery` **5/5**（两份送审物）未受影响。
+
+### 31.6 仍未闭环
+
+- **未部署、未重启**；复审方把部署裁决推迟到本节两项收口之后——两项已完成，待复审。
+- 本节修的是「**读取损坏**」这一支；**账本读取失败后其余路径**（接管/恢复/`_ready`）的
+  Fail-Closed 语义由既有 D-009 承担，**本轮未重新验证**。
+- `T3d` 仍为表征测试；重启收编（R0 §24.6）、轮询静默（R1/R2）、`fetch_positions` 全量普查
+  仍 **NOT VERIFIED**。
+- 5 处监控路径 `print` 文案仍写「验证失败」（属提示语，非告警；critical 正文已准确）——
+  **可选补项，本轮未做**。
 

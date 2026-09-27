@@ -675,8 +675,19 @@ def check_n6_upper_caller_sends_single_critical():
         f"ok={inj_ret[0]!r}；reason={str(reason)[:160]!r}")
 
 
+_GUARD_STATES = ("persist_failed", "ledger_unreadable")
+
+
 def check_n6a_all_verify_failure_msg_sites_guarded():
-    """N6a（结构断言）：**8 个** `_verify_failure_msg` 调用点全部被 persist_failed 守卫包住。
+    """N6a（结构断言）：**8 个** `_verify_failure_msg` 调用点全部被守卫包住，
+    且每个守卫必须同时覆盖 **persist_failed + ledger_unreadable** 两个状态。
+
+    为什么是两个：统一入口是这两条状态的 critical **唯一告警所有者**，任一状态漏守卫，
+    该路径就会再补发一条 warning → 同一事件双通知（ChatGPT 复审② 的原始缺陷模式）。
+    第四态 `ledger_unreadable` 是复审④新增，本断言相对 N6a 原版**加强**：原版只认
+    `if verify_result == 'persist_failed':` 一种写法，守卫形态一改（如改成 `not in (...)`）
+    就会整体失配 → 现改为**按语义**扫描「向上 26 行内 `if verify_result ...` 提及了哪几个
+    状态」，守卫写法怎么变都拦得住（第三、四态各带 8 行说明注释，窗口必须盖得住）。
 
     行为负测只覆盖 1 条上层路径；其余 7 条（含 5 条监控路径）靠本结构断言看住——
     新增未守卫的调用点会因 `调用点 != 8 或存在未守卫行` 被逼审。
@@ -688,23 +699,25 @@ def check_n6a_all_verify_failure_msg_sites_guarded():
              if "_verify_failure_msg(" in s and not s.lstrip().startswith("def ")]
     unguarded = []
     for i in sites:
-        ok = False
-        for j in range(i - 1, max(i - 14, -1), -1):
+        found = set()
+        for j in range(i - 1, max(i - 26, -1), -1):
             s = lines[j]
-            if ("if verify_result == 'persist_failed':" in s
-                    or "if verify_result != 'persist_failed':" in s):
-                ok = True
-                break
-            if "if verify_result != 'success':" in s:
-                break          # 已到外层 if，中间没有守卫
-        if not ok:
-            unguarded.append(i + 1)
+            if s.lstrip().startswith("if verify_result"):
+                for st in _GUARD_STATES:
+                    if f"'{st}'" in s:
+                        found.add(st)
+                if "if verify_result != 'success':" in s:
+                    break          # 已到外层 if，中间没有更多守卫
+        missing = [st for st in _GUARD_STATES if st not in found]
+        if missing:
+            unguarded.append((i + 1, missing))
 
     report(
-        f"N6a 全部 {len(sites)} 个 _verify_failure_msg 调用点均被 persist_failed 守卫拦截",
+        f"N6a 全部 {len(sites)} 个 _verify_failure_msg 调用点均被守卫"
+        f"（persist_failed + ledger_unreadable 双状态）拦截",
         len(sites) == 8 and not unguarded,
         f"调用点={len(sites)} 处（期望 8）；未守卫的行={unguarded}"
-        f"（任一未守卫 = 该路径会对 persist_failed 再发一条 warning，双通知回归）")
+        f"（任一状态漏守卫 = 该路径会对上游已发 critical 的事件再补一条 warning，双通知回归）")
 
 
 # --------------------------------------------------------------------------
@@ -775,6 +788,177 @@ def check_n7a_all_g3_sites_gate_on_explicit_committed():
         f"任一缺失 = 该站点退回『非 persist_failed 即成功』，未知形态会被当成功簿记")
 
 
+# --------------------------------------------------------------------------
+# N8 / N8a：D-009×G3 交叉 —— 「账本读取损坏」不得流入 G3a 撤单分支
+#   ChatGPT 复审④（2026-09-27）。**来源：生产基线 b595156 既有缺陷，非 1142156 引入**。
+#   时序：意图写盘成功 → 交易所创建成功 → 订单查询成功 → G3 锁内账本重读损坏
+#         → 交易所有单且 open。旧路径会返回 'g3_triggered' → G3a → cancel_order
+#         把刚创建的有效保护单撤掉。
+# --------------------------------------------------------------------------
+
+def _run_g3_ledger(case):
+    """驱动统一入口走完「意图写盘 → 创建 → 查询 → G3」，返回观察结果。
+
+    两组 setup 的**唯一差异**是账本可信度：
+      case="corrupt" → G3 锁内 load_all_states 读取失败（占位 {} + _state_corrupted=True）
+      case="clean"   → 账本**可信**，但批次确实已被清理（合法 {} 中无该批次）
+    两种 case 下 G3 里的 `b is None` **都为 True**，因此这对用例正是
+    「不能都用 b is None 裁决」的判别对：行为差异只能来自 _state_corrupted 的区分。
+    """
+    d, state_path = _fresh_state_file()
+    try:
+        _seed_batch(state_path, protection_registry={})
+        states = _read_disk(state_path)
+        fake = _make_fake(state_path, states)
+        # 真实读取（而非 _make_fake 的快照桩）——否则复现不出 _state_corrupted 语义
+        fake.load_all_states = lambda: CryptoTrader.load_all_states(fake)
+        # G3a 内部的撤单执行体也必须是真实的，否则控制组的 cancel_order 是假绿
+        fake._g3_cancel_race_order = (
+            lambda *a, **k: CryptoTrader._g3_cancel_race_order(fake, *a, **k))
+
+        # ① 意图写盘：走**真实** _update_registry 落 PENDING_CREATE
+        CryptoTrader._update_registry(
+            fake, SYMBOL, BATCH, IDENT_SL, state="PENDING_CREATE", id_known=False,
+            order_kind="conditional", role="SL", layer=0, side="LONG")
+        intent_on_disk = (_read_disk(state_path).get(SYMBOL, {}).get(BATCH, {})
+                          .get("protection_registry", {}).get(IDENT_SL, {}).get("state"))
+        # ② 交易所创建成功
+        created = fake.exchange.create_order(
+            SYMBOL, "STOP_MARKET", "sell", 0.43, {"stopPrice": 55000.0})
+
+        # ③ 账本分叉：可信清理 vs 读取损坏
+        if case == "corrupt":
+            io.open(state_path, "w", encoding="utf-8").write("{ 这不是合法 JSON")
+        else:
+            with io.open(state_path, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+
+        # 锁外告警断言：在 send_tg_notification 里记录 _state_lock 当时是否被持有
+        lock_seen = []
+        _orig_send = fake.send_tg_notification
+
+        def _send(text, **kw):
+            lock_seen.append(fake._state_lock.locked())
+            _orig_send(text, **kw)
+        fake.send_tg_notification = _send
+
+        g3a_calls = []
+        _real_g3a = CryptoTrader._g3a_converge_race_order
+
+        def _spy_g3a(*a, **k):
+            g3a_calls.append(a[1] if len(a) > 1 else None)
+            return _real_g3a(fake, *a, **k)
+        fake._g3a_converge_race_order = _spy_g3a
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ret = CryptoTrader._verify_and_update_registry(
+                fake, SYMBOL, BATCH, IDENT_SL, str(created.get("id")), desc="首次止损单")
+        return {"ret": ret, "sent": list(fake.sent), "lock": lock_seen,
+                "cancel": fake.exchange.cancel_order.call_count,
+                "create": fake.exchange.create_order.call_count,
+                "g3a": len(g3a_calls), "intent": intent_on_disk}
+    finally:
+        _restore_state_file()
+
+
+def check_n8_ledger_corruption_must_not_cancel_protection():
+    """N8（负测）：G3 锁内账本重读损坏 → **不撤单、不宣称提交成功、锁外可见告警**。
+
+    改前行为：load_all_states 返回占位 {} → `b is None` → 'g3_triggered' →
+    _g3a_converge_race_order 查到交易所单 open → cancel_order 撤掉刚创建的保护单。
+    本例断言的正是那条路径必须被掐断（把 `_state_corrupted` 判据改回永假即变红）。
+    """
+    r = _run_g3_ledger("corrupt")
+    crit = [m for lvl, m in r["sent"] if lvl == "critical"]
+
+    report(
+        "N8-1 前置条件成立：意图已落盘 + 交易所创建成功 + 查询成功（否则本负测无意义）",
+        r["intent"] == "PENDING_CREATE" and r["create"] >= 1,
+        f"磁盘 intent={r['intent']!r}；create_order 调用={r['create']} 次（期望 >=1）。"
+        f"此时 G3 尚未执行，cancel={r['cancel']} / G3a={r['g3a']}（进入收敛前为 0）")
+
+    report(
+        "N8-2 账本不可读 → **不调用 cancel_order、不进 G3a**（否则误撤有效保护单）",
+        r["cancel"] == 0 and r["g3a"] == 0,
+        f"cancel_order 调用={r['cancel']} 次；G3a 调用={r['g3a']} 次（期望均 0）。"
+        f"改前这两项都是 1 —— 交易所 open 单会被直接撤掉")
+
+    report(
+        "N8-3 **不宣称提交成功**：返回第四态而非 'success'",
+        r["ret"] == "ledger_unreadable",
+        f"返回={r['ret']!r}（期望 'ledger_unreadable'；改前是经 G3a 后返回 'success'）")
+
+    report(
+        "N8-4 锁外给出**恰好一条** critical，且措辞指向账本而非交易所",
+        len(r["sent"]) == 1 and [lv for lv, _ in r["sent"]] == ["critical"]
+        and len(r["lock"]) == 1 and r["lock"][0] is False
+        and any("账本" in m or "trade_state" in m for m in crit)
+        and not any("订单创建验证失败" in m or "交易所返回订单不存在" in m for m in crit),
+        f"通知级别={[lv for lv, _ in r['sent']]}；发送时 _state_lock.locked={r['lock']}"
+        f"（期望恰 1 条 critical 且 False=锁外）；含账本措辞="
+        f"{any('账本' in m or 'trade_state' in m for m in crit)}")
+
+    msg = CryptoTrader._verify_failure_msg(
+        fake_for_msg(), "首次止损单", "sl_ex_1", SYMBOL, "ledger_unreadable")
+    report(
+        "N8-5 兜底文案不谎称「交易所订单不存在」（该单已 verify 成功）",
+        "订单创建验证失败（NOT_FOUND）" not in msg and "LEDGER_UNREADABLE" in msg,
+        f"文案前 60 字={msg[:60]!r}")
+
+
+def check_n8a_control_trusted_ledger_still_converges():
+    """N8a（对照）：账本**可信**且批次确实已清理 → 原有 G3a 竞态收敛仍必须执行。
+
+    没有对照组，N8-2 的「不撤单」可能是假绿（比如 G3a 根本没被绑真、fetch 没返回 open）。
+    对照组证明：同一套 fake、同一段代码，**只把账本换成可信的**，撤单就该发生——
+    于是 N8-2 与 N8a 的差异只能来自 `_state_corrupted` 的区分，而非「b is None」同判。
+    """
+    r = _run_g3_ledger("clean")
+
+    report(
+        "N8a-1 前置：意图已落盘、创建成功（与 N8-1 同一 setup）",
+        r["intent"] == "PENDING_CREATE",
+        f"磁盘 intent={r['intent']!r}")
+
+    report(
+        "N8a-2 可信账本中批次确已清理 → G3a 竞态收敛**照常执行**（撤单 1 次）",
+        r["g3a"] == 1 and r["cancel"] == 1,
+        f"G3a 调用={r['g3a']} 次；cancel_order 调用={r['cancel']} 次（期望均 1）。"
+        f"若为 0 = 我把 g3_triggered 一刀切禁撤单，把正常收敛也砍掉了")
+
+    report(
+        "N8a-3 维持既有语义：转 G3a 收敛后统一入口仍返回 'success'（本项只作对照，非新行为）",
+        r["ret"] == "success",
+        f"返回={r['ret']!r}（与改前一致，证明本次修复未改动正常路径）")
+
+
+def check_n8b_g3_decides_corruption_before_none():
+    """N8b（结构断言）：G3 内 `_state_corrupted` 判据必须**排在** `b is None` 之前。
+
+    N8/N8a 是行为判别对；本条把「两种情况不能都用 b is None 裁决」直接钉进源码顺序——
+    防止日后有人把判据挪到 `if b is None` 之后（那时 {} 会先命中 'g3_triggered'）。
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trader_260725.py")
+    src = io.open(path, encoding="utf-8").read()
+    start = src.index("def _commit_protection_with_g3")
+    end = src.index("def _g3_cancel_race_order")
+    seg = src[start:end]
+    i_flag = seg.find("_state_corrupted', False) is True")
+    i_none = seg.find("if b is None:")
+    has_4th = "return 'ledger_unreadable'" in seg
+
+    report(
+        "N8b G3 内 `_state_corrupted` 判据先于 `b is None`，且返回第四态",
+        i_flag != -1 and i_none != -1 and i_flag < i_none and has_4th,
+        f"_state_corrupted 位置={i_flag}；`b is None` 位置={i_none}（期望前者更小）；"
+        f"段内含 return 'ledger_unreadable'={has_4th}")
+
+
+def fake_for_msg():
+    """给 _verify_failure_msg 造一个只用得到 self 的最小替身（纯函数，不读状态）。"""
+    return mock.MagicMock()
+
+
 CHECKS = [
     check_control_persist_works_without_injection,
     check_n1_intent_write_failure_blocks_create,
@@ -790,6 +974,9 @@ CHECKS = [
     check_n6a_all_verify_failure_msg_sites_guarded,
     check_n7_unknown_g3_return_is_not_success,
     check_n7a_all_g3_sites_gate_on_explicit_committed,
+    check_n8_ledger_corruption_must_not_cancel_protection,
+    check_n8a_control_trusted_ledger_still_converges,
+    check_n8b_g3_decides_corruption_before_none,
 ]
 
 

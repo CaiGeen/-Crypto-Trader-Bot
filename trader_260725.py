@@ -3552,6 +3552,15 @@ class CryptoTrader:
                         f"⚠️ 新止盈单 `{new_tp_order['id']}`：订单已存在、确认未落盘（persist_failed）\n"
                         f"ℹ️ 该单已在交易所创建并验证成功，但本地账本无 CONFIRMED，故未记录订单\n"
                         f"🛠️ 请人工补记后再继续操作，避免重复下单")
+                if verify_result == 'ledger_unreadable':
+                    # D-009×G3 交叉（第四态）：critical 已由统一入口发出（唯一告警所有者），
+                    # 此处只给**准确**理由——沿用下方「创建验证失败/未记录订单」会把人指向
+                    # 交易所查单，而真正要修的是本地 trade_state.json。
+                    return False, (
+                        f"⚠️ 新止盈单 `{new_tp_order['id']}`：本地账本读取失败，未入账\n"
+                        f"ℹ️ 该单已在交易所创建并验证成功，但 trade_state.json 损坏无法读取，"
+                        f"故未 Commit、未记录订单\n"
+                        f"🛠️ 请先修复账本再人工核实该单，切勿直接补单")
                 self.send_tg_notification(
                     self._verify_failure_msg("新止盈单", new_tp_order['id'], target_symbol, verify_result),
                     level='critical' if verify_result == 'unknown' else 'warning')
@@ -3727,6 +3736,15 @@ class CryptoTrader:
                         f"⚠️ 新止损单 `{new_sl_order['id']}`：订单已存在、确认未落盘（persist_failed）\n"
                         f"ℹ️ 该单已在交易所创建并验证成功，但本地账本无 CONFIRMED，故未记录订单\n"
                         f"🛠️ 请人工补记后再继续操作，避免重复下单")
+                if verify_result == 'ledger_unreadable':
+                    # D-009×G3 交叉（第四态）：critical 已由统一入口发出（唯一告警所有者），
+                    # 此处只给**准确**理由——沿用下方「创建验证失败/未记录订单」会把人指向
+                    # 交易所查单，而真正要修的是本地 trade_state.json。
+                    return False, (
+                        f"⚠️ 新止损单 `{new_sl_order['id']}`：本地账本读取失败，未入账\n"
+                        f"ℹ️ 该单已在交易所创建并验证成功，但 trade_state.json 损坏无法读取，"
+                        f"故未 Commit、未记录订单\n"
+                        f"🛠️ 请先修复账本再人工核实该单，切勿直接补单")
                 self.send_tg_notification(
                     self._verify_failure_msg("新止损单", new_sl_order['id'], target_symbol, verify_result),
                     level='critical' if verify_result == 'unknown' else 'warning')
@@ -3964,6 +3982,15 @@ class CryptoTrader:
                         f"⚠️ 保本损止损单 `{new_sl_order['id']}`：订单已存在、确认未落盘（persist_failed）\n"
                         f"ℹ️ 该单已在交易所创建并验证成功，但本地账本无 CONFIRMED，故未记录订单\n"
                         f"🛠️ 请人工补记后再继续操作，避免重复下单")
+                if verify_result == 'ledger_unreadable':
+                    # D-009×G3 交叉（第四态）：critical 已由统一入口发出（唯一告警所有者），
+                    # 此处只给**准确**理由——沿用下方「创建验证失败/未记录订单」会把人指向
+                    # 交易所查单，而真正要修的是本地 trade_state.json。
+                    return False, (
+                        f"⚠️ 保本损止损单 `{new_sl_order['id']}`：本地账本读取失败，未入账\n"
+                        f"ℹ️ 该单已在交易所创建并验证成功，但 trade_state.json 损坏无法读取，"
+                        f"故未 Commit、未记录订单\n"
+                        f"🛠️ 请先修复账本再人工核实该单，切勿直接补单")
                 self.send_tg_notification(
                     self._verify_failure_msg("保本损止损单", new_sl_order['id'], symbol, verify_result),
                     level='critical' if verify_result == 'unknown' else 'warning')
@@ -6371,6 +6398,25 @@ class CryptoTrader:
                     f"🛠️ 请人工核实并补记，避免重复挂单！",
                     level='critical')
                 return 'persist_failed'
+            elif g3 == 'ledger_unreadable':
+                # D-009×G3 交叉（第四态）：锁内账本重读损坏 → **不是**批次已清理，
+                # **严禁**转 G3a——账本不可读时交易所 open 单会被 cancel_order 撤掉，
+                # 等于亲手撤掉刚创建的有效保护单。本函数此刻已在 _state_lock 之外
+                # （_commit_protection_with_g3 返回即释放），与 persist_failed 同权：
+                # 统一入口是这八条路径的 critical **唯一**告警所有者。
+                # 透传非 success；registry 一律不动（账本本就不可信，禁止写入）。
+                self.send_tg_notification(
+                    f"🚨【资金安全】保护单未入账（LEDGER_UNREADABLE）\n"
+                    f"🆔 批次：`{batch_id}` / `{symbol}`\n"
+                    f"📌 {desc}（identity `{identity}`）\n"
+                    f"📋 订单：`{order_id}`\n"
+                    f"⚠️ 该单已在交易所创建并 verify 成功，但 G3 锁内**账本重读失败**"
+                    f"（{getattr(self, '_state_corruption_detail', '') or 'trade_state.json 损坏'}）\n"
+                    f"⚠️ 程序**无法判断批次是否仍存活**：未 Commit，且**不做任何竞态收敛/撤单**\n"
+                    f"🛡️ 已刻意不转 G3a——账本不可读时撤单会误撤有效保护单\n"
+                    f"🛠️ 请先修复 `trade_state.json`，再人工核实该单与批次状态！",
+                    level='critical')
+                return 'ledger_unreadable'
             elif g3 != 'committed':
                 # 保守（ChatGPT 复审③）：**只有显式 `'committed'` 才报 success**。
                 # AST 枚举本函数返回只有 'committed' / 'g3_triggered' /
@@ -6434,13 +6480,30 @@ class CryptoTrader:
                            → 磁盘仍停在 PENDING_CREATE（磁盘重读仍非 CONFIRMED）。
                            **不得**当 'committed' 处置。携带 order_id：交易所可能已有该单，
                            供锁外 critical 告警与人工对账使用。
-        ⚠️ **四个调用点必须逐一显式处理第三态**——只改返回值、不改消费点，第三态会被
+          'ledger_unreadable'
+                         → **D-009×G3 交叉（第四态，ChatGPT 2026-09-27 复审）**：锁内
+                           load_all_states() 读取损坏 → _state_corrupted=True，本次返回值
+                           是**占位 `{}`**，语义是「不知道有哪些批次」而非「批次已清理」。
+                           **不得**当 'g3_triggered' 处置——那会让调用方进 G3a，交易所有单
+                           且 open → cancel_order 撤掉刚创建的保护单（本层唯一防线失效）。
+                           也**不得**冒充 'persist_failed'：两者修复动作不同（本态要先修
+                           trade_state.json 再人工对账）。来源为生产基线 b595156 既有
+                           缺陷，**非 1142156 引入**。
+        ⚠️ **四个调用点必须逐一显式处理第三、四态**——只改返回值、不改消费点，它们会被
            依次当成：站点1 直接 `return 'success'`、站点2/3/4 落入 `else` 成功簿记
-           （站点3/4 还会 `_gate_alert_clear` 连既有告警额度一起清掉）。
+           （站点3/4 还会 `_gate_alert_clear` 连既有告警额度一起清掉）；
+           其中 `g3_triggered` 还会驱动 G3a 撤单分支（账本不可读时 = 误撤保护单）。
         边界：锁内零交易所 API；_state_lock 非重入 → 禁止调用 save_batch_state/
         _update_registry（内部再取锁会死锁），直接操作 dict + _persist_states（L1249 契约）。"""
         with self._state_lock:
             all_states = self.load_all_states()  # 硬约束①：锁内重读，禁旧快照
+            # D-009×G3 交叉（ChatGPT 2026-09-27 复审，生产基线 b595156 既有缺陷）：
+            # 读取损坏时 load_all_states 已置 _state_corrupted=True 并返回**占位 {}**，
+            # 此刻 `b is None` 的含义是「不知道有哪些批次」，**不是**「批次已清理」。
+            # 四态裁决顺序：① 账本不可读 ② 关闭态 ③ 可信账本无批次 ④ 提交；
+            # ① 与 ③ 的下游动作相反（前者禁撤单、后者必须进 G3a 收敛），不可同判。
+            if getattr(self, '_state_corrupted', False) is True:
+                return 'ledger_unreadable'
             b = all_states.get(symbol, {}).get(batch_id)
             if b is None:
                 return 'g3_triggered'
@@ -7570,6 +7633,16 @@ class CryptoTrader:
                     f"⚠️ 该单已在交易所创建并 verify 成功，但本地确认写盘未成功\n"
                     f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
                     f"🛠️ 请人工核实并补记，避免重复挂单！")
+        if verify_result == 'ledger_unreadable':
+            # D-009×G3 交叉（第四态）：与上面 persist_failed 分支同性质——8 个调用点的
+            # 守卫正常情况下到不了这里，但一旦有新调用点漏加守卫，落到下面的 NOT_FOUND
+            # 分支会发出「交易所返回订单不存在」（与事实**相反**：该单已 verify 成功）。
+            # 本态的正确修复动作是**先修 trade_state.json**，不是去交易所补单。
+            return (f"🚨 **保护单未入账（LEDGER_UNREADABLE）**\n"
+                    f"📌 {desc} ID `{order_id}` ({symbol})\n"
+                    f"⚠️ 该单已在交易所创建并 verify 成功，但 G3 锁内账本重读失败\n"
+                    f"⚠️ 程序**无法判断批次是否存活**：未 Commit，也未做任何竞态收敛/撤单\n"
+                    f"🛠️ 请**先修复 `trade_state.json`**，再人工核实该单与批次，切勿直接补单！")
         return (f"❌ **订单创建验证失败（NOT_FOUND）**\n"
                 f"📌 {desc} ID `{order_id}` ({symbol})\n"
                 f"⚠️ 交易所返回订单不存在，程序【未记录】此订单（不 Commit）。")
@@ -8241,9 +8314,9 @@ class CryptoTrader:
                                         symbol, batch_id, sl_identity, new_sl_order['id'], desc='部分减仓换挂止损')
                                     if verify_result != 'success':
                                         print(f"  └─ ❌ 新止损单验证失败({verify_result})，不 Commit/不撤旧: {new_sl_order['id']}")
-                                        # C2 消费点（ChatGPT 复审②）：persist_failed 的 critical 已由
+                                        # C2 消费点（ChatGPT 复审②④）：persist_failed / ledger_unreadable 的 critical 已由
                                         # 统一入口发出（唯一告警所有者），此处不再补发第二条 warning。
-                                        if verify_result != 'persist_failed':
+                                        if verify_result not in ('persist_failed', 'ledger_unreadable'):
                                             self.send_tg_notification(
                                                 self._verify_failure_msg("止损更新单", new_sl_order['id'], symbol, verify_result),
                                                 level='critical' if verify_result == 'unknown' else 'warning')
@@ -8324,9 +8397,9 @@ class CryptoTrader:
                                         symbol, batch_id, tp_identity, new_tp_order['id'], desc='部分减仓换挂止盈')
                                     if verify_result != 'success':
                                         print(f"  └─ ❌ 新止盈单验证失败({verify_result})，不 Commit/不撤旧: {new_tp_order['id']}")
-                                        # C2 消费点（ChatGPT 复审②）：persist_failed 的 critical 已由
+                                        # C2 消费点（ChatGPT 复审②④）：persist_failed / ledger_unreadable 的 critical 已由
                                         # 统一入口发出（唯一告警所有者），此处不再补发第二条 warning。
-                                        if verify_result != 'persist_failed':
+                                        if verify_result not in ('persist_failed', 'ledger_unreadable'):
                                             self.send_tg_notification(
                                                 self._verify_failure_msg("止盈更新单", new_tp_order['id'], symbol, verify_result),
                                                 level='critical' if verify_result == 'unknown' else 'warning')
@@ -9093,9 +9166,9 @@ class CryptoTrader:
                                             current_sl_id = None
                                             sl_success = False
                                             print(f"  └─ ❌ 止损单验证失败({verify_result})，不 Commit/不补单/不重挂: {new_sl_order['id']}")
-                                            # C2 消费点（ChatGPT 复审②）：persist_failed 的 critical 已由
+                                            # C2 消费点（ChatGPT 复审②④）：persist_failed / ledger_unreadable 的 critical 已由
                                             # 统一入口发出（唯一告警所有者），此处不再补发第二条 warning。
-                                            if verify_result != 'persist_failed':
+                                            if verify_result not in ('persist_failed', 'ledger_unreadable'):
                                                 self.send_tg_notification(
                                                     self._verify_failure_msg("止损单", new_sl_order['id'], symbol, verify_result),
                                                     level='critical' if verify_result == 'unknown' else 'warning')
@@ -9260,9 +9333,9 @@ class CryptoTrader:
                                                     desc='降级恢复止损单')
                                                 if verify_result != 'success':
                                                     print(f"  └─ ❌ 降级恢复单验证失败({verify_result})，不 Commit/不补单: {recovery_order['id']}")
-                                                    # C2 消费点（ChatGPT 复审②）：persist_failed 的 critical 已由
+                                                    # C2 消费点（ChatGPT 复审②④）：persist_failed / ledger_unreadable 的 critical 已由
                                                     # 统一入口发出（唯一告警所有者），此处不再补发第二条 warning。
-                                                    if verify_result != 'persist_failed':
+                                                    if verify_result not in ('persist_failed', 'ledger_unreadable'):
                                                         self.send_tg_notification(
                                                             self._verify_failure_msg("降级恢复止损单", recovery_order['id'],
                                                                                       symbol, verify_result),
@@ -9440,9 +9513,9 @@ class CryptoTrader:
                                     symbol, batch_id, tp_identity, new_tp_order['id'], desc='补挂止盈单')
                                 if verify_result != 'success':
                                     print(f"  └─ ❌ 止盈单验证失败({verify_result})，不 Commit/不补单: {new_tp_order['id']}")
-                                    # C2 消费点（ChatGPT 复审②）：persist_failed 的 critical 已由
+                                    # C2 消费点（ChatGPT 复审②④）：persist_failed / ledger_unreadable 的 critical 已由
                                     # 统一入口发出（唯一告警所有者），此处不再补发第二条 warning。
-                                    if verify_result != 'persist_failed':
+                                    if verify_result not in ('persist_failed', 'ledger_unreadable'):
                                         self.send_tg_notification(
                                             self._verify_failure_msg("止盈单", new_tp_order['id'], symbol, verify_result),
                                             level='critical' if verify_result == 'unknown' else 'warning')
@@ -9904,6 +9977,19 @@ class CryptoTrader:
                                     f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
                                     f"🛠️ 请人工核实并补记，避免重复挂单！",
                                     level='critical')
+                            elif _g3 == 'ledger_unreadable':
+                                # D-009×G3 交叉（第四态）：账本锁内重读损坏 → **不是**批次已清理，
+                                # 故**不转 G3a**（否则交易所 open 单会被 cancel_order 撤掉），
+                                # 也**不落 else** 成功簿记。critical 与 persist_failed 同权，
+                                # 在 _state_lock 已释放后由本点发出。
+                                self.send_tg_notification(
+                                    f"🚨【资金安全】预生成止损单未入账（LEDGER_UNREADABLE）\n"
+                                    f"🆔 批次：`{batch_id}` / `{symbol}`\n"
+                                    f"📋 订单：`{new_sl_order['id']}`\n"
+                                    f"⚠️ 该单已在交易所创建并 verify 成功，但 G3 锁内账本重读失败\n"
+                                    f"⚠️ 无法判断批次是否存活：未 Commit、未做竞态收敛/撤单\n"
+                                    f"🛠️ 请先修复 `trade_state.json` 再人工核实该单！",
+                                    level='critical')
                             elif _g3 != 'committed':
                                 # 保守（ChatGPT 复审③）：成功簿记**只**在显式 `'committed'` 时执行。
                                 # 生产不可达（AST 枚举 G3 只返回三种形态）；真到了就不宣称已挂出、
@@ -10086,6 +10172,18 @@ class CryptoTrader:
                                     f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
                                     f"🛠️ 请人工核实并补记，避免重复挂单！",
                                     level='critical')
+                            elif _g3 == 'ledger_unreadable':
+                                # D-009×G3 交叉（第四态）：账本锁内重读损坏 → **不是**批次已清理，
+                                # **不转 G3a**（否则 open 单被 cancel_order 误撤）、**不落 else**
+                                # （否则 `_gate_alert_clear` 连既有告警额度一起清掉）。
+                                self.send_tg_notification(
+                                    f"🚨【资金安全】兜底止损单未入账（LEDGER_UNREADABLE）\n"
+                                    f"🆔 批次：`{batch_id}` / `{symbol}`\n"
+                                    f"📋 订单：`{new_sl_order['id']}`\n"
+                                    f"⚠️ 该单已在交易所创建并 verify 成功，但 G3 锁内账本重读失败\n"
+                                    f"⚠️ 无法判断批次是否存活：未 Commit、未做竞态收敛/撤单\n"
+                                    f"🛠️ 请先修复 `trade_state.json` 再人工核实该单！",
+                                    level='critical')
                             elif _g3 != 'committed':
                                 # 保守（ChatGPT 复审③）：成功簿记**只**在显式 `'committed'` 时执行。
                                 # 尤其本处 else 含 `_gate_alert_clear`——未知形态绝不能清告警额度。
@@ -10265,6 +10363,18 @@ class CryptoTrader:
                                 f"⚠️ 该单已在交易所创建并 verify 成功，但本地确认写盘未成功\n"
                                 f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
                                 f"🛠️ 请人工核实并补记，避免重复挂单！",
+                                level='critical')
+                        elif _g3 == 'ledger_unreadable':
+                            # D-009×G3 交叉（第四态）：账本锁内重读损坏 → **不是**批次已清理，
+                            # **不转 G3a**（否则 open 单被 cancel_order 误撤）、**不落 else**
+                            # （否则 `_gate_alert_clear` + 写 tp_order_id 都会被当成功执行）。
+                            self.send_tg_notification(
+                                f"🚨【资金安全】预生成止盈单未入账（LEDGER_UNREADABLE）\n"
+                                f"🆔 批次：`{batch_id}` / `{symbol}`\n"
+                                f"📋 订单：`{new_tp_order['id']}`\n"
+                                f"⚠️ 该单已在交易所创建并 verify 成功，但 G3 锁内账本重读失败\n"
+                                f"⚠️ 无法判断批次是否存活：未 Commit、未做竞态收敛/撤单\n"
+                                f"🛠️ 请先修复 `trade_state.json` 再人工核实该单！",
                                 level='critical')
                         elif _g3 != 'committed':
                             # 保守（ChatGPT 复审③）：成功簿记**只**在显式 `'committed'` 时执行。

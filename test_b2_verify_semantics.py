@@ -171,7 +171,12 @@ def main():
     if passed == total:
         print("⚠️ 红灯阶段提示：若本文件先红（T1-T3 因 helper 未实现 FAIL、T4-T6 因残留 FAIL），"
               "红阶段成立 → 可进入 B2-0 实施；实施后须全绿。")
+    # 门禁盲区收口（ChatGPT 复审④，2026-09-27）：本文件此前 `main()` 无返回值 +
+    # `if __name__ == '__main__': main()` → **断言全挂也恒 rc=0**。run_test_gate 的脚本式
+    # 分类只看退出码，于是「脚本式 FAIL 0」根本不能证明本文件全绿。断言失败必须让
+    # 进程退出码非零，门禁才可能报红（本项已用故意失败实测过一次报红再改回）。
+    return 0 if passed == total else 1
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
