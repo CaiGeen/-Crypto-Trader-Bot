@@ -11,13 +11,17 @@
 import ast
 import copy
 import importlib.util
+import os
 import textwrap
 import threading
 import types
 
-TRADER_PATH = r'G:\my-crypto-bot\trader_260725.py'
-HELPER_PATH = r'G:\my-crypto-bot\送审附件_v6.2\new_helpers_v62.py'
-BOTRUNNER_PATH = r'G:\my-crypto-bot\bot_runner.py'
+# 源码一律读「测试文件所在仓库」，禁止硬编码生产目录 —— 否则 worktree 跑的门禁
+# 实际在校验生产目录里的旧代码（2026-09-27 部署时的假绿根因）。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+TRADER_PATH = os.path.join(_HERE, 'trader_260725.py')
+HELPER_PATH = os.path.join(_HERE, '送审附件_v6.2', 'new_helpers_v62.py')
+BOTRUNNER_PATH = os.path.join(_HERE, 'bot_runner.py')
 
 SRC = open(TRADER_PATH, encoding='utf-8').read()
 HLP = open(HELPER_PATH, encoding='utf-8').read()
@@ -78,7 +82,11 @@ F = {n: ex_t(n) for n in (
     '_maybe_report_conservation_conflict', '_check_conservation_conflict',
     '_is_valid_inflight_close_txn',
     '_final_pre_create_check', '_assert_create_allowed', '_commit_protection_with_g3',
-    '_update_registry', '_verify_and_update_registry', '_verify_order_created',
+    # _update_registry 现在委托给 _update_registry_locked（1fbb546 C1/G1 拆分），
+    # 桩不绑真身就会 AttributeError —— 2026-09-27 部署门禁 FAIL 的根因。
+    # 这里绑**真实实现**（读写仍走桩的 load_all_states/_persist_states），不写空实现。
+    '_update_registry', '_update_registry_locked', '_verify_and_update_registry',
+    '_verify_order_created',
     '_build_intent', '_protection_identity', '_close_amount_guard',
     '_try_acquire_resize_inflight', '_release_resize_inflight',
     '_maybe_runtime_resume_partial')}

@@ -12,8 +12,10 @@ import textwrap
 
 import parser as parser_mod
 
-TRADER_PATH = r'G:\my-crypto-bot\trader_260725.py'
-BOTRUNNER_PATH = r'G:\my-crypto-bot\bot_runner.py'
+# 源码一律读「测试文件所在仓库」，禁止硬编码生产目录（同 test_v64_partial_close.py）。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+TRADER_PATH = os.path.join(_HERE, 'trader_260725.py')
+BOTRUNNER_PATH = os.path.join(_HERE, 'bot_runner.py')
 
 SRC = open(TRADER_PATH, encoding='utf-8').read()
 BR = open(BOTRUNNER_PATH, encoding='utf-8').read()

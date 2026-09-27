@@ -20,6 +20,9 @@ SYM = 'BTCUSDT'
 BID = 'batch_A'
 OP = 'OP1'
 
+# 源码一律读「测试文件所在仓库」，禁止硬编码生产目录（同 test_v64_partial_close.py）。
+SRC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trader_260725.py')
+
 
 # ────────────────── harness ──────────────────
 
@@ -409,7 +412,7 @@ def r8_monitor_canceled_self_heal():
     b2 = _state_read(t)[SYM][BID]
     assert b2['close_phase'] == 0 and b2['pending_close'] is False, b2
     # 结构断言：monitor canceled 分支已接线裁决器（防回归）
-    src = open(r'G:\my-crypto-bot\trader_260725.py', encoding='utf-8').read()
+    src = open(SRC_PATH, encoding='utf-8').read()
     i = src.find("elif status == 'canceled' or status == 'expired':")
     assert i > 0
     seg = src[i:i + 1200]
@@ -682,7 +685,7 @@ def r16_pnl_gate_monitor_no_bypass_clear():
         and b_snap.get('settled_by_limit_close'), \
         f'批次必须保持 phase=2 等待续跑: {b_snap}'
     # 结构断言：settled 分支路由 finalizer，禁止直连 converge/clear
-    src = open(r'G:\my-crypto-bot\trader_260725.py', encoding='utf-8').read()
+    src = open(SRC_PATH, encoding='utf-8').read()
     i = src.find("latest_b_data.get('settled_by_limit_close', False)")
     assert i > 0
     seg = src[i:i + 900]
@@ -707,7 +710,7 @@ def r17_monitor_fail_command_takeover():
     b2 = _state_read(t)
     assert BID not in b2.get(SYM, {}), '接管后必须完成 converge+clear'
     # monitor 结构断言：finalizer 失败继续轮询，不得无条件 break
-    src = open(r'G:\my-crypto-bot\trader_260725.py', encoding='utf-8').read()
+    src = open(SRC_PATH, encoding='utf-8').read()
     i = src.find('🔥 P5c（ChatGPT 二复审 Blocker 3）：必须检查返回值')
     assert i > 0, 'monitor full-fill 分支未接线返回值检查'
     seg = src[i:i + 500]
@@ -871,7 +874,7 @@ def r20_manual_review_recovery_no_clear():
     assert b4.get('close_reason') == 'limit_cancel_manual_review', b4.get('close_reason')
     assert b4.get('close_phase') == 1, '绝不恢复 ACTIVE'
     # c) 结构断言：启动 stale 清理必须先经限价理由守卫（不 stale-clear）
-    src = open(r'G:\my-crypto-bot\trader_260725.py', encoding='utf-8').read()
+    src = open(SRC_PATH, encoding='utf-8').read()
     i = src.find('交恢复分型（不清理）')
     assert i > 0, 'stale 清理分支未接线限价理由守卫'
     j = src.find('无挂单且无持仓，自动清理', i)
