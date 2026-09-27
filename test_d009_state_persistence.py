@@ -114,7 +114,8 @@ def make_fake(env, ex, position_amt=0.0):
     fake.opened_paths = []
 
     # 真实方法绑定（生产逻辑本体参与测试）
-    _bind = ('load_all_states', '_persist_states', '_load_tombstones',
+    _bind = ('load_all_states', '_load_all_states_ex', '_persist_states',
+             '_load_tombstones',
              '_persist_tombstones', '_prune_tombstones', 'save_batch_state',
              'clear_batch_state', 'recover_active_batches', 'execute_signal',
              '_merge_batch_state', '_collect_batch_order_ids',

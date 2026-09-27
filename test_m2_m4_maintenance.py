@@ -206,6 +206,9 @@ class TombstoneEntryIntegrityTests(unittest.TestCase):
         fake.send_tg_notification = (
             lambda text, **k: sent.append((k.get('level', 'info'), str(text))))
         fake.load_all_states = lambda: trader_260725.CryptoTrader.load_all_states(fake)
+        # G3/默认读取已改用「本次读取」三元组接口（ChatGPT 复审⑤）
+        fake._load_all_states_ex = (
+            lambda: trader_260725.CryptoTrader._load_all_states_ex(fake))
         fake._persist_states = (
             lambda all_states: trader_260725.CryptoTrader._persist_states(fake, all_states))
         # 必须绑定真实墓碑读取：MagicMock 会吞掉 _load_tombstones 与

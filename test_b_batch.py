@@ -210,6 +210,7 @@ def make_fake_b(env, ex):
     fake.send_tg_notification = lambda text, **kw: fake.sent.append(
         (kw.get('level', 'info'), str(text)))
     _bind = ('save_batch_state', 'clear_batch_state', 'load_all_states',
+             '_load_all_states_ex',
              '_persist_states', '_load_tombstones', '_persist_tombstones',
              '_prune_tombstones', '_merge_batch_state', '_collect_batch_order_ids',
              '_update_registry', '_commit_registry_txn',

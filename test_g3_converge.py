@@ -126,6 +126,9 @@ def make_fake(store, ex):
         (kw.get('level', 'info'), str(text)[:80]))
     fake._state_lock = threading.Lock()                      # 生产同款非重入锁
     fake.load_all_states = lambda: store.load()
+    # G3 已改用「本次读取」三元组接口（ChatGPT 复审⑤）：(数据, 是否损坏, 详情)
+    # 与上面的 load_all_states 桩同源：默认**本次读取可信、未损坏**。
+    fake._load_all_states_ex = lambda: (store.load(), False, "")
     fake._persist_states = lambda all_s: store.persist(all_s)
     fake.save_batch_state = lambda s, b, d: CryptoTrader.save_batch_state(fake, s, b, d)
     # P0 Batch C（2026-08-29）：save/clear 重写后新增 helper —— 未绑定时

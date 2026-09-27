@@ -188,6 +188,9 @@ def make_trader(states, actual_pos=2.0, lazy_market=False):
         return t._stub_actual
 
     t.load_all_states = load_all_states
+    # G3 已改用「本次读取」三元组接口（ChatGPT 复审⑤）：(数据, 是否损坏, 详情)
+    # 与上面的 load_all_states 桩同源：默认**本次读取可信、未损坏**。
+    t._load_all_states_ex = lambda: (load_all_states(), False, "")
     t._persist_states = _persist_states
     t.send_tg_notification = send_tg_notification
     t._safe_api_call = _safe_api_call

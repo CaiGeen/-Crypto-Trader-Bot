@@ -165,6 +165,9 @@ def _make_fake(state_path, states):
     # 真实锁 + 真实落盘（本文件与既有 fake 的唯一区别）
     fake._state_lock = threading.Lock()
     fake.load_all_states = lambda: states
+    # G3 改用读取三元组接口（ChatGPT 复审⑤）：返回「本次读取」的
+    # (data, corrupted, detail)。默认**不损坏**，与上面 load_all_states 桩同源。
+    fake._load_all_states_ex = lambda: (states, False, "")
     fake._persist_states = lambda all_s: CryptoTrader._persist_states(fake, all_s)
     fake._update_registry = lambda s, b, i, **f: CryptoTrader._update_registry(fake, s, b, i, **f)
     # ⚠️ C1/G1 三条包装**必须**绑真实实现（第 8 次 MagicMock 陷阱）：
@@ -796,22 +799,35 @@ def check_n7a_all_g3_sites_gate_on_explicit_committed():
 #         把刚创建的有效保护单撤掉。
 # --------------------------------------------------------------------------
 
-def _run_g3_ledger(case):
+def _run_g3_ledger(case, inject_concurrency=False):
     """驱动统一入口走完「意图写盘 → 创建 → 查询 → G3」，返回观察结果。
 
     两组 setup 的**唯一差异**是账本可信度：
-      case="corrupt" → G3 锁内 load_all_states 读取失败（占位 {} + _state_corrupted=True）
+      case="corrupt" → G3 锁内读取失败（占位 {} + 本次读取返回 corrupted=True）
       case="clean"   → 账本**可信**，但批次确实已被清理（合法 {} 中无该批次）
     两种 case 下 G3 里的 `b is None` **都为 True**，因此这对用例正是
-    「不能都用 b is None 裁决」的判别对：行为差异只能来自 _state_corrupted 的区分。
+    「不能都用 b is None 裁决」的判别对：行为差异只能来自本次读取的 corrupted。
+
+    inject_concurrency=True（N9/N9a）时，在**A 读完之后、G3 判定之前**确定性地
+    插入线程 B：B 从不持 `_state_lock` 的路径调 `load_all_states()`，进入读取后
+    第一行就把实例共享字段 `_state_corrupted` 重置为 False，然后**在读文件前暂停**
+    —— 这正是 ChatGPT 复审⑤描述的交错（A 持锁也挡不住 B 重置共享字段）。
     """
     d, state_path = _fresh_state_file()
+    fake = None
+    _b_release = threading.Event()
+    _b_reset = threading.Event()
+    _b_threads = []
+    _orig_exists = os.path.exists
+    interleaved = {"start": False, "reset": False, "flag_at_decision": None}
     try:
         _seed_batch(state_path, protection_registry={})
         states = _read_disk(state_path)
         fake = _make_fake(state_path, states)
-        # 真实读取（而非 _make_fake 的快照桩）——否则复现不出 _state_corrupted 语义
+        # 真实读取（而非 _make_fake 的快照桩）——否则复现不出读取损坏语义
         fake.load_all_states = lambda: CryptoTrader.load_all_states(fake)
+        fake._load_all_states_ex = (
+            lambda: CryptoTrader._load_all_states_ex(fake))
         # G3a 内部的撤单执行体也必须是真实的，否则控制组的 cancel_order 是假绿
         fake._g3_cancel_race_order = (
             lambda *a, **k: CryptoTrader._g3_cancel_race_order(fake, *a, **k))
@@ -850,14 +866,59 @@ def _run_g3_ledger(case):
             return _real_g3a(fake, *a, **k)
         fake._g3a_converge_race_order = _spy_g3a
 
+        _a_thread = threading.current_thread()
+        _real_ex = CryptoTrader._load_all_states_ex
+
+        if inject_concurrency:
+            def _hooked_ex():
+                # 本线程（A）的真实读取
+                _r = _real_ex(fake)
+                if threading.current_thread() is _a_thread and not interleaved["start"]:
+                    interleaved["start"] = True
+                    # 线程 B：**不持 _state_lock** 走一次完整的 load_all_states()
+                    t = threading.Thread(
+                        target=lambda: fake.load_all_states(), daemon=True)
+                    t.start()
+                    _b_threads.append(t)
+                    if not _b_reset.wait(5):
+                        raise AssertionError("B 线程未进入读取，交错注入失败")
+                    interleaved["reset"] = True
+                    # **此刻即 G3 的判定点**：A 的读取说 corrupted=True，
+                    # 而共享字段已被线程 B 冲成 False —— 若 G3 读共享字段就全错。
+                    interleaved["flag_at_decision"] = getattr(
+                        fake, "_state_corrupted", None)
+                return _r
+            fake._load_all_states_ex = _hooked_ex
+
+            # B 进入 _load_all_states_ex 后：先 self._state_corrupted=False（真实代码首行），
+            # 再 os.path.exists(STATE_FILE) —— 在此**暂停**，把共享字段留在 False。
+            def _paused_exists(p):
+                if (interleaved["start"] and not interleaved["reset"]
+                        and threading.current_thread() is not _a_thread
+                        and not _b_reset.is_set()):
+                    _b_reset.set()
+                    _b_release.wait(10)
+                return _orig_exists(p)
+            os.path.exists = _paused_exists
+
         with contextlib.redirect_stdout(io.StringIO()):
             ret = CryptoTrader._verify_and_update_registry(
                 fake, SYMBOL, BATCH, IDENT_SL, str(created.get("id")), desc="首次止损单")
+            # 放行线程 B（其读取的 🚨 打印一并留在重定向缓冲里，不污染控制台）
+            _b_release.set()
+            for _t in _b_threads:
+                _t.join(5)
         return {"ret": ret, "sent": list(fake.sent), "lock": lock_seen,
                 "cancel": fake.exchange.cancel_order.call_count,
                 "create": fake.exchange.create_order.call_count,
-                "g3a": len(g3a_calls), "intent": intent_on_disk}
+                "g3a": len(g3a_calls), "intent": intent_on_disk,
+                "interleaved": interleaved["reset"],
+                "flag_at_decision": interleaved["flag_at_decision"]}
     finally:
+        _b_release.set()
+        for _t in _b_threads:
+            _t.join(5)
+        os.path.exists = _orig_exists
         _restore_state_file()
 
 
@@ -933,25 +994,99 @@ def check_n8a_control_trusted_ledger_still_converges():
 
 
 def check_n8b_g3_decides_corruption_before_none():
-    """N8b（结构断言）：G3 内 `_state_corrupted` 判据必须**排在** `b is None` 之前。
+    """N8b（结构断言）：G3 内「本次读取是否损坏」判据必须**排在** `b is None` 之前，
+    且必须取自读取的**返回值**、不得改读共享实例字段。
 
-    N8/N8a 是行为判别对；本条把「两种情况不能都用 b is None 裁决」直接钉进源码顺序——
-    防止日后有人把判据挪到 `if b is None` 之后（那时 {} 会先命中 'g3_triggered'）。
+    N8/N8a 是行为判别对，N9/N9a 是并发交错判别对；本条把
+    「两种情况不能都用 b is None 裁决」+「不能用可被别人覆盖的共享字段裁决」
+    直接钉进源码，防止日后把判据挪到 `if b is None` 之后、或改回读实例字段。
     """
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trader_260725.py")
     src = io.open(path, encoding="utf-8").read()
     start = src.index("def _commit_protection_with_g3")
     end = src.index("def _g3_cancel_race_order")
     seg = src[start:end]
-    i_flag = seg.find("_state_corrupted', False) is True")
+    i_reader = seg.find("self._load_all_states_ex()")
+    i_flag = seg.find("if _ledger_corrupted is True:")
     i_none = seg.find("if b is None:")
-    has_4th = "return 'ledger_unreadable'" in seg
+    has_4th = "return ('ledger_unreadable'" in seg
+    # 关键回归护栏：G3 判据段**不得**再出现共享字段读取
+    uses_shared = "_state_corrupted', False) is True" in seg
 
     report(
-        "N8b G3 内 `_state_corrupted` 判据先于 `b is None`，且返回第四态",
-        i_flag != -1 and i_none != -1 and i_flag < i_none and has_4th,
-        f"_state_corrupted 位置={i_flag}；`b is None` 位置={i_none}（期望前者更小）；"
-        f"段内含 return 'ledger_unreadable'={has_4th}")
+        "N8b G3 用本次读取返回的三元组判损坏、且判据先于 `b is None`、不用共享字段",
+        i_reader != -1 and i_flag != -1 and i_none != -1
+        and i_flag < i_none and has_4th and not uses_shared,
+        f"读取接口位置={i_reader}；corrupted 判据={i_flag}；`b is None`={i_none}"
+        f"（期望三者依次存在且前两者更小）；返回二元组={has_4th}；"
+        f"段内仍读共享字段={uses_shared}（期望 False）")
+
+
+def check_n9_concurrent_reader_cannot_clobber_g3_decision():
+    """N9（并发负测，ChatGPT 复审⑤）：确定性交错下 A 仍必须判 `ledger_unreadable`。
+
+    缺陷窗口：`load_all_states()` 在每次读取**开始**就把实例共享字段
+    `_state_corrupted` 重置为 False；G3 虽持 `_state_lock`，却在本次读取**返回之后**
+    才看这个共享字段。线程 B 从不持 `_state_lock` 的路径发起另一次读取 → 字段被冲成
+    False → A 把损坏账本当成「可信空账本」→ `b is None` → g3_triggered → G3a →
+    cancel_order 误撤交易所上的真实保护单。
+    本用例把该交错**确定性**地插进「A 读完之后、A 判定之前」，并断言
+    `flag_at_decision is False`（共享字段确已被 B 冲掉）——即本负测真的站在缺陷窗口里。
+    旧单线程 N8/N8a 复现不出这个窗口，故必须有本条。
+    """
+    r = _run_g3_ledger("corrupt", inject_concurrency=True)
+    crit = [m for lvl, m in r["sent"] if lvl == "critical"]
+
+    report(
+        "N9-1 交错注入成功：B 已进入读取并把共享字段冲成 False（A 的判定点上）",
+        r["interleaved"] is True and r["flag_at_decision"] is False,
+        f"交错发生={r['interleaved']}；判定时刻共享 _state_corrupted="
+        f"{r['flag_at_decision']!r}（期望 False = 缺陷窗口确实成立）")
+
+    report(
+        "N9-2 交错下 A 仍**不撤单、不进 G3a**（否则误撤有效保护单）",
+        r["cancel"] == 0 and r["g3a"] == 0,
+        f"cancel_order={r['cancel']} 次；G3a={r['g3a']} 次（期望均 0）。"
+        f"若 G3 读共享字段，此处两项都是 1")
+
+    report(
+        "N9-3 交错下 A 仍返回第四态，不宣称提交成功",
+        r["ret"] == "ledger_unreadable",
+        f"返回={r['ret']!r}（期望 'ledger_unreadable'）")
+
+    report(
+        "N9-4 交错下锁外恰一条 critical，措辞指向账本",
+        len(r["sent"]) == 1 and [lv for lv, _ in r["sent"]] == ["critical"]
+        and len(r["lock"]) == 1 and r["lock"][0] is False
+        and any("账本" in m or "trade_state" in m for m in crit),
+        f"通知级别={[lv for lv, _ in r['sent']]}；发送时 _state_lock.locked="
+        f"{r['lock']}（期望恰 1 条 critical 且 False=锁外）")
+
+
+def check_n9a_concurrent_control_trusted_ledger_still_converges():
+    """N9a（并发对照）：同样的交错下，可信账本无批次 → G3a 照常执行。
+
+    没有这条，N9-2 可能是「我把第四态写成无条件返回」的假绿——
+    对照证明差异**只**来自本次读取的 corrupted，而非见到交错就一律禁撤单。
+    """
+    r = _run_g3_ledger("clean", inject_concurrency=True)
+
+    report(
+        "N9a-1 交错注入同样成立（与 N9 同一套注入，控制可比）",
+        r["interleaved"] is True and r["flag_at_decision"] is False,
+        f"交错发生={r['interleaved']}；判定时刻共享 _state_corrupted="
+        f"{r['flag_at_decision']!r}")
+
+    report(
+        "N9a-2 同一交错下可信账本无批次 → G3a 竞态收敛**照常执行**（撤单 1 次）",
+        r["g3a"] == 1 and r["cancel"] == 1,
+        f"G3a={r['g3a']} 次；cancel_order={r['cancel']} 次（期望均 1）。"
+        f"若为 0 = 我在并发下把正常收敛也一刀切禁掉了")
+
+    report(
+        "N9a-3 维持既有语义：转 G3a 后统一入口仍返回 'success'",
+        r["ret"] == "success",
+        f"返回={r['ret']!r}（与单线程 N8a-3 一致，证明修复未改动正常路径）")
 
 
 def fake_for_msg():
@@ -977,6 +1112,8 @@ CHECKS = [
     check_n8_ledger_corruption_must_not_cancel_protection,
     check_n8a_control_trusted_ledger_still_converges,
     check_n8b_g3_decides_corruption_before_none,
+    check_n9_concurrent_reader_cannot_clobber_g3_decision,
+    check_n9a_concurrent_control_trusted_ledger_still_converges,
 ]
 
 

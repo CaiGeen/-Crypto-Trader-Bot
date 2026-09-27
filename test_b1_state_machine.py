@@ -53,6 +53,9 @@ def _make_base_fake():
 
 def _bind_helpers(fake, states):
     fake.load_all_states = lambda: states
+    # G3 已改用「本次读取」三元组接口（ChatGPT 复审⑤）：(数据, 是否损坏, 详情)
+    # 与上面的 load_all_states 桩同源：默认**本次读取可信、未损坏**。
+    fake._load_all_states_ex = lambda: (states, False, "")
     fake._update_registry = lambda s, b, i, **f: CryptoTrader._update_registry(fake, s, b, i, **f)
     # C1/G1（契约 §24.3）：创建路径改走 _update_registry_checked，它内部调 _update_registry_locked。
     # 两条都必须绑真实实现（同第 58 行坑）：漏绑 → 自动 mock 返回 MagicMock →

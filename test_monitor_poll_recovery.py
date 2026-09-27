@@ -148,6 +148,9 @@ def _make_fake(state_path, states):
     fake._finally_cleanup_decision = lambda s, b: ('skip', None)
 
     fake.load_all_states = lambda: states
+    # G3 已改用「本次读取」三元组接口（ChatGPT 复审⑤）：(数据, 是否损坏, 详情)
+    # 与上面的 load_all_states 桩同源：默认**本次读取可信、未损坏**。
+    fake._load_all_states_ex = lambda: (states, False, "")
     # 本文件不测持久化（T3/T4 已用真实落盘覆盖），故 save_batch_state 用**记录式桩**：
     # 真实实现会走 merge + json.dump，循环里若有未绑定的辅助把 MagicMock 写进批次对象，
     # 就会抛「Object of type MagicMock is not JSON serializable」并让落盘失败，

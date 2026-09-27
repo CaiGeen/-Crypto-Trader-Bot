@@ -2410,7 +2410,7 @@ class CryptoTrader:
             except Exception as e:
                 print(f"⚠️ 时间同步微调失败: {e}")
 
-    def load_all_states(self) -> dict:
+    def _load_all_states_ex(self) -> tuple:
         """D-009 P0-A（ChatGPT R2 批准）：读取状态账本——三态分离，杜绝"损坏=空"的致命误读。
 
         三种"空"的安全含义完全不同，旧实现把它们全部塌缩成 {}：
@@ -2428,24 +2428,37 @@ class CryptoTrader:
 
         损坏时置位 self._state_corrupted=True 并返回 {}（占位，返回值在损坏态
         下无意义）。调用方读取返回值前必须先判 _state_corrupted。
+
+        —— 返回三元组 (data, corrupted, detail)，而非 dict（ChatGPT 复审⑤）——
+        **本次读取是否损坏，必须随本次读取的结果一起交给调用方**。
+        `self._state_corrupted` 是**实例共享**字段：本函数第一行就把它重置为
+        False，因此任何不持 `_state_lock` 的并发 `load_all_states()` 都能在
+        G3 读完之后、判定之前把它冲成 False —— G3 即使持锁也挡不住（持锁只能
+        约束自己）。以共享字段为**唯一**判据 → 损坏账本被当成「可信空账本」→
+        `g3_triggered → G3a → cancel_order` 误撤交易所上的真实保护单。
+        故：凡据「本次读取可信吗」做安全裁决的调用方（G3）必须用本返回值；
+        共享字段仅供 D-009 既有的 Fail-Closed 闸门（拒绝覆盖写、_ready 恒 False）
+        这类**不在乎是哪一次读取**的读点继续使用。
         """
         self._state_corrupted = False
         self._state_corruption_detail = ""
         if not os.path.exists(STATE_FILE):
-            return {}
+            return {}, False, ""
         try:
             with open(STATE_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except Exception as e:
+            _detail = f"{type(e).__name__}: {e}"
             self._state_corrupted = True
-            self._state_corruption_detail = f"{type(e).__name__}: {e}"
+            self._state_corruption_detail = _detail
             print(f"🚨 [D-009] trade_state.json 读取失败（账本损坏，Fail-Closed）: {e}")
-            return {}
+            return {}, True, _detail
         if not isinstance(data, dict):
+            _detail = f"根节点类型非法: {type(data).__name__}"
             self._state_corrupted = True
-            self._state_corruption_detail = f"根节点类型非法: {type(data).__name__}"
+            self._state_corruption_detail = _detail
             print(f"🚨 [D-009] trade_state.json 根节点非 dict（账本损坏，Fail-Closed）")
-            return {}
+            return {}, True, _detail
         # 第十六轮复审 P1：**根节点是 dict 不代表内容可信**——与墓碑条目级校验
         # （_load_tombstones 2026-09-25）是同一性质的问题，只是位置换到了账本。
         # 账本不变量是 {symbol: {batch_id: dict}}，旧实现只验根节点，于是两种
@@ -2458,21 +2471,37 @@ class CryptoTrader:
         # 同等处理（置标志 + 返回占位 {}，调用方一律 Fail-Closed）。
         for _sym, _node in data.items():
             if not isinstance(_node, dict):
+                _detail = (f"交易对节点类型非法: {_sym!r} -> {type(_node).__name__}")
                 self._state_corrupted = True
-                self._state_corruption_detail = (
-                    f"交易对节点类型非法: {_sym!r} -> {type(_node).__name__}")
+                self._state_corruption_detail = _detail
                 print(f"🚨 [D-009] trade_state.json 交易对节点非 dict"
                       f"（账本损坏，Fail-Closed）: {_sym!r} -> {type(_node).__name__}")
-                return {}
+                return {}, True, _detail
             for _bid, _bd in _node.items():
                 if not isinstance(_bd, dict):
+                    _detail = (f"批次节点类型非法: {_sym!r}/{_bid!r} -> {type(_bd).__name__}")
                     self._state_corrupted = True
-                    self._state_corruption_detail = (
-                        f"批次节点类型非法: {_sym!r}/{_bid!r} -> {type(_bd).__name__}")
+                    self._state_corruption_detail = _detail
                     print(f"🚨 [D-009] trade_state.json 批次节点非 dict"
                           f"（账本损坏，Fail-Closed）: {_sym!r}/{_bid!r} "
                           f"-> {type(_bd).__name__}")
-                    return {}
+                    return {}, True, _detail
+        return data, False, ""
+
+    def load_all_states(self) -> dict:
+        """读取状态账本的**默认**接口——签名与返回值完全兼容（绝大多数调用方
+        只要数据）。内部委托 `_load_all_states_ex()`，并把「本次读取」的结论
+        同步写回实例字段 `_state_corrupted` / `_state_corruption_detail`，
+        供 D-009 既有的 Fail-Closed 闸门（_persist_states 拒绝覆盖写、_ready
+        恒 False 等）继续沿用。
+
+        ⚠️ 这两个实例字段是**共享且会被并发覆盖**的（见 `_load_all_states_ex`
+        docstring）。需要「这一次读取可信吗」做安全裁决的调用方（G3）请直接
+        调 `_load_all_states_ex()`，取返回三元组，别读实例字段。
+        """
+        data, _corrupted, _detail = self._load_all_states_ex()
+        self._state_corrupted = _corrupted
+        self._state_corruption_detail = _detail
         return data
 
     def _persist_states(self, all_states: dict) -> bool:
@@ -6398,20 +6427,23 @@ class CryptoTrader:
                     f"🛠️ 请人工核实并补记，避免重复挂单！",
                     level='critical')
                 return 'persist_failed'
-            elif g3 == 'ledger_unreadable':
+            elif isinstance(g3, tuple) and len(g3) == 2 \
+                    and g3[0] == 'ledger_unreadable':
                 # D-009×G3 交叉（第四态）：锁内账本重读损坏 → **不是**批次已清理，
                 # **严禁**转 G3a——账本不可读时交易所 open 单会被 cancel_order 撤掉，
                 # 等于亲手撤掉刚创建的有效保护单。本函数此刻已在 _state_lock 之外
                 # （_commit_protection_with_g3 返回即释放），与 persist_failed 同权：
                 # 统一入口是这八条路径的 critical **唯一**告警所有者。
                 # 透传非 success；registry 一律不动（账本本就不可信，禁止写入）。
+                # 归因只用 g3[1]（**本次读取返回的**详情），不读共享字段
+                # _state_corruption_detail——那可能是另一线程某次读取的原因。
                 self.send_tg_notification(
                     f"🚨【资金安全】保护单未入账（LEDGER_UNREADABLE）\n"
                     f"🆔 批次：`{batch_id}` / `{symbol}`\n"
                     f"📌 {desc}（identity `{identity}`）\n"
                     f"📋 订单：`{order_id}`\n"
                     f"⚠️ 该单已在交易所创建并 verify 成功，但 G3 锁内**账本重读失败**"
-                    f"（{getattr(self, '_state_corruption_detail', '') or 'trade_state.json 损坏'}）\n"
+                    f"（{g3[1] or 'trade_state.json 损坏'}）\n"
                     f"⚠️ 程序**无法判断批次是否仍存活**：未 Commit，且**不做任何竞态收敛/撤单**\n"
                     f"🛡️ 已刻意不转 G3a——账本不可读时撤单会误撤有效保护单\n"
                     f"🛠️ 请先修复 `trade_state.json`，再人工核实该单与批次状态！",
@@ -6480,15 +6512,21 @@ class CryptoTrader:
                            → 磁盘仍停在 PENDING_CREATE（磁盘重读仍非 CONFIRMED）。
                            **不得**当 'committed' 处置。携带 order_id：交易所可能已有该单，
                            供锁外 critical 告警与人工对账使用。
-          'ledger_unreadable'
+          ('ledger_unreadable', detail)
                          → **D-009×G3 交叉（第四态，ChatGPT 2026-09-27 复审）**：锁内
-                           load_all_states() 读取损坏 → _state_corrupted=True，本次返回值
-                           是**占位 `{}`**，语义是「不知道有哪些批次」而非「批次已清理」。
+                           `_load_all_states_ex()` 读取损坏 → 占位 `{}`，语义是
+                           「不知道有哪些批次」而非「批次已清理」。
                            **不得**当 'g3_triggered' 处置——那会让调用方进 G3a，交易所有单
                            且 open → cancel_order 撤掉刚创建的保护单（本层唯一防线失效）。
                            也**不得**冒充 'persist_failed'：两者修复动作不同（本态要先修
                            trade_state.json 再人工对账）。来源为生产基线 b595156 既有
                            缺陷，**非 1142156 引入**。
+                         **必须是二元组、且 detail 来自本次读取的返回值**——
+                           「本次读取是否损坏 + 为何损坏」由本次读取的返回值携带，
+                           不得改读共享实例字段 `_state_corrupted`/`_state_corruption_detail`
+                           （ChatGPT 复审⑤：该字段在每次读取**开始**被重置，不持锁的并发
+                           读取能在判定前把它冲成 False/别的详情，G3 即使持 `_state_lock`
+                           也挡不住 → 损坏账本被当成可信空账本 → 误撤保护单）。
         ⚠️ **四个调用点必须逐一显式处理第三、四态**——只改返回值、不改消费点，它们会被
            依次当成：站点1 直接 `return 'success'`、站点2/3/4 落入 `else` 成功簿记
            （站点3/4 还会 `_gate_alert_clear` 连既有告警额度一起清掉）；
@@ -6496,14 +6534,24 @@ class CryptoTrader:
         边界：锁内零交易所 API；_state_lock 非重入 → 禁止调用 save_batch_state/
         _update_registry（内部再取锁会死锁），直接操作 dict + _persist_states（L1249 契约）。"""
         with self._state_lock:
-            all_states = self.load_all_states()  # 硬约束①：锁内重读，禁旧快照
+            # 硬约束①：锁内重读，禁旧快照。
+            # **取三元组而非 dict**（ChatGPT 复审⑤并发窗口）：本次读取是否损坏，
+            # 必须由**本次读取的返回值**告知，不能读实例字段 `_state_corrupted`——
+            # 该字段是共享的，本函数第一行就把它重置为 False，任何不持 _state_lock
+            # 的并发读取都能在本读取完成之后、本判定之前把它冲成 False；G3 持锁
+            # 只能约束自己，约束不了别人 → 损坏账本会被当成「可信空账本」→
+            # `b is None` → g3_triggered → G3a → cancel_order 误撤真实保护单。
+            all_states, _ledger_corrupted, _ledger_detail = \
+                self._load_all_states_ex()
             # D-009×G3 交叉（ChatGPT 2026-09-27 复审，生产基线 b595156 既有缺陷）：
-            # 读取损坏时 load_all_states 已置 _state_corrupted=True 并返回**占位 {}**，
+            # 读取损坏时读取结果是**占位 {}**，
             # 此刻 `b is None` 的含义是「不知道有哪些批次」，**不是**「批次已清理」。
             # 四态裁决顺序：① 账本不可读 ② 关闭态 ③ 可信账本无批次 ④ 提交；
             # ① 与 ③ 的下游动作相反（前者禁撤单、后者必须进 G3a 收敛），不可同判。
-            if getattr(self, '_state_corrupted', False) is True:
-                return 'ledger_unreadable'
+            if _ledger_corrupted is True:
+                # 携带**本次读取自己的**损坏详情（而非共享字段里的详情——那可能是
+                # 另一线程某次读取的原因），供锁外 critical 归因，避免张冠李戴。
+                return ('ledger_unreadable', _ledger_detail)
             b = all_states.get(symbol, {}).get(batch_id)
             if b is None:
                 return 'g3_triggered'
@@ -9977,16 +10025,19 @@ class CryptoTrader:
                                     f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
                                     f"🛠️ 请人工核实并补记，避免重复挂单！",
                                     level='critical')
-                            elif _g3 == 'ledger_unreadable':
+                            elif isinstance(_g3, tuple) and len(_g3) == 2 \
+                                    and _g3[0] == 'ledger_unreadable':
                                 # D-009×G3 交叉（第四态）：账本锁内重读损坏 → **不是**批次已清理，
                                 # 故**不转 G3a**（否则交易所 open 单会被 cancel_order 撤掉），
                                 # 也**不落 else** 成功簿记。critical 与 persist_failed 同权，
                                 # 在 _state_lock 已释放后由本点发出。
+                                # 归因用 _g3[1]（本次读取返回的详情），不读共享实例字段。
                                 self.send_tg_notification(
                                     f"🚨【资金安全】预生成止损单未入账（LEDGER_UNREADABLE）\n"
                                     f"🆔 批次：`{batch_id}` / `{symbol}`\n"
                                     f"📋 订单：`{new_sl_order['id']}`\n"
-                                    f"⚠️ 该单已在交易所创建并 verify 成功，但 G3 锁内账本重读失败\n"
+                                    f"⚠️ 该单已在交易所创建并 verify 成功，但 G3 锁内账本重读失败"
+                                    f"（{_g3[1] or 'trade_state.json 损坏'}）\n"
                                     f"⚠️ 无法判断批次是否存活：未 Commit、未做竞态收敛/撤单\n"
                                     f"🛠️ 请先修复 `trade_state.json` 再人工核实该单！",
                                     level='critical')
@@ -10172,15 +10223,18 @@ class CryptoTrader:
                                     f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
                                     f"🛠️ 请人工核实并补记，避免重复挂单！",
                                     level='critical')
-                            elif _g3 == 'ledger_unreadable':
+                            elif isinstance(_g3, tuple) and len(_g3) == 2 \
+                                    and _g3[0] == 'ledger_unreadable':
                                 # D-009×G3 交叉（第四态）：账本锁内重读损坏 → **不是**批次已清理，
                                 # **不转 G3a**（否则 open 单被 cancel_order 误撤）、**不落 else**
                                 # （否则 `_gate_alert_clear` 连既有告警额度一起清掉）。
+                                # 归因用 _g3[1]（本次读取返回的详情），不读共享实例字段。
                                 self.send_tg_notification(
                                     f"🚨【资金安全】兜底止损单未入账（LEDGER_UNREADABLE）\n"
                                     f"🆔 批次：`{batch_id}` / `{symbol}`\n"
                                     f"📋 订单：`{new_sl_order['id']}`\n"
-                                    f"⚠️ 该单已在交易所创建并 verify 成功，但 G3 锁内账本重读失败\n"
+                                    f"⚠️ 该单已在交易所创建并 verify 成功，但 G3 锁内账本重读失败"
+                                    f"（{_g3[1] or 'trade_state.json 损坏'}）\n"
                                     f"⚠️ 无法判断批次是否存活：未 Commit、未做竞态收敛/撤单\n"
                                     f"🛠️ 请先修复 `trade_state.json` 再人工核实该单！",
                                     level='critical')
@@ -10364,15 +10418,18 @@ class CryptoTrader:
                                 f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
                                 f"🛠️ 请人工核实并补记，避免重复挂单！",
                                 level='critical')
-                        elif _g3 == 'ledger_unreadable':
+                        elif isinstance(_g3, tuple) and len(_g3) == 2 \
+                                and _g3[0] == 'ledger_unreadable':
                             # D-009×G3 交叉（第四态）：账本锁内重读损坏 → **不是**批次已清理，
                             # **不转 G3a**（否则 open 单被 cancel_order 误撤）、**不落 else**
                             # （否则 `_gate_alert_clear` + 写 tp_order_id 都会被当成功执行）。
+                            # 归因用 _g3[1]（本次读取返回的详情），不读共享实例字段。
                             self.send_tg_notification(
                                 f"🚨【资金安全】预生成止盈单未入账（LEDGER_UNREADABLE）\n"
                                 f"🆔 批次：`{batch_id}` / `{symbol}`\n"
                                 f"📋 订单：`{new_tp_order['id']}`\n"
-                                f"⚠️ 该单已在交易所创建并 verify 成功，但 G3 锁内账本重读失败\n"
+                                f"⚠️ 该单已在交易所创建并 verify 成功，但 G3 锁内账本重读失败"
+                                f"（{_g3[1] or 'trade_state.json 损坏'}）\n"
                                 f"⚠️ 无法判断批次是否存活：未 Commit、未做竞态收敛/撤单\n"
                                 f"🛠️ 请先修复 `trade_state.json` 再人工核实该单！",
                                 level='critical')

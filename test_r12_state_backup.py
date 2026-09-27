@@ -46,6 +46,10 @@ class PersistFake:
     def load_all_states(self):
         return CryptoTrader.load_all_states(self)
 
+    def _load_all_states_ex(self):
+        # G3/默认读取已改用「本次读取」三元组接口（ChatGPT 复审⑤）
+        return CryptoTrader._load_all_states_ex(self)
+
     def _persist_states(self, all_states):
         return CryptoTrader._persist_states(self, all_states)
 

@@ -271,6 +271,9 @@ def make_fake(store, ex):
     # 死锁违规（如 _commit_protection_with_g3 锁内调 _update_registry→save_batch_state）
     fake._state_lock = threading.Lock()
     fake.load_all_states = lambda: store.load()
+    # G3 已改用「本次读取」三元组接口（ChatGPT 复审⑤）：(数据, 是否损坏, 详情)
+    # 与上面的 load_all_states 桩同源：默认**本次读取可信、未损坏**。
+    fake._load_all_states_ex = lambda: (store.load(), False, "")
     fake.save_batch_state = lambda s, b, d: CryptoTrader.save_batch_state(fake, s, b, d)
     fake.clear_batch_state = lambda s, b, **k: CryptoTrader.clear_batch_state(fake, s, b, **k)
     fake._persist_states = lambda all_s: store.persist(all_s)

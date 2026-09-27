@@ -103,6 +103,9 @@ def scenario_6():
     fake.states = {SYMBOL: {BATCH: {'current_sl_id': None, 'tp_order_id': None,
                                     'pending_sl_orders': [0]}}}
     fake.load_all_states = lambda: fake.states
+    # G3 已改用「本次读取」三元组接口（ChatGPT 复审⑤）：(数据, 是否损坏, 详情)
+    # 与上面的 load_all_states 桩同源：默认**本次读取可信、未损坏**。
+    fake._load_all_states_ex = lambda: (fake.states, False, "")
     fake.save_batch_state = lambda s, b, d: None
     fake._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
 

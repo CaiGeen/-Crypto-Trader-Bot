@@ -54,6 +54,9 @@ def _make_fake(states):
     fake.send_tg_notification = lambda text, **kw: fake.sent.append((kw.get('level', 'info'), str(text)))
     fake.save_batch_state = lambda s, b, d: fake.saved.append(dict(d))
     fake.load_all_states = lambda: states
+    # G3 已改用「本次读取」三元组接口（ChatGPT 复审⑤）：(数据, 是否损坏, 详情)
+    # 与上面的 load_all_states 桩同源：默认**本次读取可信、未损坏**。
+    fake._load_all_states_ex = lambda: (states, False, "")
     fake._update_registry = lambda s, b, i, **f: CryptoTrader._update_registry(fake, s, b, i, **f)
     fake._assert_create_allowed = lambda s, b, i, **kw: CryptoTrader._assert_create_allowed(fake, s, b, i, **kw)
     fake._adjudicate_recreate_before_repair = lambda s, b, i: CryptoTrader._adjudicate_recreate_before_repair(fake, s, b, i)

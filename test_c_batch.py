@@ -56,6 +56,7 @@ def _make_fake(state_file, tomb_file):
     # （MagicMock 坑第 8 次实证：_verify_clear_proof 未绑定 → 返回 MagicMock 恒非 None
     #  → proof 恒被拒且 _converge_alert 无副作用静默丢告警）
     for _n in ('save_batch_state', 'clear_batch_state', 'load_all_states',
+               '_load_all_states_ex',
                '_persist_states', '_load_tombstones', '_persist_tombstones',
                '_prune_tombstones', '_merge_batch_state',
                '_collect_batch_order_ids', '_assert_create_allowed',
