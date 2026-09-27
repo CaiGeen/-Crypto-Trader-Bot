@@ -63,6 +63,17 @@ def _bind_helpers(fake, states):
     fake._verify_order_created = lambda oid, sym, kind='conditional': CryptoTrader._verify_order_created(fake, oid, sym, kind)
     fake._classify_create_exception = lambda e: CryptoTrader._classify_create_exception(fake, e)
     fake._protection_identity = lambda b, r, l, s: CryptoTrader._protection_identity(fake, b, r, l, s)
+    # ChatGPT 复审③（成功判据改显式 `== 'committed'`）：G3 必须绑真实实现。
+    # 不绑 → 自动 mock 返回 MagicMock → 统一入口走「返回形态未知」分支返回 'unknown'。
+    # 更根本：CONFIRMED **只**由 _commit_protection_with_g3 写（统一入口自己不写），
+    # 不绑则 registry 永远是空 → T1 在 883ec7e 基线就是 `[FAIL] 返回='success',
+    # registry.state=None`（门禁只看 rc，本文件恒 rc=0，故一直没暴露）。
+    # ⚠️ _persist_states 用 **True 桩**而非真实实现：真实实现会写 STATE_FILE，而本文件
+    # 没有像 test_protection_write_gates 那样重定向 STATE_FILE → 会碰真实账本文件。
+    # 桩供给的是「磁盘写入成功」这一环境结果，不是替生产决定判据（判据仍在 `is not True`）。
+    fake._persist_states = lambda all_s: True
+    fake._commit_protection_with_g3 = (
+        lambda *a, **k: CryptoTrader._commit_protection_with_g3(fake, *a, **k))
     # B2-0 新增统一入口（红灯阶段未实现 → 跳过绑定，调用走 MagicMock 自动 mock 恒 FAIL）
     if hasattr(CryptoTrader, '_verify_and_update_registry'):
         fake._verify_and_update_registry = lambda s, b, i, oid, **kw: CryptoTrader._verify_and_update_registry(

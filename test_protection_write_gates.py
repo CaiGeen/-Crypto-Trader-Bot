@@ -607,6 +607,174 @@ def check_control_persist_works_without_injection():
         _restore_state_file()
 
 
+# --------------------------------------------------------------------------
+# N6 / N6a：统一入口为 persist_failed 发 critical 之后，**上层不得再发第二条**
+#           （ChatGPT 复审②：同一事件两种级别 + 反事实返回理由）
+# --------------------------------------------------------------------------
+
+def _run_update_sl(inject):
+    """驱动**真实上层调用方** `update_batch_sl`（用户改止损），返回 (返回值, 通知列表, 磁盘)。"""
+    d, state_path = _fresh_state_file()
+    try:
+        _seed_batch(state_path,
+                    protection_registry={},
+                    current_sl_id=None,
+                    last_filled_count=1,
+                    params_base={"leverage": 100},
+                    is_hedge_mode=False)
+        states = _read_disk(state_path)
+        fake = _make_fake(state_path, states)
+        # 被测入口本身 + 它额外依赖的两处（漏绑 → MagicMock 解包失败/float(MagicMock) 报错）
+        fake.update_batch_sl = lambda b, p: CryptoTrader.update_batch_sl(fake, b, p)
+        fake._batch_net_position = lambda b: (0.43, 0.43)
+        fake._verify_failure_msg = (
+            lambda desc, oid, sym, vr: CryptoTrader._verify_failure_msg(fake, desc, oid, sym, vr))
+        fake.exchange.fetch_ticker.return_value = {"last": 60000.0, "close": 60000.0}
+        if inject:
+            _inject_confirm_write_failure(fake)
+        ret = fake.update_batch_sl(BATCH, 55000.0)
+        return ret, list(fake.sent), _read_disk(state_path)
+    finally:
+        _restore_state_file()
+
+
+def check_n6_upper_caller_sends_single_critical():
+    """N6：真实上层调用方 × 确认写盘失败 → **只有一条通知**（critical），
+    且返回理由写明「订单已存在、确认未落盘」。
+
+    为什么必须走真实上层：N2a-1 只直接调统一入口，**看不到** 8 个调用方各自再补发
+    一条 `warning` 的双通知问题，也看不到它们返回的反事实措辞（「创建验证失败…未记录订单」，
+    而事实是该单已在交易所创建并 verify 成功）。
+    """
+    ctl_ret, ctl_sent, _ = _run_update_sl(inject=False)
+    inj_ret, inj_sent, _ = _run_update_sl(inject=True)
+
+    ctl_levels = [lv for lv, _ in ctl_sent]
+    inj_levels = [lv for lv, _ in inj_sent]
+    inj_bodies = [b for _, b in inj_sent]
+
+    report(
+        "N6 对照组走通真实上层成功路径（防假绿）",
+        ctl_ret[0] is True and len(ctl_sent) == 1 and "critical" not in ctl_levels,
+        f"返回 ok={ctl_ret[0]!r}；通知级别={ctl_levels}（期望 1 条非 critical 的成功通知）")
+
+    report(
+        "N6 注入后**只产生 1 条**通知且为 critical（上层不再补发第二条 warning）",
+        len(inj_sent) == 1 and inj_levels == ["critical"],
+        f"通知级别={inj_levels}（期望恰为 ['critical']）；"
+        f"正文含『确认未落盘』="
+        f"{('确认未落盘' in inj_bodies[0]) if inj_bodies else None}。"
+        f"若出现 2 条 = 统一入口 critical + 上层 warning 的双通知回归")
+
+    reason = inj_ret[1] if isinstance(inj_ret, (tuple, list)) and len(inj_ret) > 1 else ""
+    report(
+        "N6 返回理由写明「订单已存在、确认未落盘」，不再用反事实的「创建验证失败」",
+        inj_ret[0] is False
+        and "订单已存在、确认未落盘" in str(reason)
+        and "创建验证失败" not in str(reason),
+        f"ok={inj_ret[0]!r}；reason={str(reason)[:160]!r}")
+
+
+def check_n6a_all_verify_failure_msg_sites_guarded():
+    """N6a（结构断言）：**8 个** `_verify_failure_msg` 调用点全部被 persist_failed 守卫包住。
+
+    行为负测只覆盖 1 条上层路径；其余 7 条（含 5 条监控路径）靠本结构断言看住——
+    新增未守卫的调用点会因 `调用点 != 8 或存在未守卫行` 被逼审。
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trader_260725.py")
+    lines = io.open(path, encoding="utf-8").read().split("\n")
+
+    sites = [i for i, s in enumerate(lines)
+             if "_verify_failure_msg(" in s and not s.lstrip().startswith("def ")]
+    unguarded = []
+    for i in sites:
+        ok = False
+        for j in range(i - 1, max(i - 14, -1), -1):
+            s = lines[j]
+            if ("if verify_result == 'persist_failed':" in s
+                    or "if verify_result != 'persist_failed':" in s):
+                ok = True
+                break
+            if "if verify_result != 'success':" in s:
+                break          # 已到外层 if，中间没有守卫
+        if not ok:
+            unguarded.append(i + 1)
+
+    report(
+        f"N6a 全部 {len(sites)} 个 _verify_failure_msg 调用点均被 persist_failed 守卫拦截",
+        len(sites) == 8 and not unguarded,
+        f"调用点={len(sites)} 处（期望 8）；未守卫的行={unguarded}"
+        f"（任一未守卫 = 该路径会对 persist_failed 再发一条 warning，双通知回归）")
+
+
+# --------------------------------------------------------------------------
+# N7 / N7a：ChatGPT 复审③ —— 成功簿记显式要求 `== 'committed'`，未知结果保守处理
+# --------------------------------------------------------------------------
+
+def _disk_reg_state(state_path, ident=IDENT_SL):
+    return (_read_disk(state_path).get(SYMBOL, {}).get(BATCH, {})
+            .get("protection_registry", {}).get(ident, {}).get("state"))
+
+
+def check_n7_unknown_g3_return_is_not_success():
+    """N7：G3 返回**契约之外**的形态时，统一入口不得报 `success`，也不得改写 registry。
+
+    为什么这是负测而不是表征：在 `elif g3 != 'committed'` 之前，代码是
+    「不是 g3_triggered、不是 persist_failed → 落到 `return 'success'`」。
+    本例正是那个 else 兜底会吞掉的情形（生产 AST 枚举到不了，但测试替身
+    返回 MagicMock 就是走到它）——所以断言 `ret != 'success'` 是检验**期望行为**。
+    """
+    d, state_path = _fresh_state_file()
+    try:
+        _seed_pending_registry(state_path)
+        states = _read_disk(state_path)
+        fake = _make_fake(state_path, states)
+        # 用一个契约之外的值替换 G3（_commit_protection_with_g3 实际只会返回三种，
+        # 这里显式构造「未知形态」，不靠 mock 自然行为）
+        fake._commit_protection_with_g3 = (
+            lambda *a, **k: "__sentinel_not_in_contract__")
+        before = _disk_reg_state(state_path)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ret = CryptoTrader._verify_and_update_registry(
+                fake, SYMBOL, BATCH, IDENT_SL, "sl_ex_1", desc="首次止损单")
+        after = _disk_reg_state(state_path)
+        out = buf.getvalue()
+
+        report(
+            "N7-1 G3 返回契约外形态 → 统一入口不报 'success'（显式 == 'committed' 判据）",
+            ret != "success" and ret == "unknown",
+            f"返回={ret!r}（期望 'unknown'；改判据前的 else 兜底会给出 'success'）")
+
+        report(
+            "N7-2 未知形态打印可追溯日志（含 offending 值）且**不改写** registry",
+            "返回形态未知" in out
+            and "__sentinel_not_in_contract__" in out
+            and after == before,
+            f"stdout 含『返回形态未知』={'返回形态未知' in out}；"
+            f"含 offending 值={'__sentinel_not_in_contract__' in out}（否则日志无法定位是哪个返回）；"
+            f"registry.state 前={before!r} 后={after!r}（期望相等，未知形态不得写盘）")
+    finally:
+        _restore_state_file()
+
+
+def check_n7a_all_g3_sites_gate_on_explicit_committed():
+    """N7a（结构断言）：4 个 G3 消费站点全部用显式 `!= 'committed'` 拦截，无裸 `else` 成功簿记。
+
+    行为负测只覆盖站点1；站点2/3/4 的 `else` 里含 `_gate_alert_clear` 与成功簿记，
+    靠本结构断言看住——任何一处退回「else 即成功」都会让本项变红。
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trader_260725.py")
+    lines = io.open(path, encoding="utf-8").read().split("\n")
+    hits = [(i + 1, s.strip()) for i, s in enumerate(lines)
+            if re.search(r"elif _?g3 != 'committed':", s)]
+    report(
+        f"N7a 全部 {len(hits)} 个 G3 消费站点均有显式 `!= 'committed'` 判据",
+        len(hits) == 4,
+        f"命中行={[h[0] for h in hits]}（期望恰为 4 处：站点1 统一入口 + 站点2/3/4）；"
+        f"任一缺失 = 该站点退回『非 persist_failed 即成功』，未知形态会被当成功簿记")
+
+
 CHECKS = [
     check_control_persist_works_without_injection,
     check_n1_intent_write_failure_blocks_create,
@@ -618,6 +786,10 @@ CHECKS = [
     check_n2a_3_fallback_sl_consumer,
     check_n2a_4_tp_consumer,
     check_n3_gate_blocks_recreate_after_persist_failure,
+    check_n6_upper_caller_sends_single_critical,
+    check_n6a_all_verify_failure_msg_sites_guarded,
+    check_n7_unknown_g3_return_is_not_success,
+    check_n7a_all_g3_sites_gate_on_explicit_committed,
 ]
 
 

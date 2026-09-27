@@ -3544,6 +3544,14 @@ class CryptoTrader:
             verify_result = self._verify_and_update_registry(
                 target_symbol, batch_id, tp_identity, new_tp_order['id'], desc='用户修改止盈')
             if verify_result != 'success':
+                if verify_result == 'persist_failed':
+                    # C2 消费点（ChatGPT 复审②）：统一入口已为本事件发过 critical，是**唯一告警所有者**；
+                    # 此处再发一条 warning = 同一事件、两种级别。且下方「创建验证失败 / 未记录订单」
+                    # 与事实相反——该单已在交易所创建并 verify 成功，只是本地确认未落盘。
+                    return False, (
+                        f"⚠️ 新止盈单 `{new_tp_order['id']}`：订单已存在、确认未落盘（persist_failed）\n"
+                        f"ℹ️ 该单已在交易所创建并验证成功，但本地账本无 CONFIRMED，故未记录订单\n"
+                        f"🛠️ 请人工补记后再继续操作，避免重复下单")
                 self.send_tg_notification(
                     self._verify_failure_msg("新止盈单", new_tp_order['id'], target_symbol, verify_result),
                     level='critical' if verify_result == 'unknown' else 'warning')
@@ -3711,6 +3719,14 @@ class CryptoTrader:
             verify_result = self._verify_and_update_registry(
                 target_symbol, batch_id, sl_identity, new_sl_order['id'], desc='用户修改止损')
             if verify_result != 'success':
+                if verify_result == 'persist_failed':
+                    # C2 消费点（ChatGPT 复审②）：统一入口已为本事件发过 critical，是**唯一告警所有者**；
+                    # 此处再发一条 warning = 同一事件、两种级别。且下方「创建验证失败 / 未记录订单」
+                    # 与事实相反——该单已在交易所创建并 verify 成功，只是本地确认未落盘。
+                    return False, (
+                        f"⚠️ 新止损单 `{new_sl_order['id']}`：订单已存在、确认未落盘（persist_failed）\n"
+                        f"ℹ️ 该单已在交易所创建并验证成功，但本地账本无 CONFIRMED，故未记录订单\n"
+                        f"🛠️ 请人工补记后再继续操作，避免重复下单")
                 self.send_tg_notification(
                     self._verify_failure_msg("新止损单", new_sl_order['id'], target_symbol, verify_result),
                     level='critical' if verify_result == 'unknown' else 'warning')
@@ -3940,6 +3956,14 @@ class CryptoTrader:
             verify_result = self._verify_and_update_registry(
                 symbol, batch_id, sl_identity, new_sl_order['id'], desc='保本损')
             if verify_result != 'success':
+                if verify_result == 'persist_failed':
+                    # C2 消费点（ChatGPT 复审②）：统一入口已为本事件发过 critical，是**唯一告警所有者**；
+                    # 此处再发一条 warning = 同一事件、两种级别。且下方「创建验证失败 / 未记录订单」
+                    # 与事实相反——该单已在交易所创建并 verify 成功，只是本地确认未落盘。
+                    return False, (
+                        f"⚠️ 保本损止损单 `{new_sl_order['id']}`：订单已存在、确认未落盘（persist_failed）\n"
+                        f"ℹ️ 该单已在交易所创建并验证成功，但本地账本无 CONFIRMED，故未记录订单\n"
+                        f"🛠️ 请人工补记后再继续操作，避免重复下单")
                 self.send_tg_notification(
                     self._verify_failure_msg("保本损止损单", new_sl_order['id'], symbol, verify_result),
                     level='critical' if verify_result == 'unknown' else 'warning')
@@ -6347,6 +6371,16 @@ class CryptoTrader:
                     f"🛠️ 请人工核实并补记，避免重复挂单！",
                     level='critical')
                 return 'persist_failed'
+            elif g3 != 'committed':
+                # 保守（ChatGPT 复审③）：**只有显式 `'committed'` 才报 success**。
+                # AST 枚举本函数返回只有 'committed' / 'g3_triggered' /
+                # ('persist_failed', id) 三种 → 生产到不了这里；真到了就说明返回形态
+                # 超出设计（典型：测试替身返回 MagicMock）→ 按未知上报，**不得**因为
+                # 「不是 persist_failed」就当成已提交——不能让测试替身决定生产判据。
+                # registry 一律不动（不摧毁 G3 可能已写入的真实状态），由调用方按非 success 处理。
+                print(f"  └─ ⚠️ G3 提交返回形态未知({g3!r})：不报 success，"
+                      f"identity={identity} / order={order_id} 需人工核实")
+                return 'unknown'
             return 'success'
         elif verify_result == 'not_found':
             self._update_registry(symbol, batch_id, identity, state='NOT_CONFIRMED',
@@ -8207,9 +8241,12 @@ class CryptoTrader:
                                         symbol, batch_id, sl_identity, new_sl_order['id'], desc='部分减仓换挂止损')
                                     if verify_result != 'success':
                                         print(f"  └─ ❌ 新止损单验证失败({verify_result})，不 Commit/不撤旧: {new_sl_order['id']}")
-                                        self.send_tg_notification(
-                                            self._verify_failure_msg("止损更新单", new_sl_order['id'], symbol, verify_result),
-                                            level='critical' if verify_result == 'unknown' else 'warning')
+                                        # C2 消费点（ChatGPT 复审②）：persist_failed 的 critical 已由
+                                        # 统一入口发出（唯一告警所有者），此处不再补发第二条 warning。
+                                        if verify_result != 'persist_failed':
+                                            self.send_tg_notification(
+                                                self._verify_failure_msg("止损更新单", new_sl_order['id'], symbol, verify_result),
+                                                level='critical' if verify_result == 'unknown' else 'warning')
                                     else:
                                         new_sl_id = new_sl_order['id']
                                         print(f"  └─ ✅ 新止损单已挂: {formatted_sl_price} (数量: {batch_filled_amount}, ID: {new_sl_id})")
@@ -8287,9 +8324,12 @@ class CryptoTrader:
                                         symbol, batch_id, tp_identity, new_tp_order['id'], desc='部分减仓换挂止盈')
                                     if verify_result != 'success':
                                         print(f"  └─ ❌ 新止盈单验证失败({verify_result})，不 Commit/不撤旧: {new_tp_order['id']}")
-                                        self.send_tg_notification(
-                                            self._verify_failure_msg("止盈更新单", new_tp_order['id'], symbol, verify_result),
-                                            level='critical' if verify_result == 'unknown' else 'warning')
+                                        # C2 消费点（ChatGPT 复审②）：persist_failed 的 critical 已由
+                                        # 统一入口发出（唯一告警所有者），此处不再补发第二条 warning。
+                                        if verify_result != 'persist_failed':
+                                            self.send_tg_notification(
+                                                self._verify_failure_msg("止盈更新单", new_tp_order['id'], symbol, verify_result),
+                                                level='critical' if verify_result == 'unknown' else 'warning')
                                     else:
                                         new_tp_id = new_tp_order['id']
                                         print(f"  └─ ✅ 新止盈单已挂: {formatted_tp_price} (数量: {batch_filled_amount}, ID: {new_tp_id})")
@@ -9053,9 +9093,12 @@ class CryptoTrader:
                                             current_sl_id = None
                                             sl_success = False
                                             print(f"  └─ ❌ 止损单验证失败({verify_result})，不 Commit/不补单/不重挂: {new_sl_order['id']}")
-                                            self.send_tg_notification(
-                                                self._verify_failure_msg("止损单", new_sl_order['id'], symbol, verify_result),
-                                                level='critical' if verify_result == 'unknown' else 'warning')
+                                            # C2 消费点（ChatGPT 复审②）：persist_failed 的 critical 已由
+                                            # 统一入口发出（唯一告警所有者），此处不再补发第二条 warning。
+                                            if verify_result != 'persist_failed':
+                                                self.send_tg_notification(
+                                                    self._verify_failure_msg("止损单", new_sl_order['id'], symbol, verify_result),
+                                                    level='critical' if verify_result == 'unknown' else 'warning')
                                         else:
                                             current_sl_id = new_sl_order['id']
                                             sl_success = True
@@ -9217,10 +9260,13 @@ class CryptoTrader:
                                                     desc='降级恢复止损单')
                                                 if verify_result != 'success':
                                                     print(f"  └─ ❌ 降级恢复单验证失败({verify_result})，不 Commit/不补单: {recovery_order['id']}")
-                                                    self.send_tg_notification(
-                                                        self._verify_failure_msg("降级恢复止损单", recovery_order['id'],
-                                                                                  symbol, verify_result),
-                                                        level='critical' if verify_result == 'unknown' else 'warning')
+                                                    # C2 消费点（ChatGPT 复审②）：persist_failed 的 critical 已由
+                                                    # 统一入口发出（唯一告警所有者），此处不再补发第二条 warning。
+                                                    if verify_result != 'persist_failed':
+                                                        self.send_tg_notification(
+                                                            self._verify_failure_msg("降级恢复止损单", recovery_order['id'],
+                                                                                      symbol, verify_result),
+                                                            level='critical' if verify_result == 'unknown' else 'warning')
                                                     sl_success = False
                                                 else:
                                                     current_sl_id = recovery_order['id']
@@ -9394,9 +9440,12 @@ class CryptoTrader:
                                     symbol, batch_id, tp_identity, new_tp_order['id'], desc='补挂止盈单')
                                 if verify_result != 'success':
                                     print(f"  └─ ❌ 止盈单验证失败({verify_result})，不 Commit/不补单: {new_tp_order['id']}")
-                                    self.send_tg_notification(
-                                        self._verify_failure_msg("止盈单", new_tp_order['id'], symbol, verify_result),
-                                        level='critical' if verify_result == 'unknown' else 'warning')
+                                    # C2 消费点（ChatGPT 复审②）：persist_failed 的 critical 已由
+                                    # 统一入口发出（唯一告警所有者），此处不再补发第二条 warning。
+                                    if verify_result != 'persist_failed':
+                                        self.send_tg_notification(
+                                            self._verify_failure_msg("止盈单", new_tp_order['id'], symbol, verify_result),
+                                            level='critical' if verify_result == 'unknown' else 'warning')
                                     tp_order_id = None
                                 else:
                                     tp_order_id = new_tp_order['id']
@@ -9855,6 +9904,13 @@ class CryptoTrader:
                                     f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
                                     f"🛠️ 请人工核实并补记，避免重复挂单！",
                                     level='critical')
+                            elif _g3 != 'committed':
+                                # 保守（ChatGPT 复审③）：成功簿记**只**在显式 `'committed'` 时执行。
+                                # 生产不可达（AST 枚举 G3 只返回三种形态）；真到了就不宣称已挂出、
+                                # 不清告警额度——磁盘仍有 PENDING_CREATE 意图锚点，G1 闸门会拦住
+                                # 同 identity 重建，不会双单。
+                                print(f"  └─ ⚠️ G3 提交返回形态未知({_g3!r})：跳过成功簿记，"
+                                      f"订单 {new_sl_order['id']} 未记入 current_sl_id，请人工核实")
                             else:
                                 sl_price = sl_params['params']['stopPrice']
                                 latest_b_data['current_sl_id'] = new_sl_order['id']
@@ -10030,6 +10086,11 @@ class CryptoTrader:
                                     f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
                                     f"🛠️ 请人工核实并补记，避免重复挂单！",
                                     level='critical')
+                            elif _g3 != 'committed':
+                                # 保守（ChatGPT 复审③）：成功簿记**只**在显式 `'committed'` 时执行。
+                                # 尤其本处 else 含 `_gate_alert_clear`——未知形态绝不能清告警额度。
+                                print(f"  └─ ⚠️ G3 提交返回形态未知({_g3!r})：跳过成功簿记，"
+                                      f"订单 {new_sl_order['id']} 未记入 current_sl_id，请人工核实")
                             else:
                                 # ChatGPT 终审（2026-08-20）：兜底 SL 成功挂出 = 真正恢复 →
                                 # 恢复 FAILED 告警 3 次额度（L4885 直发点同 identity 去重计数）
@@ -10205,6 +10266,11 @@ class CryptoTrader:
                                 f"⚠️ **交易所可能已有该单**，磁盘账本仍无 CONFIRMED 记录\n"
                                 f"🛠️ 请人工核实并补记，避免重复挂单！",
                                 level='critical')
+                        elif _g3 != 'committed':
+                            # 保守（ChatGPT 复审③）：成功簿记**只**在显式 `'committed'` 时执行。
+                            # 尤其本处的 else 含 `_gate_alert_clear`——未知形态绝不能清额度。
+                            print(f"  └─ ⚠️ G3 提交返回形态未知({_g3!r})：跳过成功簿记，"
+                                  f"订单 {new_tp_order['id']} 未记入 tp_order_id，请人工核实")
                         else:
                             # ChatGPT 终审（2026-08-20）：预生成 TP 成功挂出 = 真正恢复 → 恢复 FAILED 告警额度
                             self._gate_alert_clear(identity)
