@@ -4,7 +4,13 @@
 
 本文件对应**可部署版本**（M2–M4，不含 M1'）。背景（第八轮复审 / ChatGPT 复核 d539da9）：
   M2 消除第 3 批次起的轮询断崖（F6：<=2 → 10~15s，<=4 → 原 75~100s）
-  M3 批次硬上限 3 + 修正 D10 误导文案（原称「改 .env 即时生效无需重启」，实为需重启）
+  M3 风控键**配置检查**（2026-09-27，两轮 ChatGPT 复审收口）：
+     两个 RISK_* 键须 ① 用**与 load_dotenv 同源的解析器**可解析（防 trader
+     L1634-1641 静默回落）② **文件期望值 == 本次进程有效值**（防 override=False
+     下启动环境遮蔽 .env 造成的假绿）。
+     **不钉任何数值区间、不从 .env 推导时间保证** → 调批次/品种上限只改 .env。
+     `M2PollingCliffTests` 只是**正常网络下的轮询分档回归**，不保证成交发现时间。
+     + 修正 D10 误导文案（原称「改 .env 即时生效无需重启」，实为需重启）
   M4 启动配置横幅：打印**进程内真正生效**的值（永久解决 A9 类验收缺口）
 
 ⚠️ M1'（崩溃邮件在途去重 + 迟到回灌）**刻意不含**在内：ChatGPT 复核 d539da9 指出
@@ -27,6 +33,11 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# 配置检查必须与**运行时同一个解析器**取值 —— 首版手工按行扫已实测证伪：
+#   重复键 2…5 → 手工取 '2' / 运行时取 '5'；export KEY=6 → 手工 None / 运行时 '6'；
+#   KEY="7" → 手工 '"7"' / 运行时 '7'；KEY=8 # 注释 → 手工 '8 # comment' / 运行时 '8'
+from dotenv import dotenv_values, load_dotenv  # noqa: E402
 
 import email_gate  # noqa: E402
 import bot_runner  # noqa: E402
@@ -76,28 +87,186 @@ class M3D10WordingTests(unittest.TestCase):
             src = f.read()
         self.assertIn("需重启 watchdog/bot_runner 才对运行中进程生效", src)
 
-    def test_m3_batch_cap_matches_live_env_file(self):
-        """实盘 `.env`（不入库）必须**显式**写出批次上限，而不是依赖默认值。
+    # ── M3 风控键配置检查：与实盘 `.env` 联动（2026-09-27，按 ChatGPT 复审收口）──
+    # 首版 9cc930a 两处已撤，记录在此防重犯：
+    #   ① `WINDOW_LIMIT=45` 重新造出一个**隐形上限** —— 批次 7 / 9 过不了门禁，
+    #      与「上限可按需求增减」相悖；`<3` 也被写成了永久安全不变量。
+    #   ② 把「正常路径轮询间隔 <=45s」**误称为**「裸仓发现窗口上限」，超出口径：
+    #        trader L7807    sleep_interval = _calculate_monitoring_interval() ← 只测了这条
+    #        trader L7808-10 连续网络错误 → x3（封顶 300s）
+    #        trader L7811-12 3s 快轮询只在**发现成交之后**，缩短不了首次发现之前的等待
+    #        另有 sleep 之后的 API 耗时；下调上限时已有活跃批次可能已超新上限
+    #   ⇒ 本文件**不再从某台机器的 .env 推导任何时间保证**。
+    #
+    # 分工（互不替代）：
+    #   配置检查（本处）→ 两道判据：① 文件值用**与 load_dotenv 同源的解析器**可解析
+    #                     ② 文件期望值 == **本次进程有效值**（防启动环境遮蔽）
+    #   轮询档位        → `M2PollingCliffTests` 只是**正常网络下的轮询分档回归**：
+    #                     固定 `_calculate_monitoring_interval` 的输出区间，
+    #                     **不保证实际成交发现时间**，不可称作"时间保证"
+    #   容量            → 不设门禁，见用例 docstring 的复核提示
+    #
+    # 留痕：`.env` 不入库（.gitignore:4），值变更靠**部署步骤 0 记 SHA256 +
+    #       步骤 5 判据 ⑥ 复核**留痕，不在本测试里另开日志。
 
-        上限值 = 3（用户 2026-09-25 定）：M2 消除了第 3 批次的轮询断崖后，
-        3 档为 20~30s，不再承担「保护单补建窗口过长」的代价。
-        若日后改为 4 或其他值，**必须同步改这里的断言**，否则配置与测试脱节。
+    ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+    def _file_value(self, path: str, key: str):
+        """按 **与 `load_dotenv()` 同源的解析器** 取文件期望值；键缺失返回 None。
+
+        为什么不能手工按行扫（首版做法，2026-09-27 实测证伪）：
+            写法           手工取第一条      运行时 load_dotenv
+            重复键 2…5     '2'               '5'          （后者覆盖）
+            export KEY=6   None              '6'          → **假红**（报"未设置"而程序正常）
+            KEY="7"        '"7"'             '7'          → **假红**（int() 抛）
+            KEY=8 # 注释   '8 # comment'     '8'          → **假红**（int() 抛）
+        ⇒ 手工解析与程序读到的**不是同一个值**，那句"逐字复刻、成为同一件事"不成立。
+        实测 `dotenv_values ≡ load_dotenv` 于上述全部写法。
         """
-        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-        self.assertTrue(os.path.exists(env_path), "实盘 .env 不存在，无法核对上限")
-        with open(env_path, encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f
-                     if ln.strip().startswith("RISK_MAX_ACTIVE_BATCHES")]
-        self.assertTrue(lines, ".env 未显式设置 RISK_MAX_ACTIVE_BATCHES（会退回默认 3）")
-        self.assertEqual(lines[0].split("=", 1)[1].strip(), "3")
+        vals = dotenv_values(path)
+        if key not in vals:
+            return None
+        v = vals[key]
+        return "" if v is None else str(v).strip()
 
-    def test_m3_batch_cap_3_still_fast_enough(self):
-        """上限=3 的前提是 M2 已让 3 档保持 20~30s（否则等于退回断崖）"""
-        fake = mock.Mock()
-        fake._get_active_batch_count.return_value = 3
-        for _ in range(20):
-            v = trader_260725.CryptoTrader._calculate_monitoring_interval(fake)
-            self.assertLessEqual(v, 30.0, "3 档轮询必须 <=30s")
+    def _parse_int_or_fail(self, key: str, raw: str, default: int, where: str) -> int:
+        """解析为 int；失败即报「静默回落 = 配置假生效」。"""
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            self.fail(
+                f"{where}: {key}={raw!r} 无法解析为整数 → 运行时静默回落 {default}"
+                f"（trader L1634-1641），进程将按 {default} 而非 {raw!r} 执行"
+                f" = 配置假生效。请把值改成整数，**不是放宽本断言**。")
+
+    def _file_vs_effective(self, path: str, key: str, default: int):
+        """返回 (文件期望 int, 本次进程有效 int) —— 两者不同即为**遮蔽**。
+
+        「进程有效值」可作口径的前提：`bot_runner.py:58` 与 `trader_260725.py:32`
+        都在 **import 时**执行 `load_dotenv()`（默认 `override=False`），
+        而本测试文件顶部就 import 了这两个模块。
+        """
+        file_raw = self._file_value(path, key)
+        self.assertIsNotNone(
+            file_raw, f"{path} 未显式设置 {key} → 代码退回默认 {default}，配置不生效")
+        file_val = self._parse_int_or_fail(key, file_raw, default, "文件期望值")
+        eff = os.environ.get(key)
+        self.assertIsNotNone(
+            eff, f"进程有效值 {key} 不存在 —— load_dotenv() 未执行，无法比对")
+        eff_val = self._parse_int_or_fail(key, eff, default, "进程有效值")
+        return file_val, eff_val
+
+    def test_m3_risk_keys_match_runtime_parse_and_process_value(self):
+        """**配置检查**，两道判据。通过只代表「文件自洽且与**本测试进程**一致」。
+
+        判据 A — 文件值用**与 load_dotenv 同源的解析器**可解析：
+          不可解析会**静默回落**（`trader L1634-1641`：BATCHES→3、SYMBOLS→1），
+          届时「.env 写 9 / 2，进程仍按 3 / 1 跑」且零提示 = **配置假生效**。
+          两键**都**有此缺陷，故一并校验。
+
+        判据 B — 文件期望值 == **本次进程有效值**（首版缺失，故其"假绿"）：
+          `load_dotenv()` 默认 `override=False` —— 启动环境预置同名变量时
+          **文件值被完全忽略**。只读文件的测试此时会通过，而程序用的是旧值。
+          实测复现：`.env=2` + 环境已有 `1` → `os.getenv` 得 `'1'`。
+
+        **不查任何数值区间**：取多少是每机可不同的需求，不该钉进入库测试
+        （9cc930a 之前 `== "3"` 是老毛病；f2efcf1 的 `>=3` 下限**同样已删** ——
+        改称"需求约束"并没有改变"下调仍要碰测试"这一使用结果）。
+
+        三态必须分清，**别把"整数可解析"说成"上限有效"**：
+          不可解析/缺失 → **假生效**（本测试拦）
+          >0            → 闸门**生效**，值即上限
+          <=0           → 闸门**已禁用**（`trader L1628/L1654/L1657` 设计语义，
+                          `test_account_risk.py:171` 钉为设计）—— **受支持状态，
+                          本测试不拦**；但它是"禁用"，不等于"上限有效"。
+
+        明确**不**由本测试保证的事：
+          - **不证明「成交 → 首次发现 <= N 秒」**。真实延迟还含网络失败 ×3
+            （`trader L7808-7810`）、sleep 之后的 API 耗时，以及下调上限时
+            已有活跃批次可能已超新上限。`M2PollingCliffTests` 只是
+            **正常网络下的轮询分档回归**（固定函数输出区间），不是"时间保证"。
+          - **不证明生产进程已加载**：判据 B 比的是**本测试进程**的 `os.environ`，
+            不是生产 Bot 的。生效证据始终是重启后
+            `bot_runner.log_effective_config()` 横幅同名键值（D10 / F10）。
+
+        容量提示（**不是门禁，不拦任何值**）：批次 >= 7 落入 45~60s 档，
+        **尚未压测**，调高前请按实际运行负载判断，不靠本测试承诺保护时延。
+        """
+        for key, default in (("RISK_MAX_ACTIVE_BATCHES", 3),
+                             ("RISK_MAX_ACTIVE_SYMBOLS", 1)):
+            file_val, eff_val = self._file_vs_effective(self.ENV_PATH, key, default)
+            self.assertEqual(
+                file_val, eff_val,
+                f"{key}: 文件期望 {file_val}，进程有效值 {eff_val} —— "
+                f"`load_dotenv()` 默认 override=False，**启动环境预置的同名变量会遮蔽"
+                f" .env**，此时只改 .env 并不生效。请清除启动环境中的同名变量；"
+                f"最终以重启后的配置横幅确认实盘值。")
+
+    def test_m3_env_parser_matches_runtime_dotenv_semantics(self):
+        """负测①：配置检查必须与运行时**同一个解析器**，各种合法写法同解。
+
+        首版手工取第一条，在下列写法上与 `load_dotenv()` **实测不一致** ——
+        `export` / 行内注释 / 引号 会**假红**（报"未设置"或 `int()` 抛），
+        重复键会**假绿**（取到另一行）。
+        """
+        bodies = {
+            "plain":       "RISK_MAX_ACTIVE_BATCHES=4",
+            "duplicate":   "RISK_MAX_ACTIVE_BATCHES=2\nRISK_MAX_ACTIVE_BATCHES=5",
+            "export":      "export RISK_MAX_ACTIVE_BATCHES=6",
+            "quoted":      'RISK_MAX_ACTIVE_BATCHES="7"',
+            "inline_note": "RISK_MAX_ACTIVE_BATCHES=8 # comment",
+            "spaces":      "RISK_MAX_ACTIVE_BATCHES = 9",
+        }
+        key = "RISK_MAX_ACTIVE_BATCHES"
+        for name, body in bodies.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as d:
+                    p = os.path.join(d, ".env")
+                    with io.open(p, "w", encoding="utf-8") as f:
+                        f.write(body + "\n")
+                    file_val = self._file_value(p, key)
+                    # 运行时口径：先移除本进程已有值，再按运行时方式加载
+                    saved = os.environ.pop(key, None)
+                    try:
+                        load_dotenv(p, override=False)
+                        runtime = os.environ.get(key)
+                    finally:
+                        os.environ.pop(key, None)
+                        if saved is not None:
+                            os.environ[key] = saved
+                    self.assertEqual(
+                        file_val, runtime,
+                        f"{name}: 配置检查读到 {file_val!r}，运行时读到 {runtime!r}"
+                        f" —— 测试与程序在看不同的值，配置检查形同虚设")
+
+    def test_m3_detects_startup_env_shadowing_file(self):
+        """负测②：`.env` 写 2、启动环境已有 1 → 程序用 1，只读文件的测试会**假绿**。"""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, ".env")
+            with io.open(p, "w", encoding="utf-8") as f:
+                f.write("RISK_MAX_ACTIVE_SYMBOLS=2\n")
+            with mock.patch.dict(os.environ, {"RISK_MAX_ACTIVE_SYMBOLS": "1"}):
+                load_dotenv(p, override=False)     # 与运行时同一调用
+                self.assertEqual(os.environ.get("RISK_MAX_ACTIVE_SYMBOLS"), "1",
+                                 "前置条件：override=False 应让文件值失效")
+                file_val, eff_val = self._file_vs_effective(
+                    p, "RISK_MAX_ACTIVE_SYMBOLS", 1)
+                self.assertNotEqual(
+                    file_val, eff_val,
+                    "配置检查的文件/进程比对**未能识别遮蔽** → 会假绿")
+
+    # ── 已删除：`test_m3_batch_floor_matches_current_requirement`（BATCHES >= 3）──
+    # ChatGPT 复审 f2efcf1：「改称『需求约束』没有改变使用结果 —— 有意从 3→2 时
+    # 门禁仍红、仍要碰测试」，与本次「上限是可增减的配置值」的目标冲突，故整条删除。
+    #
+    # 后果（如实登记，不假装没有）：用户 2026-09-25 定的「至少 3 个活跃批次」
+    # 「批次数不得被当作安全参数」**自此不再由门禁执行**，只剩文档与部署步骤 0
+    # 的 .env SHA256 复核两处。若要恢复硬约束，应放回测试、或由**产品语义**
+    # 而非测试来决定。
+    #
+    # `<=0` 同样不拦：`trader L1628/L1654/L1657` 把它定义为**禁用闸门**，
+    # 是受支持语义（`test_account_risk.py:171` 钉为设计）。配置检查的职责是
+    # **说清三态**，不是替产品决定能否禁用。
 
 
 class M4ConfigBannerTests(unittest.TestCase):
