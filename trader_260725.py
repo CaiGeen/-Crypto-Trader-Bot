@@ -355,13 +355,14 @@ AUTH_BLIND_SLEEP_SECONDS = 300
 # POLL_FAIL_ALERT_ROUNDS：连续失败多少轮即判定降级（不承诺固定发现时延——每轮先睡
 #   动态间隔，失败后下轮 ×3 且封顶 300s，_safe_api_call 内部还有重试与冷却）
 POLL_FAIL_ALERT_ROUNDS = 3
-# 🔥 第七轮复审：启动重证认定止损单时**只认这些明确类型**。
+# 🔥 收敛审查 S7：启动重证认定止损单时**只认这些明确类型**（取自 info.type，
+# 交易所原始类型；顶层 type 会被 ccxt 归一化为 market，不可作判据）。
 # 旧条件 `type.startswith('STOP') or info.stopPrice` 接受任何带 stopPrice 的订单，
 # 而 TAKE_PROFIT_MARKET 的 info 里同样带 stopPrice → 止盈单会被误认作止损。
 # 白名单而非黑名单：新增类型必须显式评审后再加，不得靠前缀/字段自动放行。
 _STOP_ORDER_TYPES = frozenset({
     'STOP_MARKET', 'STOP', 'STOP_LOSS', 'STOP_LOSS_LIMIT',
-    'STOP_MARKET_LIMIT', 'TAKE_PROFIT_MARKET_STOP', 'TRAILING_STOP_MARKET',
+    'STOP_MARKET_LIMIT', 'TRAILING_STOP_MARKET',
 })
 # POLL_STALE_ALERT_SECONDS：数据陈旧达到该时长亦判定降级（逐批计算）
 POLL_STALE_ALERT_SECONDS = 120.0
@@ -3661,36 +3662,46 @@ class CryptoTrader:
                                 _want = ('SELL'
                                          if (_bd.get('side') or 'BUY').upper() == 'BUY'
                                          else 'BUY')
-                                _o_type = str(_so.get('type') or '').upper()
-                                # 🔥 第七轮复审：旧条件 `_o_type.startswith('STOP')
-                                #   or info.stopPrice` 接受**任何**带 stopPrice 的订单 ——
-                                #   TAKE_PROFIT_MARKET 的 info 里同样有 stopPrice，
-                                #   会被误认作止损。必须只认明确的止损类型（白名单）。
-                                # ⚠️ 以下三项是**独立顺序检查**，不是 if/elif 链：
-                                #    写成链会让后面的检查被前面的分支吞掉
-                                #    （本轮已因此漏掉 Hedge 下的覆盖量检查）。
+                                # 🔥 收敛审查 S7：统一到仓库已有数据契约。
+                                # 与 _check_protection_order_validity（L6868）冲突点：
+                                #   - 顶层 type 会被 ccxt 归一化为 market → 不可作为
+                                #     类型判据；**原始类型是 info.type**（未被归一化）
+                                #   - positionSide 权威来源是 info.positionSide
+                                # 裁定：从 info 读**原始** type/positionSide。
+                                _so_info = _so.get('info') or {}
                                 _sl_bad = False
-                                if _o_type not in _STOP_ORDER_TYPES:
+                                # ⓪ 方向：止损必须与持仓反向（BUY 仓 → SELL 保护单）。
+                                #    （收敛审查：此处曾在重写中被漏掉，必须保留。）
+                                if str(_so.get('side') or '').upper() != _want:
                                     _sl_bad = True
                                     _reverify_detail.append(
-                                        f"{_sym}/{_bid} SL 订单类型非止损单"
-                                        f"（type={_o_type!r}，"
-                                        f"即便带 stopPrice 也不认作止损）")
-                                # Hedge 下 positionSide 必须 **等于** 本仓方向；
-                                # 缺失 / BOTH 属 UNKNOWN，不能放行
+                                        f"{_sym}/{_bid} SL 方向错误：交易所="
+                                        f"{_so.get('side')!r} 期望={_want}")
+                                # ① 明确识别止损**类型**：只认白名单，止盈单
+                                #    （TAKE_PROFIT_MARKET 的 info 里同样有 stopPrice）
+                                #    必须被排除。info.type 优先，顶层 type 仅作回退。
+                                _raw_type = str(_so_info.get('type')
+                                                or _so.get('type') or '').upper().strip()
+                                if _raw_type not in _STOP_ORDER_TYPES:
+                                    _sl_bad = True
+                                    _reverify_detail.append(
+                                        f"{_sym}/{_bid} SL 非止损类型"
+                                        f"（原始 type={_raw_type!r}，白名单={sorted(_STOP_ORDER_TYPES)}；"
+                                        f"即便 info.stopPrice 存在也不认作止损）→ 保持未就绪")
+                                # ② Hedge 下 positionSide 从 **info** 读，必须等于本仓方向
                                 if bool(_bd.get('is_hedge_mode')):
                                     _want_ps = ('LONG'
                                                 if (_bd.get('side') or 'BUY').upper() == 'BUY'
                                                 else 'SHORT')
-                                    _o_ps = str(_so.get('positionSide') or '').upper()
+                                    _o_ps = str(_so_info.get('positionSide') or '').upper()
                                     if _o_ps != _want_ps:
                                         _sl_bad = True
                                         _reverify_detail.append(
-                                            f"{_sym}/{_bid} SL positionSide 缺失/不符："
+                                            f"{_sym}/{_bid} SL info.positionSide 缺失/不符："
                                             f"交易所={_o_ps!r} 期望={_want_ps}"
                                             f"（Hedge 下缺失或 BOTH 均判 UNKNOWN）")
-                                # 覆盖量：必须有限正数。NaN/inf 会**绕过** `>` 比较
-                                # （NaN 的任何比较都是 False），必须显式排除。
+                                # ③ 覆盖量：必须有限正数。NaN/inf 会**绕过** `>` 比较
+                                #    （NaN 的任何比较都是 False），必须显式排除。
                                 try:
                                     _cov = float(_so.get('amount'))
                                 except (TypeError, ValueError):
@@ -6659,10 +6670,20 @@ class CryptoTrader:
                     # 自检也不再只看列表长度：数量/止损价为 0、layer_sl_params 为空
                     # 都会让监控算错保护量或挂不出 TP，一并判无效。
                     _n_orders = len(_takeover_orders)
+                    # 🔥 收敛审查 S5：float() 遇不可解析的账本值会抛异常，
+                    # 在设置未决闸门前炸掉整个分支 → 必须 try/except，
+                    # 不可解析即该层判无效（Fail-Closed）。
+                    def _pos_num(v):
+                        try:
+                            f = float(v)
+                        except (TypeError, ValueError):
+                            return None
+                        return f if (f > 0 and f == f
+                                     and f not in (float('inf'), float('-inf'))) else None
                     _amt_bad = [i for i, a in enumerate(_tk_target_amounts[:_n_orders])
-                                if not (a and float(a) > 0)]
+                                if _pos_num(a) is None]
                     _slp_bad = [i for i, s in enumerate(list(_tk_stop_steps or [])[:_n_orders])
-                               if not (s and float(s) > 0)]
+                               if _pos_num(s) is None]
                     _tk_ok = (not _rb_matched_unwritten
                               and (not _n_orders
                                    or (len(_tk_target_amounts) >= _n_orders
@@ -6670,6 +6691,7 @@ class CryptoTrader:
                                        and not _amt_bad and not _slp_bad
                                        and bool(_tk_layer_sl) and bool(_tk_tp_params))))
                     _tk_started = False
+                    _tk_alive = threading.Event()
                     if not _tk_ok:
                         print(f"  └─ ⛔ 拒绝启动监控接管"
                               f"（收编未确认落盘={_rb_matched_unwritten}；"
@@ -6681,8 +6703,15 @@ class CryptoTrader:
                               f"→ 保持未决闸门与禁止新增风险，待交易所核实或人工处置")
                     else:
                         try:
-                            threading.Thread(
-                                target=self._start_monitoring,
+                            # 🔥 收敛审查 S6：Thread.start() 返回 ≠ 监控在运行。
+                            # 用 Event 确认子线程**已进入 _start_monitoring 主体**；
+                            # 若线程在 set() 之前/之后立即退出，Event 不会置位
+                            # 或置位后线程已死 —— 两种情况都不得解除闸门。
+                            def _tk_wrapper(**_kw):
+                                _tk_alive.set()
+                                return self._start_monitoring(**_kw)
+                            _tk_thread = threading.Thread(
+                                target=_tk_wrapper,
                                 kwargs={
                                     'symbol': symbol,
                                     'batch_id': batch_id,
@@ -6703,8 +6732,22 @@ class CryptoTrader:
                                     'prepared_tp_params': _tk_tp_params,
                                     'layer_sl_params': _tk_layer_sl,
                                 },
-                                daemon=True).start()
-                            _tk_started = True
+                                daemon=True)
+                            _tk_thread.start()
+                            # 等待子线程确认已进入主体。
+                            # 🔥 收敛审查 S6：Event 证明"已进入 _start_monitoring"；
+                            # is_alive() 证明"进入后没有立即退出"。
+                            # 两者缺一都不得解除闸门 —— 子线程启动后立即退出
+                            # 时调用方仍可能解除未决闸门，正是本条要堵的出口。
+                            if _tk_alive.wait(timeout=5.0):
+                                if _tk_thread.is_alive():
+                                    _tk_started = True
+                                else:
+                                    print(f"  └─ ⚠️ 监控线程进入主体后已退出"
+                                          f"（alive=False）→ 视为未启动")
+                            else:
+                                print(f"  └─ ⚠️ 监控线程未在 5s 内确认进入主体"
+                                      f"→ 视为未启动")
                             print(f"  └─ ✅ 已启动监控接管（订单 ID={_takeover_orders}，"
                                   f"数量层={len(_tk_target_amounts)}，"
                                   f"止损层={len(_tk_stop_steps or [])}）")

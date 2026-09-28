@@ -28,6 +28,9 @@ import test_monitor_poll_recovery as PR
 
 SYMBOL = PR.SYMBOL
 REAL_OID = 'REAL_EXCHANGE_OID_1'
+# 🔥 收敛审查 S6：模拟真实 _start_monitoring 的"无限循环存活"。
+# 永不置位；daemon 线程随进程退出回收。
+_BLOCK = threading.Event()
 BATCH = PR.BATCH
 ENTRY_ID = PR.ENTRY_ID
 
@@ -720,10 +723,15 @@ def _two_layer_fake():
     f._state_lock = threading.RLock()
     f.monitoring_started = []
     f.monitoring_started_ids = []
-    f._start_monitoring = (
-        lambda *a, **k: (f.monitoring_started.append(k.get('batch_id')),
-                         f.monitoring_started_ids.extend(
-                             k.get('entry_orders') or [])))
+    # 🔥 收敛审查 S6：替身必须模拟真实监控的**存活**（_start_monitoring 是无限
+    # 循环）。若替身立即返回，接管代码的 is_alive() 会判"进入主体后已退出"，
+    # 未决闸门不解除 → B15b/B19b 假红。用永不置位的事件阻塞（daemon 线程，
+    # 进程退出时自动回收）。
+    def _start_stub(*a, **k):
+        f.monitoring_started.append(k.get('batch_id'))
+        f.monitoring_started_ids.extend(k.get('entry_orders') or [])
+        _BLOCK.wait()
+    f._start_monitoring = _start_stub
     return f, _TwoLayerSignal()
 
 
@@ -1068,7 +1076,15 @@ def _reconciled_run():
     _bind_real_reconcile(f)
     f._state_lock = threading.RLock()
     f.monitor_kwargs = []
-    f._start_monitoring = lambda *a, **k: f.monitor_kwargs.append(k)
+    # 🔥 收敛审查 S6：替身必须模拟真实监控的存活 —— 真实 _start_monitoring
+    # 是无限循环，线程进入后 is_alive() 恒为 True。若替身立即返回或 sleep
+    # 太短，is_alive() 竞态会让 B15b/B19b 假红（线程已退出 → 闸门不解除）。
+    # 用永不置位的事件阻塞（daemon 线程，进程退出时自动回收）。
+    _block = threading.Event()
+    def _alive_stub(*a, **k):
+        f.monitor_kwargs.append(k)
+        _block.wait()         # 模拟监控主循环：永不返回
+    f._start_monitoring = _alive_stub
     f.exchange.fetch_open_orders.side_effect = None
     f.exchange.fetch_open_orders.return_value = [{
         'id': REAL_OID, 'symbol': SYMBOL, 'type': 'STOP_MARKET', 'side': 'buy',
@@ -1143,7 +1159,15 @@ def test_block22_takeover_refused_when_persist_unconfirmed():
     _bind_real_reconcile(f)
     f._state_lock = threading.RLock()
     f.monitor_kwargs = []
-    f._start_monitoring = lambda *a, **k: f.monitor_kwargs.append(k)
+    # 🔥 收敛审查 S6：替身必须模拟真实监控的存活 —— 真实 _start_monitoring
+    # 是无限循环，线程进入后 is_alive() 恒为 True。若替身立即返回或 sleep
+    # 太短，is_alive() 竞态会让 B15b/B19b 假红（线程已退出 → 闸门不解除）。
+    # 用永不置位的事件阻塞（daemon 线程，进程退出时自动回收）。
+    _block = threading.Event()
+    def _alive_stub(*a, **k):
+        f.monitor_kwargs.append(k)
+        _block.wait()         # 模拟监控主循环：永不返回
+    f._start_monitoring = _alive_stub
     f.exchange.fetch_open_orders.side_effect = None
     f.exchange.fetch_open_orders.return_value = [{
         'id': REAL_OID, 'symbol': SYMBOL, 'type': 'STOP_MARKET', 'side': 'buy',
@@ -1221,14 +1245,11 @@ def test_block24_restart_rejects_unresolved_skeleton():
 # ── B25：Hedge Mode SL 反例——错 positionSide / 错类型 / NaN / inf 覆盖量 ──
 def test_block25_hedge_sl_variants():
     for label, over in (
-            ('positionSide 错', {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL',
-                                 'amount': 0.43, 'positionSide': 'SHORT'}),
-            ('非止损类型', {'id': 'SL1', 'type': 'LIMIT', 'side': 'SELL',
-                            'amount': 0.43, 'positionSide': 'LONG'}),
-            ('覆盖量 NaN', {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL',
-                            'amount': float('nan'), 'positionSide': 'LONG'}),
-            ('覆盖量 inf', {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL',
-                            'amount': float('inf'), 'positionSide': 'LONG'})):
+            ('positionSide 错', _ccxt_order(position_side='SHORT')),
+            ('非止损类型', _ccxt_order(kind='LIMIT', top_type='limit',
+                                       stop_price=None)),
+            ('覆盖量 NaN', _ccxt_order(amount=float('nan'))),
+            ('覆盖量 inf', _ccxt_order(amount=float('inf')))):
         d = tempfile.mkdtemp(prefix='blk25_')
         sp = os.path.join(d, 'trade_state.json')
         trader_260725.STATE_FILE = sp
@@ -1263,7 +1284,15 @@ def test_block26_refused_takeover_still_blocks_new_entry():
     _bind_real_reconcile(f)
     f._state_lock = threading.RLock()
     f.monitor_kwargs = []
-    f._start_monitoring = lambda *a, **k: f.monitor_kwargs.append(k)
+    # 🔥 收敛审查 S6：替身必须模拟真实监控的存活 —— 真实 _start_monitoring
+    # 是无限循环，线程进入后 is_alive() 恒为 True。若替身立即返回或 sleep
+    # 太短，is_alive() 竞态会让 B15b/B19b 假红（线程已退出 → 闸门不解除）。
+    # 用永不置位的事件阻塞（daemon 线程，进程退出时自动回收）。
+    _block = threading.Event()
+    def _alive_stub(*a, **k):
+        f.monitor_kwargs.append(k)
+        _block.wait()         # 模拟监控主循环：永不返回
+    f._start_monitoring = _alive_stub
     f.exchange.fetch_open_orders.side_effect = None
     f.exchange.fetch_open_orders.return_value = [{
         'id': REAL_OID, 'symbol': SYMBOL, 'type': 'STOP_MARKET', 'side': 'buy',
@@ -1312,14 +1341,9 @@ def test_block26_refused_takeover_still_blocks_new_entry():
 def test_block27_non_stop_and_missing_pside():
     for label, order in (
             ('TAKE_PROFIT_MARKET 带 stopPrice',
-             {'id': 'SL1', 'type': 'TAKE_PROFIT_MARKET', 'side': 'SELL',
-              'amount': 0.43, 'positionSide': 'LONG',
-              'info': {'stopPrice': 55000.0, 'origQty': '0.43'}}),
-            ('positionSide 缺失',
-             {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL', 'amount': 0.43}),
-            ('positionSide=BOTH',
-             {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL', 'amount': 0.43,
-              'positionSide': 'BOTH'})):
+             _ccxt_order(kind='TAKE_PROFIT_MARKET')),
+            ('positionSide 缺失', _ccxt_order(position_side='')),
+            ('positionSide=BOTH', _ccxt_order(position_side='BOTH'))):
         d = tempfile.mkdtemp(prefix='blk27_')
         sp = os.path.join(d, 'trade_state.json')
         trader_260725.STATE_FILE = sp
@@ -1337,6 +1361,28 @@ def test_block27_non_stop_and_missing_pside():
                    f'recover={ok!r}，_ready={fake._ready}')
         finally:
             trader_260725.STATE_FILE = PR._real_state_file
+
+
+def _ccxt_order(kind='STOP_MARKET', side='SELL', amount=0.43,
+                position_side='LONG', stop_price='55000.0',
+                top_type='market', oid='SL1', status='open',
+                reduce_only='false', close_position='false'):
+    """脱敏的真实 ccxt 订单形状（Binance USD-M futures）。
+
+    校准用：顶层 `type` 被 ccxt **归一化**（STOP_MARKET → market），
+    交易所原始类型只在 `info.type`；positionSide / stopPrice / reduceOnly
+    同样只在 `info`。测试必须按这个形状构造，才能排除"手工顶层字段"造成的假绿。
+    """
+    return {
+        'id': oid, 'status': status, 'type': top_type, 'side': side,
+        'amount': amount, 'price': None,
+        'info': {
+            'type': kind, 'positionSide': position_side,
+            'stopPrice': stop_price, 'reduceOnly': reduce_only,
+            'closePosition': close_position,
+            'origQty': str(amount), 'side': str(side).upper(),
+        },
+    }
 
 
 def _sl_open_then_entry_closed(order):
@@ -1363,10 +1409,9 @@ def test_block28_unresolved_gate_release_path():
         _init_poll_tracking(fake)
         fake._unresolved_intent_batches.add(BATCH)     # 之前置入
         fake.exchange.fetch_open_orders.side_effect = None
-        fake.exchange.fetch_open_orders.return_value = [
-            {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL', 'amount': 0.43}]
-        fake.exchange.fetch_order.side_effect = _sl_open_then_entry_closed(
-            {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL', 'amount': 0.43})
+        _sl_rv = _ccxt_order()
+        fake.exchange.fetch_open_orders.return_value = [_sl_rv]
+        fake.exchange.fetch_order.side_effect = _sl_open_then_entry_closed(_sl_rv)
         fake._get_current_position_amt = lambda *a, **k: 0.43
         CryptoTrader.recover_active_batches(fake)
         report('B28 意图已核实且账本无未决 → 解除新增风险闸门',
@@ -1404,10 +1449,9 @@ def test_block29_reverify_uses_post_recovery_ledger():
             return copy.deepcopy(pre) if seq['n'] <= 1 else orig_load()
         fake.load_all_states = _load
         fake.exchange.fetch_open_orders.side_effect = None
-        fake.exchange.fetch_open_orders.return_value = [
-            {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL', 'amount': 0.43}]
-        fake.exchange.fetch_order.side_effect = _sl_open_then_entry_closed(
-            {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL', 'amount': 0.43})
+        _sl_rv = _ccxt_order()
+        fake.exchange.fetch_open_orders.return_value = [_sl_rv]
+        fake.exchange.fetch_order.side_effect = _sl_open_then_entry_closed(_sl_rv)
         fake._get_current_position_amt = lambda *a, **k: 0.43
         ok = CryptoTrader.recover_active_batches(fake)
         # ⚠️ 如实收窄：READY 轴本用例**不**断言（recover 另有其他检查未过，
@@ -1419,6 +1463,118 @@ def test_block29_reverify_uses_post_recovery_ledger():
                f'load_all_states 调用={seq["n"]} 次，recover={ok!r}（仅作参考）')
     finally:
         trader_260725.STATE_FILE = PR._real_state_file
+
+
+# ── B30：已收编成功但子线程进入后立即退出 → 闸门不得解除（收敛审查 S6）──
+def test_block30_thread_exits_immediately():
+    f, sig = _two_layer_fake()
+    _bind_real_reconcile(f)
+    f._state_lock = threading.RLock()
+    f.monitor_started = []
+    # 🔥 子线程"进入主体后立即退出"：_tk_alive 会置位，但 is_alive() 为 False。
+    f._start_monitoring = lambda *a, **k: f.monitor_started.append(k.get('batch_id'))
+    f.exchange.fetch_open_orders.side_effect = None
+    f.exchange.fetch_open_orders.return_value = [{'id': REAL_OID, 'symbol': SYMBOL, 'type': 'STOP_MARKET',
+          'side': 'buy', 'price': 77000.0, 'amount': 0.43, 'status': 'open'}]
+    f.exchange.create_order.side_effect = RuntimeError('创建结果未知')
+    CryptoTrader.execute_signal(f, sig)
+    time.sleep(0.4)
+    report('B30a 收编成功但子线程进入后立即退出 → 不得解除未决闸门',
+           'batch_new_001' in f._unresolved_intent_batches,
+           f'未决意图={f._unresolved_intent_batches}（应含本批次；'
+           f'旧实现把 Thread.start() 返回当作"监控已运行"）')
+    # 闸门必须真的挡住新 ENTRY
+    created = []
+    f.exchange.create_order.side_effect = lambda **kk: created.append(kk) or {'id': 'Z'}
+    f._poll_degraded_batches.discard('batch_new_001')
+    CryptoTrader.execute_signal(f, sig)
+    time.sleep(0.3)
+    report('B30b 闸门在位 → 新 ENTRY 创建被阻断',
+           len(created) == 0, f'本轮 create 调用={len(created)}（应 0）')
+
+
+# ── B31：已收编成功但账本字段不可解析 → 不得抛异常、不得放行（S5）──────
+def test_block31_unparsable_ledger_value():
+    f, sig = _two_layer_fake()
+    _bind_real_reconcile(f)
+    f._state_lock = threading.RLock()
+    f.monitor_kwargs = []
+    f._start_monitoring = lambda *a, **k: f.monitor_kwargs.append(k)
+    f.exchange.fetch_open_orders.side_effect = None
+    f.exchange.fetch_open_orders.return_value = [{'id': REAL_OID, 'symbol': SYMBOL, 'type': 'STOP_MARKET',
+          'side': 'buy', 'price': 77000.0, 'amount': 0.43, 'status': 'open'}]
+    f.exchange.create_order.side_effect = RuntimeError('创建结果未知')
+    _real_rebuild = f._rebuild_entry_orders_from_registry
+
+    def _poisoned(*a, **k):
+        orders, ok = _real_rebuild(*a, **k)
+        b = f.persisted.get('batch_new_001', {})
+        b['target_amounts'] = ['not-a-number', None]   # 不可解析
+        b['stop_steps'] = ['oops', '']
+        return orders, ok
+    f._rebuild_entry_orders_from_registry = _poisoned
+    raised = None
+    try:
+        CryptoTrader.execute_signal(f, sig)
+    except Exception as e:                                  # noqa: BLE001
+        raised = e
+    time.sleep(0.3)
+    report('B31a 账本数量/止损值不可解析 → 不得抛异常',
+           raised is None, f'异常={raised!r}（旧实现 float(a) 会直接抛 TypeError）')
+    report('B31b 不可解析 → 拒绝启动监控（不得放行）',
+           len(f.monitor_kwargs) == 0, f'启动次数={len(f.monitor_kwargs)}（应 0）')
+    report('B31c 不可解析 → 未决闸门保持',
+           'batch_new_001' in f._unresolved_intent_batches,
+           f'未决意图={f._unresolved_intent_batches}')
+
+
+# ── B32：真实 ccxt 订单形状校准（收敛审查 S7）────────────────────────────
+def test_block32_real_ccxt_shape_calibration():
+    # 32a 合法 SL（顶层 type 已被归一化为 market，原始类型只在 info.type）
+    #     → 必须 READY（不得误报）
+    d = tempfile.mkdtemp(prefix='blk32a_')
+    sp = os.path.join(d, 'trade_state.json')
+    trader_260725.STATE_FILE = sp
+    try:
+        _realistic_seed(sp, current_sl_id='SL1', is_hedge_mode=True)
+        fake = PR._make_fake(sp, PR._disk(sp))
+        _init_poll_tracking(fake)
+        good = _ccxt_order()          # info.type=STOP_MARKET, top type=market
+        fake.exchange.fetch_open_orders.side_effect = None
+        fake.exchange.fetch_open_orders.return_value = [good]
+        fake.exchange.fetch_order.side_effect = _sl_open_then_entry_closed(good)
+        fake._get_current_position_amt = lambda *a, **k: 0.43
+        ok = CryptoTrader.recover_active_batches(fake)
+        report('B32a 真实 ccxt 合法止损单（info.type=STOP_MARKET，顶层=market）→ READY',
+               ok is True and fake._ready is True,
+               f'recover={ok!r}，_ready={fake._ready}，'
+               f'顶层 type={good.get("type")!r}，info.type={good["info"]["type"]!r}')
+    finally:
+        trader_260725.STATE_FILE = PR._real_state_file
+
+    # 32b 真实 ccxt 止盈单（TAKE_PROFIT_MARKET + stopPrice + positionSide 正确）
+    #     → 不得 READY
+    for label, order in (
+            ('TAKE_PROFIT_MARKET', _ccxt_order(kind='TAKE_PROFIT_MARKET')),
+            ('TRAILING_STOP_MARKET 以外的普通 LIMIT',
+             _ccxt_order(kind='LIMIT', top_type='limit', stop_price=None))):
+        d = tempfile.mkdtemp(prefix='blk32b_')
+        sp = os.path.join(d, 'trade_state.json')
+        trader_260725.STATE_FILE = sp
+        try:
+            _realistic_seed(sp, current_sl_id='SL1', is_hedge_mode=True)
+            fake = PR._make_fake(sp, PR._disk(sp))
+            _init_poll_tracking(fake)
+            fake.exchange.fetch_open_orders.side_effect = None
+            fake.exchange.fetch_open_orders.return_value = [order]
+            fake.exchange.fetch_order.side_effect = _sl_open_then_entry_closed(order)
+            fake._get_current_position_amt = lambda *a, **k: 0.43
+            ok = CryptoTrader.recover_active_batches(fake)
+            report(f'B32b 真实 ccxt {label}（带 stopPrice）→ 不得 READY',
+                   ok is False and fake._ready is False,
+                   f'recover={ok!r}，_ready={fake._ready}')
+        finally:
+            trader_260725.STATE_FILE = PR._real_state_file
 
 
 def main():
@@ -1455,6 +1611,9 @@ def main():
         test_block27_non_stop_and_missing_pside,
         test_block28_unresolved_gate_release_path,
         test_block29_reverify_uses_post_recovery_ledger,
+        test_block30_thread_exits_immediately,
+        test_block31_unparsable_ledger_value,
+        test_block32_real_ccxt_shape_calibration,
         test_block1_fetch_order_failure_keeps_degraded,
         test_block2_degrade_after_check_blocks_entry_create,
         test_block3_per_batch_stale_not_masked_by_other_batch,
