@@ -70,6 +70,11 @@ REAL_HELPERS = (
     # `_batch_net_position` 未绑定时返回 None → 解包 2 元组抛 ValueError，
     # 使监控线程在判定前就异常退出（W1），导致 T3/T4 假绿。显式绑定真实实现。
     "_batch_net_position",
+    # R1/R2 第五轮复审：接管路径要用**真实**的无 ID 意图对账
+    # （_self_heal_no_id / _rebuild_entry_orders_from_registry）——用桩只能证明
+    # 「调用过」，证明不了「无 ID 的 ENTRY 真能被收编并按真实 ID 交监控」。
+    "_self_heal_no_id", "_rebuild_entry_orders_from_registry",
+    "_registry_has_unresolved_entries",
 )
 
 

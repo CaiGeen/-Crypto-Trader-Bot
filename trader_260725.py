@@ -3577,23 +3577,74 @@ class CryptoTrader:
                         _reverify_detail.append(
                             f"{_sym}/{_bid} ENTRY {_e} 状态未知({_st!r})，"
                             f"无法判明成交/撤销")
-                # ③ 保护单核对：有持仓时须存在**真实 SL 锚点**（role=SL 且 state=CONFIRMED）
-                #    仅非空 protection_registry（含只有 ENTRY 记录）**不算**保护锚点。
+                # ③ 保护单核对：有持仓时以**交易所实况**核实 SL（ChatGPT 第五轮复审）。
+                #    旧实现只看本地记录（current_sl_id 非空 / registry 有 CONFIRMED SL）
+                #    就放行 —— 止损在交易所消失而本地 ID 未清时仍会进入 READY。
+                #    现在必须：SL 仍在交易所 + 方向正确 + 覆盖量 ≥ 持仓；
+                #    查询失败或覆盖不明 → 保持未就绪（UNKNOWN ≠ 无仓）。
                 if _pos:
                     _reg = _bd.get('protection_registry') or {}
-                    _has_sl_anchor = bool(_bd.get('current_sl_id'))
-                    if not _has_sl_anchor:
+                    _sl_id = _bd.get('current_sl_id')
+                    if not _sl_id:
                         for _rv in _reg.values():
                             if (isinstance(_rv, dict) and _rv.get('role') == 'SL'
                                     and _rv.get('state') == 'CONFIRMED'
                                     and _rv.get('order_id')):
-                                _has_sl_anchor = True
+                                _sl_id = _rv.get('order_id')
                                 break
-                    if not _has_sl_anchor:
+                    if not _sl_id:
                         _reverify_ok = False
                         _reverify_detail.append(
-                            f"{_sym}/{_bid} 有持仓但无**有效 SL 锚点**"
+                            f"{_sym}/{_bid} 有持仓但本地无 SL 锚点"
                             f"（current_sl_id 空且 registry 无 CONFIRMED SL）")
+                    else:
+                        _sl_known = None
+                        try:
+                            _sl_known = self._safe_api_call(
+                                self.exchange.fetch_open_orders, _sym,
+                                params={'stop': True})
+                            if not isinstance(_sl_known, list):
+                                _sl_known = None
+                        except Exception:
+                            _sl_known = None
+                        if _sl_known is None:
+                            _reverify_ok = False
+                            _reverify_detail.append(
+                                f"{_sym}/{_bid} 交易所条件单查询失败 → SL 实况 UNKNOWN，"
+                                f"保持未就绪")
+                        else:
+                            _m = [o for o in _sl_known
+                                  if isinstance(o, dict)
+                                  and str(o.get('id')) == str(_sl_id)]
+                            if not _m:
+                                _reverify_ok = False
+                                _reverify_detail.append(
+                                    f"{_sym}/{_bid} 本地 SL `{_sl_id}` 在交易所**已不存在**"
+                                    f"（止损消失但本地未清）→ 保持未就绪")
+                            else:
+                                _so = _m[0]
+                                _want = ('SELL'
+                                         if (_bd.get('side') or 'BUY').upper() == 'BUY'
+                                         else 'BUY')
+                                if str(_so.get('side') or '').upper() != _want:
+                                    _reverify_ok = False
+                                    _reverify_detail.append(
+                                        f"{_sym}/{_bid} SL 方向异常：交易所="
+                                        f"{_so.get('side')!r} 期望={_want}")
+                                else:
+                                    try:
+                                        _cov = float(_so.get('amount'))
+                                    except (TypeError, ValueError):
+                                        _cov = None
+                                    if _cov is None or _cov <= 0:
+                                        _reverify_ok = False
+                                        _reverify_detail.append(
+                                            f"{_sym}/{_bid} SL 覆盖量无法判明 → 保持未就绪")
+                                    elif _cov + 1e-12 < float(_pos):
+                                        _reverify_ok = False
+                                        _reverify_detail.append(
+                                            f"{_sym}/{_bid} SL 覆盖不足："
+                                            f"SL={_cov} < 持仓={_pos}")
                 elif _seen:
                     # 有未结 ENTRY 但无持仓：本轮不额外判保护（未成交无需 SL），
                     # 但保留 order ID 供恢复期仲裁，不在重证阶段清理。
@@ -6428,12 +6479,26 @@ class CryptoTrader:
                     print(f"⚠️ [PROVEN-CLEAN] 未尝试层意图收敛失败（按未清理处理）: {_ce}")
 
                 if _clean_all_absent:
-                    # 仅当所有未尝试层已确认落 ABSENT 时，才停用空骨架（并校核落盘）
+                    # 🔥 ChatGPT 第五轮复审：CLEAN_REJECT 的**全部**前提都必须成立——
+                    #   ① 读到**预期骨架**（批次存在且为 dict）
+                    #   ② 重读后仍无 entry_orders、且 registry 无未决 ENTRY 意图
+                    #      （并发变化检测：读改写在 _state_lock 内原子完成）
+                    #   ③ 停用**写盘已确认**（_persist_states 返回 True）
+                    # 旧实现只在「存在且无 entry_orders」时停用；批次缺失或已有
+                    # entry_orders 时什么都不做却仍返回 CLEAN_REJECT —— 假出口。
                     try:
                         with self._state_lock:
                             latest = self.load_all_states()
                             _b = (latest.get(symbol, {}) or {}).get(batch_id)
-                            if isinstance(_b, dict) and not _b.get('entry_orders'):
+                            if not isinstance(_b, dict):
+                                _clean_all_absent = False
+                                print("⚠️ [PROVEN-CLEAN] 重读不到预期骨架批次"
+                                      "（缺失/非字典）→ 不得 CLEAN_REJECT")
+                            elif _b.get('entry_orders') or self._registry_has_unresolved_entries(_b):
+                                _clean_all_absent = False
+                                print("⚠️ [PROVEN-CLEAN] 重读发现 entry_orders/未决 ENTRY "
+                                      "意图（并发变化）→ 不得 CLEAN_REJECT")
+                            else:
                                 _b['is_active'] = False
                                 # 🔥 ChatGPT 第四轮复审：必须校核落盘结果，不能忽略返回值
                                 if self._persist_states(latest) is not True:
@@ -6447,15 +6512,33 @@ class CryptoTrader:
                 if not _clean_all_absent:
                     print(f"🚫 [资金安全] 批次 `{batch_id}` 存在未决 ENTRY 意图或落盘未确认，"
                           f"不返回 CLEAN_REJECT；批次保持 active 并交监控接管。")
-                    # 🔥 必须**实际启动接管**，而非只打印（原分支没有接管路径）
+                    # 🔥 ChatGPT 第五轮复审：接管**之前**先走可处理无 ID 意图的对账路径。
+                    # 旧实现直接用 entry_orders=[] 起监控——那是**无效接管**：
+                    # 监控只遍历传入的订单 ID，无 ID 身份的匹配（_self_heal_no_id）
+                    # 原本仅在启动恢复路径调用。若创建实际成功并成交，
+                    # 这条新线程既认不出该 ENTRY、也补不上保护。
+                    _takeover_orders = list(entry_orders)
+                    _reconciled = False
                     try:
-                        import threading as _th
-                        _th.Thread(
+                        self._self_heal_no_id(symbol, batch_id)
+                        self._recheck_registry_self_heal(symbol, batch_id)
+                        _rb, _rb_ok = self._rebuild_entry_orders_from_registry(
+                            symbol, batch_id)
+                        if _rb_ok and _rb:
+                            _takeover_orders = _rb
+                            _reconciled = True
+                            print(f"  └─ ✅ 对账收编 {len(_rb)} 层无 ID ENTRY"
+                                  f"（零二次 Create），接管将按真实订单 ID 监控")
+                    except Exception as _re:
+                        print(f"  └─ ⚠️ 无 ID 意图对账异常（按未判明处理）: {_re}")
+
+                    try:
+                        threading.Thread(
                             target=self._start_monitoring,
                             kwargs={
                                 'symbol': symbol,
                                 'batch_id': batch_id,
-                                'entry_orders': entry_orders,
+                                'entry_orders': _takeover_orders,
                                 'stop_steps': active_stop_steps,
                                 'take_profit_price': signal.take_profit,
                                 'current_sl_id': None,
@@ -6466,16 +6549,35 @@ class CryptoTrader:
                                 'is_hedge_mode': is_hedge_mode,
                                 'side': side,
                                 'last_filled_count': 0,
-                                'filled_details': [0.0] * len(entry_orders),
+                                'filled_details': [0.0] * len(_takeover_orders),
                                 'total_entry_fee': 0.0,
-                                'pending_sl_orders': list(range(len(entry_orders))),
+                                'pending_sl_orders': list(range(len(_takeover_orders))),
                                 'prepared_tp_params': {},
                                 'layer_sl_params': [],
                             },
                             daemon=True).start()
-                        print(f"  └─ ✅ 已启动监控接管（接管未决骨架批次）")
+                        print(f"  └─ ✅ 已启动监控接管（订单 ID={_takeover_orders}）")
                     except Exception as _te:
                         print(f"  └─ ⚠️ 监控接管启动失败: {_te}")
+
+                    if not _reconciled:
+                        # 🔥 对账后仍无法判明（无 ID 意图无签名/快照 INVALID/命中多条）
+                        #   → 交易所是否真实挂单或已成交**未知**。
+                        #   置入降级集合 = 持续禁止新增风险（execute_signal 每层创建前
+                        #   都读该集合），并发 critical 告警要求人工核对。
+                        #   ⚠️ 监控仍会按**交易所持仓**发现裸仓并尝试补挂保护；
+                        #   但在持续无法访问交易所时，系统不能替用户核实并补齐裸仓。
+                        with self._poll_alert_lock:
+                            self._poll_degraded_batches.add(batch_id)
+                            self._poll_fail_streak[batch_id] = max(
+                                self._poll_fail_streak.get(batch_id, 0), 1)
+                        self.send_tg_notification(
+                            f"🚨【资金安全·critical】批次 `{batch_id}` 存在**无 ID 的未决 "
+                            f"ENTRY 意图**，对账后仍无法判明交易所是否真实挂单/已成交。\n"
+                            f"🚫 已持续禁止新增风险（降级闸门），并已启动监控接管。\n"
+                            f"💡 若交易所实际成交而保护未补挂，**本系统无法自动补齐**，"
+                            f"请立即人工核对仓位与止损单。",
+                            level='critical')
                     return None
 
                 print("❌ 没有成功挂出任何有效开仓条件单（触发价均不符合逻辑），程序安全退出。")
@@ -8314,8 +8416,11 @@ class CryptoTrader:
 
                         except Exception as e:
                             print(f"⚠️ 补查开仓订单 {order_id_raw} 状态失败 ({e})，将在下一轮重试...")
-                        # 🔥 R1/R2 阻断1：本轮此单状态**未知**（回查失败）→ 记为未判定
-                        _poll_orders_unresolved = True
+                            # 🔥 R1/R2 阻断1：本轮此单状态**未知**（回查失败）→ 记为未判定
+                            # 🔥 ChatGPT 第五轮复审：此标记**必须**在 except 之内。
+                            # 放在 except 之外会把「回查成功、当轮已判明」的订单也标为未知，
+                            # 无故推迟降级解除，并污染恢复测试对真实原因的判断。
+                            _poll_orders_unresolved = True
 
                 # 🔥 如果有新成交的层，发送合并通知
                 if newly_filled_layers:

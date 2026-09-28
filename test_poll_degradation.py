@@ -27,6 +27,7 @@ from trader_260725 import CryptoTrader
 import test_monitor_poll_recovery as PR
 
 SYMBOL = PR.SYMBOL
+REAL_OID = 'REAL_EXCHANGE_OID_1'
 BATCH = PR.BATCH
 ENTRY_ID = PR.ENTRY_ID
 
@@ -133,17 +134,47 @@ class _EntryFake:
         self.tg_sent = []
         self.create_calls = []
         self._poll_degraded_batches = set()
-        self._registry_log = []            # (state, layer) —— 核对磁盘 registry 证据
+        self._registry_log = []            # (state, identity) —— 核对磁盘 registry 证据
         self.is_active_seen = None         # save_batch_state 观测到的 is_active
         self.persisted = {}                # 最终落盘视图
+        # 🔥 历史踩坑：新增跟踪变量必须显式初始化，否则 MagicMock/缺属性会在
+        #    线程或门禁路径抛 AttributeError，制造假绿/假红。
+        self._poll_alert_lock = threading.RLock()
+        self._poll_fail_streak = {}
 
     def _update_registry(self, symbol, batch_id, identity, state=None, **kw):
+        # 🔥 保真度（ChatGPT 前两轮复审）：必须**真的写进 registry**，
+        # 只记录调用无法证明 ABSENT 落盘，也无法让下游 registry 判定生效。
         self._registry_log.append((state, str(identity)))   # 记录原始 identity
+        if getattr(self, 'persist_ok', True):
+            b = self.persisted.setdefault(batch_id, {})
+            b.setdefault('protection_registry', {})[str(identity)] = {
+                'role': 'ENTRY', 'state': state, 'order_id': kw.get('order_id')}
 
     def _update_registry_checked(self, symbol, batch_id, identity, state=None, **kw):
         # 返回 True ⟺ 写盘确认（替身按 self.persist_ok 模拟可注入的写盘结果）
-        self._registry_log.append((state, str(identity)))
+        self._update_registry(symbol, batch_id, identity, state=state, **kw)
         return getattr(self, 'persist_ok', True)
+
+    def _registry_has_unresolved_entries(self, b_data):
+        """与真实实现同口径（L7118）：任一 registry 条目处于未决态 → True。"""
+        reg = (b_data or {}).get('protection_registry') or {}
+        for e in reg.values():
+            if isinstance(e, dict) and e.get('state') in (
+                    'PENDING_CREATE', 'PENDING_VERIFY', 'NOT_CONFIRMED', 'HARD_LOCK'):
+                return True
+        return False
+
+    def _self_heal_no_id(self, symbol, batch_id):
+        self.heal_calls = getattr(self, 'heal_calls', 0) + 1
+
+    def _recheck_registry_self_heal(self, symbol, batch_id):
+        pass
+
+    def _rebuild_entry_orders_from_registry(self, symbol, batch_id):
+        """替身：默认对账**未收编**（结果仍未知），可注入 (orders, ok) 反例。"""
+        return list(getattr(self, 'rebuild_result', ([], False))[0]), \
+            bool(getattr(self, 'rebuild_result', ([], False))[1])
 
     def save_batch_state(self, symbol, batch_id, data):
         self.is_active_seen = data.get('is_active')
@@ -151,11 +182,19 @@ class _EntryFake:
         return True
 
     def _persist_states(self, all_states):
-        self.persisted = copy.deepcopy(all_states)
+        if not getattr(self, 'persist_ok', True):
+            return False          # 注入写盘失败
+        # all_states 是 {symbol: {batch: data}}；替身内部按 {batch: data} 存，
+        # 必须**摊平**，否则 load_all_states 再包一层会把账本视图打翻。
+        self.persisted = {}
+        for _bs in (all_states or {}).values():
+            if isinstance(_bs, dict):
+                for _bid, _b in _bs.items():
+                    self.persisted[_bid] = copy.deepcopy(_b)
         return True
 
     def load_all_states(self):
-        return {SYMBOL: {BATCH: dict(self.persisted.get(BATCH, {'is_active': False}))}}
+        return {SYMBOL: {bid: copy.deepcopy(b) for bid, b in self.persisted.items()}}
 
     def _safe_api_call(self, fn, *a, **k):
         return fn(*a, **k)
@@ -526,7 +565,6 @@ def test_block6_partial_create_not_clean_reject():
     f0 = _entry_fake_with_exchange()
     f0.registry_layers = []          # 实际进入 create 的层
     f0._state_lock = threading.RLock()
-    f0.load_all_states = lambda: f0.persisted
     _orig_create0 = f0.exchange.create_order
 
     def _spy_create0(**k):
@@ -558,7 +596,6 @@ def test_block6_partial_create_not_clean_reject():
     f1 = _entry_fake_with_exchange()
     f1.registry_layers = []
     f1._state_lock = threading.RLock()     # 空骨架停用路径需要
-    f1.load_all_states = lambda: f1.persisted
     n = {'c': 0}
     _orig_create = f1.exchange.create_order
 
@@ -679,11 +716,103 @@ def _two_layer_fake():
     f = _entry_fake_with_exchange()
     f.registry_layers = []
     f._state_lock = threading.RLock()
-    f.load_all_states = lambda: f.persisted
     f.monitoring_started = []
+    f.monitoring_started_ids = []
     f._start_monitoring = (
-        lambda *a, **k: f.monitoring_started.append(k.get('batch_id')))
+        lambda *a, **k: (f.monitoring_started.append(k.get('batch_id')),
+                         f.monitoring_started_ids.extend(
+                             k.get('entry_orders') or [])))
     return f, _TwoLayerSignal()
+
+
+def _zero_create_fake():
+    """零创建替身：骨架落盘后才降级 → 首层创建前被暂停门拦截 → 进入 PROVEN-CLEAN。"""
+    f, sig = _two_layer_fake()
+    f.registry_layers = []
+    _orig_create = f.exchange.create_order
+
+    def _spy(**k):
+        f.registry_layers.append(len(f.registry_layers))
+        return _orig_create(**k)
+    f.exchange.create_order.side_effect = _spy
+    _orig_save = f.save_batch_state
+
+    def _save_then_pause(*a, **k):
+        r = _orig_save(*a, **k)
+        f._poll_degraded_batches.add('batch_new_001')   # 骨架已落，此刻才降级
+        return r
+    f.save_batch_state = _save_then_pause
+    return f, sig
+
+
+# ── B18：CLEAN_REJECT 假出口——并发变化 / 骨架缺失 / 残留未决意图 ─────────
+def test_block18_clean_reject_no_fake_exit():
+    # 并发注入点用 `_update_registry`：新实现走 `_update_registry_checked`
+    # （替身内部转调 `_update_registry`），旧实现直接走 `_update_registry` ——
+    # 挂在这一层才能对**两个版本都**真正注入并发变化（挂 checked 则旧版收不到）。
+    def _after_absent(f, mutate):
+        _orig = f._update_registry
+
+        def _hook(symbol, batch_id, identity, state=None, **kw):
+            r = _orig(symbol, batch_id, identity, state=state, **kw)
+            if state == 'ABSENT':
+                mutate(f)
+            return r
+        f._update_registry = _hook
+        return f
+
+    # 18a 并发变化：落 ABSENT 期间骨架被写入 entry_orders → 不得 CLEAN_REJECT
+    f, sig = _zero_create_fake()
+    _after_absent(f, lambda x: x.persisted.setdefault('batch_new_001', {})
+                  .__setitem__('entry_orders', ['RACE']))
+    r = CryptoTrader.execute_signal(f, sig)
+    report('B18a 重读发现 entry_orders（并发变化）→ 不得 CLEAN_REJECT',
+           r != 'CLEAN_REJECT', f'返回={r!r}（应非 CLEAN_REJECT）')
+
+    # 18b 骨架缺失：落 ABSENT 后批次被移除 → 重读不到 → 不得 CLEAN_REJECT
+    f2, sig2 = _zero_create_fake()
+    _after_absent(f2, lambda x: x.persisted.pop('batch_new_001', None))
+    r2 = CryptoTrader.execute_signal(f2, sig2)
+    report('B18b 重读不到预期骨架批次 → 不得 CLEAN_REJECT',
+           r2 != 'CLEAN_REJECT', f'返回={r2!r}（应非 CLEAN_REJECT）')
+
+    # 18c 未决意图仍在 registry → 不得 CLEAN_REJECT
+    def _add_pending(x):
+        x.persisted.setdefault('batch_new_001', {}).setdefault(
+            'protection_registry', {})['X|ENTRY|L9|LONG'] = {
+                'role': 'ENTRY', 'state': 'PENDING_CREATE', 'order_id': None}
+    f3, sig3 = _zero_create_fake()
+    _after_absent(f3, _add_pending)
+    r3 = CryptoTrader.execute_signal(f3, sig3)
+    report('B18c 重读发现未决 ENTRY 意图 → 不得 CLEAN_REJECT',
+           r3 != 'CLEAN_REJECT', f'返回={r3!r}（应非 CLEAN_REJECT）')
+
+
+# ── B19：对账结果决定接管是否用真实 ID / 是否降级告警 ────────────────────
+def test_block19_reconcile_drives_takeover():
+    f, sig = _two_layer_fake()
+    f.rebuild_result = (['REAL_OID'], True)
+    f.exchange.create_order.side_effect = RuntimeError('创建结果未知')
+    CryptoTrader.execute_signal(f, sig)
+    time.sleep(0.3)
+    report('B19a 对账收编成功 → 接管按真实订单 ID 监控',
+           'REAL_OID' in f.monitoring_started_ids,
+           f'接管传入 entry_orders={f.monitoring_started_ids}（应含 REAL_OID）')
+    report('B19b 对账成功 → 不误置降级',
+           'batch_new_001' not in f._poll_degraded_batches,
+           f'degraded={f._poll_degraded_batches}（对账已判明，不应降级）')
+
+    f2, sig2 = _two_layer_fake()
+    f2.rebuild_result = ([], False)          # 未收编 → 结果仍未知
+    f2.exchange.create_order.side_effect = RuntimeError('创建结果未知')
+    CryptoTrader.execute_signal(f2, sig2)
+    time.sleep(0.3)
+    report('B19c 对账仍未知 → 持续禁止新增风险（置入降级集合）',
+           'batch_new_001' in f2._poll_degraded_batches,
+           f'degraded={f2._poll_degraded_batches}（应含本批次）')
+    report('B19d 对账仍未知 → 必须发 critical 告警要求人工核对',
+           any(lv == 'critical' for lv, _ in f2.tg_sent),
+           f'告警级别={[lv for lv, _ in f2.tg_sent]}')
 
 
 def test_block10_write_false_no_clean_reject():
@@ -794,6 +923,137 @@ def test_block14_sl_failure_keeps_paused():
         trader_260725.STATE_FILE = PR._real_state_file
 
 
+def _bind_real_reconcile(f):
+    """把**真实**的无 ID 意图对账实现绑到 execute_signal 替身上。
+
+    ChatGPT 第五轮复审：B11b 的桩只证明「调用过 _start_monitoring」，
+    证明不了「无 ID 的 ENTRY 真能被收编并按真实 ID 交监控」。"""
+    for name in ('_order_matches_intent', '_commit_registry_txn',
+                 '_self_heal_no_id', '_recheck_registry_self_heal',
+                 '_rebuild_entry_orders_from_registry',
+                 '_registry_has_unresolved_entries'):
+        setattr(f, name, (lambda n=name: lambda *a, **k: getattr(CryptoTrader, n)(f, *a, **k))())
+    return f
+
+
+# ── B15：创建返回异常但交易所实际有单并成交（第五轮复审阻断1）────────────
+def test_block15_unknown_create_real_monitor_takeover():
+    """真实对账 + 真实监控控制流：create 抛未知异常，交易所**实际有单且已成交**。
+
+    旧实现用 entry_orders=[] 启动监控 → 监控只遍历传入 ID → 永远不会对该 ENTRY
+    调 fetch_order → 创建实际成功并成交时无人补挂保护。"""
+    f, sig = _two_layer_fake()
+    _bind_real_reconcile(f)
+    f._state_lock = threading.RLock()
+    # 交易所实况：第 1 层的开仓条件单**真实存在**（尽管 create 抛了异常）
+    real_order = {'id': REAL_OID, 'symbol': SYMBOL, 'type': 'STOP_MARKET',
+                  'side': 'buy', 'price': 77000.0, 'amount': 0.43, 'status': 'open'}
+    f.exchange.fetch_open_orders.side_effect = None
+    f.exchange.fetch_open_orders.return_value = [real_order]
+    f.exchange.create_order.side_effect = RuntimeError('创建结果未知（网络中断）')
+    CryptoTrader.execute_signal(f, sig)
+    time.sleep(0.4)   # 接管在线程中启动
+
+    report('B15a 真实对账从交易所收编无 ID ENTRY → 接管按真实 ID 监控',
+           REAL_OID in f.monitoring_started_ids,
+           f'接管传入 entry_orders={f.monitoring_started_ids}（应含 {REAL_OID}）')
+    report('B15b 对账已判明 → 不误置降级',
+           'batch_new_001' not in f._poll_degraded_batches,
+           f'degraded={f._poll_degraded_batches}')
+
+    # 真实监控控制流：用接管实际拿到的 ID 驱动 → 必须识别该 ENTRY 成交
+    if REAL_OID in f.monitoring_started_ids:
+        d = tempfile.mkdtemp(prefix='blk15m_')
+        sp = os.path.join(d, 'trade_state.json')
+        trader_260725.STATE_FILE = sp
+        try:
+            _realistic_seed(sp, entry_orders=[REAL_OID], current_sl_id=None,
+                            last_filled_count=0, pending_sl_orders=[0],
+                            protection_registry={
+                                f'{BATCH}|ENTRY|L0|LONG': {
+                                    'role': 'ENTRY', 'state': 'CONFIRMED',
+                                    'order_id': REAL_OID, 'id_known': True}})
+            mf = PR._make_fake(sp, PR._disk(sp))
+            _init_poll_tracking(mf)
+            mf.exchange.fetch_open_orders.side_effect = None
+            mf.exchange.fetch_open_orders.return_value = []      # 已不在未结 = 已成交
+            mf.exchange.fetch_order.return_value = {
+                'id': REAL_OID, 'status': 'closed', 'average': 58000.0,
+                'info': {'cumQuote': '24940', 'executedQty': '0.43', 'updateTime': 1}}
+            mf._get_current_position_amt = lambda *a, **k: 0.43
+            PR._drive(mf, None, max_rounds=3)
+            report('B15c 真实监控按真实 ID 识别该 ENTRY 成交并进入补挂保护路径',
+                   mf.exchange.fetch_order.call_count >= 1
+                   and len(mf.sl_place_calls) >= 1,
+                   f'fetch_order={mf.exchange.fetch_order.call_count} 次，'
+                   f'补挂路径进入={len(mf.sl_place_calls)} 次'
+                   f'（fetch_order=0 即监控认不出该 ENTRY）')
+        finally:
+            trader_260725.STATE_FILE = PR._real_state_file
+
+
+# ── B16：SL 在交易所消失但本地 ID 未清（第五轮复审阻断2）─────────────────
+def test_block16_sl_vanished_on_exchange():
+    d = tempfile.mkdtemp(prefix='blk16_')
+    sp = os.path.join(d, 'trade_state.json')
+    trader_260725.STATE_FILE = sp
+    try:
+        _realistic_seed(sp, current_sl_id='SL_GONE')
+        fake = PR._make_fake(sp, PR._disk(sp))
+        _init_poll_tracking(fake)
+        fake.exchange.fetch_open_orders.side_effect = None
+        fake.exchange.fetch_open_orders.return_value = []
+        # ⚠️ 关键：SL 回查必须返回 open，否则监控线程会**先**把 current_sl_id 清成
+        # None，重证就会因「无 SL 锚点」而红 —— 打在另一个原因上，失去区分度。
+        def _fo(oid, sym=None, *a, **k):
+            if str(oid) == 'SL_GONE':
+                return {'id': 'SL_GONE', 'status': 'open', 'amount': 0.43,
+                        'side': 'sell', 'info': {'stopPrice': 55000.0}}
+            return {'id': str(oid), 'status': 'closed', 'average': 58000.0,
+                    'info': {'cumQuote': '24940', 'executedQty': '0.43'}}
+        fake.exchange.fetch_order.side_effect = _fo
+        fake._get_current_position_amt = lambda *a, **k: 0.43
+        ok = CryptoTrader.recover_active_batches(fake)
+        report('B16 本地 SL ID 非空但交易所已无该止损单 → 不得 READY',
+               ok is False and fake._ready is False,
+               f'recover={ok!r}，_ready={fake._ready}')
+    finally:
+        trader_260725.STATE_FILE = PR._real_state_file
+
+
+# ── B17：SL 方向错 / 覆盖不足 / 覆盖量不明（第五轮复审阻断2）─────────────
+def test_block17_sl_direction_and_coverage():
+    for label, order in (
+            ('方向错', {'id': 'SL1', 'side': 'BUY', 'amount': 0.43}),
+            ('覆盖不足', {'id': 'SL1', 'side': 'SELL', 'amount': 0.1}),
+            ('覆盖量不明', {'id': 'SL1', 'side': 'SELL', 'amount': None})):
+        d = tempfile.mkdtemp(prefix='blk17_')
+        sp = os.path.join(d, 'trade_state.json')
+        trader_260725.STATE_FILE = sp
+        try:
+            _realistic_seed(sp, current_sl_id='SL1')
+            fake = PR._make_fake(sp, PR._disk(sp))
+            _init_poll_tracking(fake)
+            fake.exchange.fetch_open_orders.side_effect = None
+            fake.exchange.fetch_open_orders.return_value = [order]
+            # ⚠️ 只有 SL 回查返回 open（否则监控会先清掉 current_sl_id）；
+            #    ENTRY 必须返回 closed，否则 ENTRY 判明那一步就先红了，
+            #    测试会打在另一个原因上、失去区分度。
+            def _fo(oid, sym=None, *a, **k):
+                if str(oid) == 'SL1':
+                    return dict(order, id='SL1', status='open')
+                return {'id': str(oid), 'status': 'closed', 'average': 58000.0,
+                        'info': {'cumQuote': '24940', 'executedQty': '0.43'}}
+            fake.exchange.fetch_order.side_effect = _fo
+            fake._get_current_position_amt = lambda *a, **k: 0.43
+            ok = CryptoTrader.recover_active_batches(fake)
+            report(f'B17 SL {label} → 不得 READY',
+                   ok is False and fake._ready is False,
+                   f'recover={ok!r}，_ready={fake._ready}')
+        finally:
+            trader_260725.STATE_FILE = PR._real_state_file
+
+
 def main():
     tests = [
         test_single_batch_persistent_failure_alerts_and_marks_degraded,
@@ -813,6 +1073,11 @@ def main():
         test_block12_reverify_inconsistent_success,
         test_block13_reverify_position_without_sl,
         test_block14_sl_failure_keeps_paused,
+        test_block15_unknown_create_real_monitor_takeover,
+        test_block16_sl_vanished_on_exchange,
+        test_block17_sl_direction_and_coverage,
+        test_block18_clean_reject_no_fake_exit,
+        test_block19_reconcile_drives_takeover,
         test_block1_fetch_order_failure_keeps_degraded,
         test_block2_degrade_after_check_blocks_entry_create,
         test_block3_per_batch_stale_not_masked_by_other_batch,
