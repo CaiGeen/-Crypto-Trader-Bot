@@ -66,6 +66,10 @@ REAL_HELPERS = (
     "_place_prepared_orders_immediately", "_monitor_lifecycle_check",
     "_calculate_monitoring_interval", "_get_active_batch_count",
     "_alert_poll_degraded",
+    # R1/R2 修复后，恢复判定会走到本轮"所需保护已确认"这一步；
+    # `_batch_net_position` 未绑定时返回 None → 解包 2 元组抛 ValueError，
+    # 使监控线程在判定前就异常退出（W1），导致 T3/T4 假绿。显式绑定真实实现。
+    "_batch_net_position",
 )
 
 
