@@ -480,6 +480,13 @@ class CryptoTrader:
         self._poll_first_fail_time = {}       # batch_id → 本次连续失败首次时间
         self._poll_last_success_time = {}     # batch_id → 最后一次【完整】成功业务处理时间
         self._poll_degraded_batches = set()   # 当前降级的 batch_id 集合（全局暂停依据）
+        # 🔥 ChatGPT 第六轮复审：「创建结果未决」与「轮询失败」必须**分开管理**。
+        # 轮询失败会在一次正常轮询后被通用恢复分支解除；而创建结果未决的批次
+        # （无 ENTRY ID 可遍历 → batch_filled_amount=0）会被同一条分支**误解除**，
+        # 导致"持续禁止新增风险"并不持续。本集合**只**由以下两者清除：
+        #   ① 交易所核实 + 收编写盘已确认；② 人工处置（人工核对后清账）。
+        # 通用轮询恢复分支**不得**清除本集合；重启后由启动重证从账本重建。
+        self._unresolved_intent_batches = set()
         self._poll_alert_lock = threading.Lock()
         self._poll_alert_active = False       # 本故障周期是否已【成功送达】告警
         self._poll_alert_attempted = {}       # batch_id → 上次尝试提醒时间（限频用）        # F4b（事件3通知风暴，2026-08-21）：进程启动时刻——自愈 MISMATCH 针对启动前历史条目
@@ -3543,6 +3550,16 @@ class CryptoTrader:
                 if _pos is None:
                     _reverify_ok = False
                     _reverify_detail.append(f"{_sym}/{_bid} 持仓 UNKNOWN")
+                # ⓪ 🔥 ChatGPT 第六轮复审：registry 仍有**未决 ENTRY 意图** → 拒绝就绪。
+                #    「无本地订单 + 查询仓位为零」的未决骨架在旧逻辑下没有任何拒绝条件，
+                #    会顺利进入 READY；而创建结果至今未判明，仍可能已在交易所成交。
+                #    同时把该批次置入未决意图集合（重启后重建，不依赖内存态）。
+                if self._registry_has_unresolved_entries(_bd):
+                    self._unresolved_intent_batches.add(_bid)
+                    _reverify_ok = False
+                    _reverify_detail.append(
+                        f"{_sym}/{_bid} 存在未决 ENTRY 意图（创建结果未判明）"
+                        f"→ 持续禁止新增风险，待交易所核实或人工处置")
                 # ② 未结订单核对：本地 ENTRY 与交易所未结单**逐条比对**
                 #    （ChatGPT 第四轮复审：只收集 ID 不比较 = 空结果也判通过）
                 _local_entries = [str(x) for x in (_bd.get('entry_orders') or [])]
@@ -3626,20 +3643,46 @@ class CryptoTrader:
                                 _want = ('SELL'
                                          if (_bd.get('side') or 'BUY').upper() == 'BUY'
                                          else 'BUY')
-                                if str(_so.get('side') or '').upper() != _want:
+                                _o_type = str(_so.get('type') or '').upper()
+                                _has_stop = _o_type.startswith('STOP') or bool(
+                                    (_so.get('info') or {}).get('stopPrice'))
+                                if not _has_stop:
+                                    # 🔥 第六轮复审：仅核 ID/方向/数量不够 ——
+                                    # 一个 LIMIT 单同样有 SELL + amount，
+                                    # 不能据此认作该仓位的止损。
                                     _reverify_ok = False
                                     _reverify_detail.append(
-                                        f"{_sym}/{_bid} SL 方向异常：交易所="
-                                        f"{_so.get('side')!r} 期望={_want}")
+                                        f"{_sym}/{_bid} SL 订单类型非止损单"
+                                        f"（type={_o_type!r}）→ 保持未就绪")
+                                elif (bool(_bd.get('is_hedge_mode'))
+                                      and str(_so.get('positionSide') or '').upper()
+                                      not in ('', 'BOTH')
+                                      and str(_so.get('positionSide') or '').upper()
+                                      != ('LONG'
+                                          if (_bd.get('side') or 'BUY').upper() == 'BUY'
+                                          else 'SHORT')):
+                                    # 🔥 第六轮复审：双向持仓下一张 SELL 单**可能**
+                                    # 属于空头仓；必须核 positionSide 对应本仓方向。
+                                    # ⚠️ 此处**不能**写成 elif 链的终点——必须继续核覆盖量。
+                                    _reverify_ok = False
+                                    _reverify_detail.append(
+                                        f"{_sym}/{_bid} SL positionSide 不符："
+                                        f"交易所={_so.get('positionSide')!r} 期望="
+                                        f"{'LONG' if (_bd.get('side') or 'BUY').upper() == 'BUY' else 'SHORT'}")
                                 else:
+                                    # 覆盖量：必须有限正数。NaN/inf 会**绕过** `>` 比较
+                                    # （NaN 的任何比较都是 False），必须显式排除。
                                     try:
                                         _cov = float(_so.get('amount'))
                                     except (TypeError, ValueError):
                                         _cov = None
-                                    if _cov is None or _cov <= 0:
+                                    if (_cov is None or not (_cov > 0)
+                                            or _cov != _cov
+                                            or _cov in (float('inf'), float('-inf'))):
                                         _reverify_ok = False
                                         _reverify_detail.append(
-                                            f"{_sym}/{_bid} SL 覆盖量无法判明 → 保持未就绪")
+                                            f"{_sym}/{_bid} SL 覆盖量非有限正数"
+                                            f"（{_so.get('amount')!r}）→ 保持未就绪")
                                     elif _cov + 1e-12 < float(_pos):
                                         _reverify_ok = False
                                         _reverify_detail.append(
@@ -6239,9 +6282,10 @@ class CryptoTrader:
             # 🔥 R1/R2: 监控降级时拒绝新信号（Fail-Closed，任何调用路径必经）。
             # 位置：所有前置门闸（含余额）之后、任何副作用（骨架/create_order）之前。
             # 覆盖时序：信号已通过前置检查、期间另一线程才报故障 → 此处复核仍拦截。
-            if self._poll_degraded_batches:
-                print(f"🚫 [POLL] 监控降级中，拒绝新信号 [{batch_id}] ({symbol}): "
-                      f"降级批次={self._poll_degraded_batches}")
+            if self._poll_degraded_batches or self._unresolved_intent_batches:
+                print(f"🚫 [POLL] 监控降级/存在未决创建意图，拒绝新信号 [{batch_id}] ({symbol}): "
+                      f"降级批次={self._poll_degraded_batches}，"
+                      f"未决意图批次={self._unresolved_intent_batches}")
                 try:
                     self.send_tg_notification(
                         f"🚨【资金安全】监控降级，新信号被拒绝\n"
@@ -6366,9 +6410,10 @@ class CryptoTrader:
                     # （另一线程可能在本轮骨架检查之后才置降级）。骨架已落、尚未
                     # 创建时退出 → registry 的 PENDING_CREATE 留证据，恢复时仲裁
                     # 闸门会拦住重挂（D-005 幂等语义），不产生"交易所有单、本地无锚点"。
-                    if self._poll_degraded_batches:
-                        print(f"🚫 [POLL] 第 {idx + 1} 层创建前复核：监控降级，已阻断本层"
-                              f"（降级批次={self._poll_degraded_batches}）")
+                    if self._poll_degraded_batches or self._unresolved_intent_batches:
+                        print(f"🚫 [POLL] 第 {idx + 1} 层创建前复核：监控降级/存在未决创建"
+                              f"意图，已阻断本层（降级批次={self._poll_degraded_batches}，"
+                              f"未决意图批次={self._unresolved_intent_batches}）")
                         break
                     # 注：_attempted_layers 只在**结果非确定拒绝**时记录（成功/未知），
                     #  -2021 确定拒绝不记（证明无副作用，仍可 CLEAN_REJECT）。
@@ -6519,11 +6564,17 @@ class CryptoTrader:
                     # 这条新线程既认不出该 ENTRY、也补不上保护。
                     _takeover_orders = list(entry_orders)
                     _reconciled = False
+                    _rb_matched_unwritten = False
                     try:
                         self._self_heal_no_id(symbol, batch_id)
                         self._recheck_registry_self_heal(symbol, batch_id)
                         _rb, _rb_ok = self._rebuild_entry_orders_from_registry(
                             symbol, batch_id)
+                        if _rb:
+                            # 交易所有匹配单、但收编**未确认落盘** —— 事实已知、
+                            # 账本未知。此时既不能按 ID 接管（本地无凭据），
+                            # 也不能当作"无匹配"走兜底 → 单独标记，接管一律否决。
+                            _rb_matched_unwritten = not _rb_ok
                         if _rb_ok and _rb:
                             _takeover_orders = _rb
                             _reconciled = True
@@ -6531,34 +6582,96 @@ class CryptoTrader:
                                   f"（零二次 Create），接管将按真实订单 ID 监控")
                     except Exception as _re:
                         print(f"  └─ ⚠️ 无 ID 意图对账异常（按未判明处理）: {_re}")
+                    if not _rb_matched_unwritten and not _takeover_orders:
+                        # 🔥 第六轮复审：收编没产出 ≠ 交易所没单。独立复核一次
+                        # §6.3 签名匹配——若交易所有匹配单而本地仍无凭据，
+                        # 说明「事实已知、账本未知」，此时按 ID 接管无据、
+                        # 按空 ID 接管又认不出该 ENTRY → 一律否决接管。
+                        try:
+                            _snap = (self._safe_api_call(
+                                self.exchange.fetch_open_orders, symbol, retries=1) or [])
+                            _regd = ((self.load_all_states()
+                                      .get(symbol, {}) or {}).get(batch_id, {})
+                                     .get('protection_registry') or {})
+                            for _ch in _snap:
+                                for _ident, _e in _regd.items():
+                                    if (isinstance(_e, dict)
+                                            and _e.get('role') == 'ENTRY'
+                                            and not _e.get('order_id')
+                                            and _e.get('intent')
+                                            and self._order_matches_intent(
+                                                _ch, _e['intent'], symbol)):
+                                        _rb_matched_unwritten = True
+                                        break
+                                if _rb_matched_unwritten:
+                                    break
+                        except Exception as _me:
+                            print(f"  └─ ⚠️ 独立签名复核异常（按未判明处理）: {_me}")
 
-                    try:
-                        threading.Thread(
-                            target=self._start_monitoring,
-                            kwargs={
-                                'symbol': symbol,
-                                'batch_id': batch_id,
-                                'entry_orders': _takeover_orders,
-                                'stop_steps': active_stop_steps,
-                                'take_profit_price': signal.take_profit,
-                                'current_sl_id': None,
-                                'tp_order_id': None,
-                                'batch_total_amount': batch_total_amount,
-                                'target_amounts': target_amounts,
-                                'params_base': params_base,
-                                'is_hedge_mode': is_hedge_mode,
-                                'side': side,
-                                'last_filled_count': 0,
-                                'filled_details': [0.0] * len(_takeover_orders),
-                                'total_entry_fee': 0.0,
-                                'pending_sl_orders': list(range(len(_takeover_orders))),
-                                'prepared_tp_params': {},
-                                'layer_sl_params': [],
-                            },
-                            daemon=True).start()
-                        print(f"  └─ ✅ 已启动监控接管（订单 ID={_takeover_orders}）")
-                    except Exception as _te:
-                        print(f"  └─ ⚠️ 监控接管启动失败: {_te}")
+                    # 🔥 ChatGPT 第六轮复审：收编成功后**不得**继续用创建异常前的
+                    # target_amounts / active_stop_steps 起监控——那两组可能为空，
+                    # 而监控识别成交后按层访问 target_amounts[idx] 会异常退出、
+                    # 保护根本走不到。必须以**收编后落盘的完整批次状态**为准。
+                    _tk_stop_steps = active_stop_steps
+                    _tk_target_amounts = target_amounts
+                    _tk_total_amount = batch_total_amount
+                    _tk_layer_sl = []
+                    _tk_tp_params = {}
+                    if _reconciled:
+                        try:
+                            _tk_b = (self.load_all_states()
+                                     .get(symbol, {}) or {}).get(batch_id, {}) or {}
+                            _tk_stop_steps = _tk_b.get('stop_steps') or _tk_stop_steps
+                            _tk_target_amounts = _tk_b.get('target_amounts') or _tk_target_amounts
+                            _tk_total_amount = _tk_b.get('batch_total_amount') or _tk_total_amount
+                            _tk_layer_sl = _tk_b.get('layer_sl_params') or []
+                            _tk_tp_params = _tk_b.get('prepared_tp_params') or {}
+                        except Exception as _se:
+                            print(f"  └─ ⚠️ 接管读取落盘批次状态失败: {_se}")
+                    # 逐层一致性自检：数量/止损参数层数不足 → 监控会越界，必须拒绝接管。
+                    # 🔥 第六轮复审：「交易所有匹配单但收编未确认落盘」也一律否决接管
+                    # ——本地无凭据却按 ID 监控会读到陈旧/空状态，比不接管更危险。
+                    _tk_ok = (not _rb_matched_unwritten
+                              and (not _takeover_orders
+                                   or (len(_tk_target_amounts) >= len(_takeover_orders)
+                                       and len(_tk_stop_steps or [])
+                                       >= len(_takeover_orders))))
+                    if not _tk_ok:
+                        print(f"  └─ ⛔ 拒绝启动监控接管"
+                              f"（收编未确认落盘={_rb_matched_unwritten}；"
+                              f"订单 {len(_takeover_orders)} / 数量 {len(_tk_target_amounts)} / "
+                              f"止损层 {len(_tk_stop_steps or [])}）"
+                              f"→ 保持未决意图与禁止新增风险，待交易所核实或人工处置")
+                    else:
+                        try:
+                            threading.Thread(
+                                target=self._start_monitoring,
+                                kwargs={
+                                    'symbol': symbol,
+                                    'batch_id': batch_id,
+                                    'entry_orders': _takeover_orders,
+                                    'stop_steps': _tk_stop_steps,
+                                    'take_profit_price': signal.take_profit,
+                                    'current_sl_id': None,
+                                    'tp_order_id': None,
+                                    'batch_total_amount': _tk_total_amount,
+                                    'target_amounts': _tk_target_amounts,
+                                    'params_base': params_base,
+                                    'is_hedge_mode': is_hedge_mode,
+                                    'side': side,
+                                    'last_filled_count': 0,
+                                    'filled_details': [0.0] * len(_takeover_orders),
+                                    'total_entry_fee': 0.0,
+                                    'pending_sl_orders': list(range(len(_takeover_orders))),
+                                    'prepared_tp_params': _tk_tp_params,
+                                    'layer_sl_params': _tk_layer_sl,
+                                },
+                                daemon=True).start()
+                            print(f"  └─ ✅ 已启动监控接管（订单 ID={_takeover_orders}，"
+                                  f"数量层={len(_tk_target_amounts)}，"
+                                  f"止损层={len(_tk_stop_steps or [])}）")
+                        except Exception as _te:
+                            print(f"  └─ ⚠️ 监控接管启动失败: {_te}")
 
                     if not _reconciled:
                         # 🔥 对账后仍无法判明（无 ID 意图无签名/快照 INVALID/命中多条）
@@ -6571,10 +6684,16 @@ class CryptoTrader:
                             self._poll_degraded_batches.add(batch_id)
                             self._poll_fail_streak[batch_id] = max(
                                 self._poll_fail_streak.get(batch_id, 0), 1)
+                        # 🔥 第六轮复审：同时置入**未决意图集合**——通用轮询恢复分支
+                        # 会在一次正常轮询后把降级标记洗掉（无 ENTRY 可遍历、
+                        # batch_filled_amount=0 → 满足解除条件），那不是"持续"。
+                        self._unresolved_intent_batches.add(batch_id)
                         self.send_tg_notification(
-                            f"🚨【资金安全·critical】批次 `{batch_id}` 存在**无 ID 的未决 "
-                            f"ENTRY 意图**，对账后仍无法判明交易所是否真实挂单/已成交。\n"
-                            f"🚫 已持续禁止新增风险（降级闸门），并已启动监控接管。\n"
+                            f"🚨【资金安全·critical】批次 `{batch_id}` 存在**未决 "
+                            f"ENTRY 意图**（创建结果未判明"
+                            + ("；交易所已匹配到订单但**收编未确认落盘**"
+                               if _rb_matched_unwritten else "") + "）。\n"
+                            f"🚫 已持续禁止新增风险（未决意图闸门），并已启动监控接管。\n"
                             f"💡 若交易所实际成交而保护未补挂，**本系统无法自动补齐**，"
                             f"请立即人工核对仓位与止损单。",
                             level='critical')
@@ -7288,8 +7407,11 @@ class CryptoTrader:
                 if v is None:
                     continue
                 latest_b[k] = v
-            self._persist_states(latest_all)
-        return True
+            # 🔥 ChatGPT 第六轮复审：本函数此前**忽略** _persist_states 返回值恒返回 True，
+            # 使「收编成功」不等于「收编事实已落盘」。改为返回写盘是否已确认。
+            # 六个既有调用点均不检查返回值（行为不变），落盘判定由收编路径承担。
+            return self._persist_states(latest_all) is True
+        return False
 
     def _assert_create_allowed(self, symbol, batch_id, identity, desc='保护单', replace_order_id=None,
                                owner_op_id=None):
@@ -8051,7 +8173,12 @@ class CryptoTrader:
             txn_fields['stop_steps'] = stop_steps
         if not b.get('last_filled_count'):
             txn_fields['pending_sl_orders'] = list(range(len(entry_orders)))
-        self._commit_registry_txn(symbol, batch_id, batch_fields=txn_fields)
+        # 🔥 ChatGPT 第六轮复审：**收编成功 ≠ 收编事实已落盘**。
+        # 落盘未确认时不得返回 ok=True —— 否则调用方会解除暂停并认为已收编。
+        if self._commit_registry_txn(symbol, batch_id, batch_fields=txn_fields) is not True:
+            print(f"  └─ ⚠️ [自愈] 批次 {batch_id} 收编结果**未确认落盘**"
+                  f"（保持未收编，待人工对账）")
+            return entry_orders, False
         return entry_orders, True
 
     def _verify_failure_msg(self, desc, order_id, symbol, verify_result):
