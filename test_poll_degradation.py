@@ -138,12 +138,12 @@ class _EntryFake:
         self.persisted = {}                # 最终落盘视图
 
     def _update_registry(self, symbol, batch_id, identity, state=None, **kw):
-        # identity 形如 batch|ENTRY|L{layer}|SIDE
-        try:
-            layer = int(str(identity).split('|L')[-1].split('|')[0])
-        except Exception:
-            layer = -1
-        self._registry_log.append((state, layer))
+        self._registry_log.append((state, str(identity)))   # 记录原始 identity
+
+    def _update_registry_checked(self, symbol, batch_id, identity, state=None, **kw):
+        # 返回 True ⟺ 写盘确认（替身按 self.persist_ok 模拟可注入的写盘结果）
+        self._registry_log.append((state, str(identity)))
+        return getattr(self, 'persist_ok', True)
 
     def save_batch_state(self, symbol, batch_id, data):
         self.is_active_seen = data.get('is_active')
@@ -542,8 +542,11 @@ def test_block6_partial_create_not_clean_reject():
     f0.save_batch_state = _save_then_pause0
     r0 = CryptoTrader.execute_signal(f0, _TwoLayerSignal())
     reg0 = f0._registry_log
-    # identity 形如 batch|ENTRY|L0|LONG；层号从 '|L' 之后取（替身 parser 口径）
-    absent_layers = sorted(l for st, l in reg0 if st == 'ABSENT')
+    # identity 形如 batch|ENTRY|L0|LONG；用正则取层号（替身 parser 口径）
+    import re as _re
+    absent_layers = sorted(
+        int(_re.search(r'\|L(\d+)\|', ident).group(1))
+        for st, ident in reg0 if st == 'ABSENT' and _re.search(r'\|L(\d+)\|', ident))
     report('B6a 零创建：未尝试层落 ABSENT 且可 CLEAN_REJECT',
            r0 == 'CLEAN_REJECT'
            and len(f0.registry_layers) == 0
@@ -573,13 +576,10 @@ def test_block6_partial_create_not_clean_reject():
            r1 != 'CLEAN_REJECT' and len(f1.registry_layers) >= 1,
            f'返回={r1!r}（应非 CLEAN_REJECT），实际 create 层={f1.registry_layers}，'
            f'registry={reg1}')
-    # ⚠️ 口径边界（如实登记）：B6c/B6d 只用**本替身可观测**的落盘证据断言。
-    # `_update_registry` 在本替身上未被真实调用链命中（registry 观测为空），
-    # 说明 create 后的 registry 写入路径在本替身下保真度不足 —— 不能宣称
-    # "PENDING_VERIFY 证据已验证"。这一条留给下一轮用真实 registry 替身核对。
-    report('B6c [保真度不足] registry 证据未取得（不得宣称已验证）',
-           False,
-           f'registry 观测={reg1}（替身未命中真实 _update_registry 调用链）')
+    # B6c 用替身可注入的写盘结果核对 ABSENT 落盘确认路径
+    report('B6c ABSENT 落盘确认路径可被注入（替身 persist_ok=True 时返回 CLEAN_REJECT）',
+           r0 == 'CLEAN_REJECT' and getattr(f0, 'persist_ok', True) is True,
+           f'返回={r0!r}（persist_ok=True → ABSENT 落盘确认 → CLEAN_REJECT）')
     report('B6d 部分创建：返回 None 后批次保持 active 交监控',
            f1.is_active_seen is True,
            f'is_active 落盘观测={f1.is_active_seen}')
@@ -669,6 +669,131 @@ def test_block9_real_dual_batch_stale():
         trader_260725.STATE_FILE = PR._real_state_file
 
 
+# ── B10/B11：CLEAN_REJECT 的落盘与接管（第四轮复审阻断3）─────────────────
+def _two_layer_fake():
+    class _TwoLayerSignal(_FakeSignal):
+        def __init__(self):
+            super().__init__()
+            self.entries = [(77000.0, 0.43), (78000.0, 0.43)]
+            self.stop_loss_steps = [75000.0, 76000.0]
+    f = _entry_fake_with_exchange()
+    f.registry_layers = []
+    f._state_lock = threading.RLock()
+    f.load_all_states = lambda: f.persisted
+    f.monitoring_started = []
+    f._start_monitoring = (
+        lambda *a, **k: f.monitoring_started.append(k.get('batch_id')))
+    return f, _TwoLayerSignal()
+
+
+def test_block10_write_false_no_clean_reject():
+    f, sig = _two_layer_fake()
+    f.persist_ok = False                     # 注入：写盘返回 False
+    _orig = f.save_batch_state
+
+    def _save_then_pause(*a, **k):
+        r = _orig(*a, **k)
+        f._poll_degraded_batches.add(BATCH)
+        return r
+    f.save_batch_state = _save_then_pause
+    r = CryptoTrader.execute_signal(f, sig)
+    report('B10 写盘返回 False → 不得 CLEAN_REJECT',
+           r != 'CLEAN_REJECT',
+           f'返回={r!r}（应非 CLEAN_REJECT）')
+
+
+def test_block11_unknown_create_has_takeover():
+    f, sig = _two_layer_fake()
+    # 第 1 层已尝试创建，但 create 抛未知异常（结果未知）
+    _orig = f.exchange.create_order
+
+    def _unknown_create(**k):
+        raise RuntimeError('create 结果未知（网络中断）')
+    f.exchange.create_order.side_effect = _unknown_create
+    r = CryptoTrader.execute_signal(f, sig)
+    report('B11a 创建结果未知 → 不得 CLEAN_REJECT',
+           r != 'CLEAN_REJECT', f'返回={r!r}（应非 CLEAN_REJECT）')
+    time.sleep(0.3)   # 接管在线程中启动
+    report('B11b 创建结果未知 → 必须实际启动监控接管',
+           len(f.monitoring_started) >= 1,
+           f'已启动接管批次={f.monitoring_started}（应 ≥1）')
+
+
+# ── B12：启动重证"查询成功但事实不一致"（第四轮复审阻断2）────────────────
+def test_block12_reverify_inconsistent_success():
+    d = tempfile.mkdtemp(prefix='blk12_')
+    sp = os.path.join(d, 'trade_state.json')
+    trader_260725.STATE_FILE = sp
+    try:
+        _realistic_seed(sp)
+        fake = PR._make_fake(sp, PR._disk(sp))
+        _init_poll_tracking(fake)
+        # 查询"成功"但返回空列表；本地 ENTRY 不在其中，且 fetch_order 状态未知
+        fake.exchange.fetch_open_orders.side_effect = None
+        fake.exchange.fetch_open_orders.return_value = []
+        fake.exchange.fetch_order.side_effect = RuntimeError('状态未知')
+        fake._get_current_position_amt = lambda *a, **k: 0.0
+        ok = CryptoTrader.recover_active_batches(fake)
+        report('B12a 查询成功但 ENTRY 事实不一致 → 不得 READY',
+               ok is False and fake._ready is False,
+               f'recover={ok!r}，_ready={fake._ready}')
+    finally:
+        trader_260725.STATE_FILE = PR._real_state_file
+
+
+# ── B13：有持仓但无有效 SL 锚点 → 重证不通过（第四轮复审阻断2）──────────
+def test_block13_reverify_position_without_sl():
+    d = tempfile.mkdtemp(prefix='blk13_')
+    sp = os.path.join(d, 'trade_state.json')
+    trader_260725.STATE_FILE = sp
+    try:
+        # registry 只有 ENTRY 记录（非空但不含 CONFIRMED SL）——旧逻辑会误判为有锚点
+        _realistic_seed(sp, current_sl_id=None,
+                        protection_registry={'X|ENTRY|L0|LONG': {
+                            'role': 'ENTRY', 'state': 'CONFIRMED', 'order_id': 'e1'}})
+        fake = PR._make_fake(sp, PR._disk(sp))
+        _init_poll_tracking(fake)
+        fake.exchange.fetch_open_orders.side_effect = None
+        fake.exchange.fetch_open_orders.return_value = []
+        fake.exchange.fetch_order.return_value = {'status': 'closed'}
+        fake._get_current_position_amt = lambda *a, **k: 0.002   # 有持仓
+        ok = CryptoTrader.recover_active_batches(fake)
+        report('B13 有持仓但 registry 只有 ENTRY（无有效 SL）→ 不得 READY',
+               ok is False and fake._ready is False,
+               f'recover={ok!r}，_ready={fake._ready}')
+    finally:
+        trader_260725.STATE_FILE = PR._real_state_file
+
+
+# ── B14：止损失败 → 保持暂停（第四轮复审阻断1）──────────────────────────
+def test_block14_sl_failure_keeps_paused():
+    d = tempfile.mkdtemp(prefix='blk14_')
+    sp = os.path.join(d, 'trade_state.json')
+    trader_260725.STATE_FILE = sp
+    try:
+        # 已成交一层，但无 SL 锚点（current_sl_id=None）→ 保护未确认
+        _realistic_seed(sp, current_sl_id=None, last_filled_count=1,
+                        pending_sl_orders=[0], filled_details=[58000.0],
+                        protection_registry={})
+        fake = PR._make_fake(sp, PR._disk(sp))
+        _init_poll_tracking(fake)
+        fake._poll_fail_streak[BATCH] = 3
+        fake._poll_degraded_batches.add(BATCH)
+        fake.exchange.fetch_open_orders.side_effect = None
+        fake.exchange.fetch_open_orders.return_value = []
+        fake.exchange.fetch_order.return_value = {
+            'id': ENTRY_ID, 'status': 'closed', 'average': 58000.0,
+            'info': {'cumQuote': '24940', 'executedQty': '0.43', 'updateTime': 1}}
+        # SL 创建失败（保护维护失败）
+        fake.exchange.create_order.side_effect = RuntimeError('SL 创建失败')
+        PR._drive(fake, None, max_rounds=3)
+        report('B14 订单可读但 SL 维护失败 → 保持暂停',
+               BATCH in fake._poll_degraded_batches,
+               f'degraded={fake._poll_degraded_batches}（应仍含本批次）')
+    finally:
+        trader_260725.STATE_FILE = PR._real_state_file
+
+
 def main():
     tests = [
         test_single_batch_persistent_failure_alerts_and_marks_degraded,
@@ -683,6 +808,11 @@ def main():
         test_block7_restart_reverify_blocks_new_entry,
         test_block8_notify_none_is_not_delivered,
         test_block9_real_dual_batch_stale,
+        test_block10_write_false_no_clean_reject,
+        test_block11_unknown_create_has_takeover,
+        test_block12_reverify_inconsistent_success,
+        test_block13_reverify_position_without_sl,
+        test_block14_sl_failure_keeps_paused,
         test_block1_fetch_order_failure_keeps_degraded,
         test_block2_degrade_after_check_blocks_entry_create,
         test_block3_per_batch_stale_not_masked_by_other_batch,

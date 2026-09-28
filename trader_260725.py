@@ -3543,9 +3543,11 @@ class CryptoTrader:
                 if _pos is None:
                     _reverify_ok = False
                     _reverify_detail.append(f"{_sym}/{_bid} 持仓 UNKNOWN")
-                # ② 未结订单核对（本地记录了入场单，必须能在交易所侧看到）
+                # ② 未结订单核对：本地 ENTRY 与交易所未结单**逐条比对**
+                #    （ChatGPT 第四轮复审：只收集 ID 不比较 = 空结果也判通过）
                 _local_entries = [str(x) for x in (_bd.get('entry_orders') or [])]
                 _seen = set()
+                _orders_known = True
                 if _local_entries:
                     try:
                         _oo = self._safe_api_call(self.exchange.fetch_open_orders, _sym) or []
@@ -3553,14 +3555,49 @@ class CryptoTrader:
                             if isinstance(_o, dict) and _o.get('id') is not None:
                                 _seen.add(str(_o['id']))
                     except Exception as _oe:
+                        _orders_known = False
                         _reverify_ok = False
                         _reverify_detail.append(f"{_sym}/{_bid} 未结订单查询异常({_oe})")
-                # ③ 保护单核对：有持仓或仍有挂单时，本地须有 SL 锚点
-                if (_pos or _seen) and not (_bd.get('current_sl_id')
-                                            or _bd.get('protection_registry')):
-                    _reverify_ok = False
-                    _reverify_detail.append(
-                        f"{_sym}/{_bid} 有敞口但无保护锚点（current_sl_id/registry 均空）")
+                if _orders_known:
+                    _missing = [e for e in _local_entries if e not in _seen]
+                    for _e in _missing:
+                        # 本地有 ENTRY 但交易所未结列表没有 → 判明成交/撤销/UNKNOWN
+                        _st = None
+                        try:
+                            _od = self._safe_api_call(self.exchange.fetch_order, _e, _sym)
+                            if isinstance(_od, dict):
+                                _st = _od.get('status')
+                        except Exception:
+                            _st = None
+                        if _st in ('closed', 'filled'):
+                            continue          # 已成交 → 由下方保护核对接管
+                        if _st in ('canceled', 'expired', 'rejected'):
+                            continue          # 已终结 → 无挂单风险
+                        _reverify_ok = False
+                        _reverify_detail.append(
+                            f"{_sym}/{_bid} ENTRY {_e} 状态未知({_st!r})，"
+                            f"无法判明成交/撤销")
+                # ③ 保护单核对：有持仓时须存在**真实 SL 锚点**（role=SL 且 state=CONFIRMED）
+                #    仅非空 protection_registry（含只有 ENTRY 记录）**不算**保护锚点。
+                if _pos:
+                    _reg = _bd.get('protection_registry') or {}
+                    _has_sl_anchor = bool(_bd.get('current_sl_id'))
+                    if not _has_sl_anchor:
+                        for _rv in _reg.values():
+                            if (isinstance(_rv, dict) and _rv.get('role') == 'SL'
+                                    and _rv.get('state') == 'CONFIRMED'
+                                    and _rv.get('order_id')):
+                                _has_sl_anchor = True
+                                break
+                    if not _has_sl_anchor:
+                        _reverify_ok = False
+                        _reverify_detail.append(
+                            f"{_sym}/{_bid} 有持仓但无**有效 SL 锚点**"
+                            f"（current_sl_id 空且 registry 无 CONFIRMED SL）")
+                elif _seen:
+                    # 有未结 ENTRY 但无持仓：本轮不额外判保护（未成交无需 SL），
+                    # 但保留 order ID 供恢复期仲裁，不在重证阶段清理。
+                    pass
         if not _reverify_ok:
             # 🔥 Fail-Closed：显式置 _ready=False，不依赖调用方记得处理 False 返回值
             self._ready = False
@@ -6282,7 +6319,8 @@ class CryptoTrader:
                         print(f"🚫 [POLL] 第 {idx + 1} 层创建前复核：监控降级，已阻断本层"
                               f"（降级批次={self._poll_degraded_batches}）")
                         break
-                    _attempted_layers.add(idx)   # 已尝试创建（后续判定不得 CLEAN_REJECT）
+                    # 注：_attempted_layers 只在**结果非确定拒绝**时记录（成功/未知），
+                    #  -2021 确定拒绝不记（证明无副作用，仍可 CLEAN_REJECT）。
                     order = self._safe_api_call(
                         self.exchange.create_order,
                         symbol=symbol,
@@ -6293,6 +6331,7 @@ class CryptoTrader:
                         retries=1
                     )
                     entry_orders.append(order['id'])
+                    _attempted_layers.add(idx)   # 创建成功 → 不得 CLEAN_REJECT
                     target_amounts.append(formatted_amount)
                     active_stop_steps.append(signal.stop_loss_steps[idx])
                     batch_total_amount += formatted_amount
@@ -6324,13 +6363,29 @@ class CryptoTrader:
                     if "-2021" in str(e):
                         print(
                             f"⚠️ [挂单失败] 第 {idx + 1} 层触发价 {formatted_price} 不满足{'高于' if side == 'BUY' else '低于'}市价条件，已自动跳过。")
-                        # B2-5（§5.6）：-2021 确定拒绝 → 该层 ABSENT（不残留 PENDING_CREATE、不计 FAILED）
-                        self._update_registry(
-                            symbol, batch_id,
-                            self._protection_identity(batch_id, 'ENTRY', idx, position_side),
-                            state='ABSENT')
+                        # B2-5（§5.6）：-2021 确定拒绝 = 证明无交易所副作用 → 该层
+                        # ABSENT（不残留 PENDING_CREATE）。**不算 attempted**，故仍可
+                        # 在全部层确定无副作用时返回 CLEAN_REJECT。
+                        if self._update_registry_checked(
+                                symbol, batch_id,
+                                self._protection_identity(batch_id, 'ENTRY', idx, position_side),
+                                state='ABSENT') is not True:
+                            _attempted_layers.add(idx)   # 落盘未确认 → 留证据
+                            break
                     else:
-                        raise e
+                        # 🔥 ChatGPT 第四轮复审：结果**未知**（非确定拒绝）→ 保留证据
+                        # 并走接管路径，绝不返回 CLEAN_REJECT、也不裸抛异常。
+                        print(f"⚠️ [挂单未知] 第 {idx + 1} 层创建结果未知（{e}），"
+                              f"保留意图证据并交监控接管")
+                        _attempted_layers.add(idx)
+                        break
+                except Exception as _ge:
+                    # 🔥 ChatGPT 第四轮复审：**任何**非确定拒绝的创建异常（网络中断/
+                    # 未知错误）结果皆未知 → 保留意图证据并交监控接管，不裸抛异常。
+                    print(f"⚠️ [挂单未知] 第 {idx + 1} 层创建结果未知"
+                          f"（{type(_ge).__name__}: {_ge}），保留意图证据并交监控接管")
+                    _attempted_layers.add(idx)
+                    break
 
             if not entry_orders:
                 # 🔥 v6.4（PROVEN-CLEAN 收口）：到达此处 = 所有层均被本地价格过滤
@@ -6348,6 +6403,10 @@ class CryptoTrader:
                 # 口径：_attempted_layers 为本轮**实际调用过 create_order** 的层号
                 # （含失败尝试 —— 失败也可能已在交易所产生副作用，须保留证据）。
                 # 任何已尝试层 → 不得 CLEAN_REJECT。
+                #
+                # 🔥 ChatGPT 第四轮复审：必须用**能确认落盘**的接口。
+                # `_update_registry` 的返回值是 fail_count，**不代表写盘成功**；
+                # 唯一可信接口是 `_update_registry_checked`（True ⟺ _persist_states True）。
                 _clean_all_absent = True
                 try:
                     for _ci, (_c_tp, _c_amt) in enumerate(signal.entries):
@@ -6357,27 +6416,68 @@ class CryptoTrader:
                         if _ci in _attempted_layers:
                             _clean_all_absent = False
                             break           # 已尝试创建 → 保留证据，不收敛为 ABSENT
-                        # 明确未尝试创建：可靠落盘为 ABSENT
-                        self._update_registry(symbol, batch_id, _cid, state='ABSENT')
+                        # 明确未尝试创建：以「已确认落盘」为准收敛为 ABSENT
+                        if self._update_registry_checked(
+                                symbol, batch_id, _cid, state='ABSENT') is not True:
+                            _clean_all_absent = False
+                            print(f"⚠️ [PROVEN-CLEAN] 第 {_ci+1} 层 ABSENT 未确认落盘"
+                                  f"（按未清理处理）")
+                            break
                 except Exception as _ce:
                     _clean_all_absent = False
                     print(f"⚠️ [PROVEN-CLEAN] 未尝试层意图收敛失败（按未清理处理）: {_ce}")
 
+                if _clean_all_absent:
+                    # 仅当所有未尝试层已确认落 ABSENT 时，才停用空骨架（并校核落盘）
+                    try:
+                        with self._state_lock:
+                            latest = self.load_all_states()
+                            _b = (latest.get(symbol, {}) or {}).get(batch_id)
+                            if isinstance(_b, dict) and not _b.get('entry_orders'):
+                                _b['is_active'] = False
+                                # 🔥 ChatGPT 第四轮复审：必须校核落盘结果，不能忽略返回值
+                                if self._persist_states(latest) is not True:
+                                    _clean_all_absent = False
+                                    print("⚠️ [PROVEN-CLEAN] 空骨架停用未确认落盘"
+                                          "（按未清理处理）")
+                    except Exception as _e:
+                        _clean_all_absent = False
+                        print(f"⚠️ [PROVEN-CLEAN] 空骨架停用失败（按未清理处理）: {_e}")
+
                 if not _clean_all_absent:
-                    print(f"🚫 [资金安全] 批次 `{batch_id}` 存在未决 ENTRY 意图"
-                          f"（部分层已创建或状态未确认），不返回 CLEAN_REJECT，"
-                          f"批次保持 active 并交监控接管。")
+                    print(f"🚫 [资金安全] 批次 `{batch_id}` 存在未决 ENTRY 意图或落盘未确认，"
+                          f"不返回 CLEAN_REJECT；批次保持 active 并交监控接管。")
+                    # 🔥 必须**实际启动接管**，而非只打印（原分支没有接管路径）
+                    try:
+                        import threading as _th
+                        _th.Thread(
+                            target=self._start_monitoring,
+                            kwargs={
+                                'symbol': symbol,
+                                'batch_id': batch_id,
+                                'entry_orders': entry_orders,
+                                'stop_steps': active_stop_steps,
+                                'take_profit_price': signal.take_profit,
+                                'current_sl_id': None,
+                                'tp_order_id': None,
+                                'batch_total_amount': batch_total_amount,
+                                'target_amounts': target_amounts,
+                                'params_base': params_base,
+                                'is_hedge_mode': is_hedge_mode,
+                                'side': side,
+                                'last_filled_count': 0,
+                                'filled_details': [0.0] * len(entry_orders),
+                                'total_entry_fee': 0.0,
+                                'pending_sl_orders': list(range(len(entry_orders))),
+                                'prepared_tp_params': {},
+                                'layer_sl_params': [],
+                            },
+                            daemon=True).start()
+                        print(f"  └─ ✅ 已启动监控接管（接管未决骨架批次）")
+                    except Exception as _te:
+                        print(f"  └─ ⚠️ 监控接管启动失败: {_te}")
                     return None
 
-                try:
-                    with self._state_lock:
-                        latest = self.load_all_states()
-                        _b = (latest.get(symbol, {}) or {}).get(batch_id)
-                        if isinstance(_b, dict) and not _b.get('entry_orders'):
-                            _b['is_active'] = False
-                            self._persist_states(latest)
-                except Exception as _e:
-                    print(f"⚠️ [PROVEN-CLEAN] 空骨架停用失败（不影响拒绝结果）: {_e}")
                 print("❌ 没有成功挂出任何有效开仓条件单（触发价均不符合逻辑），程序安全退出。")
                 # 🔥 哨兵（Fix D）：bot_runner 据此释放 D-005 记录，允许立即修正重发；
                 # 其余 None 路径（异常/未知）保持 EXECUTING 10 分钟 Fail-Closed 不变
@@ -9296,20 +9396,9 @@ class CryptoTrader:
                 #   ③ 本轮无新成交待处理
                 #   ④ 交易所 SL 有效性：待挂列表已被 _prune_pending_sl_by_registry 按
                 #      registry 收敛（有 order_id 的层已移出，交给 R-B 自愈重查确认）
-                _poll_pending_filled = [idx for idx in pending_sl_orders
-                                        if idx < batch_filled_count]
-                _poll_protection_done = (not _poll_pending_filled) and (not newly_filled_layers)
-                if (self._poll_fail_streak.get(batch_id, 0) > 0
-                        and not _poll_orders_unresolved and _poll_protection_done):
-                    self._poll_fail_streak[batch_id] = 0
-                    self._poll_first_fail_time.pop(batch_id, None)
-                    self._poll_last_success_time[batch_id] = time.time()
-                    with self._poll_alert_lock:
-                        if batch_id in self._poll_degraded_batches:
-                            self._poll_degraded_batches.discard(batch_id)
-                            if not self._poll_degraded_batches:
-                                self._poll_alert_active = False
-                                print("✅ [POLL] 全部批次监控恢复")
+                # 🔥 R1/R2（ChatGPT 第四轮复审）：恢复判定**不在此处**——本段仍在
+                # 止损更新之前。改到本轮止损/止盈维护**结束之后**（文末标注处），
+                # 且区分「订单数据可读」与「保护已确认」两个判据。
 
                 # ==================== 处理待补挂止损 ====================
                 if pending_sl_orders and has_entered_position and batch_filled_amount > 0:
@@ -9953,6 +10042,41 @@ class CryptoTrader:
                         self.send_tg_notification(risk_update_msg, reply_markup=reply_markup)
 
                     last_filled_count = batch_filled_count
+
+                # 🔥 R1/R2（ChatGPT 第四轮复审）：恢复判定 —— **分开两个判据**，
+                # 且必须在本轮止损/止盈维护**之后**、循环层级执行（未成交批次不进入
+                # 上方维护分支，故不能放在分支内）。
+                #   ① 订单数据可读：本轮所有需核对订单均已判定（无 UNKNOWN）
+                #   ② 保护已确认：已成交仓位存在有效 SL 锚点；`pending_sl_orders`
+                #      为空**不能**证明交易所 SL 有效 → 额外要求 current_sl_id 存在
+                #      （止损失败时它被置 None）。保护未知/维护失败 → 保持暂停。
+                _poll_pending_filled = [idx for idx in pending_sl_orders
+                                        if idx < batch_filled_count]
+                _poll_needs_protection = (batch_filled_amount > 0)
+                _poll_protection_confirmed = (
+                    not _poll_pending_filled
+                    and not newly_filled_layers
+                    and (not _poll_needs_protection or bool(current_sl_id)))
+                if (self._poll_fail_streak.get(batch_id, 0) > 0
+                        and not _poll_orders_unresolved
+                        and _poll_protection_confirmed):
+                    self._poll_fail_streak[batch_id] = 0
+                    self._poll_first_fail_time.pop(batch_id, None)
+                    self._poll_last_success_time[batch_id] = time.time()
+                    with self._poll_alert_lock:
+                        if batch_id in self._poll_degraded_batches:
+                            self._poll_degraded_batches.discard(batch_id)
+                            if not self._poll_degraded_batches:
+                                self._poll_alert_active = False
+                                print("✅ [POLL] 全部批次监控恢复")
+                elif (self._poll_fail_streak.get(batch_id, 0) > 0
+                        and not _poll_orders_unresolved
+                        and _poll_needs_protection
+                        and not _poll_protection_confirmed):
+                    print(f"  └─ ⏸️ [POLL] 订单已可读但保护未确认"
+                          f"（SL 锚点缺失/维护失败）→ 保持暂停新增风险")
+
+                if _health_instance:
 
                     # 保存状态（M3 修复：增量更新，基于已有状态复制只写本段变化的字段，
                     # 避免整对象重建静默清空 D-001 未来新增的状态字段，如 KAMA/自动保本相关字段）
