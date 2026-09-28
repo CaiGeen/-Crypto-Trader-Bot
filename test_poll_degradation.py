@@ -1255,6 +1255,172 @@ def test_block25_hedge_sl_variants():
             trader_260725.STATE_FILE = PR._real_state_file
 
 
+# ── B26：收编成功但参数不完整 → 无监控时仍禁止新 ENTRY（第七轮复审阻断1）──
+def test_block26_refused_takeover_still_blocks_new_entry():
+    # B26a 收编已确认落盘，但重建出的**参数无效**（数量/止损价为 0、layer_sl_params 空）
+    # → 旧自检只看列表长度会放行；新自检必须拒绝接管，且**仍置未决闸门**。
+    f, sig = _two_layer_fake()
+    _bind_real_reconcile(f)
+    f._state_lock = threading.RLock()
+    f.monitor_kwargs = []
+    f._start_monitoring = lambda *a, **k: f.monitor_kwargs.append(k)
+    f.exchange.fetch_open_orders.side_effect = None
+    f.exchange.fetch_open_orders.return_value = [{
+        'id': REAL_OID, 'symbol': SYMBOL, 'type': 'STOP_MARKET', 'side': 'buy',
+        'price': 77000.0, 'amount': 0.43, 'status': 'open'}]
+    f.exchange.create_order.side_effect = RuntimeError('创建结果未知')
+    _real_rebuild = f._rebuild_entry_orders_from_registry
+
+    def _poisoned_rebuild(*a, **k):
+        orders, ok = _real_rebuild(*a, **k)
+        b = f.persisted.get('batch_new_001', {})     # 收编后重读到的就是这份
+        b['target_amounts'] = [0.0]
+        b['stop_steps'] = [0.0]
+        b['layer_sl_params'] = []
+        return orders, ok
+    f._rebuild_entry_orders_from_registry = _poisoned_rebuild
+    CryptoTrader.execute_signal(f, sig)
+    time.sleep(0.4)
+    report('B26a 数量/止损价为 0 或 layer_sl_params 为空 → 不得放行接管',
+           len(f.monitor_kwargs) == 0,
+           f'启动次数={len(f.monitor_kwargs)}（应 0；旧自检只看长度会误放行）')
+    report('B26a2 收编成功但参数无效 → 仍置未决闸门（无监控也禁止新风险）',
+           'batch_new_001' in f._unresolved_intent_batches,
+           f'未决意图={f._unresolved_intent_batches}')
+    created = []
+    f.exchange.create_order.side_effect = (
+        lambda **kk: created.append(kk) or {'id': 'Y'})
+    f._poll_degraded_batches.discard('batch_new_001')
+    CryptoTrader.execute_signal(f, sig)
+    time.sleep(0.3)
+    report('B26a3 闸门在位时新 ENTRY 创建被阻断',
+           len(created) == 0, f'本轮 create 调用={len(created)}（应 0）')
+
+    # B26b 线程启动失败 → 同一个出口，同样必须置未决闸门
+    f2, sig2 = _two_layer_fake()
+    f2._start_monitoring = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError('线程启动失败'))
+    f2.exchange.create_order.side_effect = RuntimeError('创建结果未知')
+    CryptoTrader.execute_signal(f2, sig2)
+    time.sleep(0.3)
+    report('B26b 线程启动失败 → 未决闸门仍置位（无监控也禁止新风险）',
+           'batch_new_001' in f2._unresolved_intent_batches,
+           f'未决意图={f2._unresolved_intent_batches}')
+
+
+# ── B27：止盈单 / positionSide 缺失不得认作 SL（第七轮复审阻断2）──────────
+def test_block27_non_stop_and_missing_pside():
+    for label, order in (
+            ('TAKE_PROFIT_MARKET 带 stopPrice',
+             {'id': 'SL1', 'type': 'TAKE_PROFIT_MARKET', 'side': 'SELL',
+              'amount': 0.43, 'positionSide': 'LONG',
+              'info': {'stopPrice': 55000.0, 'origQty': '0.43'}}),
+            ('positionSide 缺失',
+             {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL', 'amount': 0.43}),
+            ('positionSide=BOTH',
+             {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL', 'amount': 0.43,
+              'positionSide': 'BOTH'})):
+        d = tempfile.mkdtemp(prefix='blk27_')
+        sp = os.path.join(d, 'trade_state.json')
+        trader_260725.STATE_FILE = sp
+        try:
+            _realistic_seed(sp, current_sl_id='SL1', is_hedge_mode=True)
+            fake = PR._make_fake(sp, PR._disk(sp))
+            _init_poll_tracking(fake)
+            fake.exchange.fetch_open_orders.side_effect = None
+            fake.exchange.fetch_open_orders.return_value = [order]
+            fake.exchange.fetch_order.side_effect = _sl_open_then_entry_closed(order)
+            fake._get_current_position_amt = lambda *a, **k: 0.43
+            ok = CryptoTrader.recover_active_batches(fake)
+            report(f'B27 Hedge {label} → 不得 READY',
+                   ok is False and fake._ready is False,
+                   f'recover={ok!r}，_ready={fake._ready}')
+        finally:
+            trader_260725.STATE_FILE = PR._real_state_file
+
+
+def _sl_open_then_entry_closed(order):
+    def _fo(oid, sym=None, *a, **k):
+        if str(oid) == 'SL1':
+            return dict(order, id='SL1', status='open')
+        return {'id': str(oid), 'status': 'closed', 'average': 58000.0,
+                'info': {'cumQuote': '24940', 'executedQty': '0.43'}}
+    return _fo
+
+
+# ── B28：未决闸门必须有经核实后的解除路径，且普通轮询不得解除 ────────────
+def test_block28_unresolved_gate_release_path():
+    d = tempfile.mkdtemp(prefix='blk28_')
+    sp = os.path.join(d, 'trade_state.json')
+    trader_260725.STATE_FILE = sp
+    try:
+        # 已核实：registry 全部 CONFIRMED，且账本有真实 order_id
+        _realistic_seed(sp, current_sl_id='SL1', protection_registry={
+            f'{BATCH}|ENTRY|L0|LONG': {
+                'role': 'ENTRY', 'state': 'CONFIRMED',
+                'order_id': ENTRY_ID, 'id_known': True}})
+        fake = PR._make_fake(sp, PR._disk(sp))
+        _init_poll_tracking(fake)
+        fake._unresolved_intent_batches.add(BATCH)     # 之前置入
+        fake.exchange.fetch_open_orders.side_effect = None
+        fake.exchange.fetch_open_orders.return_value = [
+            {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL', 'amount': 0.43}]
+        fake.exchange.fetch_order.side_effect = _sl_open_then_entry_closed(
+            {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL', 'amount': 0.43})
+        fake._get_current_position_amt = lambda *a, **k: 0.43
+        CryptoTrader.recover_active_batches(fake)
+        report('B28 意图已核实且账本无未决 → 解除新增风险闸门',
+               BATCH not in fake._unresolved_intent_batches,
+               f'未决意图={fake._unresolved_intent_batches}（应为空）')
+    finally:
+        trader_260725.STATE_FILE = PR._real_state_file
+
+
+# ── B29：重证必须读恢复后最新账本（刚收编的批次不得仍判未决）──────────
+def test_block29_reverify_uses_post_recovery_ledger():
+    d = tempfile.mkdtemp(prefix='blk29_')
+    sp = os.path.join(d, 'trade_state.json')
+    trader_260725.STATE_FILE = sp
+    try:
+        _realistic_seed(sp, entry_orders=[ENTRY_ID], current_sl_id='SL1',
+                        protection_registry={
+                            f'{BATCH}|ENTRY|L0|LONG': {
+                                'role': 'ENTRY', 'state': 'CONFIRMED',
+                                'order_id': ENTRY_ID, 'id_known': True}})
+        fake = PR._make_fake(sp, PR._disk(sp))
+        _init_poll_tracking(fake)
+        # 恢复前 all_states 快照里 registry 是 PENDING_CREATE（未收编）；
+        # 恢复流程收编后会写回 CONFIRMED —— 重证必须读**恢复后**的账本。
+        pre = PR._disk(sp)
+        pre[SYMBOL][BATCH]['protection_registry'] = {
+            f'{BATCH}|ENTRY|L0|LONG': {
+                'role': 'ENTRY', 'state': 'PENDING_CREATE',
+                'order_id': None, 'id_known': False}}
+        orig_load = fake.load_all_states
+        seq = {'n': 0}
+
+        def _load():
+            seq['n'] += 1
+            return copy.deepcopy(pre) if seq['n'] <= 1 else orig_load()
+        fake.load_all_states = _load
+        fake.exchange.fetch_open_orders.side_effect = None
+        fake.exchange.fetch_open_orders.return_value = [
+            {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL', 'amount': 0.43}]
+        fake.exchange.fetch_order.side_effect = _sl_open_then_entry_closed(
+            {'id': 'SL1', 'type': 'STOP_MARKET', 'side': 'SELL', 'amount': 0.43})
+        fake._get_current_position_amt = lambda *a, **k: 0.43
+        ok = CryptoTrader.recover_active_batches(fake)
+        # ⚠️ 如实收窄：READY 轴本用例**不**断言（recover 另有其他检查未过，
+        #    混在一起会掩盖本条要验的判据）。这里只断言「不得仍判未决」——
+        #    旧实现读恢复前 all_states，会把刚收编的批次判为未决。
+        report('B29 恢复流程已收编 → 重证不得仍判未决（须读恢复后账本）',
+               BATCH not in fake._unresolved_intent_batches,
+               f'未决意图={fake._unresolved_intent_batches}（应为空），'
+               f'load_all_states 调用={seq["n"]} 次，recover={ok!r}（仅作参考）')
+    finally:
+        trader_260725.STATE_FILE = PR._real_state_file
+
+
 def main():
     tests = [
         test_single_batch_persistent_failure_alerts_and_marks_degraded,
@@ -1285,6 +1451,10 @@ def main():
         test_block23_unresolved_survives_poll_recovery,
         test_block24_restart_rejects_unresolved_skeleton,
         test_block25_hedge_sl_variants,
+        test_block26_refused_takeover_still_blocks_new_entry,
+        test_block27_non_stop_and_missing_pside,
+        test_block28_unresolved_gate_release_path,
+        test_block29_reverify_uses_post_recovery_ledger,
         test_block1_fetch_order_failure_keeps_degraded,
         test_block2_degrade_after_check_blocks_entry_create,
         test_block3_per_batch_stale_not_masked_by_other_batch,
