@@ -8203,29 +8203,59 @@ class CryptoTrader:
                             settlement_qty = _net_qty
 
                             # 获取当前市价（平仓价格）
+                            # 🔴 P1 修正（2026-09-27，ChatGPT 复审；离线负测
+                            #    test_p1_settlement_price.py 驱动）：
+                            #   原实现取价失败 → exit_price = avg_price_net（成本价）
+                            #   → gross_pnl 恒为 0 → 报告发出「平仓价=持仓均价、
+                            #   名义盈亏 +0.00」的失真数字。而本块发完即
+                            #   收敛（converge）+ 清理批次账本（见本块末尾的
+                            #   _converge_batch_orders_before_clear → clear_batch_state
+                            #   → break），批次消失，
+                            #   且 L8190 已把 settlement_reported=True 落账本
+                            #   （_persist_states）→ 失真报告成为终局，不存在重发通道。
+                            #   更坏的同源分支（复审未指出）：ticker 的 last/close 均为 0
+                            #   时 `or 0.0` 兜出 0.0 且【不抛异常】→ 走不到 except →
+                            #   gross_pnl = (0 − 均价) × 数量 → 报出巨额假亏损。
+                            #   修正：取价失败或非正价 → exit_price = None（不可用），
+                            #   报告如实标注不可计算，绝不以成本价 / 0 冒充。
+                            #   有价路径的输出与修正前逐字节相同（防基线漂移）。
                             try:
                                 ticker = self._safe_api_call(self.exchange.fetch_ticker, symbol)
-                                exit_price = float(ticker.get('last') or ticker.get('close') or 0.0)
+                                _ep = float(ticker.get('last') or ticker.get('close') or 0.0)
+                                exit_price = _ep if _ep > 0 else None
                             except Exception:
-                                exit_price = avg_price_net
+                                exit_price = None
+                            _price_ok = exit_price is not None
 
-                            # 计算盈亏
-                            if side == 'BUY':
-                                gross_pnl = (exit_price - avg_price_net) * settlement_qty
+                            # 计算盈亏（价格不可用 → 不计算，杜绝伪造数字）
+                            if _price_ok:
+                                if side == 'BUY':
+                                    gross_pnl = (exit_price - avg_price_net) * settlement_qty
+                                else:
+                                    gross_pnl = (avg_price_net - exit_price) * settlement_qty
+
+                                # 估算平仓手续费（市价平仓用 TAKER_FEE_RATE）
+                                exit_fee = exit_price * settlement_qty * TAKER_FEE_RATE
+                                # 🔥 T1-C：净份额（_fee_rem），根除全量再扣的显示双重扣
+                                total_fees = _fee_rem + exit_fee
+                                net_pnl = gross_pnl - total_fees
+
+                                capital_base = avg_price_net * settlement_qty if settlement_qty > 0 else 1
+                                net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
+                            pnl_emoji = ("🟢" if net_pnl >= 0 else "🔴") \
+                                if _price_ok else "⚠️"
+
+                            # 构建盈亏报告（分叉仅在价格不可用时生效，有价路径不变）
+                            if _price_ok:
+                                _line_price = f"💵 **平仓价格**：`{exit_price:.2f}` USDT"
+                                _line_gross = f"📊 **名义盈亏**：`{gross_pnl:+.2f}` USDT"
+                                _line_fees = f"💸 **总手续费**：`{total_fees:.4f}` USDT"
+                                _line_net = f"{pnl_emoji} **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%)"
                             else:
-                                gross_pnl = (avg_price_net - exit_price) * settlement_qty
-
-                            # 估算平仓手续费（市价平仓用 TAKER_FEE_RATE）
-                            exit_fee = exit_price * settlement_qty * TAKER_FEE_RATE
-                            # 🔥 T1-C：净份额（_fee_rem），根除全量再扣的显示双重扣
-                            total_fees = _fee_rem + exit_fee
-                            net_pnl = gross_pnl - total_fees
-
-                            capital_base = avg_price_net * settlement_qty if settlement_qty > 0 else 1
-                            net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
-
-                            # 构建盈亏报告
-                            pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
+                                _line_price = "💵 **平仓价格**：⚠️ 不可用（本轮取价失败，未以成本价冒充）"
+                                _line_gross = "📊 **名义盈亏**：⚠️ 不可计算（缺平仓价）"
+                                _line_fees = f"💸 **总手续费**：`{_fee_rem:.4f}` USDT（仅入场手续费，平仓费不可算）"
+                                _line_net = "⚠️ **最终净盈亏**：不可计算（价格缺失，未回退成本价）"
                             pnl_msg = (
                                 f"📊 **[平仓结算]**\n\n"
                                 f"🆔 **批次号**：`{batch_id}`\n"
@@ -8234,11 +8264,11 @@ class CryptoTrader:
                                 f"📊 **平仓模式**：未知\n"
                                 f"📊 **已成交层数**：`{batch_filled_count}/{len(entry_orders)}`\n"
                                 f"📈 **持仓均价**：`{avg_price_net:.2f}` USDT\n"
-                                f"💵 **平仓价格**：`{exit_price:.2f}` USDT\n"
+                                f"{_line_price}\n"
                                 f"🔢 **平仓数量**：`{settlement_qty}`\n"
-                                f"📊 **名义盈亏**：`{gross_pnl:+.2f}` USDT\n"
-                                f"💸 **总手续费**：`{total_fees:.4f}` USDT\n"
-                                f"{pnl_emoji} **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
+                                f"{_line_gross}\n"
+                                f"{_line_fees}\n"
+                                f"{_line_net}"
                             )
 
                             print(f"\n{pnl_msg}")
@@ -12274,8 +12304,19 @@ class CryptoTrader:
             if isinstance(_o, dict) and _o.get('id'):
                 _open_map[str(_o['id'])] = _o
         open_orders = list(_open_map.values())
-        # ② D-B1 贡献扣减：symbol 持仓（绝对值）− 其他活跃批次已成交贡献
-        _side = b_data.get('side') or 'BUY'
+        # ② D-B1 贡献扣减：symbol 持仓（目标方向，绝对值）−【同方向】其他活跃批次已成交贡献
+        # 🔴 P0 修正（2026-09-27，ChatGPT 复审；离线负测 test_b1_converge_side_filter.py 驱动）：
+        #   pos_amt 经 _get_current_position_amt 取得，对冲模式下只认目标方向（L4152-4155），
+        #   而此处原先把同 symbol 【全部】其他活跃批次的账面成交量不分方向累加 →
+        #   双向并存时 contribution 被人为压到 0 → 误判 position_zero →
+        #   L1 撤掉本批次保护单（含 SL）→ 产出合法 proof → clear_batch_state 删除账本，
+        #   而交易所仓位仍在 = 裸仓 + 无止损 + 账本已删。
+        #   两条约束：(a) 贡献扣减只统计【目标方向】的其他批次；
+        #             (b) 方向不可判定（本批次或任何其他活跃批次）→ 拒绝清理，Fail-Closed。
+        #   无其他活跃批次时完全保留既有行为（单批次回归护栏，T4c）。
+        _side_raw = (b_data.get('side') or '').strip().upper()
+        _side_known = _side_raw in ('BUY', 'SELL')
+        _side = _side_raw if _side_known else 'BUY'   # 仅供下方持仓查询，语义与旧版一致
         try:
             pos_amt = self._get_current_position_amt(
                 symbol, bool(b_data.get('is_hedge_mode')), side=_side)
@@ -12283,12 +12324,24 @@ class CryptoTrader:
             pos_amt = None
         _others_filled = 0.0
         _owned_ids = set()
+        _other_active = 0
+        _dir_undeterminable = False
         try:
             for _bid, _bd in (all_states.get(symbol) or {}).items():
                 if not isinstance(_bd, dict):
                     continue
                 _owned_ids.update(str(_i) for _i in self._collect_batch_order_ids(_bd) if _i)
                 if _bid != batch_id and _bd.get('is_active'):
+                    _other_active += 1
+                    _oside = (_bd.get('side') or '').strip().upper()
+                    if _oside not in ('BUY', 'SELL'):
+                        # 方向未知 → 无法判断它是否占用本方向仓位，一律不计入，
+                        # 并在循环结束后整体拒绝清理（UNKNOWN ≠ EMPTY）
+                        _dir_undeterminable = True
+                        continue
+                    if _oside != _side:
+                        # 反向批次占用的是对向仓位，不能从本方向持仓里扣
+                        continue
                     _ta = _bd.get('target_amounts') or []
                     _n = int(_bd.get('last_filled_count') or 0)
                     if _n > 0:
@@ -12300,6 +12353,14 @@ class CryptoTrader:
                             pass
         except Exception as e:
             print(f"⚠️ [B1] 跨批次预计算异常: {e}")
+            return None
+        if _other_active > 0 and (not _side_known or _dir_undeterminable):
+            self._converge_alert(
+                ('direction_unknown', symbol, batch_id),
+                f"❌资金安全收敛 `{batch_id}`({symbol}) 同币存在 {_other_active} 个"
+                f"其他活跃批次但方向无法判定（本批次 side={_side_raw!r} / 其他批次含未知方向），"
+                f"拒绝清理——UNKNOWN ≠ EMPTY，Fail-Closed。",
+                level='critical')
             return None
         try:
             _contribution = float(pos_amt) - _others_filled
