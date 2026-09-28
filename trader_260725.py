@@ -8203,29 +8203,57 @@ class CryptoTrader:
                             settlement_qty = _net_qty
 
                             # 获取当前市价（平仓价格）
+                            # 🔴 P1 修正（2026-09-27，ChatGPT 复审；离线负测
+                            #    test_p1_settlement_price.py 驱动）：
+                            #   原实现取价失败 → exit_price = avg_price_net（成本价）
+                            #   → gross_pnl 恒为 0 → 报告发出「平仓价=持仓均价、
+                            #   名义盈亏 +0.00」的失真数字。而本块发完即
+                            #   converge + clear_batch_state（见 L8263-8265），批次消失，
+                            #   且 L8190 已把 settlement_reported=True 落账本
+                            #   （_persist_states）→ 失真报告成为终局，不存在重发通道。
+                            #   更坏的同源分支（复审未指出）：ticker 的 last/close 均为 0
+                            #   时 `or 0.0` 兜出 0.0 且【不抛异常】→ 走不到 except →
+                            #   gross_pnl = (0 − 均价) × 数量 → 报出巨额假亏损。
+                            #   修正：取价失败或非正价 → exit_price = None（不可用），
+                            #   报告如实标注不可计算，绝不以成本价 / 0 冒充。
+                            #   有价路径的输出与修正前逐字节相同（防基线漂移）。
                             try:
                                 ticker = self._safe_api_call(self.exchange.fetch_ticker, symbol)
-                                exit_price = float(ticker.get('last') or ticker.get('close') or 0.0)
+                                _ep = float(ticker.get('last') or ticker.get('close') or 0.0)
+                                exit_price = _ep if _ep > 0 else None
                             except Exception:
-                                exit_price = avg_price_net
+                                exit_price = None
+                            _price_ok = exit_price is not None
 
-                            # 计算盈亏
-                            if side == 'BUY':
-                                gross_pnl = (exit_price - avg_price_net) * settlement_qty
+                            # 计算盈亏（价格不可用 → 不计算，杜绝伪造数字）
+                            if _price_ok:
+                                if side == 'BUY':
+                                    gross_pnl = (exit_price - avg_price_net) * settlement_qty
+                                else:
+                                    gross_pnl = (avg_price_net - exit_price) * settlement_qty
+
+                                # 估算平仓手续费（市价平仓用 TAKER_FEE_RATE）
+                                exit_fee = exit_price * settlement_qty * TAKER_FEE_RATE
+                                # 🔥 T1-C：净份额（_fee_rem），根除全量再扣的显示双重扣
+                                total_fees = _fee_rem + exit_fee
+                                net_pnl = gross_pnl - total_fees
+
+                                capital_base = avg_price_net * settlement_qty if settlement_qty > 0 else 1
+                                net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
+                            pnl_emoji = ("🟢" if net_pnl >= 0 else "🔴") \
+                                if _price_ok else "⚠️"
+
+                            # 构建盈亏报告（分叉仅在价格不可用时生效，有价路径不变）
+                            if _price_ok:
+                                _line_price = f"💵 **平仓价格**：`{exit_price:.2f}` USDT"
+                                _line_gross = f"📊 **名义盈亏**：`{gross_pnl:+.2f}` USDT"
+                                _line_fees = f"💸 **总手续费**：`{total_fees:.4f}` USDT"
+                                _line_net = f"{pnl_emoji} **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%)"
                             else:
-                                gross_pnl = (avg_price_net - exit_price) * settlement_qty
-
-                            # 估算平仓手续费（市价平仓用 TAKER_FEE_RATE）
-                            exit_fee = exit_price * settlement_qty * TAKER_FEE_RATE
-                            # 🔥 T1-C：净份额（_fee_rem），根除全量再扣的显示双重扣
-                            total_fees = _fee_rem + exit_fee
-                            net_pnl = gross_pnl - total_fees
-
-                            capital_base = avg_price_net * settlement_qty if settlement_qty > 0 else 1
-                            net_pnl_pct = (net_pnl / capital_base) * 100 if capital_base > 0 else 0.0
-
-                            # 构建盈亏报告
-                            pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
+                                _line_price = "💵 **平仓价格**：⚠️ 不可用（本轮取价失败，未以成本价冒充）"
+                                _line_gross = "📊 **名义盈亏**：⚠️ 不可计算（缺平仓价）"
+                                _line_fees = f"💸 **总手续费**：`{_fee_rem:.4f}` USDT（仅入场手续费，平仓费不可算）"
+                                _line_net = "⚠️ **最终净盈亏**：不可计算（价格缺失，未回退成本价）"
                             pnl_msg = (
                                 f"📊 **[平仓结算]**\n\n"
                                 f"🆔 **批次号**：`{batch_id}`\n"
@@ -8234,11 +8262,11 @@ class CryptoTrader:
                                 f"📊 **平仓模式**：未知\n"
                                 f"📊 **已成交层数**：`{batch_filled_count}/{len(entry_orders)}`\n"
                                 f"📈 **持仓均价**：`{avg_price_net:.2f}` USDT\n"
-                                f"💵 **平仓价格**：`{exit_price:.2f}` USDT\n"
+                                f"{_line_price}\n"
                                 f"🔢 **平仓数量**：`{settlement_qty}`\n"
-                                f"📊 **名义盈亏**：`{gross_pnl:+.2f}` USDT\n"
-                                f"💸 **总手续费**：`{total_fees:.4f}` USDT\n"
-                                f"{pnl_emoji} **最终净盈亏**：`{net_pnl:+.2f}` USDT (`{net_pnl_pct:+.2f}%`)"
+                                f"{_line_gross}\n"
+                                f"{_line_fees}\n"
+                                f"{_line_net}"
                             )
 
                             print(f"\n{pnl_msg}")
