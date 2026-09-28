@@ -51,10 +51,49 @@ def _init_poll_tracking(fake):
     fake._poll_alert_lock = threading.Lock()
     fake._poll_alert_active = False
     fake._poll_alert_attempted = {}
+    fake._ready = True
+    fake._not_ready_reason = ""
     # 绑定新增告警方法（MagicMock 不会自动绑未在 REAL_HELPERS 中的新方法）
     fake._alert_poll_degraded = (
         lambda streak, stale, batch_id=None:
         CryptoTrader._alert_poll_degraded(fake, streak, stale, batch_id))
+    # 绑定启动重证所需 helper（recover_active_batches 会调用）。
+    # 不用 setattr 逐个挂 —— MagicMock 的 __setattr__ 与 getattr 互调会递归爆栈。
+    fake._run_position_census = lambda: []
+    fake._get_current_position_amt = lambda *a, **k: 0.0
+    for _h in ('_start_monitoring', '_converge_batch_orders_before_clear',
+               '_collect_batch_order_ids', '_verify_order_created',
+               '_prune_pending_sl_by_registry', '_handle_limit_close_on_recovery',
+               '_handle_partial_close_on_recovery', '_finalize_limit_full_fill',
+               '_rebuild_unresolved_entry_orders'):
+        if hasattr(CryptoTrader, _h):
+            mock.patch.object(
+                fake, _h,
+                (lambda n: lambda *a, **k: getattr(CryptoTrader, n)(fake, *a, **k))(_h)
+            ).start()
+    fake.clear_batch_state = lambda *a, **k: True
+
+
+def _realistic_seed(sp, **over):
+    """按建批真实语义播种：pending_sl_orders 含**全部入场层**（含未成交层预备项）。
+
+    另补 recover_active_batches 必需的完整批次字段（L3491-3507 直接下标访问）。
+    """
+    PR._seed(sp, **over)
+    b = json.load(open(sp, encoding='utf-8'))[SYMBOL][BATCH]
+    b['pending_sl_orders'] = [0]          # L7733-7735: last_filled_count=0 → 全层待挂
+    b.update({
+        'batch_total_amount': 0.43,
+        'is_hedge_mode': True,
+        'params_base': {'positionSide': 'LONG', 'leverage': 100},
+        'prepared_tp_params': {},
+        'layer_sl_params': [],
+        'filled_details': [58000.0],
+        'total_entry_fee': 0.15,
+    })
+    b.update(over)
+    with open(sp, 'w', encoding='utf-8') as f:
+        json.dump({SYMBOL: {BATCH: b}}, f, ensure_ascii=False, indent=2)
 
 
 def _drive_failing(fake, rounds=5):
@@ -94,6 +133,29 @@ class _EntryFake:
         self.tg_sent = []
         self.create_calls = []
         self._poll_degraded_batches = set()
+        self._registry_log = []            # (state, layer) —— 核对磁盘 registry 证据
+        self.is_active_seen = None         # save_batch_state 观测到的 is_active
+        self.persisted = {}                # 最终落盘视图
+
+    def _update_registry(self, symbol, batch_id, identity, state=None, **kw):
+        # identity 形如 batch|ENTRY|L{layer}|SIDE
+        try:
+            layer = int(str(identity).split('|L')[-1].split('|')[0])
+        except Exception:
+            layer = -1
+        self._registry_log.append((state, layer))
+
+    def save_batch_state(self, symbol, batch_id, data):
+        self.is_active_seen = data.get('is_active')
+        self.persisted[batch_id] = copy.deepcopy(data)
+        return True
+
+    def _persist_states(self, all_states):
+        self.persisted = copy.deepcopy(all_states)
+        return True
+
+    def load_all_states(self):
+        return {SYMBOL: {BATCH: dict(self.persisted.get(BATCH, {'is_active': False}))}}
 
     def _safe_api_call(self, fn, *a, **k):
         return fn(*a, **k)
@@ -107,15 +169,11 @@ class _EntryFake:
     def _get_today_realized_pnl(self, stats_file=None):
         return CryptoTrader._get_today_realized_pnl(self, stats_file)
 
-    def load_all_states(self):
-        return {}
-
     def _compute_signal_fingerprint(self, signal):
         return "fp-test"
 
     def _check_existing_conflicts(self, symbol, batch_id, all_states, fp):
         return False
-
     def _get_current_position_amt(self, *a, **k):
         return 0.0
 
@@ -132,16 +190,18 @@ class _EntryFake:
         return dict(k)
 
     def save_batch_state(self, symbol, batch_id, data):
+        self.is_active_seen = data.get('is_active')
+        self.persisted[batch_id] = copy.deepcopy(data)
         return True
-
-    def _update_registry(self, *a, **k):
-        return None
 
     def send_tg_notification(self, text, **k):
         self.tg_sent.append((k.get('level', 'info'), str(text)))
 
     def _send_email_alert(self, *a, **k):
         pass
+
+    def _start_monitoring(self, *a, **k):
+        return None          # 哨兵：不得真起监控线程（否则 AttributeError 被当拒绝）
 
 
 class _FakeSignal:
@@ -420,6 +480,195 @@ def test_block4_alert_retry_on_notify_false():
         trader_260725.STATE_FILE = PR._real_state_file
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ChatGPT 第三轮复审（4edd39a 不可合入）：3 阻断 + 2 口径
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── 阻断5：未成交层的预备项不得让降级永远不解锁 ──────────────────────────
+def test_block5_unfilled_entry_does_not_block_recovery():
+    d = tempfile.mkdtemp(prefix='blk5_')
+    sp = os.path.join(d, 'trade_state.json')
+    trader_260725.STATE_FILE = sp
+    try:
+        _realistic_seed(sp)          # pending_sl_orders=[0]（未成交层预备项）
+        fake = PR._make_fake(sp, PR._disk(sp))
+        _init_poll_tracking(fake)
+        ex = fake.exchange
+        ex.fetch_open_orders.side_effect = [
+            RuntimeError('f1'), RuntimeError('f2'), RuntimeError('f3')]
+        PR._drive(fake, None, max_rounds=3)
+        report('B5a 三轮失败后处于降级',
+               BATCH in fake._poll_degraded_batches,
+               f'degraded={fake._poll_degraded_batches}')
+        # 查询恢复：入场单仍在挂单中（未成交）→ 预备项不构成"确需保护" → 应解锁
+        ex.fetch_open_orders.side_effect = None
+        ex.fetch_open_orders.return_value = [{'id': ENTRY_ID, 'status': 'open'}]
+        PR._drive(fake, None, max_rounds=3)
+        report('B5b 未成交 ENTRY 恢复正常后应解锁',
+               BATCH not in fake._poll_degraded_batches,
+               f'恢复后 degraded={fake._poll_degraded_batches}'
+               f'（pending_sl_orders=[0] 为未成交层预备项，不得阻止解锁）')
+    finally:
+        trader_260725.STATE_FILE = PR._real_state_file
+
+
+# ── 阻断6：部分层已创建时不得返回 CLEAN_REJECT ───────────────────────────
+def test_block6_partial_create_not_clean_reject():
+    class _TwoLayerSignal(_FakeSignal):
+        def __init__(self):
+            super().__init__()
+            self.entries = [(77000.0, 0.43), (78000.0, 0.43)]
+            self.stop_loss_steps = [75000.0, 76000.0]
+
+    # 6a 零创建：先过前置暂停门 → 在**骨架落盘后、首层创建前**才降级
+    #     （这才是阻断2 的真实时序）；未尝试层应落 ABSENT，允许 CLEAN_REJECT。
+    #     注意 create_order 计数器只统计**真正发出的调用**，不能用它判"零副作用"。
+    f0 = _entry_fake_with_exchange()
+    f0.registry_layers = []          # 实际进入 create 的层
+    f0._state_lock = threading.RLock()
+    f0.load_all_states = lambda: f0.persisted
+    _orig_create0 = f0.exchange.create_order
+
+    def _spy_create0(**k):
+        f0.registry_layers.append(len(f0.registry_layers))
+        return _orig_create0(**k)
+    f0.exchange.create_order.side_effect = _spy_create0
+    _orig_save0 = f0.save_batch_state
+
+    def _save_then_pause0(*a, **k):
+        r = _orig_save0(*a, **k)
+        f0._poll_degraded_batches.add(BATCH)   # 骨架已落，此刻才降级
+        return r
+    f0.save_batch_state = _save_then_pause0
+    r0 = CryptoTrader.execute_signal(f0, _TwoLayerSignal())
+    reg0 = f0._registry_log
+    # identity 形如 batch|ENTRY|L0|LONG；层号从 '|L' 之后取（替身 parser 口径）
+    absent_layers = sorted(l for st, l in reg0 if st == 'ABSENT')
+    report('B6a 零创建：未尝试层落 ABSENT 且可 CLEAN_REJECT',
+           r0 == 'CLEAN_REJECT'
+           and len(f0.registry_layers) == 0
+           and absent_layers == [0, 1],
+           f'返回={r0!r}，实际 create 层={f0.registry_layers}（应空），'
+           f'ABSENT 层={absent_layers}（应 [0,1]），原始 registry={reg0}')
+
+    # 6b 部分创建：第 1 层成功后第 2 层才被暂停 → 不得 CLEAN_REJECT
+    f1 = _entry_fake_with_exchange()
+    f1.registry_layers = []
+    f1._state_lock = threading.RLock()     # 空骨架停用路径需要
+    f1.load_all_states = lambda: f1.persisted
+    n = {'c': 0}
+    _orig_create = f1.exchange.create_order
+
+    def _create_then_pause(**k):
+        f1.registry_layers.append(n['c'])
+        n['c'] += 1
+        r = _orig_create(**k)
+        if n['c'] >= 1:
+            f1._poll_degraded_batches.add(BATCH)   # 第 2 层前降级
+        return r
+    f1.exchange.create_order.side_effect = _create_then_pause
+    r1 = CryptoTrader.execute_signal(f1, _TwoLayerSignal())
+    reg1 = f1._registry_log
+    report('B6b 部分创建：不得返回 CLEAN_REJECT（须保留证据）',
+           r1 != 'CLEAN_REJECT' and len(f1.registry_layers) >= 1,
+           f'返回={r1!r}（应非 CLEAN_REJECT），实际 create 层={f1.registry_layers}，'
+           f'registry={reg1}')
+    # ⚠️ 口径边界（如实登记）：B6c/B6d 只用**本替身可观测**的落盘证据断言。
+    # `_update_registry` 在本替身上未被真实调用链命中（registry 观测为空），
+    # 说明 create 后的 registry 写入路径在本替身下保真度不足 —— 不能宣称
+    # "PENDING_VERIFY 证据已验证"。这一条留给下一轮用真实 registry 替身核对。
+    report('B6c [保真度不足] registry 证据未取得（不得宣称已验证）',
+           False,
+           f'registry 观测={reg1}（替身未命中真实 _update_registry 调用链）')
+    report('B6d 部分创建：返回 None 后批次保持 active 交监控',
+           f1.is_active_seen is True,
+           f'is_active 落盘观测={f1.is_active_seen}')
+
+
+# ── 阻断7：降级后重启，启动重证未过 → 禁止新 ENTRY ───────────────────────
+def test_block7_restart_reverify_blocks_new_entry():
+    d = tempfile.mkdtemp(prefix='blk7_')
+    sp = os.path.join(d, 'trade_state.json')
+    trader_260725.STATE_FILE = sp
+    try:
+        _realistic_seed(sp)
+        # 模拟重启后：内存降级集合为空（丢失），但订单查询失败
+        fake = PR._make_fake(sp, PR._disk(sp))
+        _init_poll_tracking(fake)
+        fake.exchange.fetch_open_orders.side_effect = RuntimeError('查询失败')
+        ok = CryptoTrader.recover_active_batches(fake)
+        report('B7a 重启后查询失败 → recover 返回 False（保持未就绪）',
+               ok is False, f'返回={ok!r}')
+        report('B7b 重证未过 → _ready 保持 False（禁止新 ENTRY）',
+               fake._ready is False,
+               f'_ready={fake._ready}，reason={fake._not_ready_reason!r}')
+        # 证明 _ready=False 确实拦住新 ENTRY（SG1 门）
+        ef = _entry_fake_with_exchange()
+        ef._ready = False
+        ef._not_ready_reason = '启动重证未通过'
+        ret = CryptoTrader.execute_signal(ef, _FakeSignal())
+        report('B7c 未就绪时新 ENTRY 被拦（create=0）',
+               len(ef.create_calls) == 0,
+               f'create 次数={len(ef.create_calls)}，返回={ret!r}')
+    finally:
+        trader_260725.STATE_FILE = PR._real_state_file
+
+
+# ── 口径：send_tg_notification 返回 None（未配 TG）不得记成已送达 ────────
+def test_block8_notify_none_is_not_delivered():
+    d = tempfile.mkdtemp(prefix='blk8_')
+    sp = os.path.join(d, 'trade_state.json')
+    trader_260725.STATE_FILE = sp
+    try:
+        _realistic_seed(sp)
+        fake = PR._make_fake(sp, PR._disk(sp))
+        _init_poll_tracking(fake)
+        calls = []
+        fake.send_tg_notification = (
+            lambda text, **k: (calls.append(k.get('level')), None)[1])  # 返回 None
+        fake.exchange.fetch_open_orders.side_effect = RuntimeError('持续失败')
+        PR._drive(fake, None, max_rounds=6)
+        report('B8a 通知返回 None → 不得记成已送达（保留重试）',
+               fake._poll_alert_active is False,
+               f'_poll_alert_active={fake._poll_alert_active}'
+               f'（应 False → 保留重试资格），尝试次数={len(calls)}')
+        report('B8b 通知返回 None 时仍有有限重试',
+               len(calls) >= 2, f'6 轮内尝试={len(calls)} 次（应 ≥2）')
+    finally:
+        trader_260725.STATE_FILE = PR._real_state_file
+
+
+# ── 口径：真实双批次时序（A 失败、B 成功）不得被 B 遮住 A 的陈旧 ────────
+def test_block9_real_dual_batch_stale():
+    d = tempfile.mkdtemp(prefix='blk9_')
+    sp = os.path.join(d, 'trade_state.json')
+    trader_260725.STATE_FILE = sp
+    try:
+        _realistic_seed(sp)
+        fake = PR._make_fake(sp, PR._disk(sp))
+        _init_poll_tracking(fake)
+        BATCH_B = 'batch_pollrec_002'
+        # 真实驱动：A 连续失败 ≥3 轮 → 应降级（与 B 无关）
+        fake.exchange.fetch_open_orders.side_effect = RuntimeError('A 失败')
+        PR._drive(fake, None, max_rounds=3)
+        report('B9a A 连续失败后降级',
+               BATCH in fake._poll_degraded_batches,
+               f'A degraded={fake._poll_degraded_batches}')
+        # B 成功一次 → 更新 **B 自己** 的 last_success_time，不得覆盖 A 的判据
+        fake._poll_last_success_time[BATCH_B] = time.time()
+        fake._poll_degraded_batches.discard(BATCH)      # 复位
+        fake._poll_fail_streak[BATCH] = 1
+        fake._poll_first_fail_time[BATCH] = time.time() - 9999.0  # A 早已失明
+        fake.exchange.fetch_open_orders.side_effect = RuntimeError('A 失败')
+        PR._drive(fake, None, max_rounds=1)
+        report('B9b B 成功不遮住 A 的陈旧（A 应仍降级）',
+               BATCH in fake._poll_degraded_batches,
+               f'A degraded={fake._poll_degraded_batches}；'
+               f'last_success_time={fake._poll_last_success_time}')
+    finally:
+        trader_260725.STATE_FILE = PR._real_state_file
+
+
 def main():
     tests = [
         test_single_batch_persistent_failure_alerts_and_marks_degraded,
@@ -428,7 +677,12 @@ def main():
         test_complete_recovery_after_failure,
         test_notification_exception_kills_nothing,
         test_existing_sl_tp_and_monitor_not_touched,
-        # ── ChatGPT 第二轮复审：4 个阻断项负测 ──
+        # ═══ ChatGPT 第三轮复审（4edd39a 不可合入）═══
+        test_block5_unfilled_entry_does_not_block_recovery,
+        test_block6_partial_create_not_clean_reject,
+        test_block7_restart_reverify_blocks_new_entry,
+        test_block8_notify_none_is_not_delivered,
+        test_block9_real_dual_batch_stale,
         test_block1_fetch_order_failure_keeps_degraded,
         test_block2_degrade_after_check_blocks_entry_create,
         test_block3_per_batch_stale_not_masked_by_other_batch,
