@@ -335,10 +335,35 @@ def t99_production_files_untouched():
                not diff, 'diff=%s' % diff)
     try:
         import trader_260725 as _tr
-        in_prod = os.path.abspath(str(getattr(_tr, 'STATE_FILE', ''))) \
-            .startswith(_PROD_DIR + os.sep)
-        check('T99 未把生产目录写进被测模块 STATE_FILE', not in_prod,
-              'STATE_FILE=%s' % getattr(_tr, 'STATE_FILE', '<未设置>'))
+        sf = str(getattr(_tr, 'STATE_FILE', '<未设置>'))
+        in_prod = os.path.abspath(sf).startswith(_PROD_DIR + os.sep)
+        here = os.path.dirname(os.path.abspath(__file__))
+        if os.path.abspath(here) == _PROD_DIR:
+            # ── 位置分流（2026-09-28）────────────────────────────
+            # 部署清单 §步骤 4 写死了 `Set-Location G:\my-crypto-bot` 再跑
+            # `run_test_gate.py --strict`，且判据是 `EXIT=2 / 脚本式 FAIL=0`、
+            # `EXIT=1 → ⛔ 阻断启动`。在该位置，被测模块**必然**是生产那份、
+            # `STATE_FILE` **必然**指生产账本 —— 这是清单要求的运行位置，
+            # 不是缺陷。原断言 `not in_prod` 在这里 100% 红，等于拿一个
+            # 该位置永远不成立的条件去阻断启动（首次合并后实测 FAIL 1、EXIT=1）。
+            #
+            # 因此在生产位置改断言成**该位置下能成立且有意义**的那条：
+            # 被测模块确实是本目录的 trader_260725.py，也就是 `H.SRC` 读的那份
+            # （test_v64_partial_close.py:22 `TRADER_PATH = os.path.join(_HERE, ...)`）。
+            # 即「测的就是生产这份、没有测到别的副本」——顺带堵住部署记录
+            # §7-3 提的「工件全绿可能是假绿」。
+            #
+            # ⚠️ 生产免疫**不因此减弱**：仍由上面那条「内容+mtime_ns 零变化」
+            # 断言保证（`_run` 前后各取一次样，任何写入都会被抓到，且该断言
+            # 与运行位置无关、在两个目录都生效）。这里不再把「位置」当「免疫」用。
+            expect = os.path.abspath(os.path.join(here, 'trader_260725.py'))
+            actual = os.path.abspath(str(getattr(_tr, '__file__', '') or ''))
+            check('T99 生产目录运行：被测模块就是本目录那份 trader（与 H.SRC 同源）',
+                  actual == expect, 'module=%s' % actual)
+        else:
+            # 工件目录运行：护栏原样保留，强度不变。
+            check('T99 未把生产目录写进被测模块 STATE_FILE', not in_prod,
+                  'STATE_FILE=%s' % sf)
     except Exception as e:
         check('T99 被测模块可读', False, repr(e))
     return ok
