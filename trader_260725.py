@@ -8208,7 +8208,9 @@ class CryptoTrader:
                             #   原实现取价失败 → exit_price = avg_price_net（成本价）
                             #   → gross_pnl 恒为 0 → 报告发出「平仓价=持仓均价、
                             #   名义盈亏 +0.00」的失真数字。而本块发完即
-                            #   converge + clear_batch_state（见 L8263-8265），批次消失，
+                            #   收敛（converge）+ 清理批次账本（见本块末尾的
+                            #   _converge_batch_orders_before_clear → clear_batch_state
+                            #   → break），批次消失，
                             #   且 L8190 已把 settlement_reported=True 落账本
                             #   （_persist_states）→ 失真报告成为终局，不存在重发通道。
                             #   更坏的同源分支（复审未指出）：ticker 的 last/close 均为 0
