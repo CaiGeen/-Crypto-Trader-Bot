@@ -464,6 +464,15 @@ class CryptoTrader:
         self.registry_self_heal_interval = 30  # 秒
         self.self_heal_escalate_rounds = 10    # 连续未确认轮数（约 5 分钟）
         self._self_heal_unconfirmed_rounds = {}  # (symbol, batch_id, identity) → 连续未确认轮次
+        # 🔥 R1/R2: 连续轮询失败降级跟踪（2026-09-28 复审修复）
+        # 缺陷：fetch_open_orders 持续失败 → 成交识别被跳过 → 止损补挂延后，且全程无告警、
+        # 无升级、无上限；批次进度在查询之前刷新 → 独立巡检的 batch_stalled 永不触发。
+        self._poll_fail_streak = {}           # batch_id → 连续失败次数
+        self._poll_first_fail_time = {}       # batch_id → 本次连续失败首次时间
+        self._poll_last_success_time = 0.0    # 全局：最后一次成功完成业务处理的时间
+        self._poll_degraded_batches = set()   # 当前降级的 batch_id 集合（全局暂停依据）
+        self._poll_alert_lock = threading.Lock()
+        self._poll_alert_active = False       # 本故障周期是否已告警（去重）
         # F4b（事件3通知风暴，2026-08-21）：进程启动时刻——自愈 MISMATCH 针对启动前历史条目
         # （updated_at < _process_start_ts）降级为 info 不告警：重启时的状态同步 ≠ 新资金风险。
         # 边界：升级告警（连续 10 轮 ≈5 分钟仍查不到）不降级——持续查不到是真实异常，须人工核实。
@@ -903,6 +912,27 @@ class CryptoTrader:
             return False
         except Exception:
             return False
+
+    def _alert_poll_degraded(self, streak, stale):
+        """R1/R2: 监控降级 critical 告警（锁外、异常安全、按故障周期去重）。
+
+        ChatGPT 裁定：通知失败不得杀监控；暂停状态必须先于通知设置；
+        按故障周期去重，持续故障时有限提醒。
+        """
+        with self._poll_alert_lock:
+            if self._poll_alert_active:
+                return  # 本故障周期已告警
+            self._poll_alert_active = True
+        # 锁外发送（不持锁，避免通知阻塞监控）
+        try:
+            self.send_tg_notification(
+                f"🚨【资金安全】监控降级告警\n"
+                f"📉 连续失败 {streak} 轮 / 数据陈旧 {stale:.0f}s\n"
+                f"💡 程序无法可靠获取订单数据，已暂停新增风险。\n"
+                f"⚠️ 请人工核对交易所实际仓位与保护单状态。",
+                level='critical')
+        except Exception as e:
+            print(f"⚠️ [POLL] 降级告警发送失败（不影响监控）: {e}")
 
     def send_tg_notification(self, text: str, reply_markup=None, level: str = 'info'):
         """
@@ -6019,6 +6049,24 @@ class CryptoTrader:
             else:
                 print("✅ 资金校验通过，余额充裕，开始发布条件挂单...\n")
 
+            # 🔥 R1/R2: 监控降级时拒绝新信号（Fail-Closed，任何调用路径必经）。
+            # 位置：所有前置门闸（含余额）之后、任何副作用（骨架/create_order）之前。
+            # 覆盖时序：信号已通过前置检查、期间另一线程才报故障 → 此处复核仍拦截。
+            if self._poll_degraded_batches:
+                print(f"🚫 [POLL] 监控降级中，拒绝新信号 [{batch_id}] ({symbol}): "
+                      f"降级批次={self._poll_degraded_batches}")
+                try:
+                    self.send_tg_notification(
+                        f"🚨【资金安全】监控降级，新信号被拒绝\n"
+                        f"🆔 批次：`{batch_id}` ({symbol})\n"
+                        f"📉 降级批次：{self._poll_degraded_batches}\n"
+                        f"💡 程序无法可靠监控订单数据，已暂停新增风险。\n"
+                        f"⚠️ 请人工核对交易所实际仓位与保护单状态。",
+                        level='critical')
+                except Exception:
+                    pass
+                return None
+
             entry_orders = []
             target_amounts = []
             active_stop_steps = []
@@ -7724,6 +7772,18 @@ class CryptoTrader:
         # P1-2: 连续网络错误计数器（用于动态降速，避免加重限流）
         consecutive_network_errors = 0
 
+        # 🔥 R1/R2: 降级跟踪变量初始化（per-batch，测试 fake 可能不跑 __init__）
+        for _attr, _default in (
+                ('_poll_fail_streak', {}),
+                ('_poll_first_fail_time', {}),
+                ('_poll_degraded_batches', set()),
+                ('_poll_last_success_time', time.time()),
+                ('_poll_alert_active', False)):
+            if not isinstance(getattr(self, _attr, None), type(_default)):
+                setattr(self, _attr, _default)
+        if not isinstance(getattr(self, '_poll_alert_lock', None), type(threading.Lock())):
+            self._poll_alert_lock = threading.Lock()
+
         if filled_details is None or len(filled_details) != len(entry_orders):
             filled_details = [0.0] * len(entry_orders)
 
@@ -7861,7 +7921,19 @@ class CryptoTrader:
                     continue
                 except Exception as e:
                     consecutive_network_errors += 1
+                    # 🔥 R1/R2: 逐批失败跟踪（恢复须在业务处理后，不在此宣称）
+                    _streak = self._poll_fail_streak.get(batch_id, 0) + 1
+                    self._poll_fail_streak[batch_id] = _streak
+                    if _streak == 1:
+                        self._poll_first_fail_time[batch_id] = time.time()
                     print(f"⚠️ 获取未结订单失败 (连续 {consecutive_network_errors} 次，已降速)，等待下一次轮询: {e}")
+                    # 告警阈值：连续 3 轮 或 数据陈旧达设定时长（不承诺固定发现时延）
+                    _stale = (time.time() - self._poll_last_success_time
+                              if self._poll_last_success_time > 0 else 0.0)
+                    if _streak >= 3 or _stale >= 120.0:
+                        if batch_id not in self._poll_degraded_batches:
+                            self._poll_degraded_batches.add(batch_id)
+                            self._alert_poll_degraded(_streak, _stale)
                     continue
 
                 batch_filled_count = 0
@@ -7988,6 +8060,18 @@ class CryptoTrader:
 
                         except Exception as e:
                             print(f"⚠️ 补查开仓订单 {order_id_raw} 状态失败 ({e})，将在下一轮重试...")
+
+                # 🔥 R1/R2: 恢复判定——成交识别 + 保护处理完成后才可解除降级。
+                # 不在此宣称恢复（原 L7855 在 fetch 成功时即重置，过早：fetch_order 可能仍失败）。
+                if self._poll_fail_streak.get(batch_id, 0) > 0:
+                    self._poll_fail_streak[batch_id] = 0
+                    self._poll_first_fail_time.pop(batch_id, None)
+                    self._poll_last_success_time = time.time()
+                    if batch_id in self._poll_degraded_batches:
+                        self._poll_degraded_batches.discard(batch_id)
+                        if not self._poll_degraded_batches:
+                            self._poll_alert_active = False
+                            print("✅ [POLL] 全部批次监控恢复")
 
                 # 🔥 如果有新成交的层，发送合并通知
                 if newly_filled_layers:

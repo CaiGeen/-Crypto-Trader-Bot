@@ -65,6 +65,7 @@ REAL_HELPERS = (
     "_recheck_registry_self_heal", "_is_stale_pre_launch_entry",
     "_place_prepared_orders_immediately", "_monitor_lifecycle_check",
     "_calculate_monitoring_interval", "_get_active_batch_count",
+    "_alert_poll_degraded",
 )
 
 
@@ -278,7 +279,10 @@ def check_t1_recovers_and_places_sl_after_failed_round():
 
 
 # --------------------------------------------------------------------------
-# T2：该失败分支有无 TG / 有无本地「停止新风险」标志
+# T2：持续失败是否触发 critical 告警（R1/R2 修复后）
+#
+# 修复前：失败分支静默（无告警、无升级、无上限）—— 缺陷。
+# 修复后：连续 3 轮失败 → critical 告警 + 该批次标记降级。
 #
 # ⚠️ 口径边界（勿扩大）：只覆盖**这一个监控分支**。本文件**未**驱动新的开仓信号去
 # 验证账户级风险闸门（RISK_MAX_ACTIVE_BATCHES / 余额阻断等）在该场景下是否有反应，
@@ -286,7 +290,7 @@ def check_t1_recovers_and_places_sl_after_failed_round():
 # 本文件不得被引用为该结论的证据。
 # --------------------------------------------------------------------------
 
-def check_t2_failed_poll_path_has_no_alert():
+def check_t2_persistent_failure_alerts():
     d = tempfile.mkdtemp(prefix="pollrec_")
     state_path = os.path.join(d, "trade_state.json")
     trader_260725.STATE_FILE = state_path
@@ -296,20 +300,19 @@ def check_t2_failed_poll_path_has_no_alert():
         fake = _make_fake(state_path, states)
         ex = fake.exchange
 
-        # 每一轮都失败 → 只走「计数 + print + continue」
+        # 每一轮都失败 → 第 3 轮起应触发 critical 告警
         ex.fetch_open_orders.side_effect = RuntimeError("持续失败")
 
         rounds, err = _drive(fake, None, max_rounds=3)
 
         report(
-            "T2 该失败分支：未发 TG、未设本地停止新风险标志（仅限本分支）",
-            len(fake.sent) == 0,
-            f"驱动轮次={rounds}，驱动异常={err!r}，"
-            f"send_tg_notification 记录={fake.sent}（应为空 → 无告警），"
-            f"_send_email_alert 未被调用（桩）")
+            "T2 持续失败达阈值 → 发出 critical 告警",
+            len(fake.sent) >= 1,
+            f"驱动轮次={rounds}，send_tg_notification 记录={fake.sent}"
+            f"（应 ≥1 → 有告警）")
 
         report(
-            "T2b 连续失败只累加计数，无升级/无上限（当前行为）",
+            "T2b 连续失败只累加计数，成交识别被跳过",
             ex.fetch_order.call_count == 0,
             f"失败 {rounds} 轮内 fetch_order 调用={ex.fetch_order.call_count} 次"
             f"（0 = 成交识别整段被 continue 跳过）；"
@@ -320,7 +323,7 @@ def check_t2_failed_poll_path_has_no_alert():
 
 CHECKS = [
     check_t1_recovers_and_places_sl_after_failed_round,
-    check_t2_failed_poll_path_has_no_alert,
+    check_t2_persistent_failure_alerts,
 ]
 
 

@@ -54,7 +54,8 @@ def _module_assigns(tree, src, prefixes):
 
 
 # 共享命名空间：函数间经 global 名互相解析（与生产模块语义一致）
-NS = {'uuid': __import__('uuid'), 'time': __import__('time'), 'math': __import__('math')}
+NS = {'uuid': __import__('uuid'), 'time': __import__('time'), 'math': __import__('math'),
+      'threading': __import__('threading')}
 NS.update(_module_assigns(TREE, SRC, ('_MERGE', '_PARTIAL', '_partial_resize', 'TAKER',
                                        'MAKER', 'CONSERVATION', 'TOMBSTONE')))
 OWNER_FN = _extract(TREE, SRC, '_partial_resize_owner_ok', NS)
