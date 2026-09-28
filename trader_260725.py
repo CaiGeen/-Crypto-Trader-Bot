@@ -12274,8 +12274,19 @@ class CryptoTrader:
             if isinstance(_o, dict) and _o.get('id'):
                 _open_map[str(_o['id'])] = _o
         open_orders = list(_open_map.values())
-        # ② D-B1 贡献扣减：symbol 持仓（绝对值）− 其他活跃批次已成交贡献
-        _side = b_data.get('side') or 'BUY'
+        # ② D-B1 贡献扣减：symbol 持仓（目标方向，绝对值）−【同方向】其他活跃批次已成交贡献
+        # 🔴 P0 修正（2026-09-27，ChatGPT 复审；离线负测 test_b1_converge_side_filter.py 驱动）：
+        #   pos_amt 经 _get_current_position_amt 取得，对冲模式下只认目标方向（L4152-4155），
+        #   而此处原先把同 symbol 【全部】其他活跃批次的账面成交量不分方向累加 →
+        #   双向并存时 contribution 被人为压到 0 → 误判 position_zero →
+        #   L1 撤掉本批次保护单（含 SL）→ 产出合法 proof → clear_batch_state 删除账本，
+        #   而交易所仓位仍在 = 裸仓 + 无止损 + 账本已删。
+        #   两条约束：(a) 贡献扣减只统计【目标方向】的其他批次；
+        #             (b) 方向不可判定（本批次或任何其他活跃批次）→ 拒绝清理，Fail-Closed。
+        #   无其他活跃批次时完全保留既有行为（单批次回归护栏，T4c）。
+        _side_raw = (b_data.get('side') or '').strip().upper()
+        _side_known = _side_raw in ('BUY', 'SELL')
+        _side = _side_raw if _side_known else 'BUY'   # 仅供下方持仓查询，语义与旧版一致
         try:
             pos_amt = self._get_current_position_amt(
                 symbol, bool(b_data.get('is_hedge_mode')), side=_side)
@@ -12283,12 +12294,24 @@ class CryptoTrader:
             pos_amt = None
         _others_filled = 0.0
         _owned_ids = set()
+        _other_active = 0
+        _dir_undeterminable = False
         try:
             for _bid, _bd in (all_states.get(symbol) or {}).items():
                 if not isinstance(_bd, dict):
                     continue
                 _owned_ids.update(str(_i) for _i in self._collect_batch_order_ids(_bd) if _i)
                 if _bid != batch_id and _bd.get('is_active'):
+                    _other_active += 1
+                    _oside = (_bd.get('side') or '').strip().upper()
+                    if _oside not in ('BUY', 'SELL'):
+                        # 方向未知 → 无法判断它是否占用本方向仓位，一律不计入，
+                        # 并在循环结束后整体拒绝清理（UNKNOWN ≠ EMPTY）
+                        _dir_undeterminable = True
+                        continue
+                    if _oside != _side:
+                        # 反向批次占用的是对向仓位，不能从本方向持仓里扣
+                        continue
                     _ta = _bd.get('target_amounts') or []
                     _n = int(_bd.get('last_filled_count') or 0)
                     if _n > 0:
@@ -12300,6 +12323,14 @@ class CryptoTrader:
                             pass
         except Exception as e:
             print(f"⚠️ [B1] 跨批次预计算异常: {e}")
+            return None
+        if _other_active > 0 and (not _side_known or _dir_undeterminable):
+            self._converge_alert(
+                ('direction_unknown', symbol, batch_id),
+                f"❌资金安全收敛 `{batch_id}`({symbol}) 同币存在 {_other_active} 个"
+                f"其他活跃批次但方向无法判定（本批次 side={_side_raw!r} / 其他批次含未知方向），"
+                f"拒绝清理——UNKNOWN ≠ EMPTY，Fail-Closed。",
+                level='critical')
             return None
         try:
             _contribution = float(pos_amt) - _others_filled
