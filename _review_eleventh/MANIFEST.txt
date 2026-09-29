@@ -1,0 +1,171 @@
+第十一轮复审附件 —— 三项口径收口：critical 送达判定 / 退出文案代次陈述 / 写盘成功判定
+=======================================================================
+生成日期：2026-09-29
+候选分支：fix/converge-side-attribution，HEAD=72a6311（本轮改动**全部未提交**）
+生产对照：G:\my-crypto-bot，HEAD=4f0afb4（只读，未改动、未重启、未动真实订单）
+
+上一轮（第十轮）的账本竞态已按复审意见收口并**从阻断清单移除**；
+本轮处理的是复审提出的三项口径问题。
+
+
+一、附件清单与哈希
+-----------------------------------------------------------------------
+[1] candidate-working-overlay.patch
+    基准：候选 HEAD 72a6311（工作树相对 HEAD 的差异，即"本轮改了什么"）
+    6 文件 / +2055 / -213 / 174436 bytes / 57 个 hunk
+    sha256 = 6d4f65eabcc1024648e6a1228ba01eb7a9fa5688407a2aa35d4bab8b382adbd8
+    自检（必须 rc=0）：
+      cd G:\my-crypto-bot-wt
+      cmd /c "git apply --cached --check _review_eleventh\candidate-working-overlay.patch"
+    基准反证（必须失败 rc=1，成功即说明基准被混用）：
+      cmd /c "git -C G:\my-crypto-bot apply --check G:\my-crypto-bot-wt\_review_eleventh\candidate-working-overlay.patch"
+    实测：自检 rc=0，反证 rc=1。
+
+[2] production-to-candidate-72a6311.patch
+    基准：生产 HEAD 4f0afb4（候选分支提交 + 本轮未提交改动的累计差异）
+    17 文件 / +4539 / -283 / 322660 bytes
+    sha256 = 4f39d0eb0866868713d456c84e29ad1829187e1c46e82455c363a02309a9c6a3
+    自检（必须 rc=0）：
+      cmd /c "git -C G:\my-crypto-bot apply --check G:\my-crypto-bot-wt\_review_eleventh\production-to-candidate-72a6311.patch"
+    实测：rc=0。
+
+    两份补丁均为 UTF-8 无 BOM（首 4 字节 = 64 69 66 66 = "diff"，已核）。
+    导出一律用 cmd /c "git diff ... > file"；PowerShell Out-File -Encoding utf8
+    会写 BOM（EF BB BF）→ git 报 "corrupt patch"。
+
+[3] 本文件 MANIFEST.txt
+
+[4] sweep_runner.py
+    全量 sweep 的执行器（逐个跑根目录 test_*.py，打印 rc 与耗时，单脚本超时 900s）。
+
+[5] sweep_output.txt
+    本轮 sweep 的原始输出（UTF-8 无 BOM，68 行）：每个脚本的 rc/耗时、
+    汇总行 `total=56 rc0=53 nonzero=3 elapsed=491s`、三个非零项的失败摘要。
+
+overlay 覆盖的 6 个文件：
+    R1R2_收敛审查_验收契约矩阵.md      +231  -10
+    test_gate_baseline.py             +116  -30
+    test_monitor_poll_recovery.py     +1003  -1
+    test_poll_degradation.py          +148  -37
+    test_sg3_p1.py                    +11   -5
+    trader_260725.py                  +546  -130
+累计补丁 17 个文件 = 上述 6 个 + .gitignore / run_test_gate.py /
+    strategies_backtest{PROJECT_OVERVIEW.md, cache/README.md, compare_latest_vs_mark.py,
+    config.py, fetch_markprice.py, mark_price_check.py} /
+    test_b2_create_gate.py / test_v64_p3_lifecycle.py / test_v64_partial_close.py
+
+
+二、本轮改动索引（行号 = 当前工作树）
+-----------------------------------------------------------------------
+trader_260725.py
+  :8444   _write_monitor_error_if_owner(symbol, batch_id, generation)
+             —— 「代次判定 + 读账本 + 改字段 + save_batch_state 写盘」在**同一段**临界区内
+  :8478       with self._active_monitors_lock:        （临界区唯一入口）
+  :8479       判定（≠ 当前登记代次 → 'not_owner'）
+  :8482-8489  load_all_states → b_data['monitor_error']=True → save_batch_state
+  :8489       本轮改动③：return 'written' if _rc is True else 'persist_failed'
+             （原判据 `_rc is False` 才算失败 → 返回 None 会被当成"已落盘"）
+  :10823  本轮改动①：_alert_ok = self.send_tg_notification(...)   ← 网络，锁外
+  :10828  本轮改动②：文案改为按代次陈述（退出代次 ID + 本代次已终止 +
+             "若期间已有新代次接管…否则不再自动补挂" + "请按当前登记代次核实"）
+  :10835      if _alert_ok is True:            ← 只有 True 才算确认送达
+  :10837          _monitor_lifecycle['failure_alerted'] = True
+  :10839      else: print(... 未确认送达（返回 ...）→ failure_alerted 保持 False ...)
+  :10849  _w1_verdict = self._write_monitor_error_if_owner(...)
+
+test_monitor_poll_recovery.py
+  :38     import ast
+  :63     REAL_HELPERS（含第十一轮补绑的同名方法）
+  :195    _record_save 记录式桩 → **return True**（桩保真度修正：
+             save_batch_state 契约仅返回 True 表示已持久化，回 None 会被 is True 判失败）
+  :990    _s6j_run(register_during_notify)          ← 第十轮的受控并发（本轮未改语义）
+  :1085   check_s6_monitor_error_write_is_atomic()  → S6j-1 / S6j-1b / S6j-2 / S6j-3
+  :1133   本轮新增 S6j-1c：退出告警文案必须按代次陈述
+  :1198   本轮新增 _s6k_run(send_return, save_return)
+             —— 告警返回值与写盘返回值都**可指定**；load_all_states 换成每次返回
+                新对象（对齐生产"按盘读"），避免 helper 的原地改字段被断言直接看见
+  :1269   本轮新增 check_s6_alert_and_write_confirm_use_strict_success()
+             → S6k-1(False) / S6k-2(None) / S6k-3(True 阳性对照) / S6k-4(写盘 None)
+  :1337   CHECKS 登记
+
+R1R2_收敛审查_验收契约矩阵.md
+  矩阵新增 S6k-1/2/3、S6k-4、S6j-1c 三行；新增「五-4 第十一轮复审的三项收口」；
+  「六、已知未验证项」补 S6k（桩返回值）与 S6j-1c（文案）的适用边界。
+
+
+三、本轮证据
+-----------------------------------------------------------------------
+[测试] test_monitor_poll_recovery.py：30/30 通过 rc=0（第十轮 25 条 + 本轮 5 条）
+       · S6k-1 send 返回 False → 不记 failure_alerted + 保留接管收尾补发 + 有"未确认送达"日志
+       · S6k-2 send 返回 None  → 同上（未配置 TG 的真实返回值就是 None）
+       · S6k-3 阳性对照 send 返回 True → 记 failure_alerted、补发**必须消失**
+       · S6k-4 save_batch_state 返回 None → 判 persist_failed、无"已写入"日志、账本无标记
+       · S6j-1c 退出告警不含"该批次监控已终止"，且必须含"退出代次/本代次/当前登记代次"
+
+[变异] 三条，各证明一条新判据有牙齿（跑完均原样还原 + py_compile 通过）：
+       变异① 告警门去掉 is True（无条件置位）
+              → S6k-1、S6k-2 变红；S6k-3 阳性对照仍绿
+       变异② 写盘判据回退成 `_rc is False` 才失败
+              → **仅 S6k-4 变红**
+       变异③ 退出文案回退成批次级断言（"该批次监控已终止"）
+              → **仅 S6j-1c 变红**（S6i-3 仍绿属设计：它只断言"确实发了退出告警"，
+                不看措辞，措辞判据归 S6j-1c）
+       （第十轮两条变异仍成立：判定改 if False → S6j-1/3 红；摘掉代次锁 → 仅 S6j-3 红）
+
+[sweep] 全量 56 个根目录 test_*.py，本轮实测（耗时 491s）：
+        rc=0 = 53/56；非零 3 项 ——
+          test_orphan_guard.py = 42（既有，已登记）
+          test_m2_m4_maintenance.py = 1（既有失败，与生产 HEAD 复跑身份一致）
+          test_recover_semantics.py = 1（既有失败，同上）
+        → **本轮新增 rc=1 为零**
+        完整门禁 run_test_gate.py rc=3 **未执行**（运行中生产 Bot 拒绝；
+          需停机窗口或明确授权 --allow-live）→ 不得称"发布通过"
+
+[静态] py_compile：trader_260725.py / test_monitor_poll_recovery.py 均 0
+       git diff --check：rc=0
+       run_test_gate.py 本轮未被修改
+
+
+四、如实登记的边界与残余（不得宣称已验证）
+-----------------------------------------------------------------------
+1. S6k 的 False/None/True 是**桩注入的返回值**：证明"非 True 不得记成已告警/已落盘"
+   这条判据有牙齿；**不**证明真实 Telegram / 邮件通道在该时点的实际投递结果。
+   `send_tg_notification` 未配置 TG 时返回 None 这一事实来自第三轮复审与源码
+   （:1102-1115 成功才 return True，超时/请求失败 return False），不是本轮实测投递。
+2. save_batch_state 在**失败路径**上会自行发 🚨 告警（墓碑拒绝 / 写盘失败），
+   那几行位于它自己的 _state_lock **之外**、却仍在 _write_monitor_error_if_owner 的
+   _active_monitors_lock **之内** → 代次锁最长可能被一次 TG 超时（~5s）占住。
+   影响仅是登记/接管**延后**（不产生 fail-open），彻底消除需改资金安全契约，
+   **本轮未做，沿用第十轮登记，留待复审裁决**。
+3. 第十轮 S6j / 本轮 S6j-1c 是**单进程内**的受控线程时序与文案断言：
+   未做真实高并发 / 多进程压测；S6j-3 是 AST **结构**断言；
+   S6j-1c 只断言文案内容，不判定人工按文案处置是否正确。
+4. S6j 未覆盖"补挂出一张带数量的真止损"（沿用第九轮 S6f-4 的既有未验证项）；
+   test_sg3_p1 的 11 场景仍为手工构造的 ccxt 字段夹具；
+   _ccxt_order() 不是"实际脱敏载荷校准"。
+5. 两个既有 rc=1（test_m2_m4_maintenance / test_recover_semantics）本轮**未修**，
+   需另行排期。
+6. 17 文件累计差异**未**做逐项发布级审查。
+7. 本轮改动**未提交**；未合并、未重启、未部署、未动真实订单与保护参数。
+
+
+五、评分口径（三项独立，不混报）
+-----------------------------------------------------------------------
+· 报告证据分、实现终审分、发布就绪分分别给出，互不替代；
+· 本轮仅收口"告警送达 / 文案 / 写盘返回值"三条口径判据，
+  不等于发布就绪，也不等于逐项发布级审查完成；
+· 完整门禁 rc=3 未跑 → **不得**称"发布通过"；
+· 任何分数均**不构成**合并 / 部署 / 重启批准。
+
+
+六、复现导出命令
+-----------------------------------------------------------------------
+  cd G:\my-crypto-bot-wt
+  cmd /c "git diff -- trader_260725.py test_monitor_poll_recovery.py test_gate_baseline.py test_sg3_p1.py test_poll_degradation.py R1R2*.md > _review_eleventh\candidate-working-overlay.patch"
+  cmd /c "git diff 4f0afb4 > _review_eleventh\production-to-candidate-72a6311.patch"
+  certutil -hashfile _review_eleventh\candidate-working-overlay.patch SHA256
+  certutil -hashfile _review_eleventh\production-to-candidate-72a6311.patch SHA256
+  # 单测 / 变异（变异后必须还原）
+  set PYTHONIOENCODING=utf-8 && set PYTHONUTF8=1
+  G:\my-crypto-bot\.venv\Scripts\python.exe test_monitor_poll_recovery.py
+  G:\my-crypto-bot\.venv\Scripts\python.exe _review_eleventh\sweep_runner.py   # 全量 56 项

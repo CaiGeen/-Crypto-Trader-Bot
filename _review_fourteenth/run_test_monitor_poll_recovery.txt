@@ -1,0 +1,266 @@
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8698, in _start_monitoring
+    sleep_interval = self._calculate_monitoring_interval()
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "G:\my-crypto-bot-wt\test_monitor_poll_recovery.py", line 544, in <lambda>
+    fake._calculate_monitoring_interval = lambda: (_ for _ in ()).throw(
+                                                  ^^^^^^^^^^^^^^^^^^^^^^
+  File "G:\my-crypto-bot-wt\test_monitor_poll_recovery.py", line 544, in <genexpr>
+    fake._calculate_monitoring_interval = lambda: (_ for _ in ()).throw(
+RuntimeError: injected real-loop failure
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "G:\my-crypto-bot-wt\test_monitor_poll_recovery.py", line 925, in _sleep
+    raise RuntimeError("模拟：旧代次从 sleep 抛出普通异常")
+RuntimeError: 模拟：旧代次从 sleep 抛出普通异常
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "G:\my-crypto-bot-wt\test_monitor_poll_recovery.py", line 925, in _sleep
+    raise RuntimeError("模拟：旧代次从 sleep 抛出普通异常")
+RuntimeError: 模拟：旧代次从 sleep 抛出普通异常
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "G:\my-crypto-bot-wt\test_monitor_poll_recovery.py", line 1042, in _sleep
+    raise RuntimeError("模拟：旧代次从 sleep 抛出普通异常")
+RuntimeError: 模拟：旧代次从 sleep 抛出普通异常
+👀 批次 [batch_pollrec_001] 监控已注册 (代次=57af0485，活跃监控数: 1)
+👀 批次 [batch_pollrec_001] 启动【批次独立隔离】实时风控监控...
+⚠️ 获取未结订单失败 (连续 1 次，已降速)，等待下一次轮询: 模拟 fetch_open_orders 网络失败
+🎯 [批次 batch_pollrec_001] 第 1 层买单成交！实际成交价: 58000.0
+  └─ 📝 第 1 层加入待挂止损队列
+  └─ 🚫 [G1] 意图未写入磁盘，已阻止创建首次止损单
+⚠️ 补查开仓订单 e1 状态失败 ('NoneType' object is not subscriptable)，将在下一轮重试...
+🛑 [持仓归零检测] 批次 [batch_pollrec_001] 实际持仓已归零，正在安全退出监控...
+
+📊 **[平仓结算]**
+
+🆔 **批次号**：`batch_pollrec_001`
+🪙 **标的**：`BTC/USDT:USDT`
+📊 **方向**：`BUY`
+📊 **平仓模式**：未知
+📊 **已成交层数**：`1/1`
+📈 **持仓均价**：`0.00` USDT
+💵 **平仓价格**：`1.00` USDT
+🔢 **平仓数量**：`0.0`
+📊 **名义盈亏**：`+0.00` USDT
+💸 **总手续费**：`0.0000` USDT
+🟢 **最终净盈亏**：`+0.00` USDT (`+0.00%)
+  └─ ⚠️ [B] 批次 batch_pollrec_001 本轮未收敛（UNKNOWN/撤单失败），保留待下轮重试
+🛑 [持仓归零检测] 批次 [batch_pollrec_001] 实际持仓已归零，正在安全退出监控...
+
+📊 **[平仓结算]**
+
+🆔 **批次号**：`batch_pollrec_001`
+🪙 **标的**：`BTC/USDT:USDT`
+📊 **方向**：`BUY`
+📊 **平仓模式**：未知
+📊 **已成交层数**：`1/1`
+📈 **持仓均价**：`0.00` USDT
+💵 **平仓价格**：`1.00` USDT
+🔢 **平仓数量**：`0.0`
+📊 **名义盈亏**：`+0.00` USDT
+💸 **总手续费**：`0.0000` USDT
+🟢 **最终净盈亏**：`+0.00` USDT (`+0.00%)
+  └─ ⚠️ [B] 批次 batch_pollrec_001 本轮未收敛（UNKNOWN/撤单失败），保留待下轮重试
+👀 批次 [batch_pollrec_001] 监控代次 57af0485 已移除 (剩余活跃监控数: 0)
+🧹 批次 [batch_pollrec_001] 监控线程已退出
+[PASS] T1a 失败轮跳过成交识别，后续成功轮完成识别
+        fetch_order 调用=1 次（>0 = 失败轮之后的成功轮确实做了成交判定）；fetch_open_orders=3 次，驱动轮次=4
+[PASS] T1b 成交被识别后进入补挂止损路径
+        _place_prepared_orders_immediately 进入次数=1，STOP_MARKET(55000) create_order 次数=0，驱动异常=None
+[PASS] T1c 失败轮未消费状态：批次仍在账本且未被置 monitor_error
+        磁盘 is_active=True，monitor_error=None
+        [NOT VERIFIED-1] 「循环内 create_order 成功挂出 SL」未由本用例断言：
+                 _start_monitoring 1185 行、依赖面过宽，fake 保真度不足以让内层
+                 补挂走完（补挂路径本身已由 test_protection_write_gates.py 的
+                 C1 对照组直接验证：STOP_MARKET 真实挂出并落盘 CONFIRMED）。
+        [NOT VERIFIED-2] 本轮监控线程是被**测试替身缺陷**提前打断的，不是跑满哨兵轮次：
+                 证据 = 输出里的「[W1] 已写入 monitor_error 标记」（该标记只由循环
+                 外层 `except Exception` 写入，表示循环内抛了 TypeError/ValueError，
+                 根因是某个未绑定的辅助返回 MagicMock）。真实代码里这会触发
+                 「监控线程异常退出」critical —— 但那是**替身**造成的，不是被测行为，
+                 故本文件不对告警内容作断言（T2 只断言普通失败分支）。
+                 T1a/T1b/T1c 的断言全部发生在该打断**之前**，结论有效。
+👀 批次 [batch_pollrec_001] 监控已注册 (代次=8913ce9e，活跃监控数: 1)
+👀 批次 [batch_pollrec_001] 启动【批次独立隔离】实时风控监控...
+⚠️ 获取未结订单失败 (连续 1 次，已降速)，等待下一次轮询: 持续失败
+⚠️ 获取未结订单失败 (连续 2 次，已降速)，等待下一次轮询: 持续失败
+⚠️ 获取未结订单失败 (连续 3 次，已降速)，等待下一次轮询: 持续失败
+⚠️ [POLL] 降级告警未确认送达（返回 None，下轮重试）
+👀 批次 [batch_pollrec_001] 监控代次 8913ce9e 已移除 (剩余活跃监控数: 0)
+🧹 批次 [batch_pollrec_001] 监控线程已退出
+[PASS] T2 持续失败达阈值 → 发出 critical 告警
+        驱动轮次=4，send_tg_notification 记录=[('critical', '🚨【资金安全】监控降级告警\n📉 连续失败 3 轮 / 数据陈旧 0s\n💡 程序无法可靠获取订单数据，已暂停新增风险。\n⚠️ 交易所实际仓位与保护单状态需人工核对；程序无法在查询不可用时替你确认或补齐止损。\nℹ️ 本条为尝试投递；未确认送达时会重试。')]（应 ≥1 → 有告警）
+[PASS] T2b 连续失败只累加计数，成交识别被跳过
+        失败 4 轮内 fetch_order 调用=0 次（0 = 成交识别整段被 continue 跳过）；fetch_open_orders 调用=3 次
+👀 批次 [batch_pollrec_001] 监控已注册 (代次=gen-1，活跃监控数: 1)
+👀 批次 [batch_pollrec_001] 启动【批次独立隔离】实时风控监控...
+⚠️ 获取未结订单失败 (连续 1 次，已降速)，等待下一次轮询: first poll unavailable
+🧹 批次 [batch_pollrec_001] 监控线程已退出
+🚨 [资金安全] 接管收尾告警**仍未确认送达**（返回 None）——critical 至此共 2 次尝试（退出告警 1 次 + 收尾告警 1 次），此后无自动重试；请以本条进程日志为准人工核查。
+[PASS] S6a 实际监控首轮轮询失败后退出 → 从未业务接管、闸门保持
+        handoff=False，phase=unverified_exit，unresolved={'batch_pollrec_001'}
+👀 批次 [batch_pollrec_001] 监控已注册 (代次=gen-1，活跃监控数: 1)
+👀 批次 [batch_pollrec_001] 启动【批次独立隔离】实时风控监控...
+✅ [POLL] 全部批次监控恢复
+✅ [S6] 批次 batch_pollrec_001 首轮业务轮询及落盘确认完成，当前监控代次 gen-1 接管；解除新增风险闸门
+🧹 批次 [batch_pollrec_001] 监控线程已退出
+🚨 [资金安全] 接管收尾告警**仍未确认送达**（返回 None）——critical 至此共 2 次尝试（退出告警 1 次 + 收尾告警 1 次），此后无自动重试；请以本条进程日志为准人工核查。
+[PASS] S6b 实际首轮完成：订单 open、持仓零、未决 registry 空、状态落盘成功（真实 _persist_states 写盘 + 磁盘重读作放闸证据）
+        磁盘落盘次数=1，磁盘 is_active=True，handoff曾完成=True，非终态测试退出后未决闸门={'batch_pollrec_001'}，降级闸门={'batch_pollrec_001'}
+🧹 批次 [batch_pollrec_001] 状态归档/清理完毕（proof 门通过，墓碑已登记 close_phase=3，7 天防复活）。
+👀 批次 [batch_pollrec_001] 监控已注册 (代次=gen-1，活跃监控数: 1)
+👀 批次 [batch_pollrec_001] 启动【批次独立隔离】实时风控监控...
+  └─ ⚠️ 有待补挂止损的层: [0]
+  └─ 🛬 [生命周期] 批次 batch_pollrec_001 已从账本消失/停用，监控线程正常退出（零 API 零副作用）
+🧹 批次 [batch_pollrec_001] 监控线程已退出
+[PASS] S6c 实际生命周期正常退出 + durable tombstone proof（真实落盘+磁盘重读）→ 解除闸门
+        clear=True，phase=terminal，磁盘墓碑 evidence={'batch_id': 'batch_pollrec_001', 'symbol': 'BTC/USDT:USDT', 'scope': 'PRE_ENTRY', 'position_zero': True, 'state_ids_resolved': ['e1'], 'exchange_scan': 'zero'}，unresolved=set()
+👀 批次 [batch_pollrec_001] 监控已注册 (代次=gen-1，活跃监控数: 1)
+👀 批次 [batch_pollrec_001] 启动【批次独立隔离】实时风控监控...
+⚠️ 监控循环内部异常: injected real-loop failure
+⚠️ 监控异常 critical 告警未确认送达（返回 None），failure_alerted 保持 False，交由接管收尾补发
+  └─ 📝 [W1] 已写入 monitor_error 标记（重启时将跳过恢复并清理）
+🧹 批次 [batch_pollrec_001] 监控线程已退出
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "G:\my-crypto-bot-wt\test_monitor_poll_recovery.py", line 1042, in _sleep
+    raise RuntimeError("模拟：旧代次从 sleep 抛出普通异常")
+RuntimeError: 模拟：旧代次从 sleep 抛出普通异常
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "G:\my-crypto-bot-wt\test_monitor_poll_recovery.py", line 1255, in _sleep
+    raise RuntimeError("模拟：所有者代次从 sleep 抛出普通异常")
+RuntimeError: 模拟：所有者代次从 sleep 抛出普通异常
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "G:\my-crypto-bot-wt\test_monitor_poll_recovery.py", line 1255, in _sleep
+    raise RuntimeError("模拟：所有者代次从 sleep 抛出普通异常")
+RuntimeError: 模拟：所有者代次从 sleep 抛出普通异常
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "G:\my-crypto-bot-wt\test_monitor_poll_recovery.py", line 1255, in _sleep
+    raise RuntimeError("模拟：所有者代次从 sleep 抛出普通异常")
+RuntimeError: 模拟：所有者代次从 sleep 抛出普通异常
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "G:\my-crypto-bot-wt\test_monitor_poll_recovery.py", line 1255, in _sleep
+    raise RuntimeError("模拟：所有者代次从 sleep 抛出普通异常")
+RuntimeError: 模拟：所有者代次从 sleep 抛出普通异常
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "G:\my-crypto-bot-wt\test_monitor_poll_recovery.py", line 1255, in _sleep
+    raise RuntimeError("模拟：所有者代次从 sleep 抛出普通异常")
+RuntimeError: 模拟：所有者代次从 sleep 抛出普通异常
+🚨 [资金安全] 接管收尾告警**仍未确认送达**（返回 None）——critical 至此共 2 次尝试（退出告警 1 次 + 收尾告警 1 次），此后无自动重试；请以本条进程日志为准人工核查。
+[PASS] S6d 实际监控循环异常退出 → 保持闸门并告警
+        phase=unverified_exit，unresolved={'batch_pollrec_001'}，alerts=['critical', 'critical']
+👀 批次 [batch_pollrec_001] 监控已注册 (代次=old-gene，活跃监控数: 1)
+👀 批次 [batch_pollrec_001] 启动【批次独立隔离】实时风控监控...
+  └─ ⏭️ [S6] 批次 batch_pollrec_001 监控代次 old-gene已被新代次接管，旧代次停止处理
+  └─ ⏭️ [S6] 批次 [batch_pollrec_001] 退出方代次 old-gene 已非登记所有者（现为 new-gene），本代次放弃全部退出收尾副作用
+🧹 批次 [batch_pollrec_001] 监控线程已退出
+[PASS] S6e 旧代次在新代次接管后退出 → 不得删新登记或改闸门
+        alive=False，errors=[]，owner='new-generation'，unresolved={'batch_pollrec_001'}
+👀 批次 [batch_pollrec_001] 监控已注册 (代次=gen-1，活跃监控数: 1)
+👀 批次 [batch_pollrec_001] 启动【批次独立隔离】实时风控监控...
+⚠️ [SG3-P1] 批次 batch_pollrec_001 止损单无效(止损语义校验未通过：非止损类型（原始 type='TAKE_PROFIT_MARKET'，白名单=['STOP', 'STOP_LOSS', 'STOP_LOSS_LIMIT', 'STOP_MARKET', 'STOP_MARKET_LIMIT', 'TRAILING_STOP_MARKET']；即便带 stopPrice 也不认）)，准备撤销重挂...
+⚠️ [TP 补挂] 批次 batch_pollrec_001 止盈单缺失(未创建或创建失败)，准备补挂...
+
+⚡ [批次 batch_pollrec_001] 同步维护独立风控...
+  └─ 已撤销旧止损单: SL1 → registry ABSENT
+  └─ 🚫 [G1] 意图未写入磁盘，已阻止创建分层止损单
+  └─ ⏸️ [POLL] 订单已可读但保护未确认（SL 锚点缺失/维护失败）→ 保持暂停新增风险
+🧹 批次 [batch_pollrec_001] 监控线程已退出
+🚨 [资金安全] 接管收尾告警**仍未确认送达**（返回 None）——critical 至此共 2 次尝试（退出告警 1 次 + 收尾告警 1 次），此后无自动重试；请以本条进程日志为准人工核查。
+[PASS] S6f-1 有仓 + current_sl_id 指向止盈类型单 → 首轮不得放闸、闸门保持
+        handoff=False，磁盘落盘=1（落盘本身必须成功，缺的只是保护判据），未决闸门={'batch_pollrec_001'}，异常=None
+[PASS] S6f-2 拒绝理由是类型这一维（SG3 告警带白名单事实）且已进入撤旧回查
+        类型告警=True，撤旧回查 SL1 次数=1
+👀 批次 [batch_pollrec_001] 监控已注册 (代次=gen-1，活跃监控数: 1)
+👀 批次 [batch_pollrec_001] 启动【批次独立隔离】实时风控监控...
+⚠️ [TP 补挂] 批次 batch_pollrec_001 止盈单缺失(未创建或创建失败)，准备补挂...
+
+⚡ [批次 batch_pollrec_001] 同步维护独立风控...
+✅ [POLL] 全部批次监控恢复
+✅ [S6] 批次 batch_pollrec_001 首轮业务轮询及落盘确认完成，当前监控代次 gen-1 接管；解除新增风险闸门
+🧹 批次 [batch_pollrec_001] 监控线程已退出
+🚨 [资金安全] 接管收尾告警**仍未确认送达**（返回 None）——critical 至此共 2 次尝试（退出告警 1 次 + 收尾告警 1 次），此后无自动重试；请以本条进程日志为准人工核查。
+[PASS] S6f-3 阳性对照：同一时序、只把 info.type 换成 STOP_MARKET → 正常放闸
+        handoff=True，类型告警=False，撤旧回查 SL1 次数=0（0 = 未判为无效），异常=None
+👀 批次 [batch_pollrec_001] 监控已注册 (代次=gen-1，活跃监控数: 1)
+👀 批次 [batch_pollrec_001] 启动【批次独立隔离】实时风控监控...
+⚠️ [SG3-P1] 批次 batch_pollrec_001 止损单无效(止损语义校验未通过：覆盖量缺失且 info.closePosition 非 true（既无全仓平语义、又无可核实覆盖量；reduceOnly 单必须给出数量）)，准备撤销重挂...
+⚠️ [TP 补挂] 批次 batch_pollrec_001 止盈单缺失(未创建或创建失败)，准备补挂...
+
+⚡ [批次 batch_pollrec_001] 同步维护独立风控...
+  └─ 已撤销旧止损单: SL1 → registry ABSENT
+  └─ 🚫 [G1] 意图未写入磁盘，已阻止创建分层止损单
+  └─ ⏸️ [POLL] 订单已可读但保护未确认（SL 锚点缺失/维护失败）→ 保持暂停新增风险
+🧹 批次 [batch_pollrec_001] 监控线程已退出
+🚨 [资金安全] 接管收尾告警**仍未确认送达**（返回 None）——critical 至此共 2 次尝试（退出告警 1 次 + 收尾告警 1 次），此后无自动重试；请以本条进程日志为准人工核查。
+[PASS] S6f-4 reduceOnly=true + closePosition=false + amount=None → 不得放闸
+        handoff=False，磁盘落盘=1，未决闸门={'batch_pollrec_001'}，覆盖量告警=True，异常=None
+👀 批次 [batch_pollrec_001] 监控已注册 (代次=gen-1，活跃监控数: 1)
+👀 批次 [batch_pollrec_001] 启动【批次独立隔离】实时风控监控...
+⚠️ [TP 补挂] 批次 batch_pollrec_001 止盈单缺失(未创建或创建失败)，准备补挂...
+
+⚡ [批次 batch_pollrec_001] 同步维护独立风控...
+✅ [POLL] 全部批次监控恢复
+✅ [S6] 批次 batch_pollrec_001 首轮业务轮询及落盘确认完成，当前监控代次 gen-1 接管；解除新增风险闸门
+🧹 批次 [batch_pollrec_001] 监控线程已退出
+🚨 [资金安全] 接管收尾告警**仍未确认送达**（返回 None）——critical 至此共 2 次尝试（退出告警 1 次 + 收尾告警 1 次），此后无自动重试；请以本条进程日志为准人工核查。
+[PASS] S6f-5 阳性对照：真正 closePosition=true 的全仓平单 → 正常放闸
+        handoff=True，磁盘落盘=1，覆盖量告警=False，异常=None
+👀 批次 [batch_pollrec_001] 监控已注册 (代次=owner-ge，活跃监控数: 1)
+👀 批次 [batch_pollrec_001] 启动【批次独立隔离】实时风控监控...
+✅ [POLL] 全部批次监控恢复
+✅ [S6] 批次 batch_pollrec_001 首轮业务轮询及落盘确认完成，当前监控代次 owner-ge 接管；解除新增风险闸门
+  └─ 🧹 无持仓，已清理批次状态（proof 收敛通过）
+🧹 批次 [batch_pollrec_001] 监控线程已退出
+🚨 [资金安全] 接管收尾告警**仍未确认送达**（返回 None）——critical 至此共 2 次尝试（退出告警 1 次 + 收尾告警 1 次），此后无自动重试；请以本条进程日志为准人工核查。
+[PASS] S6g-1 阳性对照：所有者代次退出 → 真实收尾确实跑到撤单/收敛/清理
+        decision=1，cancel_limit=1，converge=1，clear=1，finalize=0，异常=None
+[PASS] S6g-2 旧代次在新代次接管后退出 → 收尾判定被跳过、零交易所/账本副作用
+        alive=False，errors=[]，hits={'decision': 0, 'cancel_limit': 0, 'converge': 0, 'clear': 0, 'finalize': 0}
+[PASS] S6g-3 确认走到了非所有者分支（而非测试没跑到 finally）
+        日志含非所有者标记=True；owner='new-generation'；日志尾部=['  └─ ⏭️ [S6] 批次 [batch_pollrec_001] 退出方代次 old-gene 已非登记所有者（现为 new-gene），本代次放弃全部退出收尾副作用', '🧹 批次 [batch_pollrec_001] 监控线程已退出']
+[PASS] S6i-1 旧代次异常退出 → 不写 monitor_error、不发终止告警、登记仍属新代次
+        账本 monitor_error=None，落盘含 monitor_error 的次数=0，退出告警=False，登记='gen-s6i-new'，退出原因='monitor exception: 模拟：旧代次从 sleep 抛出普通异常'
+[PASS] S6i-2 确认真的进了 except 并走到非所有者分支（而非根本没抛异常）
+        异常分支日志=True，门控日志=True，errors=[]（预期为空：except 不 re-raise）
+[PASS] S6i-3 阳性对照：**所有者**代次异常退出 → 确实写 monitor_error + 发终止告警
+        账本 monitor_error=True，退出告警=True，异常分支日志=True，被门控=False
+[PASS] S6j-1 通知期间完成新代次登记 → 旧代次放行后不写 monitor_error
+        卡到通知=True，账本 monitor_error=None，含 monitor_error 的落盘=0，放弃写入日志=True，登记='gen-s6j-new'，线程残留=False，errors=[]
+[PASS] S6j-1b 通知（网络）期间登记方能立刻拿到代次锁 → 通知没有占着锁
+        5s 内抢到代次锁=True；抢不到 = 有网络调用留在了 _active_monitors_lock 里
+[PASS] S6j-2 阳性对照：同一卡点但无人接管 → monitor_error 照常写入
+        卡到通知=True，账本 monitor_error=True，已写入日志=True，放弃写入日志=False，errors=[]
+[PASS] S6j-1c 退出告警按代次陈述：不说'该批次监控已终止'，要求按当前登记代次核实
+        退出告警条数=1，仍含旧文案'该批次监控已终止'=False，含'退出代次'=True，含'本代次'=True，含'当前登记代次'=True
+[PASS] S6j-3 结构：判定与 save_batch_state 同在代次锁内、且锁内零网络
+        方法内 _active_monitors_lock 临界区数=1，判定在写盘之前且读了代次登记=True，锁外告警（helper 无 send_tg_notification）=True，except 内告警未被代次锁包住=True
+[PASS] S6k-1 send 返回 False → 不记 failure_alerted、保留接管收尾补发资格
+        failure_alerted=False，补发告警=True，未确认送达日志=True，退出告警已尝试=True，errors=[]
+[PASS] S6k-2 send 返回 None → 不记 failure_alerted、保留接管收尾补发资格
+        failure_alerted=False，补发告警=True，未确认送达日志=True，退出告警已尝试=True，errors=[]
+[PASS] S6k-3 阳性对照：send 返回 True → 记 failure_alerted、接管收尾不再补发
+        failure_alerted=True，补发告警=False，未确认送达日志=False，退出告警已发=True，errors=[]
+[PASS] S6k-4 save_batch_state 返回 None → 判 persist_failed、不记'已写入'、账本无 monitor_error
+        账本 monitor_error=None，已确认落盘次数=0，'已写入'日志=False，'落盘被拒'日志=True，errors=[]
+[PASS] S6k-5 两次 critical 均未确认送达 → 恰好 2 次尝试 + 终局日志（明确无第 3 次重试）
+        failure_alerted=False，退出告警=1 次，收尾告警=1 次，终局日志=1 条，errors=[]
+
+====================================================================
+监控轮询恢复注入测试: 31/31 通过
+====================================================================

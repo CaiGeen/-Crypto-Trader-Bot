@@ -1,0 +1,69 @@
+test_account_risk.py                           rc=0     1.6s
+test_auth_blocked.py                           rc=0    11.4s
+test_b1_converge_side_filter.py                rc=0     5.1s
+test_b1_state_machine.py                       rc=0     6.9s
+test_b2_create_gate.py                         rc=0     2.4s
+test_b2_hardlock.py                            rc=0     1.2s
+test_b2_intent.py                              rc=0     0.9s
+test_b2_restart_semantics.py                   rc=0     8.4s
+test_b2_verify_semantics.py                    rc=0     6.9s
+test_b_batch.py                                rc=0     1.5s
+test_c_batch.py                                rc=0     1.3s
+test_close_confirmation_v3.py                  rc=0     0.6s
+test_close_confirmation_v4.py                  rc=0    14.4s
+test_close_confirmation_v5.py                  rc=0    14.4s
+test_close_confirmation_v6.py                  rc=0    15.1s
+test_close_confirmation_v62.py                 rc=0    15.3s
+test_cooldown_alert.py                         rc=0     1.1s
+test_d009_state_persistence.py                 rc=0     1.0s
+test_dedup_entry.py                            rc=0     1.2s
+test_email_channels.py                         rc=0     0.9s
+test_email_gate.py                             rc=0     0.2s
+test_g3_converge.py                            rc=0     1.4s
+test_gate_baseline.py                          rc=0    19.8s
+test_health_progress.py                        rc=0     0.2s
+test_m2_m4_maintenance.py                      rc=1     1.1s
+test_monitor_poll_recovery.py                  rc=0    40.4s
+test_notify_queue.py                           rc=0     2.1s
+test_orphan_guard.py                           rc=42    0.9s
+test_p1_settlement_price.py                    rc=0    12.7s
+test_p5_closecancel.py                         rc=0   170.4s
+test_p6_conservation.py                        rc=0     1.0s
+test_poll_degradation.py                       rc=0     6.6s
+test_position_close_confirmation.py            rc=0     0.1s
+test_protection_chain_fix.py                   rc=0     1.1s
+test_protection_write_gates.py                 rc=0     1.2s
+test_r0_notify_chains.py                       rc=0     1.1s
+test_r10_limit_close_alert.py                  rc=0     0.9s
+test_r12_state_backup.py                       rc=0     1.2s
+test_r6_bare_calls.py                          rc=0     0.8s
+test_recover_semantics.py                      rc=1     0.8s
+test_sg3_p1.py                                 rc=0     1.5s
+test_t1c_fees.py                               rc=0    56.8s
+test_tg_reply_fallback.py                      rc=0     1.0s
+test_tp_deadlock_fix.py                        rc=0     1.0s
+test_tp_validation.py                          rc=0     1.0s
+test_transition_safety_gate.py                 rc=0     4.4s
+test_v62_green.py                              rc=0    10.4s
+test_v62_red_first.py                          rc=0     1.2s
+test_v62_staged_integration.py                 rc=0     5.8s
+test_v63_entry_idempotency.py                  rc=0     0.7s
+test_v64_diag_fixes.py                         rc=0     1.6s
+test_v64_p1_resize.py                          rc=0     7.2s
+test_v64_p3_lifecycle.py                       rc=0    15.0s
+test_v64_p4_metrics.py                         rc=0     3.0s
+test_v64_partial_close.py                      rc=0     5.2s
+test_watchdog_guard.py                         rc=0     0.1s
+
+total=56  rc0=53  nonzero=3  elapsed=491s
+NONZERO test_m2_m4_maintenance.py rc=1
+    FAIL: test_execute_signal_emits_no_generic_persist_alert (__main__.BatchSkeletonPersistenceGateTests.test_execute_signal_emits_no_generic_persist_alert)
+    AssertionError: Lists differ: ["馃毃銆愯祫閲戝畨鍏ㄣ€戠洃鎺ч檷绾э紝鏂颁俊鍙疯鎷掔粷\n馃啍 鎵规锛歚batch_b2_5` (B[127 chars]鐘舵€併€?] != []
+    FAILED (failures=1)
+    馃毇 [鐘舵€佹寔涔呭寲] 鎵规 `batch_new` (BTC/USDT:USDT) 鏈‘璁よ惤鐩橈細trade_state.json 宸叉崯鍧忥紝绋嬪簭鎸?Fail-Closed 鎷掔粷瑕嗙洊鍐欏叆浠ヤ繚鎶ょ幇鍦猴紙JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)锛?
+    馃毇 [鐘舵€佹寔涔呭寲] 鎵规 `batch_new` (BTC/USDT:USDT) 鏈‘璁よ惤鐩橈細trade_state.json 宸叉崯鍧忥紝绋嬪簭鎸?Fail-Closed 鎷掔粷瑕嗙洊鍐欏叆浠ヤ繚鎶ょ幇鍦猴紙JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)锛?
+NONZERO test_orphan_guard.py rc=42
+NONZERO test_recover_semantics.py rc=1
+    [FAIL] 鍦烘櫙B: 1 鎵规鎺ョ -> True + 鍚姩 1 鐩戞帶绾跨▼ (杩斿洖: False, 绾跨▼: ['batch_001'], 鏉犳潌璋冪敤: 1)
+    [PASS] 鍦烘櫙D: 鎭㈠涓紓甯?-> Exception 鍐掑嚭 (鎹曡幏: RuntimeError('妯℃嫙锛氱姸鎬佹枃浠舵崯鍧?))
+    [PASS] +1: 閮ㄥ垎鎵规澶辫触 -> 寮傚父涓柇锛堥潪 True锛?(杩斿洖鍊? 寮傚父 KeyError)

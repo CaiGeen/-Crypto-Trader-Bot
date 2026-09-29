@@ -1,0 +1,8 @@
+① 生产目录 git apply --check -> rc=0 
+② 起步树：生产文件 10/12（缺=R1R2_收敛审查_验收契约矩阵.md, test_poll_degradation.py 即生产尚不存在的新增文件）
+   git apply -> rc=0  skipped=0 
+   EOL-ONLY  R1R2_收敛审查_验收契约矩阵.md (norm_eq=True)
+   EOL-ONLY  test_monitor_poll_recovery.py (norm_eq=True)
+   EOL-ONLY  test_poll_degradation.py (norm_eq=True)
+   EOL-ONLY  trader_260725.py (norm_eq=True)
+   files=12  raw_identical=8  norm_identical=12

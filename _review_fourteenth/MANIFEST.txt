@@ -1,0 +1,187 @@
+================================================================================
+第十四轮交付清单 MANIFEST —— P1-1 恢复分支「持仓 UNKNOWN 放闸」定点反例 + 修复
+生成时间：2026-09-29 +08:00
+分支：fix/converge-side-attribution（**全部改动仍未提交**）
+候选 HEAD：72a6311（+未提交改动）   生产 HEAD：4f0afb4   merge-base：8c96867
+================================================================================
+
+【0】本轮范围（严格按 ChatGPT 第十三轮复审要求，只做 P1-1、不扩 P2）
+--------------------------------------------------------------------------------
+复审结论：发布差异方向可接受；但 P1-1 安全路径**仍有一个放闸阻断** ——
+普通轮询恢复分支清除 `_poll_degraded_batches` 只要求
+`not _poll_orders_unresolved and _poll_protection_confirmed`，
+**缺** `current_actual_position is not None`。
+要求：只补一组定点反例（UNKNOWN 时保持闸门 + 实际新 ENTRY 零下单；
+持仓核实为零做阳性对照恢复）。**不批准合并、部署、重启。**
+
+【1】缺陷与修复
+--------------------------------------------------------------------------------
+缺陷（已实证）：订单查询恢复 + 账本无已识别成交 → `batch_filled_amount == 0`
+  → `_poll_needs_protection = False` → 保护判据被「空过」判成已确认
+  → 此时持仓查询返回 None（UNKNOWN ≠ EMPTY），旧实现照样打印
+    「✅ [POLL] 全部批次监控恢复」并清空降级闸门 → 放行新 ENTRY。
+S6 首轮接管判据（trader :10752 要求 `current_actual_position is not None`）
+**替不了**它：普通恢复分支在 `_monitor_lifecycle` 不是 dict 的常规监控线程独立生效。
+
+修复（隔离工作树、未提交，`trader_260725.py` 恢复判定块）：
+  · 新增 `_poll_position_known = (current_actual_position is not None)`
+  · 主 if 追加 `and _poll_position_known`
+  · 新增 elif：订单可读但持仓 UNKNOWN → 打印
+    「⏸️ [POLL] 订单已可读但持仓 UNKNOWN（查询失败 ≠ 零仓）→ 保持暂停新增风险」
+  · UNKNOWN 时不重置 streak，下轮重试（与 S6 :10752 同款 Fail-Closed）
+
+【2】定点反例（新用例 test_block35_position_unknown_keeps_degraded_gate，已注册 main()）
+--------------------------------------------------------------------------------
+B35a 连续失败 → 降级闸门置位
+B35b 订单可读 + 持仓 UNKNOWN → 不得解除降级闸门
+B35c 该状态下实际发起新 ENTRY → 必须零下单
+B35d 阳性对照：持仓核实为零 → 同一条恢复路径确实放闸
+B35e 阳性对照：放闸后同一替身确实落单（证 B35c 非假绿）
+
+| 断言 | 修复前 | 修复后 | 变异（摘掉判据） |
+|---|---|---|---|
+| B35b | **FAIL** `degraded=[]，streak=0` | PASS `degraded=['batch_pollrec_001']，streak=3` | **FAIL** |
+| B35c | **FAIL** `create 调用=1`（真下单） | PASS `返回=None，create=0` | **FAIL** |
+| B35d/B35e | PASS | PASS | PASS |
+| rc / 全脚本 | **1**、GREEN 94/96 | **0**、GREEN **96/96** | **1**、GREEN 94/96 |
+
+证据文件：
+  b35_run1_red.txt        修复前完整 stdout（1257 行 = 「全部批次监控恢复」）
+  b35_run2_green.txt      修复后完整 stdout（1234/1235 行 = 新 UNKNOWN 分支）
+  b35_run3_mutation.txt   变异测试：摘掉 `and _poll_position_known` → rc=1 重新变红，
+                          还原后逐字节一致（content sha256 前后相同）→ 因果性成立
+  b35_evidence.txt        四合一汇总（缺陷/修复/两态/变异 + 7 个文件 sha256）
+
+防假绿（方法要点）：
+  · B35c 在**信号时刻**把持仓查询恢复成 0.0，使 `execute_signal` 自身那道
+    「持仓 UNKNOWN → 拒绝」(:6261) 不替本用例挡单 → **降级闸门是唯一拦截**；
+    否则"零下单"可能只是前置拒绝的副产品。
+  · B35e 证明该替身确实能落单（B35c 不是"替身下不了单"的假绿）。
+  · 变异测试证明 RED/GREEN 差异由该判据造成，而非其他改动。
+
+【3】三份补丁（本轮最终）
+--------------------------------------------------------------------------------
+包 A（P1-1，已提交侧）  10 文件  +2617 -73  171734 B
+  sha256 = bad87a9b3fca2675d2ec4d807f65472a321b2363e2bb1d7e9e9381604393a706
+  ⚠️ **与第十二轮登记完全一致**（本轮未触碰任何已提交内容）
+包 B（未提交侧）          6 文件  +2408 -213 200720 B
+  sha256 = 01e98ce8ba4ce3fa71b1428c0b98f0e9f4473bbf178502b843decf018be6ed21
+  变化 = B34 用例 + **B35 用例 + 恢复分支持仓判据修复** + 文档更新
+最终发布差异（生产 4f0afb4 → A+B）
+  12 文件（2 个新增）  +4888 -149  335102 B
+  sha256 = c0a9d9d3a6efd738e92c88959bbd67502ae6970b88a2aa936bf3cf36d4634f2c
+  命中生产独有文件（.gitignore / strategies_backtest/*）= **0**
+
+验证（全部通过，可复现）：
+  ① 生产目录 `git apply --check <release diff>`（只读）        → **rc=0**
+  ② 仓库外临时目录以生产 4f0afb4 内容起步、真实贴该补丁        → **rc=0, skipped=0**
+  ③ 贴完 12 文件与候选工作树比对                                → **12/12 归一后一致**
+     （raw 8/12，另 4 个仅 CRLF/LF：矩阵、MPR、test_poll_degradation、trader）
+  ④ `merge-base 8c96867 + 包A + 包B` 重建 = 当前工作树          → apply A/B rc=0、
+     skipped=0、**12/12 归一后一致**
+  ⑤ git 自身 `--numstat` 交叉核对与补丁统计一致（+2617/−73、+2408/−213）
+
+【4】回归与 sweep（本轮实测）
+--------------------------------------------------------------------------------
+test_poll_degradation.py     GREEN **96/96**  rc=0（含 B35a-e）
+test_monitor_poll_recovery   rc=0（31/31）
+test_recover_semantics       rc=0（5/5 场景）
+test_m2_m4_maintenance       rc=0
+test_sg3_p1.py               rc=0
+test_gate_baseline.py        rc=0（14/14）
+全量 sweep                    total=56  rc0=55  nonzero=1  elapsed=551s
+                             唯一非零 = 既有 test_orphan_guard.py **rc=42**
+                             → 口径：**56 个中仍有 1 个非零 rc=42（既有）；
+                               本轮新增 rc=1 为零**
+py_compile rc=0；git diff --check rc=0
+
+【5】本目录文件
+--------------------------------------------------------------------------------
+pack-A-p1-1.patch             171734 B  bad87a9b3fca2675d2ec4d807f65472a321b2363e2bb1d7e9e9381604393a706
+pack-B-s6.patch               200720 B  01e98ce8ba4ce3fa71b1428c0b98f0e9f4473bbf178502b843decf018be6ed21
+release-diff-4f0afb4-to-AB.patch 335102 B  c0a9d9d3a6efd738e92c88959bbd67502ae6970b88a2aa936bf3cf36d4634f2c
+b35_evidence.txt               7041 B  bc49715bf461cb921955bd11c408e792fdac023474a62577c158b9af1c8cccce
+b35_run1_red.txt              88599 B
+b35_run2_green.txt            88626 B
+b35_run3_mutation.txt          1155 B
+release_diff_check.txt          495 B
+ab_rebuild_check.txt            309 B
+sweep_output.txt               3553 B
+shas.txt                        309 B
+build_patches.py / verify_release_diff.py / ab_rebuild_check.py /
+make_evidence.py / mutation_check.py / scratch_probe.py   （复现脚本）
+run_test_*.txt                 （5 个定向回归完整输出）
+
+【6】边界（本清单不主张的事）
+--------------------------------------------------------------------------------
+· **完整发布门禁 run_test_gate.py 仍未执行**（rc=3：运行中生产 Bot 拒绝）；
+  需停机窗口或明确授权 --allow-live。**未跑门禁 ≠ 发布通过。**
+· **不批准合并、部署或重启**（复审原文如此）；生产保持 4f0afb4 不变，
+  本轮对生产只做 git show / cat-file / apply --check。
+· B35 是**受控替身**驱动的定点反例，证明的是「持仓 UNKNOWN 时不得放闸」，
+  **不证明**首轮完成后所有交易所与保护事实都已正确核验。
+· 12/12 一致是**换行归一后**一致（4 个文件非逐字节相同）。
+· 运营影响（如实标注）：持仓查询若持续失败，该批次闸门将一直保持 → 新信号
+  被拒，需人工核实持仓或重启重证 —— 这是 Fail-Closed 的预期代价，不是新缺陷。
+· critical 送达只到「保留一次补发」（P1-3 登记）；S6k 三返回值为桩注入、
+  S6j 单进程受控、S6j-3 为 AST 断言、S6f-4 未断言补挂出带数量真止损、
+  test_sg3_p1 仍用手工夹具；「交易所持续不可达时对账」未端到端跑过。
+· 测试基线残留 test_orphan_guard rc=42 属**暂停清单**，未处理。
+
+【7】复现命令
+--------------------------------------------------------------------------------
+cd G:\my-crypto-bot-wt
+  # 定点反例（期望 rc=0、GREEN 96/96）
+  G:\my-crypto-bot\.venv\Scripts\python.exe test_poll_degradation.py
+  # 变异检查（期望 rc=1、B35b/B35c FAIL，脚本自动还原并逐字节断言）
+  G:\my-crypto-bot\.venv\Scripts\python.exe _review_fourteenth\mutation_check.py
+  # 重建三份补丁 + 校验发布差异 + 两包重建
+  G:\my-crypto-bot\.venv\Scripts\python.exe _review_fourteenth\build_patches.py
+  G:\my-crypto-bot\.venv\Scripts\python.exe _review_fourteenth\verify_release_diff.py
+  G:\my-crypto-bot\.venv\Scripts\python.exe _review_fourteenth\ab_rebuild_check.py
+  # 汇总证据
+  G:\my-crypto-bot\.venv\Scripts\python.exe _review_fourteenth\make_evidence.py
+  # 生产侧只读核对
+  git -C G:\my-crypto-bot apply --check <release-diff-4f0afb4-to-AB.patch>   # 期望 rc=0
+
+【8】过程教训（已写入方法，避免复现）
+--------------------------------------------------------------------------------
+· **补丁必须在文档定稿之后生成**：本轮曾先建包、后改矩阵文档，导致两包重建
+  出现 `DIFF R1R2_…矩阵.md`（11/12）；改完文档重建后回到 12/12。
+  文档与补丁的先后顺序 = 一致性前提。
+· 临时树若放在仓库工作树内部，`git apply` 以仓库根为前缀把每条 patch 判成
+  "Skipped patch" 而 **rc 仍为 0**（跳过不是错误）→ 假绿；必须
+  `--directory=` 或在仓库外贴，并检查 **skipped=0**。
+· 锚点用正则按**实际行尾**匹配（trader 为 CRLF），否则变异脚本会假失败。
+
+【9】送审方式变更（用户 2026-09-29 裁定，自下一轮起生效）
+--------------------------------------------------------------------------------
+**下一轮起：送审材料直接开 PR 推送、由 ChatGPT 读取 PR；不再本机存档转发。**
+本目录（`_review_fourteenth\`）因此是**最后一批存档转发件**。
+
+已核的通道事实（本轮实测，均可复现）：
+  git remote -v                 → origin https://github.com/CaiGeen/-Crypto-Trader-Bot.git
+                                   （生产与候选两个仓库同源；仓库 **PUBLIC**，ChatGPT 可读）
+  git ls-remote --heads origin  → fix/converge-side-attribution = 72a6311
+                                   （本地与远端一致，上游已设）
+  gh --version / gh auth status → gh v2.100.0；已认证 CaiGeen（token scopes: repo）
+  gh pr list --head fix/converge-side-attribution --state all
+                                → 空（该分支目前**没有** PR）
+
+下一轮流程（PR 只送审，**不合并**；提交/推送仍先获用户确认）：
+  git add <本轮改动> && git commit -m "..."
+  git push origin fix/converge-side-attribution
+  gh pr create --repo CaiGeen/-Crypto-Trader-Bot \
+      --base backtest/markprice-4h-fetch --head fix/converge-side-attribution \
+      --title "..." --body "..."
+  # 正文写清：两包 sha、发布差异 sha、RED/GREEN/变异证据、门禁未跑 → 不批准合并/部署/重启
+  # 送审材料路径以 PR 内文件为准（如 `_review_fifteenth/`），不再附本机文件
+
+⚠️ **PR base 必须选生产线，不能默认 main**（本轮实测量化）：
+  base = main（默认分支，tip f7572cf）
+      → 三点 diff 的 merge-base 就是 main 自身 → **Files changed ≈ 384、87 个提交**，复审材料被淹没
+  base = backtest/markprice-4h-fetch（生产 HEAD **4f0afb4** 所在分支）
+      → merge-base = 8c96867（上次部署点）→ diff 正是候选自身的改动，
+        提交全部未提交工作后 **Files changed ≈ 12**（= 两包 = 发布差异的文件集合）
+  （生产与候选两仓库同源，故候选分支上也能拿到 4f0afb4，可直接当 base。）
+================================================================================

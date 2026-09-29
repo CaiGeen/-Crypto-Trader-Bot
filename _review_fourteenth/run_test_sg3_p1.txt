@@ -1,0 +1,211 @@
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\unittest\mock.py", line 1118, in __call__
+    return self._mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\unittest\mock.py", line 1122, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\unittest\mock.py", line 1181, in _execute_mock_call
+    raise result
+ProbeReached
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\unittest\mock.py", line 1118, in __call__
+    return self._mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\unittest\mock.py", line 1122, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\unittest\mock.py", line 1181, in _execute_mock_call
+    raise result
+ProbeReached
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\unittest\mock.py", line 1118, in __call__
+    return self._mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\unittest\mock.py", line 1122, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\unittest\mock.py", line 1181, in _execute_mock_call
+    raise result
+ProbeReached
+Traceback (most recent call last):
+  File "G:\my-crypto-bot-wt\trader_260725.py", line 8706, in _start_monitoring
+    time.sleep(sleep_interval)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\unittest\mock.py", line 1118, in __call__
+    return self._mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\unittest\mock.py", line 1122, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\unittest\mock.py", line 1181, in _execute_mock_call
+    raise result
+ProbeReached
+############################################################
+C4/SG3-P1 保护单有效性校验测试（TDD）
+运行基线: commit 973b901（插入点/helper 未实现 → 预期全红）
+############################################################
+
+============================================================
+[PASS] A/正确side+reduceOnly+足量 (reason='')
+============================================================
+
+============================================================
+[PASS] A/错side (reason='方向错误(期望sell，实际BUY)')
+============================================================
+
+============================================================
+[PASS] A/无保护语义 (reason='缺少保护语义(reduceOnly/closePosition 均非 true)')
+============================================================
+
+============================================================
+[PASS] A/数量不足 (reason='覆盖数量不足(0.005 < 0.01)')
+============================================================
+
+============================================================
+[PASS] A/数量容差边界 (reason='')
+============================================================
+
+============================================================
+[PASS] A/数量超额 (reason='')
+============================================================
+
+============================================================
+[PASS] A/closePosition数量豁免 (reason='')
+============================================================
+
+============================================================
+[PASS] A/None且无保护语义 (reason='缺少保护语义(reduceOnly/closePosition 均非 true)')
+============================================================
+
+============================================================
+[PASS] A/None+reduceOnly (reason='')
+============================================================
+
+============================================================
+[PASS] A/hedge双向正确 (reason='')
+============================================================
+
+============================================================
+[PASS] A/hedge错side对positionSide (reason='方向错误(期望sell，实际BUY)')
+============================================================
+
+============================================================
+[PASS] A/hedge对side错positionSide (reason='positionSide 不匹配(期望LONG，实际SHORT)')
+============================================================
+
+============================================================
+[PASS] B/helper定义存在 (未找到 → [TDD红] 实现缺失)
+============================================================
+
+============================================================
+[PASS] B/helper零API调用 (违规调用: [])
+============================================================
+
+============================================================
+[PASS] B/插入点helper调用≥1 (调用点: 2 → [TDD红] 插入点缺失)
+============================================================
+👀 批次 [batch_sg3p1_001] 监控已注册 (代次=fb9dff94，活跃监控数: 1)
+👀 批次 [batch_sg3p1_001] 启动【批次独立隔离】实时风控监控...
+⚠️ [SG3-P1] 批次 batch_sg3p1_001 止损单无效(缺少保护语义(reduceOnly/closePosition 均非 true))，准备撤销重挂...
+
+⚡ [批次 batch_sg3p1_001] 同步维护独立风控...
+  └─ 已撤销旧止损单: sl_1 → registry ABSENT
+  └─ ❌ 止损单验证失败(<MagicMock name='mock._verify_order_created()' id='2232167881488'>)，不 Commit/不补单/不重挂: new_order
+⚠️ 监控循环内部异常: 
+⚠️ 监控异常 critical 告警未确认送达（返回 None），failure_alerted 保持 False，交由接管收尾补发
+  └─ ⚠️ [W1] 写入 monitor_error 标记失败（<MagicMock name='mock._write_monitor_error_if_owner()' id='2232226284048'>）
+👀 批次 [batch_sg3p1_001] 监控代次 fb9dff94 已移除 (剩余活跃监控数: 0)
+  └─ ⚠️ [B] 无持仓批次 batch_sg3p1_001 本轮未收敛（UNKNOWN/撤单失败/授权失效），保留状态待重启恢复重试
+🧹 批次 [batch_sg3p1_001] 监控线程已退出
+
+============================================================
+[PASS] C/SL无效触发恢复(撤旧) (cancel_order: 1 → [TDD红] 恢复链未触发)
+============================================================
+
+============================================================
+[PASS] C/SL无效触发恢复(挂新) (create_order: 1 → [TDD红] 恢复链未触发)
+============================================================
+
+============================================================
+[PASS] C/恢复创建STOP_MARKET (创建类型: ['STOP_MARKET'])
+============================================================
+
+============================================================
+[PASS] C/SG3告警已发送 (SG3告警: 1 → [TDD红] 无告警)
+============================================================
+👀 批次 [batch_sg3p1_001] 监控已注册 (代次=7f524bef，活跃监控数: 1)
+👀 批次 [batch_sg3p1_001] 启动【批次独立隔离】实时风控监控...
+ℹ️ [SG3-P1] 批次 batch_sg3p1_001 止损单无效(缺少保护语义(reduceOnly/closePosition 均非 true))，用户已接管，仅告警不自动修复
+⚠️ 监控循环内部异常: 
+⚠️ 监控异常 critical 告警未确认送达（返回 None），failure_alerted 保持 False，交由接管收尾补发
+  └─ ⚠️ [W1] 写入 monitor_error 标记失败（<MagicMock name='mock._write_monitor_error_if_owner()' id='2232226515088'>）
+👀 批次 [batch_sg3p1_001] 监控代次 7f524bef 已移除 (剩余活跃监控数: 0)
+  └─ ⚠️ [B] 无持仓批次 batch_sg3p1_001 本轮未收敛（UNKNOWN/撤单失败/授权失效），保留状态待重启恢复重试
+🧹 批次 [batch_sg3p1_001] 监控线程已退出
+
+============================================================
+[PASS] D/user_modified零撤单 (cancel_order: 0 → 应零撤单)
+============================================================
+
+============================================================
+[PASS] D/user_modified零下单 (create_order: 0 → 应零下单)
+============================================================
+
+============================================================
+[PASS] D/user_modified仍告警 (SG3告警: 1 → [TDD红] 豁免修复≠豁免告警)
+============================================================
+👀 批次 [batch_sg3p1_001] 监控已注册 (代次=e2466c99，活跃监控数: 1)
+👀 批次 [batch_sg3p1_001] 启动【批次独立隔离】实时风控监控...
+⚠️ [SG3-P1] 批次 batch_sg3p1_001 止盈单无效(方向错误(期望sell，实际BUY))，准备撤销重挂...
+
+⚡ [批次 batch_sg3p1_001] 同步维护独立风控...
+  └─ 已撤销旧止盈单: tp_1 → registry ABSENT
+  └─ ❌ 止盈单验证失败(<MagicMock name='mock._verify_order_created()' id='2232227063440'>)，不 Commit/不补单: new_order
+⚠️ 监控循环内部异常: 
+⚠️ 监控异常 critical 告警未确认送达（返回 None），failure_alerted 保持 False，交由接管收尾补发
+  └─ ⚠️ [W1] 写入 monitor_error 标记失败（<MagicMock name='mock._write_monitor_error_if_owner()' id='2232226844368'>）
+👀 批次 [batch_sg3p1_001] 监控代次 e2466c99 已移除 (剩余活跃监控数: 0)
+  └─ ⚠️ [B] 无持仓批次 batch_sg3p1_001 本轮未收敛（UNKNOWN/撤单失败/授权失效），保留状态待重启恢复重试
+🧹 批次 [batch_sg3p1_001] 监控线程已退出
+
+============================================================
+[PASS] E/TP无效触发恢复 (cancel: 1, create: 1 → [TDD红] TP 恢复链未触发)
+============================================================
+
+============================================================
+[PASS] E/恢复创建TAKE_PROFIT_MARKET (创建类型: ['TAKE_PROFIT_MARKET'])
+============================================================
+
+============================================================
+[PASS] E/SG3告警已发送 (SG3告警: 1 → [TDD红] 无告警)
+============================================================
+👀 批次 [batch_sg3p1_001] 监控已注册 (代次=4152d107，活跃监控数: 1)
+👀 批次 [batch_sg3p1_001] 启动【批次独立隔离】实时风控监控...
+⚠️ 监控循环内部异常: 
+⚠️ 监控异常 critical 告警未确认送达（返回 None），failure_alerted 保持 False，交由接管收尾补发
+  └─ ⚠️ [W1] 写入 monitor_error 标记失败（<MagicMock name='mock._write_monitor_error_if_owner()' id='2232171628496'>）
+👀 批次 [batch_sg3p1_001] 监控代次 4152d107 已移除 (剩余活跃监控数: 0)
+  └─ ⚠️ [B] 无持仓批次 batch_sg3p1_001 本轮未收敛（UNKNOWN/撤单失败/授权失效），保留状态待重启恢复重试
+🧹 批次 [batch_sg3p1_001] 监控线程已退出
+
+============================================================
+[PASS] C/全有效零撤单 (cancel_order: 0)
+============================================================
+
+============================================================
+[PASS] C/全有效零下单 (create_order: 0)
+============================================================
+
+============================================================
+[PASS] C/全有效零告警 (SG3告警: 0)
+============================================================
+
+############################################################
+✅ 全部 28 个场景通过
+C4/SG3-P1 保护单有效性校验验收完成

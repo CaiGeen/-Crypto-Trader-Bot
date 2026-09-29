@@ -1,0 +1,74 @@
+第九轮（阻断1 续 + 阻断2 续 + 门禁自测）交卷补丁清单
+生成时间：2026-09-29
+候选分支：fix/converge-side-attribution，HEAD=72a6311，改动**全部未提交**（工作树）
+生产 HEAD：4f0afb4（生产目录 G:\my-crypto-bot 仅只读对照，未被修改、未停机、未重启）
+
+====================================================================
+A. candidate-working-overlay.patch   138,313 bytes
+   sha256=6C4C5B223F0E430D6E75513B6A2D931C00D621F3367354083366C26E22D08CEB
+   基准：候选 HEAD 72a6311 → 工作树（即"本轮新改了什么"）
+   6 files changed, 1518 insertions(+), 213 deletions(-)
+
+     R1R2_收敛审查_验收契约矩阵.md       | 140 ++++++++-   （五-2 第九轮收口 + 矩阵新行 + 未验证项）
+     test_gate_baseline.py              | 146 ++++++--    （合成基线解耦 + 自洽检查，本轮由 9/13→14/14）
+     test_monitor_poll_recovery.py      | 653 +++++++++++  （S6f-4/5、_s6i_run、S6i-1/2/3）
+     test_poll_degradation.py           | 185 +++++---
+     test_sg3_p1.py                     |  16 +-
+     trader_260725.py                   | 591 ++++++++++++-
+
+   自检：
+     git apply --cached --check <本文件>   → rc=0   （对候选 HEAD 索引）
+     git -C <生产目录> apply --check <本文件> → 预期**失败**（基准不同，属正常）
+
+B. production-to-candidate-72a6311.patch   287,014 bytes
+   sha256=5FC26E45803A1C38B7C7D59197E3A75A661260C9048020F7118AD5C044022B6A
+   基准：生产 HEAD 4f0afb4 → 工作树（"累计差异 = 发布级审查对象"）
+   17 files changed, 4001 insertions(+), 282 deletions(-)
+
+     注意：本轮之前对外称"16 文件"，实测为 17（含 .gitignore）；以本清单为准。
+
+   自检：
+     git -C G:\my-crypto-bot apply --check <本文件> → rc=0
+
+   两份补丁均由 `cmd /c "git diff ... > file"` 直出（避免 PowerShell
+   Out-File -Encoding utf8 写 BOM 导致 git 报 "corrupt patch"）。
+
+====================================================================
+C. 本轮必须核对的三处代码位置（行号基于工作树）
+   1) trader_260725.py:373   _sl_order_verdict（唯一判据实现）
+      :442-451               amount is None 分支：必须 info.closePosition=='true'
+      调用点 :3772 启动重证（allow_amount_none=False, coverage_ratio=0.0）
+                :9622 运行期（allow_amount_none=True, coverage_ratio=0.001）
+   2) trader_260725.py:10744  _exception_is_owner = _is_current_monitor_generation()
+      非所有者 → 不写 monitor_error、不发"该批次监控已终止"
+      （lifecycle['exit_reason'] 保留写入：本线程自己 dict 字段，非共享状态）
+   3) test_gate_baseline.py:74   _synthetic_baseline（合成基线 1 项失败 / 8/9 / rc=1）
+                    :181  check_current_registration_is_self_consistent
+
+D. 第九轮测试与变异验证
+   test_monitor_poll_recovery.py  21/21  rc=0
+     S6f-4 反例 reduceOnly=true, closePosition=false, amount=None → 不得放闸 + 覆盖量告警
+     S6f-5 阳性对照 真 closePosition=true 全仓平 → 照常放闸
+     S6i-1 旧代次异常退出 → 新批次账本无 monitor_error、无终止告警、登记仍属新代次
+     S6i-2 日志证明真进过 except 的非所有者分支（errors 恒空是预期：该 except 不 re-raise）
+     S6i-3 所有者阳性对照 → 确实落账 + 发告警
+   test_gate_baseline.py          14/14  rc=0（原 9/13 rc=1）
+   变异验证（区分度，全部已跑）：
+     阻断1 判定改回 if True:            → S6f-4 红、S6f-5 绿
+     阻断2 _exception_is_owner 钉 True  → S6i-1、S6i-2 红
+     门禁  if newly or fixed: 改 False  → check_composition_beats_count 红（13/14）
+
+E. 全量 sweep（56 个 test_*.py，逐个直跑）
+   rc=0：53 个
+   rc=42：test_orphan_guard.py（已登记：Bot 在跑时 acquire_instance_lock 返回 42）
+   rc=1：test_m2_m4_maintenance.py、test_recover_semantics.py
+         → 二者均以生产 HEAD 4f0afb4 的 trader_260725.py 单独复跑过，
+           失败身份与计数完全一致 = **既有失败**；**本轮新增 rc=1 为零**。
+   完整发布门禁 run_test_gate.py：rc=3（运行中的生产 Bot 拒绝执行）→ **未执行，不得称发布通过**。
+
+F. 本轮明确未验证项（不得宣称已验证）
+   - S6f-4 只断言"不得放闸 + 覆盖量告警 + 已进撤旧回查"，未断言恢复链真的补挂出
+     一张带数量的真止损（与 S6f-1 同型未验证项）。
+   - test_sg3_p1 的 11 场景仍用手工 info 夹具，非实际脱敏 ccxt 载荷。
+   - 17 文件累计差异未做逐项发布级审查；未批准合并、部署或重启。
+   - 两个既有 rc=1 本轮不修。

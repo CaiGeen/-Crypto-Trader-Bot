@@ -1,0 +1,98 @@
+==============================================================================
+B35 定点反例两态证据 —— 普通轮询恢复分支不得在「持仓 UNKNOWN」时放闸
+生成时间：2026-09-29 +08:00   候选分支 fix/converge-side-attribution（未提交）
+生产 HEAD 4f0afb4（全程只读）  merge-base 8c96867
+==============================================================================
+
+【1】缺陷（ChatGPT 第十三轮指出，已实证）
+------------------------------------------------------------------------------
+普通恢复分支解除 _poll_degraded_batches 的条件只要：
+    not _poll_orders_unresolved and _poll_protection_confirmed
+缺 current_actual_position is not None。于是：
+  · 订单查询恢复、账本无已识别成交 → batch_filled_amount == 0
+  · _poll_needs_protection = False → 保护判据被「空过」判成已确认
+  · 持仓查询返回 None（UNKNOWN ≠ EMPTY）→ 旧实现照样
+    「✅ [POLL] 全部批次监控恢复」并清空降级闸门 → 放行新 ENTRY
+S6 首轮接管判据（trader :10752 要求 current_actual_position is not None）
+只在 _monitor_lifecycle 是 dict 的接管线程生效，替不了常规监控线程。
+
+【2】修复（隔离工作树、未提交；本文件只记录，不构成合并/部署批准）
+------------------------------------------------------------------------------
+恢复判定块新增第三判据：
+    _poll_position_known = (current_actual_position is not None)
+主 if 追加 and _poll_position_known；UNKNOWN 时不重置 streak，
+并新增 elif 打印「订单已可读但持仓 UNKNOWN（查询失败 ≠ 零仓）→ 保持暂停新增风险」。
+与 S6 :10752 同款 Fail-Closed。
+
+【3】新用例 test_block35_position_unknown_keeps_degraded_gate（已注册进 main()）
+------------------------------------------------------------------------------
+B35a 连续失败 → 降级闸门置位
+B35b 订单可读 + 持仓 UNKNOWN → 不得解除降级闸门
+B35c 该状态下实际发起新 ENTRY → 必须零下单
+B35d 阳性对照：持仓核实为零 → 同一条恢复路径确实放闸
+B35e 阳性对照：放闸后同一替身确实落单（证 B35c 非假绿）
+
+防假绿要点：B35c 的**信号时刻**把持仓查询恢复成 0.0，使 execute_signal
+自身那道「持仓 UNKNOWN → 拒绝」(:6261) 不替本用例挡单 —— 闸门是唯一拦截。
+
+【4】修复前（RED）—— _review_fourteenth\b35_run1_red.txt
+------------------------------------------------------------------------------
+执行：G:\my-crypto-bot\.venv\Scripts\python.exe test_poll_degradation.py
+结果：rc=1
+关键行（行号| 内容）：
+   147| ✅ [POLL] 全部批次监控恢复
+  1254| [PASS] B35a 连续失败 → 降级闸门置位 degraded=['batch_pollrec_001']
+  1257| ✅ [POLL] 全部批次监控恢复
+  1260| [FAIL] B35b 持仓 UNKNOWN → 不得解除降级闸门 degraded=[]，streak=0
+  1282|   └─ 第 1 层条件买单已挂出: 触发价 77000.0 | 数量 0.43 (预设止损价: 75000.0) (ID: B35)
+  1289| [FAIL] B35c 持仓未被监控核实过 → 新 ENTRY 零下单 返回='batch_new_001'，create 调用=1，degraded=[]
+  1294| [PASS] B35d 阳性对照：持仓核实为零 → 恢复并解除闸门 degraded=[]，streak=0
+  1316|   └─ 第 1 层条件买单已挂出: 触发价 77000.0 | 数量 0.43 (预设止损价: 75000.0) (ID: B35)
+  1323| [PASS] B35e 阳性对照：恢复后同一 ENTRY 确实能落单（③ 非假绿） 返回='batch_new_001'，create 调用=2
+  1389| GREEN: 94/96
+
+【5】修复后（GREEN）—— _review_fourteenth\b35_run2_green.txt
+------------------------------------------------------------------------------
+同一命令，结果：rc=0
+关键行（行号| 内容）：
+   147| ✅ [POLL] 全部批次监控恢复
+  1231| [PASS] B35a 连续失败 → 降级闸门置位 degraded=['batch_pollrec_001']
+  1234|   └─ ⏸️ [POLL] 订单已可读但持仓 UNKNOWN（查询失败 ≠ 零仓）→ 保持暂停新增风险
+  1235|   └─ ⏸️ [POLL] 订单已可读但持仓 UNKNOWN（查询失败 ≠ 零仓）→ 保持暂停新增风险
+  1238| [PASS] B35b 持仓 UNKNOWN → 不得解除降级闸门 degraded=['batch_pollrec_001']，streak=3
+  1261| [PASS] B35c 持仓未被监控核实过 → 新 ENTRY 零下单 返回=None，create 调用=0，degraded=['batch_pollrec_001']
+  1264| ✅ [POLL] 全部批次监控恢复
+  1267| [PASS] B35d 阳性对照：持仓核实为零 → 恢复并解除闸门 degraded=[]，streak=0
+  1289|   └─ 第 1 层条件买单已挂出: 触发价 77000.0 | 数量 0.43 (预设止损价: 75000.0) (ID: B35)
+  1296| [PASS] B35e 阳性对照：恢复后同一 ENTRY 确实能落单（③ 非假绿） 返回='batch_new_001'，create 调用=1
+  1362| GREEN: 96/96
+
+【6】关键文件 SHA-256
+------------------------------------------------------------------------------
+trader_260725.py                                           1ded77d093c1a1a788e6aad2f9848bec0b0bd285a6ea961009bc4c7bdfc3c2cc
+test_poll_degradation.py                                   2d248e940b0c5609133fa61a9258c320ee39303fc199f07df60739b257c0efb6
+_review_fourteenth/pack-A-p1-1.patch                       bad87a9b3fca2675d2ec4d807f65472a321b2363e2bb1d7e9e9381604393a706
+_review_fourteenth/pack-B-s6.patch                         01e98ce8ba4ce3fa71b1428c0b98f0e9f4473bbf178502b843decf018be6ed21
+_review_fourteenth/release-diff-4f0afb4-to-AB.patch        c0a9d9d3a6efd738e92c88959bbd67502ae6970b88a2aa936bf3cf36d4634f2c
+_review_fourteenth/b35_run1_red.txt                        bfed0bfb7c16b143a94f173ad3b5340a3d158da85778899e2fca0adb240f6b6e
+_review_fourteenth/b35_run2_green.txt                      0d93f6c233a327df3ff1b24a1a94f5bff0ac994c404f90919bba6791fe09db63
+
+【7】复现
+------------------------------------------------------------------------------
+cd G:\my-crypto-bot-wt
+  # 修复后（期望 rc=0，GREEN 96/96）
+  G:\my-crypto-bot\.venv\Scripts\python.exe test_poll_degradation.py
+  # 回到修复前（期望 rc=1，B35b/B35c FAIL）：把恢复判定块的
+  # `and _poll_position_known` 删掉并去掉新增 elif，再跑一次，随后还原
+  # 重建三份补丁 + 校验发布差异
+  G:\my-crypto-bot\.venv\Scripts\python.exe _review_fourteenth\build_patches.py
+  G:\my-crypto-bot\.venv\Scripts\python.exe _review_fourteenth\verify_release_diff.py
+
+【8】边界（本文件不主张）
+------------------------------------------------------------------------------
+· 完整发布门禁 run_test_gate.py 仍未执行（rc=3：运行中生产 Bot 拒绝）；
+  未跑门禁 ≠ 发布通过。**不批准合并、部署或重启。**
+· B35 是受控替身驱动的定点反例，证明的是「持仓 UNKNOWN 时不得放闸」，
+  不证明首轮完成后所有交易所与保护事实都已正确核验。
+· 生产目录全程只读（git show / cat-file / apply --check），状态仍为 4f0afb4。
+==============================================================================

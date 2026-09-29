@@ -1,0 +1,16 @@
+✅ check_parse_edge_cases
+✅ check_composition_beats_count
+✅ check_count_still_caught
+✅ check_rc_zero_exposes_improvement
+✅ check_current_registration_is_self_consistent
+✅ check_unexpected_rc_is_fail
+✅ check_probe_failures_are_unknown
+✅ check_probe_decisive_answers
+✅ check_probe_decisive_against_real_powershell
+✅ check_heartbeat_overrides_impossible_none
+✅ check_heartbeat_reads
+✅ check_main_refuses_on_unknown_and_running
+✅ check_main_proceeds_only_when_confirmed_none
+✅ check_registered_baseline_matches_reality
+
+GATE-BASELINE: 14/14
