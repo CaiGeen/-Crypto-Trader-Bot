@@ -167,16 +167,20 @@ cd G:\my-crypto-bot-wt
 **已按新通道送审（2026-09-29 用户确认后执行）**：
   0ec6b4d fix(poll): 闭环第十二至十四轮复审…；负测 96/96（旧 91/91）   ← 代码 8 文件 +2453 −216
   bd076c8 docs(review): 第九至十四轮送审材料 + 修复地图                   ← 材料 50 文件 +52801
-  git push origin fix/converge-side-attribution  → 72a6311..bd076c8
+  git push origin fix/converge-side-attribution  → 72a6311..bd076c8..e0b41e5
   gh pr create --repo CaiGeen/-Crypto-Trader-Bot \
       --base backtest/markprice-4h-fetch --head fix/converge-side-attribution --draft
                              → **PR #1 https://github.com/CaiGeen/-Crypto-Trader-Bot/pull/1**
   实测 PR：base=backtest/markprice-4h-fetch、draft=true、mergeable_state=clean、
-           head=bd076c8（= 本地 HEAD，同一 git 对象）、changed_files=62、+57689 −149
+           head=e0b41e5（= 本地 HEAD，同一 git 对象）、changed_files=62、+57689 −149
            文件核对：发布 12 文件 12/12 命中 + 材料 50，零杂散；
            4 个仅行尾差异文件刻意未入库；
-           **PR 代码差异 == 发布补丁**：`git diff 8c96867 bd076c8` 与
-           `release-diff-4f0afb4-to-AB.patch` sha 逐字节相同（c0a9d9d3…、335102 B）
+           **PR 中发布文件的 diff == 发布补丁（逐字节）**：两种口径同 sha
+           c0a9d9d3a6efd738e92c88959bbd67502ae6970b88a2aa936bf3cf36d4634f2c、335102 B
+           ① `git diff 8c96867 0ec6b4d`（代码提交完整 diff）
+           ② `git diff 8c96867 <head> -- <12 个发布文件>`
+           （PR 全量 diff = 62 文件 / 3565259 B，含材料，须按 12 文件过滤后比）
+  提交构成：0ec6b4d 代码 8 文件 / bd076c8 材料 50 文件 / e0b41e5 地图+MANIFEST 登记
   PR 正文已写：两包 sha、发布差异 sha、B35 RED/GREEN/变异与防假绿、
                 A+B 不可拆、门禁未跑 → **不批准合并/部署/重启**
 
