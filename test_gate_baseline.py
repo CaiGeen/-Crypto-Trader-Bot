@@ -11,8 +11,12 @@
 1. **逐项失败身份**（不是计数）：`GREEN: 3/9` 计数不变、但通过/失败的**具体是哪几项**
    换过 → 必须判 `BASELINE-DRIFT`。纯计数对这种情况完全失明。
 2. **基线登记本身仍与现实一致**：真跑一次 `test_v64_p3_lifecycle.py`，逐项解析结果
-   必须等于 `run_test_gate.BASELINE_FAIL_SET` 登记的那 6 项。
+   必须等于 `run_test_gate.BASELINE_FAIL_SET` 当前登记的失败集（2026-09-28 夹具修复后
+   为空集，任何一项转失败即漂移）。
    这一条同时是 `BASELINE_FAIL_SET` 的**基线依据**的自动化复核。
+3. **判定逻辑与登记值解耦**：组成漂移/计数漂移/全绿暴露/未登记 rc 这四条判定用
+   **合成基线**（1 项失败 / GREEN 8/9 / rc=1）钉死，不随登记值变好而假绿——
+   失败集为空时 `空 == 空` 恒真，"组成对比"根本不会被执行到。
 
 ## 跑法
 
@@ -31,7 +35,7 @@ import sys
 import tempfile
 import time
 import types
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -54,6 +58,45 @@ CASE_NAMES = [
 ]
 EXP_FAIL = set(g.BASELINE_FAIL_SET[SCRIPT])
 assert EXP_FAIL.issubset(set(CASE_NAMES)), 'BASELINE_FAIL_SET 含未登记用例名'
+
+# ------------------------------------------- 合成基线（与当前登记值解耦）
+# 第九轮复审：候选把 run_test_gate.py 的 p3 基线从「6 项失败 / GREEN 3/9 / rc=1」
+# 改成「0 项失败 / GREEN 9/9 / rc=0」，却没动本文件 —— 下面几条用例直接读
+# `g.BASELINE_*` 的**现值**，于是随基线一起变红：既测不出漂移，也分不清
+# "红是基线改了"还是"判定逻辑坏了"。教训：**判定逻辑**与**基线取值**是两件事。
+SYNTH_FAIL = {'r6_normal_batch_unchanged'}
+SYNTH_GREEN = (len(CASE_NAMES) - len(SYNTH_FAIL), len(CASE_NAMES))   # (8, 9)
+SYNTH_RC = 1
+SYNTH_FAIL_SET = frozenset(SYNTH_FAIL)
+
+
+@contextmanager
+def _synthetic_baseline():
+    """把 p3 登记临时换成「1 项失败 / GREEN 8/9 / rc=1」，退出时逐项原样还原。"""
+    real_green = g.BASELINE_GREEN.get(SCRIPT, None)
+    real_fail = g.BASELINE_FAIL_SET.get(SCRIPT, None)
+    real_exp = g.EXPECTED.get(SCRIPT, None)
+    real_base_fail = set(g.BASELINE_FAIL)
+    g.BASELINE_GREEN[SCRIPT] = SYNTH_GREEN
+    g.BASELINE_FAIL_SET[SCRIPT] = SYNTH_FAIL_SET
+    g.EXPECTED[SCRIPT] = {SYNTH_RC}
+    g.BASELINE_FAIL = {SCRIPT}
+    try:
+        yield
+    finally:
+        if real_green is None:
+            g.BASELINE_GREEN.pop(SCRIPT, None)
+        else:
+            g.BASELINE_GREEN[SCRIPT] = real_green
+        if real_fail is None:
+            g.BASELINE_FAIL_SET.pop(SCRIPT, None)
+        else:
+            g.BASELINE_FAIL_SET[SCRIPT] = real_fail
+        if real_exp is None:
+            g.EXPECTED.pop(SCRIPT, None)
+        else:
+            g.EXPECTED[SCRIPT] = real_exp
+        g.BASELINE_FAIL = real_base_fail
 
 
 def _fake_stdout(failed):
@@ -85,55 +128,95 @@ def check_parse_edge_cases():
     assert g._parse_failed_cases('GREEN: 3/9') is None, '汇总行不能被当成用例行'
     assert not g.CASE_LINE_RE.match('GREEN: 3/9'), 'GREEN 行不得匹配用例正则'
     assert not g.CASE_LINE_RE.match('some unrelated line'), '杂散行不得匹配'
-    got = g._parse_failed_cases(_fake_stdout(EXP_FAIL))
-    assert got == EXP_FAIL, '合成输出解析结果与登记基线不符'
+    # 必须用**非空**失败集验解析：空集合恒等于空集合，"解析对了"和"一行都没解析出
+    #（返回 None）"在断言上长得一模一样，等于没测。合成基线就是为这个存在的。
+    assert g._parse_failed_cases(_fake_stdout(SYNTH_FAIL)) == SYNTH_FAIL, \
+        '合成失败输出解析结果与构造不符'
+    swapped = set(CASE_NAMES) - SYNTH_FAIL
+    assert g._parse_failed_cases(_fake_stdout(swapped)) == swapped, \
+        '解析必须逐项跟随输出（不能只认固定那几项）'
+    assert g._parse_failed_cases(_fake_stdout(EXP_FAIL)) == EXP_FAIL, \
+        '合成输出解析结果与登记基线不符'
 
 
 def check_composition_beats_count():
-    """核心用例：计数完全不变（仍 3/9）时，组成变化必须被判漂移。"""
-    # 1) 基线原样 → 只判 BASELINE-FAIL（已登记），不致命
-    ok, counts, _ = _run_gate_scripts(1, _fake_stdout(EXP_FAIL))
-    assert ok and counts['BASELINE-FAIL'] == 1 and not counts['BASELINE-DRIFT'], \
-        '基线原样不应判漂移'
+    """核心用例：计数完全不变时，失败项**组成**变化必须被判漂移。"""
+    with _synthetic_baseline():
+        # 1) 基线原样 → 只判 BASELINE-FAIL（已登记），不致命
+        ok, counts, _ = _run_gate_scripts(SYNTH_RC, _fake_stdout(SYNTH_FAIL))
+        assert ok and counts['BASELINE-FAIL'] == 1 and not counts['BASELINE-DRIFT'], \
+            '基线原样不应判漂移'
 
-    # 2) 换掉其中一项（1 个失败转通过 + 1 个通过转失败）→ 仍是 6 失败 / GREEN 3/9
-    swapped = (EXP_FAIL - {'r6_normal_batch_unchanged'}) | {'r2_toctou_second_guard'}
-    assert len(swapped) == len(EXP_FAIL), '用例数必须不变，否则比的就不是组成'
-    ok, counts, text = _run_gate_scripts(1, _fake_stdout(swapped))
-    assert not ok and counts['BASELINE-DRIFT'] == 1, \
-        '计数不变但组成变了，必须判漂移（旧的纯计数逻辑对它完全失明）'
-    assert '失败项组成变了' in text and '新增失败' in text, '必须打印组成差异明细'
+        # 2) 换掉其中一项（1 个失败转通过 + 1 个通过转失败）→ 仍是 1 失败 / GREEN 8/9
+        swapped = {'r2_toctou_second_guard'}
+        assert len(swapped) == len(SYNTH_FAIL), '用例数必须不变，否则比的就不是组成'
+        ok, counts, text = _run_gate_scripts(SYNTH_RC, _fake_stdout(swapped))
+        assert not ok and counts['BASELINE-DRIFT'] == 1, \
+            '计数不变但组成变了，必须判漂移（旧的纯计数逻辑对它完全失明）'
+        assert '失败项组成变了' in text and '新增失败' in text, '必须打印组成差异明细'
 
 
 def check_count_still_caught():
     """原有的计数校验不能因本次改动而失效。"""
-    ok, counts, text = _run_gate_scripts(1, _fake_stdout(EXP_FAIL - {'r6_normal_batch_unchanged'}))
-    assert not ok and counts['BASELINE-DRIFT'] == 1, '通过数变多仍要判漂移'
-    assert '实际 4/9' in text, '必须打印实测 GREEN 值'
+    with _synthetic_baseline():
+        ok, counts, text = _run_gate_scripts(SYNTH_RC, _fake_stdout(set()))
+        assert not ok and counts['BASELINE-DRIFT'] == 1, '通过数变多仍要判漂移'
+        assert '实际 9/9' in text, '必须打印实测 GREEN 值'
 
 
 def check_rc_zero_exposes_improvement():
-    """p3 一旦全绿（rc=0），基线登记就过期了 —— 必须暴露，不能直接 PASS。
+    """基线脚本一旦全绿（rc=0），基线登记就过期了 —— 必须暴露，不能直接 PASS。
 
     第十七轮补的口子：旧判定是 `rc in allowed`（allowed={1}），rc=0 会跳过整个
     基线校验、直接落进 `elif rc == 0: PASS`，于是"变好"永远看不见。
+    用**合成基线**（期望 rc=1 / GREEN 8/9）来暴露它：登记值本身已改成 rc=0、9/9，
+    继续拿现值当期望只会让这条用例自己先变成假绿。
     """
-    ok, counts, text = _run_gate_scripts(0, _fake_stdout(set()))
-    assert not ok and counts['BASELINE-DRIFT'] == 1, '全绿必须判基线漂移'
-    assert '实际 9/9' in text, '必须打印实测 GREEN 值'
+    with _synthetic_baseline():
+        ok, counts, text = _run_gate_scripts(0, _fake_stdout(set()))
+        assert not ok and counts['BASELINE-DRIFT'] == 1, '全绿必须判基线漂移'
+        assert '实际 9/9' in text, '必须打印实测 GREEN 值'
+
+
+def check_current_registration_is_self_consistent():
+    """按**当前**登记值：p3 全绿（GREEN 9/9、rc=0、失败集为空）→ 零漂移、判 PASS。
+
+    第九轮复审：候选把 run_test_gate.py 的 p3 基线改成 9/9 + rc=0 + 空失败集，
+    却没动本文件，四条用例连同"登记=现实"一起红 —— 说明"登记值之间是否自洽"
+    之前没有任何自动化。这条只对**当前**登记负责：只改 BASELINE_GREEN 忘了放开
+    EXPECTED（或反之），会立刻在这里暴露，而不是等到停机窗口。
+    """
+    out = _fake_stdout(set())
+    m = g.GREEN_RE.search(out)
+    assert m, '合成全绿输出必须含 GREEN 行'
+    assert (int(m.group(1)), int(m.group(2))) == g.BASELINE_GREEN[SCRIPT], \
+        '登记 GREEN 与"全绿"形态不一致：BASELINE_GREEN=%s' % (g.BASELINE_GREEN[SCRIPT],)
+    assert 0 in g.EXPECTED.get(SCRIPT, {0}), \
+        'rc=0 不在 EXPECTED 登记内：全绿会被判 FAIL（登记自相矛盾），实测 %s' \
+        % (g.EXPECTED.get(SCRIPT),)
+    assert not g.BASELINE_FAIL_SET[SCRIPT], \
+        '登记的失败集非空，本用例的"全绿"前提不成立：%s' \
+        % (sorted(g.BASELINE_FAIL_SET[SCRIPT]),)
+    assert SCRIPT not in g.BASELINE_FAIL, \
+        'BASELINE_FAIL 仍登记了本脚本，与 rc=0 的 EXPECTED 自相矛盾'
+    ok, counts, text = _run_gate_scripts(0, out)
+    assert ok and not counts['BASELINE-DRIFT'] and not counts['FAIL'], \
+        '当前登记 + 全绿输出应判 PASS，实测 %s' % (counts,)
 
 
 def check_unexpected_rc_is_fail():
     """基线脚本给出未登记的退出码 → FAIL，不被基线身份豁免。"""
-    ok, counts, _ = _run_gate_scripts(2, _fake_stdout(EXP_FAIL))
-    assert not ok and counts['FAIL'] == 1, '未登记退出码必须 FAIL'
+    with _synthetic_baseline():
+        ok, counts, _ = _run_gate_scripts(2, _fake_stdout(SYNTH_FAIL))
+        assert not ok and counts['FAIL'] == 1, '未登记退出码必须 FAIL'
 
 
 def check_registered_baseline_matches_reality():
-    """真跑一次 p3，逐项结果必须等于登记的 6 项失败 —— 这就是基线依据本身。
+    """真跑一次 p3，逐项结果必须等于**当前**登记的失败集 —— 这就是基线依据本身。
 
-    这一条失败，说明 `BASELINE_FAIL_SET` / `BASELINE_GREEN` 已过期，门禁会以
-    BASELINE-DRIFT 呈现；本测试的作用是让它**可以被单独、快速地复现**。
+    这一条失败，说明 `BASELINE_FAIL_SET` / `BASELINE_GREEN` / `EXPECTED` 已过期，
+    门禁会以 BASELINE-DRIFT 或 FAIL 呈现；本测试的作用是让它**可以被单独、快速地
+    复现**。rc 断言也跟着登记走（基线已从 rc=1 改成 rc=0），不再写死。
     """
     env = dict(os.environ)
     env['PYTHONIOENCODING'] = 'utf-8'
@@ -151,7 +234,9 @@ def check_registered_baseline_matches_reality():
     newly, fixed = sorted(got - EXP_FAIL), sorted(EXP_FAIL - got)
     assert not newly and not fixed, \
         '失败项组成与登记不符：新增失败=%s 转为通过=%s' % (newly, fixed)
-    assert proc.returncode == 1, '基线脚本 rc 应为 1，实测 %s' % proc.returncode
+    assert proc.returncode in g.EXPECTED.get(SCRIPT, {0}), \
+        '基线脚本 rc 实测 %s 与 EXPECTED 登记 %s 不符' \
+        % (proc.returncode, g.EXPECTED.get(SCRIPT))
 
 
 # ==================== 生产 Bot 进程探测：三态 / Fail-Closed ====================
@@ -318,6 +403,7 @@ CHECKS = [
     check_composition_beats_count,
     check_count_still_caught,
     check_rc_zero_exposes_improvement,
+    check_current_registration_is_self_consistent,
     check_unexpected_rc_is_fail,
     check_probe_failures_are_unknown,
     check_probe_decisive_answers,

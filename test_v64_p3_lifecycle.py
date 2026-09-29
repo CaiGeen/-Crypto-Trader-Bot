@@ -19,6 +19,8 @@
 全部为运行行为测试：真跑 `_start_monitoring` 线程 + 全端点计数桩。
 """
 import copy
+import os
+import tempfile
 import threading
 import time
 import traceback
@@ -26,6 +28,7 @@ import types
 from collections import Counter
 
 import test_v64_partial_close as H
+import trader_260725
 
 SYM = H.SYM
 
@@ -38,6 +41,25 @@ class _CCXTShim:
     class OrderNotFound(Exception):
         pass
 H.NS.setdefault('ccxt', _CCXTShim)
+
+# ── 夹具 namespace 补齐（2026-09-28 复审修复）──────────────────────────────
+# _start_monitoring 经 ex_t() 以 exec(source, NS) 重建，NS 必须含其引用的模块级
+# 名字。生产在 trader_260725.py:18 `from health_progress import current_instance_id,
+# write_progress, remove_batch`，本夹具原先漏注入 → 线程在 while 之前 NameError，
+# 6 条用例全红（根因，非生产缺陷）。
+H.NS.setdefault('current_instance_id', lambda: 'p3-fixture-instance')
+H.NS.setdefault('write_progress', lambda *a, **k: None)
+H.NS.setdefault('remove_batch', lambda *a, **k: None)
+
+# ── 路径隔离（先隔离 STATE_FILE 与墓碑路径，再运行夹具）────────────────────
+# STATE_FILE / TOMBSTONE_FILE 是相对路径（trader_260725.py:33/39），按 cwd 解析。
+# 本夹具状态在内存 _states，但 save_batch_state / _merge_batch_state 绑的是真实
+# 实现，可能读 STATE_FILE。重定向到 temp，避免命中生产/工件账本。
+_TMP_DIR = tempfile.mkdtemp(prefix='p3_fixture_')
+_real_state_file = trader_260725.STATE_FILE
+_real_tombstone_file = trader_260725.TOMBSTONE_FILE
+trader_260725.STATE_FILE = os.path.join(_TMP_DIR, 'trade_state.json')
+trader_260725.TOMBSTONE_FILE = os.path.join(_TMP_DIR, 'trade_tombstones.json')
 
 
 class _FakeTime:
@@ -260,6 +282,22 @@ def _make_runner(states, position=0.002, fetch_order_result='open',
         fn = H.ex_t(name)
         if fn is not None:
             _bind_fn(t, fn)
+
+    # ── 夹具保真度补齐（2026-09-28 复审修复）────────────────────────────────
+    # ① _load_all_states_ex：G2/G3 用的「本次读取」三元组接口。夹具状态在内存
+    #    _states，真实实现读 STATE_FILE（相对路径，会命中生产/工件账本）。绑一个
+    #    返回夹具内存态的版本，语义与真实实现一致（含 _force_corrupt 损坏态）。
+    def _load_all_states_ex():
+        if getattr(t, '_force_corrupt', False):
+            return ({}, True, 'forced-corrupt')
+        return (copy.deepcopy(t._states), False, '')
+    t._load_all_states_ex = _load_all_states_ex
+
+    # ② _finally_cleanup_decision：线程 finally 块要解包 2 元组。绑生产真实实现
+    #    （AutoStub 返回 None → TypeError，线程退出路径不忠实）。
+    #    实例属性不自动绑 self → 形参为 (s, b)，显式传 t。
+    t._finally_cleanup_decision = (
+        lambda s, b: trader_260725.CryptoTrader._finally_cleanup_decision(t, s, b))
     return t
 
 
@@ -520,18 +558,23 @@ def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
     tests = [fn for fn in TESTS if only is None or fn.__name__ == only or fn.__name__.startswith(only)]
     passed = 0
-    for fn in tests:
-        try:
-            fn()
-            print(f'✅ {fn.__name__}')
-            passed += 1
-        except AssertionError as e:
-            print(f'❌ {fn.__name__}: {e}')
-        except Exception as e:
-            print(f'❌ {fn.__name__}: {type(e).__name__}: {e}')
-            traceback.print_exc()
-        finally:
-            _force_stop(_LAST_THREAD)
+    try:
+        for fn in tests:
+            try:
+                fn()
+                print(f'✅ {fn.__name__}')
+                passed += 1
+            except AssertionError as e:
+                print(f'❌ {fn.__name__}: {e}')
+            except Exception as e:
+                print(f'❌ {fn.__name__}: {type(e).__name__}: {e}')
+                traceback.print_exc()
+            finally:
+                _force_stop(_LAST_THREAD)
+    finally:
+        # 还原被隔离的路径，避免污染后续测试 / 生产
+        trader_260725.STATE_FILE = _real_state_file
+        trader_260725.TOMBSTONE_FILE = _real_tombstone_file
     print(f'\nGREEN: {passed}/{len(tests)}')
     return 0 if passed == len(tests) else 1
 
