@@ -55,6 +55,11 @@ RESULTS = []
 # ⚠️ D-010 Batch 2（2026-08-28）插码 +235 → AST 重新实测并同步：
 #    补挂SL→4885 | 降级恢复→5042 | 补挂TP→5214 | 预生成SL→5517 | 预生成SL兜底→5664 | 预生成TP→5816
 GATE_LINES = {4885, 5042, 5214, 5517, 5664, 5816}  # D-010 Batch2 后 AST 实测（2026-08-28，函数归属核实）
+# ⚠️ 2026-09-28（R1/R2 第六轮）：行号快照在每次插码后即失效，改为按**函数名**筛选。
+#    这两个函数就是原 6 个行号所属的函数（补挂SL/降级恢复/补挂TP 在 _start_monitoring，
+#    预生成 SL×2 / 预生成 TP 在 _place_prepared_orders_immediately），
+#    按函数筛选的覆盖面**严格不小于**原 6 行，且不会再随插码漂移。
+GATE_FUNCS = {"_start_monitoring", "_place_prepared_orders_immediately"}
 
 
 def report(name, passed, detail=""):
@@ -242,23 +247,31 @@ def t_gate_coverage():
         if not _is_safe_api_create(node):
             continue
         ln = _create_line(node)
-        if ln not in GATE_LINES:
-            continue
         fn = _enclosing_function(tree, node)
+        # ⚠️ 2026-09-28（R1/R2 第六轮）：原按 GATE_LINES 硬编码行号筛选，
+        # 每次插码即失效（本轮 T9 假红：gated=[]/6）。改为按**函数名**筛选 ——
+        # 保护单的两个接入函数，覆盖面严格不小于原来的 6 个行号。
+        if fn is None or fn.name not in GATE_FUNCS:
+            continue
         has_gate = False
-        if fn:
-            for c in ast.walk(fn):
-                if (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
-                        and c.func.attr == '_assert_create_allowed'
-                        and c.lineno < ln):  # 闸门必须在 create 之前
-                    has_gate = True
-                    break
+        for c in ast.walk(fn):
+            if (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                    and c.func.attr == '_assert_create_allowed'
+                    and c.lineno < ln):  # 闸门必须在 create 之前
+                has_gate = True
+                break
         if has_gate:
             gated.append(ln)
         else:
             missing.append(ln)
-    report("T9/6处接入点create前有闸门", len(gated) >= len(GATE_LINES),
-           f"(gated={sorted(gated)}/{len(GATE_LINES)} → 缺失: {sorted(missing)})")
+    # ⚠️ 2026-09-28（R1/R2 第六轮）：GATE_LINES 硬编码行号在每次插码后即失效
+    # （本轮 execute_signal 与接管块插码使其全部漂移，T9 假红）。改为**更强**的
+    # 等价断言：这两个函数内**每一个** create_order 接点都必须有闸门，
+    # 而不是"6 个指定行号碰巧有闸门"。GATE_LINES 降级为最小数量下界。
+    report("T9/两个保护单函数内每个 create 接点前都有闸门",
+           len(missing) == 0 and len(gated) >= len(GATE_LINES),
+           f"(gated={sorted(gated)}，扫描到接点={len(gated) + len(missing)}，"
+           f"下界={len(GATE_LINES)}，缺失: {sorted(missing)})")
 
 
 # =====================================================================

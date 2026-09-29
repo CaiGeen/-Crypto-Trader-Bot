@@ -94,17 +94,16 @@ def build_pytest_args():
 # ---------------------------------------------------------------- 预期退出码
 # 默认 {0}。非 0 必须显式登记 + 写明依据，否则判 FAIL。
 EXPECTED = {
-    # 基线即 3/9：f0a21d2 与 9d9526c 逐项 marker 一致（r5c 两边均通过），
-    # 6 项既有失败（线程时序 / AttributeError: 'function' object has no
-    # attribute 'get'），属独立批次排查对象，不属通知体系范围。
-    'test_v64_p3_lifecycle.py': {1},
+    # 2026-09-28 复审修复夹具（namespace shim 缺口）后 p3 全绿 rc=0。
+    # 逐项基线见 BASELINE_GREEN / BASELINE_FAIL_SET。
+    'test_v64_p3_lifecycle.py': {0},
     # 该文件开局即 acquire_instance_lock()（bot_runner.py:566），
     # Bot 运行中必然 rc=42（互斥体被持有，Fail-Closed 设计使然）；
     # 0 只在停机窗口可能。42 **不算已验证**。
     'test_orphan_guard.py': {0, 42},
 }
 
-BASELINE_FAIL = {'test_v64_p3_lifecycle.py'}
+BASELINE_FAIL = set()
 STOP_WINDOW = {'test_orphan_guard.py'}
 
 # 仅比对退出码是**不够的**：p3 恒返回 1，失败项从 6 个涨到 8 个照样被接受。
@@ -112,24 +111,16 @@ STOP_WINDOW = {'test_orphan_guard.py'}
 #   原本通过的 3 项里坏 1 项、原本失败的另 1 项恰好修好 → 仍是 3/9，数量看不出来。
 # 因此基线按**逐项失败身份**登记，任何一项的通过/失败状态改变都判 BASELINE-DRIFT。
 BASELINE_GREEN = {
-    'test_v64_p3_lifecycle.py': (3, 9),
+    'test_v64_p3_lifecycle.py': (9, 9),
 }
 GREEN_RE = re.compile(r'GREEN:\s*(\d+)\s*/\s*(\d+)')
 
 # 逐项失败身份基线。
-# 基线依据：2026-09-26 在 `5d3ab5d`（与 `f0a21d2`/`9d9526c` 逐项一致）上实测
-#   `python test_v64_p3_lifecycle.py` → rc=1、`GREEN: 3/9`、下面 6 项打印
-#   `❌ <name>: <reason>`，其余 3 项打印 `✅ <name>`。
+# 2026-09-28 复审修复夹具后：9 项全通过，失败身份基线为空集。
+# 任何一项转为失败 → newly 非空 → BASELINE-DRIFT（fatal）。
 # 改动这个集合必须同时更新基线依据，否则视为未经验证的放宽。
 BASELINE_FAIL_SET = {
-    'test_v64_p3_lifecycle.py': frozenset({
-        'r1_clear_during_sleep_zero_side_effect',
-        'r3_zombie_no_protection_repair',
-        'r4_corrupted_is_not_empty',
-        'r5_settlement_report_exactly_once',
-        'r7_settlement_uses_net_qty_not_gross',
-        'r6_normal_batch_unchanged',
-    }),
+    'test_v64_p3_lifecycle.py': frozenset(),
 }
 # 逐行形态：`✅ <name>`（通过）/ `❌ <name>: <reason>`（失败）。
 # 直接锚定 ✅/❌ 两个标记字符，`GREEN: n/m` 汇总行因此天然不会被误判成用例行。

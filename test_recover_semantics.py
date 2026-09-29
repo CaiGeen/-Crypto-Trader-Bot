@@ -28,10 +28,15 @@ def report(name, passed, detail=""):
 
 
 class FakeExchange:
-    def __init__(self, fail_time=False, positions=None):
+    def __init__(self, fail_time=False, positions=None, open_orders=None):
         self.fail_time = fail_time
         self.positions = positions or []
         self.set_leverage_calls = []
+        # 第十一轮归因修正：候选新增「启动重证」（_reverify_ok）要逐条核对
+        # 未结 ENTRY 与持仓方向的 SL 实况，只实现 fetch_time/fetch_positions
+        # 的旧夹具会让场景B 停在"未结订单查询异常"→ 返回 False。
+        # Fail-Closed 行为本身是对的，缺的是**交易所读接口**。
+        self.open_orders = list(open_orders or [])
 
     def fetch_time(self):
         if self.fail_time:
@@ -43,6 +48,19 @@ class FakeExchange:
 
     def set_leverage(self, leverage, symbol):
         self.set_leverage_calls.append((leverage, symbol))
+
+    def fetch_open_orders(self, symbol, params=None):
+        # params={'stop': True} 是重证查条件单的用法；夹具按场景给同一份实况。
+        return list(self.open_orders)
+
+    def fetch_order(self, order_id, symbol=None, **kw):
+        # **kw：ccxt 风格的 params= 调用（接管期 SL 校验就这么调）。
+        # 在未结列表里的单返回 status=open（它们本就是 open order）；
+        # 不在列表里的 ENTRY 返回 closed → 重证判明已成交/完结即可继续。
+        for _o in self.open_orders:
+            if str(_o.get('id')) == str(order_id):
+                return dict(_o, status='open')
+        return {'id': order_id, 'status': 'closed'}
 
 
 def make_fake_self(states, exchange):
@@ -60,6 +78,11 @@ def make_fake_self(states, exchange):
         lambda symbol, is_hedge_mode, side='BUY', retries=3:
         CryptoTrader._get_current_position_amt(fake, symbol, is_hedge_mode, side,
                                                retries))
+    # 第十一轮归因修正：候选新增的「启动重证」会调用
+    # self._registry_has_unresolved_entries(bd)。未绑定时是 MagicMock → 恒真 →
+    # 假"未决 ENTRY 意图" → 场景B 必然返回 False（同 :57 与归档 fake 的既有坑）。
+    fake._registry_has_unresolved_entries = (
+        lambda bd: CryptoTrader._registry_has_unresolved_entries(fake, bd))
     return fake
 
 
@@ -70,7 +93,8 @@ def make_batch(is_active=True, monitor_error=False):
         'symbol': SYMBOL,
         'entry_orders': [{'id': 'o1'}, {'id': 'o2'}],
         'last_filled_count': 1,          # 1 成交 + 1 挂单 -> has_pending_orders = True
-        'current_sl_id': None,           # 跳过 SL 验证分支
+        'current_sl_id': None,           # 默认无 SL 锚点：本文件默认场景无持仓，
+                                        # 重证 ③ 不触发；场景B 显式给出锚点
         'tp_order_id': None,
         'stop_steps': [],
         'take_profit_price': 60000.0,
@@ -95,7 +119,19 @@ def scenario_a():
 def scenario_b():
     """B: 1 活跃批次正常接管 -> True + 接管 1 个"""
     states = {SYMBOL: {'batch_001': make_batch()}}
-    ex = FakeExchange(positions=[{'symbol': SYMBOL, 'contracts': 0.005}])
+    # 第十一轮归因修正：重证要求"有持仓 → 必须有本地 SL 锚点，且该 SL 仍在
+    # 交易所（类型/方向/覆盖量逐项核对）"。旧夹具是 current_sl_id=None 且
+    # FakeExchange 没有 fetch_open_orders → 场景B 必然返回 False。
+    # 这里给出可通过判据的交易所真相：两笔已完结 ENTRY + 一张在场的止损。
+    states[SYMBOL]['batch_001']['current_sl_id'] = 'sl1'
+    ex = FakeExchange(
+        positions=[{'symbol': SYMBOL, 'contracts': 0.005}],
+        open_orders=[{'id': 'o1', 'type': 'LIMIT', 'side': 'BUY',
+                      'amount': 0.005},
+                     {'id': 'o2', 'type': 'LIMIT', 'side': 'BUY',
+                      'amount': 0.005},
+                     {'id': 'sl1', 'type': 'STOP_MARKET', 'side': 'SELL',
+                      'amount': 0.01}])
     fake = make_fake_self(states, ex)
     started = []
 

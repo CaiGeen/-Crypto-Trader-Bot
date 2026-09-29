@@ -159,12 +159,17 @@ def scenario_ast_zero_api():
 # =====================================================================
 
 def _make_sl_order(**kw):
+    # 🔥 S6 收敛（第八轮复审）：夹具必须带上**原始类型 info.type**。真实 Binance 条件单
+    #    必有该字段，而运行期接管判据（_sl_order_verdict）与启动重证都以它区分止损/止盈；
+    #    夹具不带类型 → 无法表达"这是一张止损单"，`scenario_all_valid_noop` 的
+    #    "全有效零撤单"也就证明不了类型这一维（恰恰是被复审指出的口径缺口）。
     base = {'id': 'sl_1', 'side': 'SELL', 'amount': 0.01,
-            'info': {'reduceOnly': 'true', 'closePosition': 'false', 'positionSide': 'BOTH'}}
+            'info': {'type': 'STOP_MARKET',
+                     'reduceOnly': 'true', 'closePosition': 'false', 'positionSide': 'BOTH'}}
     base.update(kw)
-    # 同步 info 子字段：ccxt 实测 reduceOnly/closePosition/positionSide 在 info 中（顶层读不到），
+    # 同步 info 子字段：ccxt 实测 reduceOnly/closePosition/positionSide/type 在 info 中（顶层读不到），
     # 测试意图覆盖 info 子字段时 base.update(kw) 只会落在顶层，必须显式同步
-    for k in ('reduceOnly', 'closePosition', 'positionSide'):
+    for k in ('type', 'reduceOnly', 'closePosition', 'positionSide'):
         if k in kw:
             base['info'][k] = kw[k]
     return base
@@ -172,10 +177,11 @@ def _make_sl_order(**kw):
 
 def _make_tp_order(**kw):
     base = {'id': 'tp_1', 'side': 'SELL', 'amount': 0.01,
-            'info': {'reduceOnly': 'true', 'closePosition': 'false', 'positionSide': 'BOTH'}}
+            'info': {'type': 'TAKE_PROFIT_MARKET',
+                     'reduceOnly': 'true', 'closePosition': 'false', 'positionSide': 'BOTH'}}
     base.update(kw)
     # 同步 info 子字段（同 _make_sl_order）
-    for k in ('reduceOnly', 'closePosition', 'positionSide'):
+    for k in ('type', 'reduceOnly', 'closePosition', 'positionSide'):
         if k in kw:
             base['info'][k] = kw[k]
     return base

@@ -80,6 +80,12 @@ def make_fake(create_results=None):
     fake._ready = True
     fake._api_cooldown_until = 0
     fake._create_n = 0
+    # R1/R2 降级闸门（execute_signal 读 self._poll_degraded_batches /
+    # self._unresolved_intent_batches）：MagicMock 未初始化时属性自动为
+    # MagicMock → 恒真 → 假"降级" → 误发 critical + 误拦新信号。按本文件
+    # 既有惯例（:106/:111/:114 都是同类补桩）显式给空集合。
+    fake._poll_degraded_batches = set()
+    fake._unresolved_intent_batches = set()
 
     def _load():
         return copy.deepcopy(fake.states)
