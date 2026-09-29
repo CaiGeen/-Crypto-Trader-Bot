@@ -182,7 +182,7 @@ cd G:\my-crypto-bot-wt
            c0a9d9d3a6efd738e92c88959bbd67502ae6970b88a2aa936bf3cf36d4634f2c、335102 B
            ① `git diff 8c96867 0ec6b4d`（代码提交完整 diff）
            ② `git diff 8c96867 <head> -- <12 个发布文件>`
-           （PR 全量 diff = 62 文件 / 3565259 B，含材料，须按 12 文件过滤后比）
+           （PR 全量 diff = 62 文件、约 3.5 MB 且随文档登记提交微增，含材料，须按 12 文件过滤后比）
   提交构成：0ec6b4d 代码 8 文件 / bd076c8 材料 50 文件 / 其后纯文档登记提交（仅地图+MANIFEST，不入 12 文件）
   PR 正文已写：两包 sha、发布差异 sha、B35 RED/GREEN/变异与防假绿、
                 A+B 不可拆、门禁未跑 → **不批准合并/部署/重启**
