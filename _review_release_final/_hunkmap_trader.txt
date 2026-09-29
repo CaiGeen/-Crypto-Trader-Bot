@@ -1,0 +1,35 @@
+﻿[ 1] -352,4 +352,119 @@ def _save_daily_report_state(state: dict, path: str | None = None) -> None: [+101 -0] # 🔥 R1/R2: 轮询降级告警阈值（2026-09-28 复审） ⏎ # POLL_FAIL_ALERT_ROUNDS：连续失败多少轮即判定降级（不承诺固定发现时延——每轮先睡 ⏎ #   动态间隔，失败后下轮 ×3 且封顶 300s，_safe_api_call 内部还有重试与冷却）
+[ 2] -465,5 +580,21 @@ class CryptoTrader: [+17 -1] # 🔥 R1/R2: 连续轮询失败降级跟踪（2026-09-28 复审修复） ⏎ # 缺陷：fetch_open_orders 持续失败 → 成交识别被跳过 → 止损补挂延后，且全程无告警、 ⏎ # 无升级、无上限；批次进度在查询之前刷新 → 独立巡检的 batch_stalled 永不触发。
+[ 3] -500,4 +631,6 @@ class CryptoTrader: [+2 -0] # 监控代次所有权：同批次重接管时，只允许当前代次修改登记/风险闸门。 ⏎ self._active_monitor_generations = {}
+[ 4] -905,4 +1038,53 @@ class CryptoTrader: [+47 -0] def _alert_poll_degraded(self, streak, stale, batch_id=None): ⏎ """R1/R2: 监控降级 critical 告警。 ⏎ ChatGPT 第二轮复审阻断4：通知**返回 False**（未抛异常）时不能把
+[ 5] -2759,4 +2941,16 @@ class CryptoTrader: [+12 -0] # S6: compact, durable copy of the exact proof predicates. ⏎ # A monitor may treat this tombstone as normal termination ⏎ # evidence only when both ledger closure and exchange
+[ 6] -3454,6 +3648,180 @@ class CryptoTrader: [+174 -1] # 🔥 R1/R2（ChatGPT 第三轮复审，重启窗口闭环）：**启动时重证**。 ⏎ # 降级集合只在内存，重启即丢 → 不能把"重启后集合为空"当作业务已恢复。 ⏎ # 复用现有 _ready 门（SG1）：对需接管的活跃批次，在完成订单 + 持仓 +
+[ 7] -6020,8 +6388,28 @@ class CryptoTrader: [+19 -0] # 🔥 R1/R2: 监控降级时拒绝新信号（Fail-Closed，任何调用路径必经）。 ⏎ # 位置：所有前置门闸（含余额）之后、任何副作用（骨架/create_order）之前。 ⏎ # 覆盖时序：信号已通过前置检查、期间另一线程才报故障 → 此处复核仍拦截。
+[ 8] -6127,4 +6515,15 @@ class CryptoTrader: [+11 -0] # 🔥 R1/R2 阻断2：每层 ENTRY 创建的**最终边界**复核暂停状态 ⏎ # （另一线程可能在本轮骨架检查之后才置降级）。骨架已落、尚未 ⏎ # 创建时退出 → registry 的 PENDING_CREATE 留证据，恢复时仲裁
+[ 9] -6137,4 +6536,5 @@ class CryptoTrader: [+1 -0] _attempted_layers.add(idx)   # 创建成功 → 不得 CLEAN_REJECT
+[10] -6168,11 +6568,35 @@ class CryptoTrader: [+30 -6] # B2-5（§5.6）：-2021 确定拒绝 = 证明无交易所副作用 → 该层 ⏎ # ABSENT（不残留 PENDING_CREATE）。**不算 attempted**，故仍可 ⏎ # 在全部层确定无副作用时返回 CLEAN_REJECT。
+[11] -6182,13 +6606,266 @@ class CryptoTrader: [+256 -8] # ⏎ # 🔥 R1/R2 阻断2（ChatGPT 第三轮复审）：本分支的成立前提是 ⏎ # 「**所有层**均无交易所副作用且状态已成功落盘」。暂停（break）会
+[12] -6899,6 +7576,9 @@ class CryptoTrader: [+5 -2] # 🔥 ChatGPT 第六轮复审：本函数此前**忽略** _persist_states 返回值恒返回 True， ⏎ # 使「收编成功」不等于「收编事实已落盘」。改为返回写盘是否已确认。 ⏎ # 六个既有调用点均不检查返回值（行为不变），落盘判定由收编路径承担。
+[13] -7662,5 +8342,10 @@ class CryptoTrader: [+6 -1] # 🔥 ChatGPT 第六轮复审：**收编成功 ≠ 收编事实已落盘**。 ⏎ # 落盘未确认时不得返回 ok=True —— 否则调用方会解除暂停并认为已收编。 ⏎ if self._commit_registry_txn(symbol, batch_id, batch_fields=txn_fields) is not True:
+[14] -7696,4 +8381,181 @@ class CryptoTrader: [+167 -0] def _monitor_takeover_handoff(self, lifecycle): ⏎ """解除接管闸门的唯一运行期入口：仅由首轮完整业务轮询调用。""" ⏎ if not isinstance(lifecycle, dict) or not lifecycle.get('reconciled'):
+[15] -7703,14 +8565,30 @@ class CryptoTrader: [+20 -5] layer_sl_params: list = None, _monitor_lifecycle=None): ⏎ _monitor_generation = ( ⏎ _monitor_lifecycle.get('generation')
+[16] -7725,4 +8603,17 @@ class CryptoTrader: [+12 -0] # 🔥 R1/R2: 降级跟踪变量初始化（per-batch，测试 fake 可能不跑 __init__） ⏎ for _attr, _default in ( ⏎ ('_poll_fail_streak', {}),
+[17] -7814,4 +8705,10 @@ class CryptoTrader: [+6 -0] # 代次所有权先于**任何**共享状态写入：旧代次不能覆盖新代次的 ⏎ # 健康进度序列（health_progress 按 batch_id 键，谁写谁覆盖）。 ⏎ if not _is_current_monitor_generation():
+[18] -7862,5 +8759,28 @@ class CryptoTrader: [+23 -0] # 🔥 R1/R2: 逐批失败跟踪（恢复须在业务处理后，不在此宣称） ⏎ _streak = self._poll_fail_streak.get(batch_id, 0) + 1 ⏎ self._poll_fail_streak[batch_id] = _streak
+[19] -7872,4 +8792,7 @@ class CryptoTrader: [+3 -0] # 🔥 R1/R2 阻断1：本轮是否有订单状态未知（回查失败） ⏎ _poll_orders_unresolved = False ⏎ _poll_sl_validated = False
+[20] -7986,7 +8909,16 @@ class CryptoTrader: [+9 -0] else: ⏎ # 回查成功但状态不在认可的终态集合中，不能把它 ⏎ # 当作“已判明”，尤其不能据此解除接管闸门。
+[21] -8692,4 +9624,5 @@ class CryptoTrader: [+1 -0] _poll_orders_unresolved = True
+[22] -8734,4 +9667,8 @@ class CryptoTrader: [+4 -0] else: ⏎ # 单个订单回查显示非终态/未知，但它不在本轮 open ⏎ # snapshot；状态来源相互矛盾，不能用作接管完成证据。
+[23] -8743,4 +9680,19 @@ class CryptoTrader: [+15 -0] # 🔥 S6 收敛（第八轮复审阻断1）：SG3 那三项判据**不判类型、不排 NaN**， ⏎ #    而首轮接管正是凭这里的结论置 `_poll_sl_validated` 放闸。运行期 ⏎ #    必须与启动重证用**同一套**类型白名单/方向/仓位方向/有限覆盖量判据，
+[24] -8758,4 +9710,5 @@ class CryptoTrader: [+1 -0] _poll_sl_validated = True
+[25] -8864,4 +9817,5 @@ class CryptoTrader: [+1 -0] tp_status = None
+[26] -8910,4 +9864,7 @@ class CryptoTrader: [+3 -0] _poll_orders_unresolved = True ⏎ if tp_status not in ('closed', 'filled', 'canceled', 'expired', 'rejected'): ⏎ _poll_orders_unresolved = True
+[27] -9058,4 +10015,19 @@ class CryptoTrader: [+14 -0] # 🔥 R1/R2（ChatGPT 第三轮复审）：恢复判定放在**本轮必要保护处理 ⏎ # 与确认之后**——即此处，而非订单识别循环紧后方。 ⏎ #
+[28] -9253,4 +10225,5 @@ class CryptoTrader: [+1 -0] _poll_sl_validated = True
+[29] -9422,4 +10395,5 @@ class CryptoTrader: [+1 -0] _poll_sl_validated = True
+[30] -9701,4 +10675,54 @@ class CryptoTrader: [+48 -0] # 🔥 R1/R2（ChatGPT 第四轮复审）：恢复判定 —— **分开两个判据**， ⏎ # 且必须在本轮止损/止盈维护**之后**、循环层级执行（未成交批次不进入 ⏎ # 上方维护分支，故不能放在分支内）。
+[31] -9728,7 +10752,37 @@ class CryptoTrader: [+31 -3] _poll_state_saved = self.save_batch_state( ⏎ symbol, batch_id, batch_state_data) is True ⏎ else:
+[32] -9747,33 +10801,91 @@ class CryptoTrader: [+83 -26] if isinstance(_monitor_lifecycle, dict): ⏎ _monitor_lifecycle['exit_reason'] = f"monitor exception: {inner_e}" ⏎ # 🔥 第九轮复审阻断2：异常处置的**副作用**同样受代次门控。
+[33] -9781,9 +10893,25 @@ class CryptoTrader: [+20 -4] # Takeover ownership is finalized by _run_monitor_takeover after ⏎ # terminal proof / abnormal exit classification. ⏎ _still_owner = (
+[34] -9794,5 +10922,15 @@ class CryptoTrader: [+11 -1] if not _still_owner: ⏎ # 🔥 S6 收敛（第八轮复审阻断2）：旧代次在**整个退出收尾**里失去副作用权限。 ⏎ #    上方的代次判断只挡住"删新登记"；下面这些真实副作用——finalizer 落账、
+[35] -12929,3 +14067,3 @@ class CryptoTrader: [+1 -1] print("🔧 trader_260725.py 仅供导入使用")
