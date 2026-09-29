@@ -1,0 +1,49 @@
+﻿== 进程链只读核对 / 实例互斥体只读探测 ==
+== 采集时刻: 2026-09-29 23:10:32 ==
+
+[1] 全部 python.exe 进程 (PID / PPID / 启动时刻 / 命令行)
+  PID=7460 PPID=42408 started=22:07:47
+     .venv\Scripts\python.exe watchdog.py
+  PID=23904 PPID=36440 started=22:07:47
+     G:\my-crypto-bot\.venv\Scripts\python.exe G:\my-crypto-bot\bot_runner.py
+  PID=36440 PPID=7460 started=22:07:47
+     "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python.exe" watchdog.py
+  PID=47996 PPID=23904 started=22:07:47
+     "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python.exe" G:\my-crypto-bot\bot_runner.py
+
+[2] 精确过滤器复核 PPID + 启动器父进程
+  PID=7460 PPID=42408 name=python.exe cli=.venv\Scripts\python.exe watchdog.py
+  PID=36440 PPID=7460 name=python.exe cli="C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python
+  PID=23904 PPID=36440 name=python.exe cli=G:\my-crypto-bot\.venv\Scripts\python.exe G:\my-crypto-bot\bot_runner.
+  PID=47996 PPID=23904 name=python.exe cli="C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python
+  PID=42408 PPID=9316 name=cmd.exe cli=C:\windows\system32\cmd.exe /c ""G:\my-crypto-bot\启动Bot.bat" "
+
+[3] 资源占用 (判断谁在真正执行业务代码)
+  PID=7460 Threads=1 CPU秒=0.02 WS_MB=2
+  PID=23904 Threads=1 CPU秒=0 WS_MB=2
+  PID=36440 Threads=4 CPU秒=0.23 WS_MB=7
+  PID=47996 Threads=3 CPU秒=4.41 WS_MB=22
+
+[4] 诊断锁文件 .bot_instance.lock (内容=拿到实例锁的 PID)
+  content=47996  mtime=09/29/2026 22:07:48
+
+[5] 实例互斥体只读探测 (OpenMutex SYNCHRONIZE-only, 不获取所有权)
+  handle=144 last_error=0 (0=����/�ɴ�, 2=ERROR_FILE_NOT_FOUND=������)
+
+[6] 日志中是否存在双实例拒绝记录
+  命中 0 条 (无双实例拒绝记录)
+
+[7] venv 启动器行为实测 (2026-09-29 探针, 独立进程, 不触碰生产)
+  命令: .venv\Scripts\python.exe probe_spawn.py (探针打印自身 pid/ppid/exe 后 sleep)
+  进程表事实: 启动器 PID=16724 (venv python) 派生子进程 PID=38340 (base Python311)
+  探针自报:   pid=38340 ppid=16724 exe=G:\my-crypto-bot\.venv\Scripts\python.exe
+  结论: venv python.exe 是启动器, 执行 Python 业务代码的是 base python311 子进程;
+        故 7460/23904 (venv) 是启动器, 36440/47996 (py311) 才是真进程
+
+[8] 结论
+  - 进程为单链而非两组并行: cmd(42408) -> 7460 -> 36440 -> 23904 -> 47996
+  - 真正执行业务的 python 进程仅 2 个: 36440(watchdog) + 47996(bot)
+  - 实例锁持有者 = 47996 (.bot_instance.lock), 互斥体存在, 无拒绝记录
+  - 心跳记录 bot_pid=23904 指的是启动器 PID(venv), 其子进程 47996 才是持锁实例
+  - 结论: 没有形成两个可交易实例; 重复进程外观 = venv 启动器产物
+  - 本文件全部为只读取证, 未重启/未停止/未触碰任何生产进程或参数
