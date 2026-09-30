@@ -3,7 +3,8 @@
 """健康巡检.py —— 死人心跳巡检（v6.5 生产运维，2026-09-23）
 
 职责：判定「守护链是否活着」——异常告警，正常完全静默。
-数据源：watchdog 维护的 .heartbeat.json（每 60s 原子刷新）。
+数据源：watchdog 维护的 .heartbeat.json（每 60s 原子刷新）
+       + .egress_ip.state.json（出口 IP 白名单核验记录，D 2026-09-30）。
 告警通道：Telegram（经 .env 的 BINANCE_PROXY）→ 代理不可用则直连重试
          → 仍失败降级 QQ 邮件（SMTP 国内直连，代理挂掉时仍可达）。
 去重：同一问题 30 分钟内只告警一次（.patrol_alert.state.json）。
@@ -12,7 +13,11 @@
   ① 纯标准库——venv 包损坏 / pip 环境被改时仍能报警；
   ② 绝不触碰交易状态（只读心跳与锁文件，不写 trade_state）；
   ③ pythonw.exe 下 sys.stdout 为 None → 入口即做空值防护；
-  ④ 自身故障绝不抛出（exit 0），只在日志留痕，避免计划任务刷"失败"。
+  ④ 自身故障绝不抛出（exit 0），只在日志留痕，避免计划任务刷"失败"；
+  ⑤ 出口 IP 白名单巡检（D，2026-09-30）：经代理取当前出口 IP，未登记时做一次
+     **只读**签名探活（GET /fapi/v1/balance）判定是否仍在币安 API 白名单；
+     不下单、不撤单、不改仓、不写 trade_state；取不到 IP 或网络失败一律只记日志、
+     绝不告警（避免代理抖动变成噪音），仅在币安明确回 -2015/-2014 时才告警。
 
 用法：
   健康巡检.py                 巡检一次（计划任务每 15 分钟调用）
@@ -45,6 +50,20 @@ BOT_DEAD_THRESHOLD = 2        # 连续 N 次巡检 bot 不存活才告警（滤�
 PROGRESS_STALL_SECONDS = int(os.getenv("PATROL_PROGRESS_STALL_SECONDS", "900"))
 HEALTH_DIR = os.path.join(BASE_DIR, ".bot_health")
 TRADE_STATE_FILE = os.path.join(BASE_DIR, "trade_state.json")
+
+# ==================== 出口 IP 白名单巡检（D，2026-09-30）====================
+# 背景：代理（FlClash 等）会在多个出口节点间轮换；币安 API key 若启用 IP 白名单，
+# 新出口的签名请求直接返回 -2015，而生产代码 **单次** -2015 即进入盲区安全模式
+# （AUTH_BLOCKED：全部 Binance API 停摆，需人工 /auth_reset）——2026-09-30 21:28 实盘发生过。
+# 既有 `_check_ip_periodically` 只在「有活跃批次的监控循环」内运行 → 空仓期无人巡检；
+# 故把该检查放进本进程：每 15 分钟一轮，空仓同样生效。
+EGRESS_STATE_FILE = os.path.join(BASE_DIR, ".egress_ip.state.json")
+EGRESS_CHECK_ENABLED = os.getenv("EGRESS_IP_CHECK", "true").strip().lower() in ("1", "true", "yes", "on")
+# 同一出口 IP 每 6h 复检一次（防「白名单后来被移除」这类反向变化），其余轮次零币安签名调用
+EGRESS_VERIFY_TTL_SECONDS = int(os.getenv("EGRESS_IP_VERIFY_TTL_SECONDS", "21600"))
+EGRESS_STATE_MAX_ENTRIES = 32          # 状态文件只留最近 N 个出口，防无限增长
+EGRESS_IP_TIMEOUT = int(os.getenv("EGRESS_IP_TIMEOUT", "8"))
+EGRESS_PROBE_TIMEOUT = int(os.getenv("EGRESS_PROBE_TIMEOUT", "12"))
 
 # pythonw.exe 场景：stdout/stderr 为 None，print 会抛 AttributeError
 if sys.stdout is None:
@@ -233,6 +252,146 @@ def alert(env: dict, key: str, title: str, detail: str, dry_run: bool) -> None:
         log(f"❌ [{key}] 所有告警通道均失败（请人工检查机器与网络）")
 
 
+# ==================== 出口 IP 白名单核验（D）====================
+def _egress_http_get(url, proxy_url="", timeout=10, headers=None):
+    """只读 GET。返回 (status, body)。网络失败由调用方捕获（本函数不吞异常）。"""
+    import urllib.request
+    req = urllib.request.Request(url, headers=headers or {})
+    if proxy_url:
+        handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    else:
+        handler = urllib.request.ProxyHandler({})          # 显式不走系统代理
+    opener = urllib.request.build_opener(handler)
+    with opener.open(req, timeout=timeout) as resp:
+        code = getattr(resp, "status", None) or resp.getcode()
+        return int(code), resp.read().decode("utf-8", "replace")
+
+
+def get_egress_ip(env: dict, proxy_url: str = ""):
+    """当前代理出口 IP；拿不到返回 None（只记日志，不告警）。"""
+    attempts = ("https://api.ipify.org?format=json", "https://ifconfig.me/ip")
+    last_err = None
+    for url in attempts:
+        try:
+            status, body = _egress_http_get(url, proxy_url, EGRESS_IP_TIMEOUT)
+            if not 200 <= status < 300:
+                last_err = f"{url} → HTTP {status}"
+                continue
+            ip = ""
+            try:
+                ip = str(json.loads(body).get("ip", "")).strip()
+            except Exception:
+                ip = ""
+            if not ip and body:
+                ip = body.strip().splitlines()[0].strip()
+            if ip and 3 <= len(ip) <= 45:
+                return ip
+            last_err = f"{url} → 响应不可解析: {body[:80]!r}"
+        except Exception as e:
+            last_err = f"{url} → {type(e).__name__}: {e}"
+    log(f"ℹ️ 出口 IP 获取失败（本轮跳过白名单核验）: {last_err}")
+    return None
+
+
+def probe_auth_for_ip(env: dict, proxy_url: str = ""):
+    """只读鉴权探活：当前出口 IP 下签名请求是否被币安接受。
+
+    返回 (verdict, detail)，verdict ∈ {"ok", "rejected", "error", "skip"}。
+    只读：GET /fapi/v1/balance（余额查询）——不下单、不撤单、不改仓。
+    """
+    key = env.get("BINANCE_API_KEY", "")
+    secret = env.get("BINANCE_SECRET", "")
+    if not (key and secret):
+        return "skip", "未配置 BINANCE_API_KEY/BINANCE_SECRET"
+    try:
+        import hmac
+        from urllib.parse import urlencode
+        query = urlencode({"timestamp": int(time.time() * 1000), "recvWindow": 5000})
+        signature = hmac.new(secret.encode(), query.encode(), "sha256").hexdigest()
+        url = f"https://fapi.binance.com/fapi/v1/balance?{query}&signature={signature}"
+        status, body = _egress_http_get(url, proxy_url, EGRESS_PROBE_TIMEOUT,
+                                        headers={"X-MBX-APIKEY": key})
+        if 200 <= status < 300:
+            return "ok", f"HTTP {status}（出口 IP 鉴权探活通过）"
+        low = (body or "").lower()
+        # 仅当币安**明确**拒绝鉴权才算「不在白名单」；其余（429/5xx/网关）归为 error
+        if "-2015" in (body or "") or "-2014" in (body or "") or "invalid api-key" in low:
+            return "rejected", f"HTTP {status}: {(body or '')[:300]}"
+        return "error", f"HTTP {status}: {(body or '')[:200]}"
+    except Exception as e:
+        return "error", f"{type(e).__name__}: {e}"
+
+
+def _egress_state_load() -> dict:
+    """读已核验出口 IP 记录 {ip: verified_at}。损坏/缺失一律当空表。"""
+    data = read_json(EGRESS_STATE_FILE)
+    if not isinstance(data, dict):
+        return {}
+    clean = {}
+    for ip, ts in data.items():
+        try:
+            clean[str(ip)] = float(ts)
+        except (TypeError, ValueError):
+            continue
+    return clean
+
+
+def _egress_state_save(ips: dict):
+    keep = sorted(ips.items(), key=lambda kv: kv[1])[-EGRESS_STATE_MAX_ENTRIES:]
+    write_json(EGRESS_STATE_FILE, {ip: ts for ip, ts in keep})
+
+
+def check_egress_ip(env: dict, proxy_url: str = "", summary=None):
+    """新增/轮换的出口 IP 是否仍在币安 API 白名单。返回 issues（3 元组列表）。
+
+    判定分级（刻意保守，避免噪音）：
+      · 已登记且未过 TTL        → 零币安签名调用，只在 summary 留痕；
+      · 未登记/已过期 + 探活通过 → 登记并写状态文件，不告警（新 IP 合法是常态）；
+      · 探活被明确拒绝(-2015)   → 告警 egress_ip_rejected（走 alert 的 30min 去重）；
+      · 取不到 IP / 网络失败     → 只记日志，绝不告警，下轮重试。
+    """
+    issues = []
+    if not EGRESS_CHECK_ENABLED:
+        return issues
+    try:
+        ip = get_egress_ip(env, proxy_url)
+        if not ip:
+            return issues
+        ips = _egress_state_load()
+        now = time.time()
+        verified_at = ips.get(ip, 0.0)
+        if verified_at and (now - verified_at) < EGRESS_VERIFY_TTL_SECONDS:
+            if summary is not None:
+                summary.append(f"出口 IP {ip} 白名单已核验({int(now - verified_at)}s 前)")
+            return issues
+
+        verdict, detail = probe_auth_for_ip(env, proxy_url)
+        if verdict == "ok":
+            ips[ip] = now
+            _egress_state_save(ips)
+            log(f"✅ 出口 IP {ip} 鉴权探活通过，已登记"
+                f"（{EGRESS_VERIFY_TTL_SECONDS}s 内不再探活）")
+            if summary is not None:
+                summary.append(f"出口 IP {ip} 探活通过")
+        elif verdict == "rejected":
+            issues.append((
+                "egress_ip_rejected",
+                f"出口 IP {ip} 不在币安 API 白名单",
+                f"只读探活被拒：{detail}\n"
+                f"影响：该出口下 bot 的签名请求会返回 -2015，生产代码单次即进入"
+                f"盲区安全模式（全部 API 停摆，需人工发送 /auth_reset 才恢复）。\n"
+                f"处置：① 把 {ip} 加入币安 API key 白名单；或 ② 在 FlClash 固定出口节点。"
+                f"完成后下轮探活通过即自动登记、告警消失。"))
+        elif verdict == "skip":
+            log(f"ℹ️ 出口 IP {ip} 白名单核验跳过：{detail}")
+        else:
+            log(f"⚠️ 出口 IP {ip} 鉴权探活未完成（不告警，下轮重试）: {detail}")
+    except Exception as e:
+        # 设计约束④：自身故障绝不抛出
+        log(f"⚠️ 出口 IP 白名单核验自身异常（按设计不抛出）: {type(e).__name__}: {e}")
+    return issues
+
+
 # ==================== 巡检主体 ====================
 def run_check(env: dict, dry_run: bool) -> int:
     proxy_url = env.get("BINANCE_PROXY", "")
@@ -332,10 +491,16 @@ def run_check(env: dict, dry_run: bool) -> int:
             issues.append(("health_state_unknown", f"业务活性状态未知：{e}",
                            "无法确认 bot 是否空闲；按 Fail-Safe 处理，核查 trade_state.json 与 .bot_health 后再决定是否重启。"))
 
-    if proxy_url and not proxy_ready(proxy_url):
+    proxy_ok = proxy_ready(proxy_url) if proxy_url else True
+    if proxy_url and not proxy_ok:
         issues.append(("proxy_down", "本地代理不可达",
                        f"{proxy_hostport(proxy_url)} 无法连接：币安 API 与 TG 均不可用，"
                        "bot 的监控循环会持续失败。请启动代理软件。"))
+
+    # D（2026-09-30）：出口 IP 白名单核验。放在 proxy_ok 分支内——代理不通时
+    # 本就取不到出口 IP，再去探活只会多一条无意义日志。
+    if proxy_ok:
+        issues.extend(check_egress_ip(env, proxy_url, summary))
 
     if issues:
         for key, title, detail in issues:
@@ -389,6 +554,16 @@ def main(argv) -> int:
         ok_mail = send_email(env, "🧪 巡检通道自检", msg + "\n（通道：邮件兜底）",
                              event="health")
         log(f"=== 自检结果: TG经代理={ok_proxy} TG直连={ok_direct} 邮件={ok_mail} ===")
+        # D：出口 IP 白名单只读核验（自检用，不发消息、不写状态文件）
+        _ip = get_egress_ip(env, proxy_url)
+        if _ip:
+            _verdict, _detail = probe_auth_for_ip(env, proxy_url)
+            log(f"=== 出口 IP 自检: ip={_ip} verdict={_verdict} ({_detail}) ===")
+            if _verdict == "rejected":
+                log(f"🚨 [egress_ip_rejected] 出口 IP {_ip} 不在币安 API 白名单，"
+                    f"请加白或在 FlClash 固定出口节点")
+        else:
+            log("=== 出口 IP 自检: 无法获取出口 IP（见上方日志）===")
         return 0
 
     return run_check(env, dry_run)

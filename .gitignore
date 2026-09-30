@@ -86,5 +86,7 @@ logs/
 .daily_report.state.json
 .daily_report.state.json.tmp
 .bot_health/
+.egress_ip.state.json
+.egress_ip.state.json.tmp
 *.bak
 
