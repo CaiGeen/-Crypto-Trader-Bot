@@ -15,7 +15,7 @@
   ③ pythonw.exe 下 sys.stdout 为 None → 入口即做空值防护；
   ④ 自身故障绝不抛出（exit 0），只在日志留痕，避免计划任务刷"失败"；
   ⑤ 出口 IP 白名单巡检（D，2026-09-30；2026-10-01 复审修订）：经代理取当前出口 IP，
-     未登记或过 6h TTL 时做一次**只读**签名探活（GET /fapi/v1/balance）判定是否仍被
+     未登记或过 6h TTL 时做一次**只读**签名探活（GET /fapi/v3/balance）判定是否仍被
      鉴权接受；不下单、不撤单、不改仓、不写 trade_state；**停机(stopped)期间照常执行**
      （它与守护链存活无关，而停机→重启正是启动探活撞 -2015 的高危窗口）。
      判定保守：取不到 IP / 网络失败 / -1021 / 非 balance 数组体一律只记日志绝不告警
@@ -25,7 +25,7 @@
 
 用法：
   健康巡检.py                 巡检一次（计划任务每 15 分钟调用）
-  健康巡检.py --dry-run       只打印判定结果，不发任何网络请求
+  健康巡检.py --dry-run       只打印判定结果，不发任何网络请求（出口 IP 核验与代理探测同样跳过）
   健康巡检.py --wait-proxy N  等待本地代理就绪，最多 N 秒（开机自启用）
   健康巡检.py --notify-proxy-down  开机自启因代理未就绪放弃时的告警
 """
@@ -377,7 +377,11 @@ def probe_auth_for_ip(env: dict, proxy_url: str = ""):
     """只读鉴权探活：当前出口 IP 下签名请求是否被币安接受。
 
     返回 (verdict, detail)，verdict ∈ {"ok", "rejected", "error", "skip"}。
-    只读：GET /fapi/v1/balance（余额查询）——不下单、不撤单、不改仓。
+    只读：GET /fapi/v3/balance（余额查询）——不下单、不撤单、不改仓。
+    端点（2026-10-01 复审 R4 阻断项）：v1 自 2023-07-15 起被币安停止支持——官方
+    change log 2023-06-28 条目 + 现场无签名实测 ``/fapi/v1/balance`` → 404、
+    ``/fapi/v3/balance`` → 401 -2014（端点存在）。走 v1 会 404 出 HTML 体，被分类
+    判成 error → 每轮只记「探活未完成」、永不登记也永不告警，D 整个特性静默失效。
 
     P2（2026-10-01 复审）：recvWindow 从 5s 放宽到 60s —— 本机时钟偏移 >5s 时
     Binance 回 -1021，原实现会落进 error 分支**永久静默**（不告警、不登记、每轮重探）。
@@ -392,7 +396,7 @@ def probe_auth_for_ip(env: dict, proxy_url: str = ""):
         from urllib.parse import urlencode
         query = urlencode({"timestamp": int(time.time() * 1000), "recvWindow": 60000})
         signature = hmac.new(secret.encode(), query.encode(), "sha256").hexdigest()
-        url = f"{_FAPI_BASE}/fapi/v1/balance?{query}&signature={signature}"
+        url = f"{_FAPI_BASE}/fapi/v3/balance?{query}&signature={signature}"
         status, body = _egress_http_get(url, proxy_url, EGRESS_PROBE_TIMEOUT,
                                         headers={"X-MBX-APIKEY": key})
         verdict = _classify_probe(status, body)
@@ -418,7 +422,7 @@ def _classify_probe(status, body) -> str:
 
     判定顺序：
       ① dict + ``code`` ∈ {-2015,-2014} → rejected（任何状态码，含 2xx 带错误体的历史形态）；
-      ② 2xx + **JSON 数组** → ok（``/fapi/v1/balance`` 恒返回数组）；2xx 但体不是数组
+      ② 2xx + **JSON 数组** → ok（``/fapi/v3/balance`` 恒返回数组）；2xx 但体不是数组
          → error，**绝不登记**；
       ③ 非 2xx：结构化体只按 code 判（已判过即 error）；只有非 JSON 体才允许按拒绝
          特征兜底（HTTPS 强证书校验下不会是代理注入的页面）。
@@ -598,12 +602,20 @@ def run_check(env: dict, dry_run: bool) -> int:
     # D：出口 IP 核验与"守护链是否活着"无关，**必须先于**下面 stopped 提前返回执行。
     # 停机静默只针对守护链类误报（watchdog/bot 存活），不能连带吞掉鉴权拒绝——
     # 「停机→重启」正是 bot 启动探活撞 -2015 进盲区的高危窗口（2026-10-01 复审 P1b）。
-    proxy_ok = proxy_ready(proxy_url) if proxy_url else True
-    if proxy_ok:
-        egress_issues = check_egress_ip(env, proxy_url, summary)
-        for key, title, detail in egress_issues:
-            log(f"🚨 [{key}] {title} | {detail}")
-            alert(env, key, title, detail, dry_run)
+    proxy_ok = True            # dry-run 下不探测（零网络契约），proxy_down 一并跳过
+    if dry_run:
+        # R4 阻断项（2026-10-01）：文件头承诺 --dry-run「不发任何网络请求」，而 D 引入的
+        # 出口核验要连本地代理 + 查 ipify + 发签名探活。dry-run 必须整体跳过并留痕；
+        # 代价是 dry-run 不再报告 proxy_down —— 探测本身就是网络请求，契约优先。
+        log("[dry-run] 跳过出口 IP 核验与代理探测（零网络：不查出口 IP、"
+            "不发签名探活、不连本地代理）")
+    else:
+        proxy_ok = proxy_ready(proxy_url) if proxy_url else True
+        if proxy_ok:
+            egress_issues = check_egress_ip(env, proxy_url, summary)
+            for key, title, detail in egress_issues:
+                log(f"🚨 [{key}] {title} | {detail}")
+                alert(env, key, title, detail, dry_run)
 
     hb = read_json(HEARTBEAT_FILE)
     if not hb:

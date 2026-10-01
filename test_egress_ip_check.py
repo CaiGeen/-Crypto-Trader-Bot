@@ -15,7 +15,8 @@
      判定按响应体**结构化 code**，不搜原始子串——余额含 -20150.5 不得误报（第三轮 P1）；
   4. 取不到出口 IP / 网络失败 / 非鉴权 HTTP 错 / -1021 / **2xx 非 balance 数组体**
      → 只记日志，**绝不告警、绝不登记**；
-  5. 探活是**只读** GET /fapi/v1/balance，带签名与 X-MBX-APIKEY，绝无下单路径；
+  5. 探活是**只读** GET /fapi/v3/balance，带签名与 X-MBX-APIKEY，绝无下单路径
+     （v1 自 2023-07-15 已被币安停止支持，现场实测 404；R4 阻断项）；
   6. 任何自身异常按设计约束④ 不得抛出（含 .env 数值解析）；
   7. 状态文件损坏当空表；verified/rejected 各自封顶；兼容首版扁平格式；
   8. 被拒后进入冷却期：不重复发失败签名请求，但**仍出 issue**（P1 防限流稀释信号）；
@@ -76,7 +77,7 @@ class _HTTP:
 
     @property
     def probe_calls(self):
-        return [c for c in self.calls if "/fapi/v1/balance" in c["url"]]
+        return [c for c in self.calls if "/fapi/v3/balance" in c["url"]]
 
     @property
     def ip_calls(self):
@@ -199,7 +200,7 @@ class NewIpTests(EgressBase):
 
         call = fake.probe_calls[0]
         self.assertTrue(
-            call["url"].startswith("https://fapi.binance.com/fapi/v1/balance?"),
+            call["url"].startswith("https://fapi.binance.com/fapi/v3/balance?"),
             call["url"])
         self.assertIn("signature=", call["url"])
         self.assertIn("timestamp=", call["url"])
@@ -713,6 +714,25 @@ class RunCheckIntegrationTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(self.captured, [], "停机期守护链类问题必须保持静默")
+
+    def test_dry_run_makes_zero_network_calls(self):
+        """R4 阻断项：--dry-run 的契约是「不发任何网络请求」——
+        proxy_ready 的 TCP 探测与出口核验（ipify + 签名探活）一律不得发生。"""
+        loglines = []
+        p.log = lambda msg: loglines.append(str(msg))
+        p.proxy_ready = lambda u, timeout=2.0: (
+            self.fail("dry-run 不得调用 proxy_ready（TCP 探测也是网络请求）"))
+        fake = _HTTP()                      # 真实出口路径若被调用，这里会留下记录
+        p._egress_http_get = fake
+
+        rc = p.run_check(dict(ENV), dry_run=True)
+
+        self.assertEqual(rc, 0, "巡检自身必须 exit 0")
+        self.assertEqual(fake.calls, [], f"dry-run 不得发起任何 HTTP 请求: {fake.calls}")
+        self.assertFalse(os.path.exists(p.EGRESS_STATE_FILE),
+                         "dry-run 不得写出 .egress_ip.state.json")
+        self.assertTrue(any("[dry-run]" in m for m in loglines),
+                        f"dry-run 必须留痕说明跳过了出口核验: {loglines}")
 
     def test_proxy_down_still_runs_no_egress_probe(self):
         """代理不通 → 不取出口 IP、不探活（避免无意义日志），proxy_down 正常上报。"""
