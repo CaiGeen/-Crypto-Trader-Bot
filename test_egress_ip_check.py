@@ -12,7 +12,9 @@
   2. 新出口 + 探活通过 → 登记 verified、清 rejected，**不告警**；
   3. 币安明确回 -2015/-2014 → issue `egress_ip_rejected:{ip}`；
      **必须覆盖真实 urllib 路径**：币安 4xx 会抛 HTTPError，不捕获就永远不告警（P0）；
-  4. 取不到出口 IP / 网络失败 / 非鉴权 HTTP 错 / -1021 → 只记日志，**绝不告警**；
+     判定按响应体**结构化 code**，不搜原始子串——余额含 -20150.5 不得误报（第三轮 P1）；
+  4. 取不到出口 IP / 网络失败 / 非鉴权 HTTP 错 / -1021 / **2xx 非 balance 数组体**
+     → 只记日志，**绝不告警、绝不登记**；
   5. 探活是**只读** GET /fapi/v1/balance，带签名与 X-MBX-APIKEY，绝无下单路径；
   6. 任何自身异常按设计约束④ 不得抛出（含 .env 数值解析）；
   7. 状态文件损坏当空表；verified/rejected 各自封顶；兼容首版扁平格式；
@@ -304,6 +306,80 @@ class IpLiteralTests(EgressBase):
         for bad in ("", None, "<!DOCTYPE html>", '{"ip": "1.2.3.4"}', "999.1.1.1",
                     "not-an-ip", 12345):
             self.assertFalse(p._is_ip_address(bad), repr(bad))
+
+
+# ==================== 第三轮复审 P1：探活按响应结构定性 ====================
+class ProbeClassificationTests(EgressBase):
+    """不搜原始子串：余额里含 -2015 的数字不得误报，2xx 非数组体不得登记。"""
+
+    def test_classify_table(self):
+        # 入参与真实调用一致：_egress_http_get 返回的是已解码 str
+        cases = [
+            (200, '[{"asset":"USDT","balance":"1"}]', "ok"),
+            # 实测过的假阳性来源：余额负盈亏含 -20150.5 子串
+            (200, '[{"asset":"USDT","balance":"1000.0","crossUnrealizedPnl":-20150.5}]', "ok"),
+            (200, '[{"balance":"0.1","crossUnrealizedPnl":-2015}]', "ok"),
+            # 拒绝码：任何状态码都要认（含 2xx 带错误体的历史形态）
+            (200, '{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action"}', "rejected"),
+            (400, '{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action"}', "rejected"),
+            (401, '{"code":-2014,"msg":"API-key format invalid"}', "rejected"),
+            (400, '{"code":"-2015","msg":"..."}', "rejected"),   # 字符串码
+            # 2xx 但体不是 balance 数组 → error，绝不登记
+            (200, '{"code":-1021,"msg":"Timestamp outside recvWindow"}', "error"),
+            (200, "<html>Bad Gateway</html>", "error"),
+            (200, "", "error"),
+            (200, "null", "error"),
+            # 非 2xx：结构化体按 code 判，无拒绝码即 error
+            (503, "<html>Service Unavailable</html>", "error"),
+            (400, '{"code":-1001,"msg":"Too many requests"}', "error"),
+            # 非 2xx + 非 JSON：才允许按拒绝特征兜底
+            (400, "request rejected: invalid api-key, request ip: 1.2.3.4", "rejected"),
+        ]
+        for status, body, expect in cases:
+            with self.subTest(status=status, body=body):
+                self.assertEqual(p._classify_probe(status, body), expect)
+
+    def test_balance_with_minus2015_digits_does_not_false_alert(self):
+        """实测假阳性回归：余额含 -2015 子串 → 必须 ok + 登记，且零告警。"""
+        fake = _HTTP(ip="198.51.100.9", probe_status=200,
+                     probe_body='[{"asset":"USDT","balance":"1000.0",'
+                                '"crossUnrealizedPnl":-20150.5,'
+                                '"availableBalance":"999.0"}]')
+        self.use_http(fake)
+
+        issues, summary = self.run_check_e()
+        state = self.read_state()
+
+        self.assertEqual(issues, [], "正常余额不得产生任何告警")
+        self.assertIn("198.51.100.9", state["verified"])
+        self.assertEqual(state["rejected"], {})
+        self.assertTrue(any("探活通过" in s for s in summary), summary)
+
+    def test_200_non_array_body_is_not_registered(self):
+        """2xx 非 balance 数组体 → error，只记日志，不得登记（否则探活形同虚设）。"""
+        fake = _HTTP(ip="198.51.100.10", probe_status=200,
+                     probe_body="<html>Bad Gateway</html>")
+        self.use_http(fake)
+
+        issues, _ = self.run_check_e()
+
+        self.assertEqual(issues, [])
+        self.assertIsNone(self.read_state(), "非数组体不得写入状态文件")
+        self.assertTrue(self.has_log("未完成"), self.logs)
+
+    def test_200_error_object_not_registered_and_shows_clock_hint(self):
+        """2xx 返回错误对象（-1021）→ 不登记，且必须给出校时提示而非泛化成网络未完成。"""
+        fake = _HTTP(ip="198.51.100.11", probe_status=200,
+                     probe_body='{"code":-1021,"msg":"Timestamp for this request '
+                                'is outside of the recvWindow"}')
+        self.use_http(fake)
+
+        issues, _ = self.run_check_e()
+
+        self.assertEqual(issues, [])
+        self.assertIsNone(self.read_state())
+        self.assertTrue(self.has_log("时间戳校验拒绝(-1021)"), self.logs)
+        self.assertFalse(self.has_log("未完成"), "时钟问题应有专门日志")
 
 
 # ==================== 契约8：拒绝冷却 ====================

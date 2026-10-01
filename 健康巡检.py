@@ -18,9 +18,10 @@
      未登记或过 6h TTL 时做一次**只读**签名探活（GET /fapi/v1/balance）判定是否仍被
      鉴权接受；不下单、不撤单、不改仓、不写 trade_state；**停机(stopped)期间照常执行**
      （它与守护链存活无关，而停机→重启正是启动探活撞 -2015 的高危窗口）。
-     判定保守：取不到 IP / 网络失败 / -1021 一律只记日志绝不告警（代理抖动与本地时钟
-     不是白名单问题）；仅在币安明确回 -2015/-2014 时告警，且记入冷却期，冷却内不重复
-     探活以免触发币安校验限流把真实拒绝信号稀释掉。
+     判定保守：取不到 IP / 网络失败 / -1021 / 非 balance 数组体一律只记日志绝不告警
+     （代理抖动、本地时钟与异常响应体都不是白名单问题）；仅当响应体结构化 ``code`` 为
+     -2015/-2014 时告警（按 code 判定、**不搜原始子串**，余额里含 -2015 的数字不会误报），
+     且记入冷却期，冷却内不重复探活以免触发币安校验限流把真实拒绝信号稀释掉。
 
 用法：
   健康巡检.py                 巡检一次（计划任务每 15 分钟调用）
@@ -394,18 +395,56 @@ def probe_auth_for_ip(env: dict, proxy_url: str = ""):
         url = f"{_FAPI_BASE}/fapi/v1/balance?{query}&signature={signature}"
         status, body = _egress_http_get(url, proxy_url, EGRESS_PROBE_TIMEOUT,
                                         headers={"X-MBX-APIKEY": key})
-        # 两种形态都要认：2xx 带错误体（历史币安行为）与 4xx 带错误体（HTTPError 分支）
-        if 200 <= status < 300 and not _looks_auth_rejected(body):
+        verdict = _classify_probe(status, body)
+        if verdict == "ok":
             return "ok", f"HTTP {status}（出口 IP 鉴权探活通过）"
-        if _looks_auth_rejected(body):
+        if verdict == "rejected":
             return "rejected", f"HTTP {status}: {(body or '')[:300]}"
         return "error", f"HTTP {status}: {(body or '')[:200]}"
     except Exception as e:
         return "error", f"{type(e).__name__}: {e}"
 
 
+_EGRESS_REJECT_CODES = (-2015, -2014)
+
+
+def _classify_probe(status, body) -> str:
+    """按**响应结构**给探活结果定性，返回 "ok" / "rejected" / "error"。
+
+    2026-10-01 第三轮复审 P1：原先只看状态码 + 搜原始子串，两向都会错——
+      · 余额 JSON 的 ``crossUnrealizedPnl=-20150.5`` 含 ``-2015`` 子串 → 正常余额被
+        误判成「鉴权被拒」，出假告警并把该 IP 塞进 rejected 桶（本地实测复现）；
+      · 2xx + 非 balance 体（错误对象/空体）→ 误判成 ok 并登记 6h，探活形同虚设。
+
+    判定顺序：
+      ① dict + ``code`` ∈ {-2015,-2014} → rejected（任何状态码，含 2xx 带错误体的历史形态）；
+      ② 2xx + **JSON 数组** → ok（``/fapi/v1/balance`` 恒返回数组）；2xx 但体不是数组
+         → error，**绝不登记**；
+      ③ 非 2xx：结构化体只按 code 判（已判过即 error）；只有非 JSON 体才允许按拒绝
+         特征兜底（HTTPS 强证书校验下不会是代理注入的页面）。
+    """
+    text = body or ""
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = None
+    code = None
+    if isinstance(data, dict):
+        try:
+            code = int(data.get("code"))
+        except (TypeError, ValueError):
+            code = None
+    if code in _EGRESS_REJECT_CODES:
+        return "rejected"
+    if 200 <= status < 300:
+        return "ok" if isinstance(data, list) else "error"
+    if data is None and _looks_auth_rejected(text):
+        return "rejected"
+    return "error"
+
+
 def _looks_auth_rejected(body) -> bool:
-    """币安明确拒绝鉴权的响应体特征（仅用于分类，不用于判断原因归属）。"""
+    """非 JSON 响应体上的鉴权拒绝特征（仅兜底；结构化体一律按 code 判定）。"""
     text = body or ""
     return "-2015" in text or "-2014" in text or "invalid api-key" in text.lower()
 
