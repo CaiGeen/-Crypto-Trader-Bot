@@ -13,8 +13,9 @@
   3. 币安明确回 -2015/-2014 → issue `egress_ip_rejected:{ip}`；
      **必须覆盖真实 urllib 路径**：币安 4xx 会抛 HTTPError，不捕获就永远不告警（P0）；
      判定按响应体**结构化 code**，不搜原始子串——余额含 -20150.5 不得误报（第三轮 P1）；
-  4. 取不到出口 IP / 网络失败 / 非鉴权 HTTP 错 / -1021 / **2xx 非 balance 数组体**
-     → 只记日志，**绝不告警、绝不登记**；
+  4. 取不到出口 IP / 网络失败 / 非鉴权 HTTP 错 / -1021 / **2xx 非合法 balance 数组体**
+     （字符串数组、空数组、空对象数组、缺 asset/balance —— R6 fail-closed）/
+     **非 2xx 非 JSON 体** → 只记日志，**绝不告警、绝不登记**；
   5. 探活是**只读** GET /fapi/v3/balance，带签名与 X-MBX-APIKEY，绝无下单路径
      （v1 自 2023-07-15 已被币安停止支持，现场实测 404；R4 阻断项）；
   6. 任何自身异常按设计约束④ 不得抛出（含 .env 数值解析）；
@@ -55,7 +56,7 @@ class _HTTP:
     """可编排的 _egress_http_get 替身：按 URL 分派，记录全部调用。"""
 
     def __init__(self, ip="203.0.113.7", ip_ok=True, ip_body=None,
-                 probe_status=200, probe_body='[{"balance":"1"}]',
+                 probe_status=200, probe_body='[{"asset":"USDT","balance":"1"}]',
                  probe_raises=None, ip_raises=None):
         self.ip, self.ip_ok, self.ip_body = ip, ip_ok, ip_body
         self.probe_status, self.probe_body = probe_status, probe_body
@@ -321,22 +322,28 @@ class ProbeClassificationTests(EgressBase):
             (200, '[{"asset":"USDT","balance":"1"}]', "ok"),
             # 实测过的假阳性来源：余额负盈亏含 -20150.5 子串
             (200, '[{"asset":"USDT","balance":"1000.0","crossUnrealizedPnl":-20150.5}]', "ok"),
-            (200, '[{"balance":"0.1","crossUnrealizedPnl":-2015}]', "ok"),
+            (200, '[{"asset":"USDT","balance":"0.1","crossUnrealizedPnl":-2015}]', "ok"),
             # 拒绝码：任何状态码都要认（含 2xx 带错误体的历史形态）
             (200, '{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action"}', "rejected"),
             (400, '{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action"}', "rejected"),
             (401, '{"code":-2014,"msg":"API-key format invalid"}', "rejected"),
             (400, '{"code":"-2015","msg":"..."}', "rejected"),   # 字符串码
-            # 2xx 但体不是 balance 数组 → error，绝不登记
+            # 2xx 但体不是**合法 balance 数组** → error，绝不登记（R6：任意 JSON list 不再放行）
             (200, '{"code":-1021,"msg":"Timestamp outside recvWindow"}', "error"),
             (200, "<html>Bad Gateway</html>", "error"),
             (200, "", "error"),
             (200, "null", "error"),
-            # 非 2xx：结构化体按 code 判，无拒绝码即 error
+            (200, '["gateway error"]', "error"),     # R6 阻断例：网关错误体
+            (200, '[]', "error"),                    # 空数组无法自证来自余额接口
+            (200, '[{},{}]', "error"),               # 空对象数组
+            (200, '[{"asset":"USDT"}]', "error"),    # 缺 balance
+            (200, '[{"balance":"0.1"}]', "error"),   # 缺 asset
+            # 非 2xx：结构化体按 code 判，其余（含全部非 JSON 体）一律 error
+            # —— R6 删除子串兜底：正文带 "invalid api-key" 字样不再算 rejected
             (503, "<html>Service Unavailable</html>", "error"),
             (400, '{"code":-1001,"msg":"Too many requests"}', "error"),
-            # 非 2xx + 非 JSON：才允许按拒绝特征兜底
-            (400, "request rejected: invalid api-key, request ip: 1.2.3.4", "rejected"),
+            (400, "request rejected: invalid api-key, request ip: 1.2.3.4", "error"),
+            (401, "Unauthorized -2015 invalid api-key", "error"),
         ]
         for status, body, expect in cases:
             with self.subTest(status=status, body=body):
@@ -383,6 +390,32 @@ class ProbeClassificationTests(EgressBase):
         self.assertIsNone(self.read_state())
         self.assertTrue(self.has_log("时间戳校验拒绝(-1021)"), self.logs)
         self.assertFalse(self.has_log("未完成"), "时钟问题应有专门日志")
+
+    def test_200_string_array_not_registered(self):
+        """R6 阻断例：200 + ["gateway error"] 是网关错误体，不是余额数组 →
+        error、只记日志，**绝不登记**（否则 6h TTL 内停止重探，探活形同虚设）。"""
+        fake = _HTTP(ip="198.51.100.12", probe_status=200,
+                     probe_body='["gateway error"]')
+        self.use_http(fake)
+
+        issues, _ = self.run_check_e()
+
+        self.assertEqual(issues, [])
+        self.assertIsNone(self.read_state(), "字符串数组不得写入状态文件")
+        self.assertTrue(self.has_log("未完成"), self.logs)
+
+    def test_400_non_json_auth_string_does_not_alert(self):
+        """R6 阻断例：非 2xx 的非 JSON 正文含 'invalid api-key' 字样 →
+        子串兜底已删除，只能判 error：不告警、不登记。"""
+        fake = _HTTP(ip="198.51.100.13", probe_status=400,
+                     probe_body="request rejected: invalid api-key, request ip: 1.2.3.4")
+        self.use_http(fake)
+
+        issues, _ = self.run_check_e()
+
+        self.assertEqual(issues, [], "子串兜底已删除，不得出 rejected 告警")
+        self.assertIsNone(self.read_state())
+        self.assertFalse(self.has_log("egress_ip_rejected"), self.logs)
 
 
 # ==================== 契约8：拒绝冷却 ====================

@@ -421,12 +421,18 @@ def _classify_probe(status, body) -> str:
         误判成「鉴权被拒」，出假告警并把该 IP 塞进 rejected 桶（本地实测复现）；
       · 2xx + 非 balance 体（错误对象/空体）→ 误判成 ok 并登记 6h，探活形同虚设。
 
+    第六轮复审阻断（R6，2026-10-01）：成功与拒绝两侧同时收窄为 **fail-closed**——
+      · 2xx 仅接受**合法 balance 数组**（``_is_balance_array``）：非空 list 且每个
+        元素是含 ``asset`` 与 ``balance`` 的 dict。``["gateway error"]``、``[]``、
+        ``[{}]`` 等任意 list 此前都会被放行登记 6h 并停止重探，探活形同虚设；
+      · 非 2xx 只有 JSON ``code`` ∈ {-2015,-2014} 才 rejected；其余 JSON 与**所有
+        非 JSON 体**一律 error —— 删除 ``_looks_auth_rejected()`` 子串兜底，彻底关掉
+        「正文里恰好出现 -2015/invalid api-key 字样就被判拒」的误判路径。
+
     判定顺序：
       ① dict + ``code`` ∈ {-2015,-2014} → rejected（任何状态码，含 2xx 带错误体的历史形态）；
-      ② 2xx + **JSON 数组** → ok（``/fapi/v3/balance`` 恒返回数组）；2xx 但体不是数组
-         → error，**绝不登记**；
-      ③ 非 2xx：结构化体只按 code 判（已判过即 error）；只有非 JSON 体才允许按拒绝
-         特征兜底（HTTPS 强证书校验下不会是代理注入的页面）。
+      ② 2xx + **合法 balance 数组** → ok；2xx 其余体 → error，**绝不登记**；
+      ③ 非 2xx：结构化体按 code 判，其余（含全部非 JSON 体）→ error。
     """
     text = body or ""
     try:
@@ -442,16 +448,21 @@ def _classify_probe(status, body) -> str:
     if code in _EGRESS_REJECT_CODES:
         return "rejected"
     if 200 <= status < 300:
-        return "ok" if isinstance(data, list) else "error"
-    if data is None and _looks_auth_rejected(text):
-        return "rejected"
+        return "ok" if _is_balance_array(data) else "error"
     return "error"
 
 
-def _looks_auth_rejected(body) -> bool:
-    """非 JSON 响应体上的鉴权拒绝特征（仅兜底；结构化体一律按 code 判定）。"""
-    text = body or ""
-    return "-2015" in text or "-2014" in text or "invalid api-key" in text.lower()
+def _is_balance_array(data) -> bool:
+    """/fapi/v3/balance 的成功体：非空 JSON 数组，且每个元素为含
+    asset + balance 的 dict。
+
+    R6 fail-closed：空数组、字符串数组、空对象数组、缺字段元素都无法自证来自
+    余额接口，一律不作为「鉴权被接受」的凭据 → 上层记 error、不登记、下轮重探。
+    """
+    return (isinstance(data, list) and bool(data)
+            and all(isinstance(element, dict)
+                    and "asset" in element and "balance" in element
+                    for element in data))
 
 
 def _egress_state_load() -> dict:
