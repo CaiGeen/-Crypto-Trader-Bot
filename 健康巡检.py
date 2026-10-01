@@ -25,7 +25,8 @@
 
 用法：
   健康巡检.py                 巡检一次（计划任务每 15 分钟调用）
-  健康巡检.py --dry-run       只打印判定结果，不发任何网络请求（出口 IP 核验与代理探测同样跳过）
+  健康巡检.py --dry-run       只打印判定结果，不发任何网络请求（出口 IP 核验、代理探测、
+                              --wait-proxy 等待、--selftest 通道自检均跳过并留 [dry-run] 痕）
   健康巡检.py --wait-proxy N  等待本地代理就绪，最多 N 秒（开机自启用）
   健康巡检.py --notify-proxy-down  开机自启因代理未就绪放弃时的告警
 """
@@ -741,6 +742,11 @@ def main(argv) -> int:
     proxy_url = env.get("BINANCE_PROXY", "")
 
     if "--wait-proxy" in args:
+        # R5：dry-run 零网络契约必须覆盖 main() 的全部联网模式（本分支与下方
+        # --selftest 曾绕过 run_check 的保护；--notify-proxy-down 早已自守）。
+        if dry_run:
+            log("[dry-run] 跳过 --wait-proxy（零网络：不探测本地代理），不等待直接返回 0")
+            return 0
         idx = args.index("--wait-proxy")
         seconds = int(args[idx + 1]) if len(args) > idx + 1 else 300
         return 0 if wait_proxy(proxy_url, seconds) else 2
@@ -764,6 +770,11 @@ def main(argv) -> int:
         return 0
 
     if "--selftest" in args:
+        # R5：自检必然外发（TG×2 + 邮件）且带出口核验/签名探活，dry-run 下整体跳过
+        if dry_run:
+            log("[dry-run] 跳过 --selftest（通道自检必然外发 TG/邮件 + 出口核验）；"
+                "要看自检结果请去掉 --dry-run")
+            return 0
         # 运维部署自检：逐通道实测（TG 经代理 / TG 直连 / 邮件兜底），结果只进日志。
         # 复审 D4：邮件自检用 event="health" —— 与真实告警同一策略（致命豁免持仓闸门），
         # 否则空仓时自检会被闸门跳过，得出「邮件通道不可用」的错误结论。

@@ -21,6 +21,8 @@
   7. 状态文件损坏当空表；verified/rejected 各自封顶；兼容首版扁平格式；
   8. 被拒后进入冷却期：不重复发失败签名请求，但**仍出 issue**（P1 防限流稀释信号）；
   9. 停机(stopped)期间巡检照常核验出口 IP，但守护链类问题仍静默（P1b）。
+ 10. `--dry-run` 的零网络契约覆盖 **CLI 全部联网模式**：`run_check`/`alert`（R4）+
+     `--wait-proxy` / `--selftest`（R5，`main()` 分派边界），且非 dry-run 时自检照常外发；
 
 运行：.venv\\Scripts\\python.exe test_egress_ip_check.py
 """
@@ -745,6 +747,82 @@ class RunCheckIntegrationTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual([k for k, _, _ in self.captured], ["proxy_down"], self.captured)
         self.assertEqual(fake.calls, [], "代理不通时不应发起任何出口查询")
+
+
+# ==================== R5：--dry-run 零网络契约覆盖 main() ====================
+class CliDryRunTests(unittest.TestCase):
+    """R5：run_check/alert 内部已遵守 dry-run（R4），但 main() 的 --wait-proxy /
+    --selftest 两个联网模式曾绕过该契约（CLI 边界打桩取证：TCP 探测 / TG×2+邮件+出口查询）。"""
+
+    _NET_FNS = ("proxy_ready", "wait_proxy", "send_tg", "send_email",
+                "get_egress_ip", "probe_auth_for_ip", "_egress_http_get")
+    _ALL = _NET_FNS + ("run_check", "load_env", "log", "LOG_DIR", "LOG_FILE")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._orig = {n: getattr(p, n) for n in self._ALL}
+        p.LOG_DIR = self.tmp.name                      # 日志重定向，不落 worktree
+        p.LOG_FILE = os.path.join(self.tmp.name, "patrol.log")
+        self.logs = []
+        p.log = lambda m: self.logs.append(str(m))
+        p.load_env = lambda: dict(ENV)
+        self.hits = []
+
+        def trap(name):
+            def f(*a, **k):
+                self.hits.append(name)
+                if name == "run_check":
+                    return 0
+                if name == "wait_proxy":
+                    return True                     # main: 0 if wait_proxy(...) else 2
+                if name == "get_egress_ip":
+                    return "203.0.113.7"
+                if name == "probe_auth_for_ip":
+                    return ("ok", "HTTP 200")
+                return True                         # send_tg / send_email / proxy_ready ...
+            return f
+        for name in self._ALL:
+            if name in self._NET_FNS or name == "run_check":
+                setattr(p, name, trap(name))
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for name, val in self._orig.items():
+            setattr(p, name, val)
+
+    def test_dry_run_skips_networking_cli_modes(self):
+        combos = (["健康巡检.py", "--dry-run", "--wait-proxy", "1"],
+                  ["健康巡检.py", "--dry-run", "--selftest"],
+                  ["健康巡检.py", "--dry-run", "--notify-proxy-down"])
+        for argv in combos:
+            with self.subTest(argv=argv):
+                self.hits.clear()
+                self.logs.clear()
+                rc = p.main(argv)
+                self.assertEqual(rc, 0, f"{argv} -> rc={rc}")
+                self.assertEqual(self.hits, [],
+                                 f"{argv} 不得触发任何联网调用: {self.hits}")
+                self.assertTrue(any("[dry-run]" in m for m in self.logs),
+                                f"{argv} 必须留 [dry-run] 痕: {self.logs}")
+
+    def test_plain_dry_run_reaches_run_check_but_no_network(self):
+        """纯 --dry-run 应落进 run_check（其零网络由 run_check 层用例保证），
+        但 main() 自身在它之前不得发起任何网络调用。"""
+        self.hits.clear()
+        rc = p.main(["健康巡检.py", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn("run_check", self.hits, "纯 dry-run 应进入正常巡检分派")
+        self.assertEqual([h for h in self.hits if h != "run_check"], [],
+                         f"main() 自身不得联网: {self.hits}")
+
+    def test_selftest_without_dry_run_still_sends(self):
+        """反向对照：去掉 --dry-run 时自检必须照常外发（防过度拦截）。"""
+        self.hits.clear()
+        rc = p.main(["健康巡检.py", "--selftest"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.hits.count("send_tg"), 2, self.hits)
+        self.assertEqual(self.hits.count("send_email"), 1, self.hits)
 
 
 if __name__ == "__main__":
