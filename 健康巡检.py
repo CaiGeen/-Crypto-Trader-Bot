@@ -70,9 +70,42 @@ _EGRESS_ENV_ERRORS: list = []
 _EGRESS_TRUE = ("1", "true", "yes", "on")
 _EGRESS_FALSE = ("0", "false", "no", "off")
 
+# 配置来源（2026-10-02 契约裁决 A）：旋钮取值 = **进程环境变量优先，取不到回退读 .env**
+# —— 与仓库其余配置（load_env() / load_dotenv）同源，5 个旋钮从此真正可配。
+# .env 解析规则与 load_env() 逐条一致（utf-8-sig、跳注释、剥引号）；读取结果懒加载进
+# _EGRESS_FILE_ENV 缓存。本段先于 log() 定义执行，失败绝不能调 log()：
+# 文件不存在/不可读 = 未配置 → 静默回退空表（.env 整体损坏由 main() 的 load_env() 统一报）。
+_EGRESS_FILE_ENV = None   # None = 尚未读取；设计约束④：导入期绝不抛出
+
+
+def _egress_env_file() -> dict:
+    global _EGRESS_FILE_ENV
+    if _EGRESS_FILE_ENV is None:
+        env = {}
+        try:
+            with open(ENV_FILE, encoding="utf-8-sig") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    env.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        except Exception:
+            env = {}
+        _EGRESS_FILE_ENV = env
+    return _EGRESS_FILE_ENV
+
+
+def _egress_env_raw(name: str) -> str:
+    """旋钮原文取值：进程环境变量优先，回退 .env 文件（剥引号后；空串 = 未配置）。"""
+    raw = (os.getenv(name, "") or "").strip()
+    if raw:
+        return raw
+    return (_egress_env_file().get(name) or "").strip()
+
 
 def _egress_env_int(name: str, default: int) -> int:
-    raw = (os.getenv(name, "") or "").strip()
+    raw = _egress_env_raw(name)
     if not raw:
         return default
     try:
@@ -83,7 +116,7 @@ def _egress_env_int(name: str, default: int) -> int:
 
 
 def _egress_env_flag(name: str, default: bool) -> bool:
-    raw = (os.getenv(name, "") or "").strip().lower()
+    raw = _egress_env_raw(name).lower()
     if not raw:
         return default
     if raw in _EGRESS_TRUE:
@@ -516,7 +549,8 @@ def _egress_issue(ip: str, detail: str, note: str = "") -> tuple:
             f"处置：查明原因后下轮探活通过即自动登记、告警消失；或在 FlClash 固定出口节点。")
     if note:
         body = f"{note}\n{body}"
-    return (f"egress_ip_rejected:{ip}", f"出口 IP {ip} 签名鉴权被拒（疑不在白名单）", body)
+    return (f"egress_ip_rejected:{ip}",
+            f"出口 IP {ip} 签名鉴权被拒（疑不在白名单或 key 权限异常）", body)
 
 
 def _prune_egress_alert_keys(now: float):

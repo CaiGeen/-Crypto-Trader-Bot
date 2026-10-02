@@ -245,6 +245,21 @@ class NewIpTests(EgressBase):
         self.assertIn("不在币安 API key 白名单", detail)
         self.assertIn("key 被禁用或权限不足", detail, "必须给出第二类原因供排查")
 
+    def test_rejected_title_covers_key_cause_too(self):
+        """口径（2026-10-02 登记项）：自检行标题不得把 -2014/key 权限问题
+        一口咬定成"不在白名单"——标题归因须与 body 的 ①② 双因枚举同向。"""
+        fake = _HTTP(ip="192.0.2.55", probe_status=400,
+                     probe_body='{"code":-2014,"msg":"API-key format invalid"}')
+        self.use_http(fake)
+
+        issues, _ = self.run_check_e()
+
+        self.assertEqual(len(issues), 1, issues)
+        key, title, detail = issues[0]
+        self.assertIn("192.0.2.55", title, "与契约3一致：标题必须带 IP")
+        self.assertIn("key", title, "标题须点出 key 权限异常这一类原因")
+        self.assertIn("白名单", title, "白名单仍是第一常见原因，须保留")
+
     def test_non_auth_http_error_is_silent(self):
         """契约4：网关/限频类错误 ≠ 鉴权拒绝 → 不告警，只记日志。"""
         fake = _HTTP(probe_status=503, probe_body="<html>Service Unavailable</html>")
@@ -530,6 +545,85 @@ class RobustnessTests(EgressBase):
         self.assertTrue(p._egress_env_flag("EGRESS_TEST_BAD_FLAG", True))
         self.assertTrue(any("EGRESS_TEST_BAD_FLAG" in m
                             for m in p._EGRESS_ENV_ERRORS))
+
+    # ---- 配置来源契约 A（2026-10-02 裁决）：进程环境变量 > .env 文件回退 ----
+
+    def test_env_int_falls_back_to_dotenv_file(self):
+        """契约A：进程环境变量取不到时回退读 .env 文件（懒加载缓存）。"""
+        saved_file, saved_cache = p.ENV_FILE, getattr(p, "_EGRESS_FILE_ENV", None)
+        self.addCleanup(lambda: (setattr(p, "ENV_FILE", saved_file),
+                                 setattr(p, "_EGRESS_FILE_ENV", saved_cache)))
+        os.environ.pop("EGRESS_TEST_FILE_INT", None)
+        self.addCleanup(os.environ.pop, "EGRESS_TEST_FILE_INT", None)
+        path = os.path.join(self.tmp.name, "fake.env")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# 注释行须跳过\nEGRESS_TEST_FILE_INT=888\n")
+        p.ENV_FILE = path
+        p._EGRESS_FILE_ENV = None
+
+        self.assertEqual(p._egress_env_int("EGRESS_TEST_FILE_INT", 77), 888)
+        self.assertIsNotNone(p._EGRESS_FILE_ENV, "读取结果须写入懒加载缓存")
+
+    def test_env_flag_falls_back_to_dotenv_file(self):
+        """契约A：布尔旋钮同样支持 .env 回退读取。"""
+        saved_file, saved_cache = p.ENV_FILE, getattr(p, "_EGRESS_FILE_ENV", None)
+        self.addCleanup(lambda: (setattr(p, "ENV_FILE", saved_file),
+                                 setattr(p, "_EGRESS_FILE_ENV", saved_cache)))
+        os.environ.pop("EGRESS_TEST_FILE_FLAG", None)
+        self.addCleanup(os.environ.pop, "EGRESS_TEST_FILE_FLAG", None)
+        path = os.path.join(self.tmp.name, "fake.env")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('EGRESS_TEST_FILE_FLAG="false"\n')   # 剥引号规则须与 load_env 一致
+        p.ENV_FILE = path
+        p._EGRESS_FILE_ENV = None
+
+        self.assertFalse(p._egress_env_flag("EGRESS_TEST_FILE_FLAG", True))
+
+    def test_process_env_wins_over_dotenv_file(self):
+        """优先级：进程环境变量 > .env 文件（与 load_dotenv 默认不覆盖已有变量一致）。"""
+        saved_file, saved_cache = p.ENV_FILE, getattr(p, "_EGRESS_FILE_ENV", None)
+        self.addCleanup(lambda: (setattr(p, "ENV_FILE", saved_file),
+                                 setattr(p, "_EGRESS_FILE_ENV", saved_cache)))
+        path = os.path.join(self.tmp.name, "fake.env")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("EGRESS_TEST_FILE_INT=888\n")
+        p.ENV_FILE = path
+        p._EGRESS_FILE_ENV = None
+        os.environ["EGRESS_TEST_FILE_INT"] = "999"
+        self.addCleanup(os.environ.pop, "EGRESS_TEST_FILE_INT", None)
+
+        self.assertEqual(p._egress_env_int("EGRESS_TEST_FILE_INT", 77), 999)
+
+    def test_env_bad_value_in_dotenv_falls_back_and_records_error(self):
+        """契约A + 约束④：.env 里的坏值同样回退默认并入队报错，绝不抛出。"""
+        saved_file, saved_cache = p.ENV_FILE, getattr(p, "_EGRESS_FILE_ENV", None)
+        self.addCleanup(lambda: (setattr(p, "ENV_FILE", saved_file),
+                                 setattr(p, "_EGRESS_FILE_ENV", saved_cache)))
+        saved_errs = list(p._EGRESS_ENV_ERRORS)
+        self.addCleanup(lambda: p._EGRESS_ENV_ERRORS.__setitem__(slice(None), saved_errs))
+        os.environ.pop("EGRESS_TEST_FILE_BAD", None)
+        self.addCleanup(os.environ.pop, "EGRESS_TEST_FILE_BAD", None)
+        path = os.path.join(self.tmp.name, "fake.env")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("EGRESS_TEST_FILE_BAD=not-a-number\n")
+        p.ENV_FILE = path
+        p._EGRESS_FILE_ENV = None
+
+        self.assertEqual(p._egress_env_int("EGRESS_TEST_FILE_BAD", 77), 77)
+        self.assertTrue(any("EGRESS_TEST_FILE_BAD" in m
+                            for m in p._EGRESS_ENV_ERRORS), p._EGRESS_ENV_ERRORS)
+
+    def test_env_missing_dotenv_file_returns_default(self):
+        """契约A：.env 文件不存在 = 未配置 → 默认值，不抛出。"""
+        saved_file, saved_cache = p.ENV_FILE, getattr(p, "_EGRESS_FILE_ENV", None)
+        self.addCleanup(lambda: (setattr(p, "ENV_FILE", saved_file),
+                                 setattr(p, "_EGRESS_FILE_ENV", saved_cache)))
+        os.environ.pop("EGRESS_TEST_NOFILE_INT", None)
+        self.addCleanup(os.environ.pop, "EGRESS_TEST_NOFILE_INT", None)
+        p.ENV_FILE = os.path.join(self.tmp.name, "no-such-file.env")
+        p._EGRESS_FILE_ENV = None
+
+        self.assertEqual(p._egress_env_int("EGRESS_TEST_NOFILE_INT", 77), 77)
 
     def test_alert_dedup_key_is_per_ip(self):
         """P3：去重按 key 计，不同被拒 IP 不能被同一个键吞掉。"""
