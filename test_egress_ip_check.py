@@ -24,6 +24,11 @@
   9. 停机(stopped)期间巡检照常核验出口 IP，但守护链类问题仍静默（P1b）。
  10. `--dry-run` 的零网络契约覆盖 **CLI 全部联网模式**：`run_check`/`alert`（R4）+
      `--wait-proxy` / `--selftest`（R5，`main()` 分派边界），且非 dry-run 时自检照常外发；
+  11. 拒止标题与 body ①② 双因枚举同向（2026-10-02 登记项）：标题须带 IP 且同时点出
+      「不在白名单」与「key 权限异常」两类原因，不得一口咬定单因；
+  12. 配置契约 A（2026-10-02 裁决）：进程环境变量 > `.env` 文件，`_egress_env_file()`
+      解析规则与 `load_env()` 逐条一致；`.env` 行内 `#` 尾注**不作剥除**——整串算取值，
+      非法值回退默认并入队 `_EGRESS_ENV_ERRORS`（约束④：导入期绝不抛出）。
 
 运行：.venv\\Scripts\\python.exe test_egress_ip_check.py
 """
@@ -624,6 +629,45 @@ class RobustnessTests(EgressBase):
         p._EGRESS_FILE_ENV = None
 
         self.assertEqual(p._egress_env_int("EGRESS_TEST_NOFILE_INT", 77), 77)
+
+    def test_egress_parser_consistent_with_load_env(self):
+        """P3 复审收口：_egress_env_file() 与 load_env() 解析规则逐条一致（同 fixture 断言相等）。"""
+        saved_file, saved_cache = p.ENV_FILE, getattr(p, "_EGRESS_FILE_ENV", None)
+        self.addCleanup(lambda: (setattr(p, "ENV_FILE", saved_file),
+                                 setattr(p, "_EGRESS_FILE_ENV", saved_cache)))
+        path = os.path.join(self.tmp.name, "parser.env")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# 注释行须跳过\n"
+                    "\n"
+                    "NO_EQUALS_LINE\n"
+                    "A=1\n"
+                    "A=2\n"
+                    'B="quoted"\n'
+                    "C='single'\n"
+                    "D= plain \n")
+        p.ENV_FILE = path
+        p._EGRESS_FILE_ENV = None
+
+        self.assertEqual(p._egress_env_file(), p.load_env())
+
+    def test_inline_comment_not_stripped_falls_back(self):
+        """契约12 + P2-1 钉住：行内 # 尾注不作剥除 → 整串非法 → 回退默认并入队报错。"""
+        saved_file, saved_cache = p.ENV_FILE, getattr(p, "_EGRESS_FILE_ENV", None)
+        self.addCleanup(lambda: (setattr(p, "ENV_FILE", saved_file),
+                                 setattr(p, "_EGRESS_FILE_ENV", saved_cache)))
+        saved_errs = list(p._EGRESS_ENV_ERRORS)
+        self.addCleanup(lambda: p._EGRESS_ENV_ERRORS.__setitem__(slice(None), saved_errs))
+        os.environ.pop("EGRESS_TEST_INLINE", None)
+        self.addCleanup(os.environ.pop, "EGRESS_TEST_INLINE", None)
+        path = os.path.join(self.tmp.name, "inline.env")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("EGRESS_TEST_INLINE=5 # 示例尾注\n")
+        p.ENV_FILE = path
+        p._EGRESS_FILE_ENV = None
+
+        self.assertEqual(p._egress_env_int("EGRESS_TEST_INLINE", 77), 77)
+        self.assertTrue(any("EGRESS_TEST_INLINE" in m
+                            for m in p._EGRESS_ENV_ERRORS), p._EGRESS_ENV_ERRORS)
 
     def test_alert_dedup_key_is_per_ip(self):
         """P3：去重按 key 计，不同被拒 IP 不能被同一个键吞掉。"""

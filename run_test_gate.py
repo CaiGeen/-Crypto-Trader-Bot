@@ -447,7 +447,7 @@ def run_scripts(strict=False, timeout=600):
     green = (not counts['FAIL'] and not counts['BASELINE-DRIFT']
              and not counts['NOT-VERIFIED'] and not counts['BASELINE-FAIL'])
     if green:
-        print('✔ 脚本段全绿（50/50 退出码 0，无任何待验证项）')
+        print(f'✔ 脚本段全绿（{len(rows)}/{len(rows)} 退出码 0，无任何待验证项）')
     else:
         print('✘ 脚本段**未全绿**：以下各项不计入通过 —— '
               + '、'.join(
