@@ -1,0 +1,33 @@
+﻿PR #2 合并与生产部署在线验收
+========================================
+日期: 2026-09-29
+
+合并
+----
+PR: https://github.com/CaiGeen/-Crypto-Trader-Bot/pull/2
+结果: MERGED
+base: backtest/markprice-4h-fetch
+head: f67a8845abf25763f5477d9ade3d5825f6f8bb3e
+差异: 12 files, +4,888/-149
+merge commit: 229fa366bc27a7a08abb27f57a496764e7233eab
+
+部署
+----
+生产目录: G:\my-crypto-bot
+停止方式: 针对 watchdog 启动器 PID 7460 执行 taskkill /F /T，进程树四 PID 全部退出；操作前部署窗口只读 API 快照为空仓/无订单。
+快进更新: 4f0afb4204cbb12278b576b965f3ae092caeb41d -> 229fa366bc27a7a08abb27f57a496764e7233eab；仅 12 个发布文件，生产未跟踪 AGENTS.md 保留。
+启动: 启动Bot.bat；watchdog PID 17280，bot launcher PID 23156，base Python bot PID 44564。
+首次 READY: 2026-09-29 23:42:19（本机时间）。日志：Binance API connected；恢复前健康检查通过；R1/R2 启动重证通过；活跃批次 0；接管历史活跃批次 0；SYSTEM READY。
+
+在线验收
+--------
+心跳于 23:47:14 刷新：watchdog_pid=17280，bot_pid=23156，bot_alive=true，stopped=false，restarts=0，last_reason 为空。
+进程树: 4 个 python.exe 外观（venv launcher + base Python watchdog/bot），单条链；实际 watchdog/bot 各一。
+.bot_instance.lock=44564；OpenMutex(Global\\my_crypto_bot_single_instance) 成功（last_error=0）。
+启动后 Binance USD-M 只读复查（2026-09-29 15:44:37 UTC）: positions=0，普通 open orders=0，conditional stop/algo open orders=0。
+启动日志严格筛选 ERROR/CRITICAL/Traceback/失败/拒绝/强杀: bot 0 条、watchdog 0 条。
+
+结论与边界
+----------
+合并和生产更新完成。验收观察窗口内服务正常启动并持续存活，重启数为 0，READY/重证均通过，当前交易所持仓与两类未结单仍为空；未观察到新启动错误或双实例。
+这是截至该在线观察窗口的结论，不是对未来运行的保证；R1/R2 故障分支未在真实交易所故障期间被人为触发。部署后未执行任何真实下单/撤单/保护参数修改。

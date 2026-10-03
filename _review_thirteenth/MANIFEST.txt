@@ -1,0 +1,115 @@
+================================================================================
+第十三轮交付清单 MANIFEST —— A+B 的 P1-1 安全路径 + 最终发布差异
+生成时间：2026-09-29 +08:00
+分支：fix/converge-side-attribution（未提交）   候选 HEAD：72a6311（+未提交改动）
+生产 HEAD：4f0afb4   merge-base：8c96867
+================================================================================
+
+【0】本轮范围（ChatGPT 第十二轮指定的唯一两件事）
+--------------------------------------------------------------------------------
+① 审 **A+B 作为一个不可拆的安全候选** 的 P1-1 安全路径；
+② 给出相对生产 4f0afb4 的**最终发布差异**。
+第十二轮三项裁定已全部接受：B34 两态证据 / 归因更正 / A+B 送审口径
+（A、B 只用于解释差异，不能分别批准发布）。
+
+**本轮未改动任何产品代码或测试代码** —— git status 与上一轮完全一致，
+产出全部位于本目录（未跟踪）。
+
+【1】本目录文件清单
+--------------------------------------------------------------------------------
+release-diff-4f0afb4-to-AB.patch  325863 B  sha256=0bb3d961e03b13dfa8887a60a8d7eafd3e877c7afc5cfee3bde9672d59723a1e
+P1_1_安全路径审查.md              10939 B  sha256=62de2e48b9e9537e56e4bf892726234b65695f967fc0cb362c8bef638a379f3a
+release_diff_check.txt              496 B  sha256=64d2f1c5e40c5871be8dc9d3caaa087b0b6696a65e31c30672e62bce4705cfa3
+build_release_diff.py              3399 B  生成发布差异的脚本（临时索引法）
+verify_release_diff.py             3531 B  双向验证脚本（生产 check + 仓库外真实贴）
+
+【2】最终发布差异（12 文件，单向前进）
+--------------------------------------------------------------------------------
+语义：生产 4f0afb4  →  A+B 候选
+规模：+4748 / -149      新增文件：2（R1R2_收敛审查_验收契约矩阵.md、test_poll_degradation.py）
+命中生产独有文件（.gitignore / strategies_backtest/*）= **0**
+
+生成方法（与第十一轮缺陷版的差别就在这里）：
+    在隔离工作树仓库内用临时 GIT_INDEX_FILE 载入生产树 4f0afb4，
+    只对这 12 个路径 git add，再 git diff --cached 4f0afb4 -- <12 路径>。
+    **没有**用 `git diff 4f0afb4 72a6311` —— 那会把生产独有的 7 个文件当成
+    反向补丁（第十一轮缺陷，17 文件）；本版生产独有文件根本不进 pathspec。
+
+【3】三项验证（可复现）
+--------------------------------------------------------------------------------
+① 生产目录 `git apply --check <release patch>`            → **rc=0**（只读，未落盘）
+② 仓库外临时目录（生产 4f0afb4 的 10 个文件起步）真实贴 → **rc=0, skipped=0**
+   （缺的 2 个正是生产尚不存在的新增文件，由补丁创建）
+③ 贴完 12 文件与候选工作树逐个比对                        → **12/12 内容一致**
+   （raw 8/12；另 4 个仅 CRLF/LF，换行归一后 norm_eq=True）
+   4 个仅行尾差异：R1R2_…矩阵.md、test_monitor_poll_recovery.py、
+                   test_poll_degradation.py、trader_260725.py
+
+交叉一致：生产 + 本补丁 ≡ merge-base 8c96867 + 包A + 包B ≡ 候选工作树
+          （后者见 _review_twelfth\ab_rebuild_check.txt：同样 12/12、skipped=0）
+
+⚠️ 方法陷阱（上一轮踩到，本轮规避并记录）：
+    临时树若放在**仓库工作树内部**，git apply 以仓库根为路径前缀，会把每条
+    patch 判成 "Skipped patch" 而 **rc 仍为 0**（跳过不是错误）→ 假绿。
+    必须在仓库外贴，或从仓库根加 --directory=<dir>，并检查 **skipped=0**。
+
+【4】P1-1 安全路径逐环锚点（详见 P1_1_安全路径审查.md 第二节）
+--------------------------------------------------------------------------------
+缺陷点        :8759-8766  fetch 失败计入 _poll_fail_streak，不在此宣称恢复
+检测→告警     :8777-8784  阈值达成 → **先置降级**后 _alert_poll_degraded（:1040）
+封新 ENTRY     :6393 入口闸（副作用之前） / :6521 每层创建前复核
+封（未决）     :6586/:6588、:6597/:6599  在任何对账/线程等待之前封住
+保持（A+B 关键）:6828-6829 打印"未决闸门保持"，:6835 条件 → :6840/:6843 置闸
+放（唯一入口） :8383-8406 _monitor_takeover_handoff，:8397 discard
+                要求 reconciled + 代次匹配 + phase=='starting'
+回封（退出）   :8494 _finish_monitor_takeover，无终结证据 → :8520 重新 add
+回封（旧代次） :8509 代次不符直接 return —— 旧代次无权改新代次闸门
+恢复           :10692-10703 订单未决/保护未确认 → **不**解除（:10704-10709 保持暂停）
+重启不放行     :3655-3821 _reverify_ok 失败 → :3805 _ready=False + critical + False
+                :3681 重证发现未决 → 重新 add；:3690 核实无未决才 discard
+B34 窗口       包A :6757-6762 线程活着即 discard → A+B 改为保持 + handoff 放闸
+
+【5】A+B 最终态实测（本轮引用，均已完成）
+--------------------------------------------------------------------------------
+test_poll_degradation.py  GREEN **91/91** rc=0（含 B34）
+test_monitor_poll_recovery.py  **31/31** rc=0
+test_recover_semantics.py  5/5 场景 rc=0
+test_m2_m4_maintenance.py  rc=0
+全量 sweep  total=56  rc0=55  nonzero=1  elapsed=521s
+            唯一非零 = 既有 test_orphan_guard.py rc=42
+B34 两态    包A rc=1（unresolved=set()、create=2）/ A+B rc=0
+            证据：_review_twelfth\b34_window_evidence.txt
+py_compile rc=0；git diff --check rc=0
+
+【6】边界（本文件不主张的事）
+--------------------------------------------------------------------------------
+- B34 用**受控监控替身**，只证明"**首轮未完成时不得放闸**"，
+  **不证明**首轮完成后所有交易所与保护事实都已正确核验。
+- 12/12 一致是**换行归一后**一致；4 个文件非逐字节相同。
+- critical 的 True/False/None 是**桩注入**，不证明真实 TG/邮件送达；
+  两次都失败后无第 3 次、无持久化重试队列（P1-3 登记）。
+- **完整发布门禁 run_test_gate.py 未执行**（rc=3：运行中生产 Bot 拒绝）；
+  需停机窗口或明确授权 --allow-live。**未跑门禁 ≠ 发布通过**。
+- save_batch_state 失败路径告警仍在代次锁内的残余 —— 未动，交复审裁决。
+- S6k 三返回值为桩注入、S6j 单进程受控、S6j-3 为 AST 结构断言、
+  S6f-4 未断言补挂出带数量的真止损、test_sg3_p1 仍用手工夹具。
+- 交易所持续不可达时的对账行为未端到端跑过。
+- **以上均不构成合并、部署或重启批准；生产保持 4f0afb4 不变。**
+
+【7】复现命令
+--------------------------------------------------------------------------------
+    # 生成发布差异（在隔离工作树内）
+    cd G:\my-crypto-bot-wt
+    G:\my-crypto-bot\.venv\Scripts\python.exe _review_thirteenth\build_release_diff.py
+
+    # 双向验证（生产只读 check + 仓库外真实贴）
+    G:\my-crypto-bot\.venv\Scripts\python.exe _review_thirteenth\verify_release_diff.py
+    # 期望：① rc=0  ② rc=0 skipped=0  ③ files=12 norm_identical=12
+
+    # 生产侧只读核对
+    cd G:\my-crypto-bot
+    git apply --check G:\my-crypto-bot-wt\_review_thirteenth\release-diff-4f0afb4-to-AB.patch   # 期望 rc=0
+
+    # 两包重建（审查分组视角，脚本在第十二轮目录）
+    G:\my-crypto-bot\.venv\Scripts\python.exe _review_twelfth\ab_rebuild_check.py    # 期望 skipped=0、12/12
+================================================================================

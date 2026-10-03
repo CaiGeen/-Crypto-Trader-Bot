@@ -1,0 +1,14 @@
+变异前 sha256(content) = 1ded77d093c1a1a788e6aad2f9848bec0b0bd285a6ea961009bc4c7bdfc3c2cc
+needle 命中次数 = 1
+已摘除 `and _poll_position_known` → 重跑 test_poll_degradation.py
+变异后 rc = 1（期望非 0 = 重新变红）
+  1254| [PASS] B35a 连续失败 → 降级闸门置位 degraded=['batch_pollrec_001']
+  1260| [FAIL] B35b 持仓 UNKNOWN → 不得解除降级闸门 degraded=[]，streak=0
+  1282|   └─ 第 1 层条件买单已挂出: 触发价 77000.0 | 数量 0.43 (预设止损价: 75000.0) (ID: B35)
+  1289| [FAIL] B35c 持仓未被监控核实过 → 新 ENTRY 零下单 返回='batch_new_001'，create 调用=1，degraded=[]
+  1294| [PASS] B35d 阳性对照：持仓核实为零 → 恢复并解除闸门 degraded=[]，streak=0
+  1316|   └─ 第 1 层条件买单已挂出: 触发价 77000.0 | 数量 0.43 (预设止损价: 75000.0) (ID: B35)
+  1323| [PASS] B35e 阳性对照：恢复后同一 ENTRY 确实能落单（③ 非假绿） 返回='batch_new_001'，create 调用=2
+  1389| GREEN: 94/96
+还原后 sha256(content) = 1ded77d093c1a1a788e6aad2f9848bec0b0bd285a6ea961009bc4c7bdfc3c2cc
+还原逐字节一致 = True

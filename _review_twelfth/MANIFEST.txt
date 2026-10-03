@@ -1,0 +1,215 @@
+================================================================================
+第十二轮交付清单 MANIFEST —— P0/P1 冻结范围
+生成时间：2026-09-29 +08:00（含第十二轮【2.5】B34 实证更新）  分支：fix/converge-side-attribution
+生产 HEAD：4f0afb4                候选 HEAD：72a6311   merge-base：8c96867
+================================================================================
+
+【0】范围裁定（本轮最重要的一条）
+--------------------------------------------------------------------------------
+目标改为：**只找影响程序使用的 P0/P1 级阻塞**；程序已在线上正常使用，小细节现在不修。
+- 第十一、十二两轮的告警返回值口径、通知文案、写盘返回值、夹具保真度 → 按地图属 **P2**。
+  **保留已做改动但标记停更**（改动小、零生产风险；回退反而制造新的差异面），
+  此后不再为此类项扩工。
+- 地图正文 + 现场事实 + 验收证据 → 见 `P0_P1_修复地图.md`（本目录外，工作树根）。
+- 按用户 2026-09-29 裁定：候选**拆成两个提交单元**送审。
+  ⚠️ **但"任一被拒不影响另一项推进"已被第十二轮复审推翻并撤回** ——
+  包 A 单独不可上线（见【2.5】B34 实证）。两包现降级为**审查分组**，
+  **不是发布单元**；**A+B 必须作为一个不可拆的安全候选**送审。
+
+【1】本目录文件清单
+--------------------------------------------------------------------------------
+pack-A-p1-1.patch   171734 B  sha256=bad87a9b3fca2675d2ec4d807f65472a321b2363e2bb1d7e9e9381604393a706
+pack-B-s6.patch     190395 B  sha256=499e36984111f231426fc331518861c4f7095536b4d4a5307fd6ec5e2441e97d
+b34_window_evidence.txt        B34 定点用例**两态**实证（包A rc=1 / A+B rc=0，含两侧 stdout 与 4 文件 sha256）
+ab_rebuild_check.txt           merge-base + 包A + 包B 重建工作树的 12 文件比对结果
+ab_rebuild_check.py            上述比对的可复现脚本（注意 `--directory=` 与 skipped=0 检查）
+p0_2_audit.txt         835 B  P0-2 只读对账原始输出（UTF-8，已隐去 API Key 前 8 位）
+sweep_output.txt               全量 sweep 原始输出（test 名/rc/耗时列，ASCII 完整）
+sweep_runner.py       1177 B  sweep 运行器（与第十一轮同一份，未改）
+
+两份补丁首 4 字节 = 64 69 66 66（"diff"，无 BOM），均可按 UTF-8 严格解码。
+包 A 补丁 sha 与上一版**完全一致**（未改动任何已提交内容）；
+包 B 补丁 sha 变化 = 新增 B34 用例 + 两份文档更新。
+
+【2】两包定义
+--------------------------------------------------------------------------------
+包 A（P1-1 生产风险修复）— 10 文件，+2617 / -73
+    = git diff 8c96867 72a6311        （候选独有：9 个提交）
+    + git diff 72a6311 -- test_recover_semantics.py tests_archive/test_b2_crashsafe_entry.py
+    文件：R1R2_收敛审查_验收契约矩阵.md | run_test_gate.py | test_b2_create_gate.py
+          test_monitor_poll_recovery.py | test_poll_degradation.py
+          test_v64_p3_lifecycle.py | test_v64_partial_close.py | trader_260725.py
+          test_recover_semantics.py | tests_archive/test_b2_crashsafe_entry.py
+
+包 B（S6 收敛审查遗留）— 6 文件，+2268 / -213
+    = git diff 72a6311 -- .  剔除上述两个夹具文件
+    文件：R1R2_收敛审查_验收契约矩阵.md | test_gate_baseline.py
+          test_monitor_poll_recovery.py | test_poll_degradation.py
+          test_sg3_p1.py | trader_260725.py
+
+两包并集 = 12 个文件（非 17，见【6】更正）。
+
+**两个夹具归包 A 的理由**：它们修的失败（启动重证 `_reverify_ok`、降级闸门）
+只在包 A 内发生；若留在包 B，包 A 单独跑验收就是红的，两包的对照结论会失真。
+
+【2.5】⚠️ 更正：包 A 单独不可上线 —— B34 两态实证（本轮最重要的一条）
+--------------------------------------------------------------------------------
+ChatGPT 第十二轮复审指出：包 A 的未知创建接管在子线程**刚进入 `_start_monitoring`
+且 `is_alive()` 时就解除未决闸门**（HEAD trader `:6757-6762`），
+而**首轮订单/持仓/止损核验尚未完成**。包 B 改为"启动处保持闸门（`:6828/:6835`）+
+首轮核验与落盘后由 `_monitor_takeover_handoff`（`:8383`）放闸"。
+
+新增定点用例 test_block34_takeover_alive_before_first_round_keeps_gate（归**包 B**），
+三前提同时满足：收编落盘成功 + `_tk_ok` 参数自检有效 + 线程已进入主体且仍在循环内。
+
+既有用例为何没钉住（归因已逐条核实，HEAD vs 工作树比对）：
+  ① **包 A 版**的 `B15b 对账已判明 → 不误置降级`、`B19b 对账成功 → 不误置降级`
+     断言的是"**别误置降级**"，与"提前放闸"**相容** —— 根本没断言闸门；
+     `B15b 替身未运行首轮业务循环 → 闸门必须保持`、
+     `B19b 只有收编、未完成业务轮询 → 闸门保持` 这两条是**包 B 改写**的。
+  ② `B30a 收编成功但子线程进入后立即退出 → 不得解除未决闸门` 断言了闸门，
+     但其替身**立即返回**（线程随即死亡 → is_alive=False）→ 绕开窗口。
+  两条路各自绕开，故"线程活着但首轮未核验"在包 A 的 88/88 中**从未被覆盖**。
+
+    断言        包A独立树(git archive 72a6311+仅注入该用例)   A+B工作树
+    B34a 前提   PASS (layer_sl=2 tp_params=True ['entered'])   PASS
+    B34b 闸门   **FAIL** unresolved=set(), degraded=set()      PASS
+    B34c 拦新单 **FAIL** create 调用=2（两层买单已挂出）        PASS
+    rc          **1**                                          **0**（全脚本 GREEN 91/91）
+
+两侧日志分界行：包A 打「✅ 已启动监控接管（…数量层=2，止损层=2）」；
+A+B 打「⏳ 已启动监控接管（…）；未决闸门保持，等待首轮业务轮询与持久化证据」。
+
+结论：
+  1) **包 A 单独不可上线**；**A+B 作为一个不可拆的安全候选**送审。
+  2) 两包仅作**审查分组**，不作**发布单元**（原"任一被拒不影响另一项推进"撤回）。
+  3) 该窗口**只在未部署候选内**：生产 4f0afb4 的 `_unresolved_intent_batches`/`_tk_*`
+     计数均为 0 → **不构成当前生产 P0**。
+  4) 包 A 的 88/88 只证"四条验收离线成立"，不证"可独立发布"。
+  5) 用户 2026-09-29 裁定采纳：不重做最小包 A、不把 B 的放闸条件移进 A。
+原始证据：b34_window_evidence.txt（含两侧完整 stdout + 4 个文件 sha256）。
+
+【3】自检结果（全部通过，可复现）
+--------------------------------------------------------------------------------
+1) 包 A 在生产目录干净应用：
+       cd G:\my-crypto-bot && git -C . apply --check <A>          → rc=0
+2) 包 A **不含任何生产独有文件**（.gitignore / strategies_backtest/* 命中数 = 0）
+       → 不会回退生产自己的功能
+3) 包 A **独立状态**跑 P1-1 验收（临时树 = git archive 4f0afb4 + 包A，不含包 B）：
+       test_poll_degradation.py      → rc=0，**GREEN: 88/88**
+       test_recover_semantics.py     → rc=0，**5/5 场景**
+       test_m2_m4_maintenance.py     → rc=0
+       ⚠️ 此项只证"四条验收**离线成立**"，**不证包 A 可独立上线**（见【2.5】）
+   3b) 包 A 独立树跑 **B34**（包 B 的新用例）→ **rc=1**（闸门被提前解除 + 新单被放行）
+4) 包 B 在包 A 之后应用：
+       git apply <B>                                          → rc=0
+5) A+B 重建候选 = 工作树：merge-base 8c96867 树 → 贴 A → 贴 B，
+       12 个文件逐个比对 → 内容 **12/12 一致**（raw 8/12，另 4 个仅 CRLF/LF 行尾，
+       换行归一后 norm_eq=True）。结果见 ab_rebuild_check.txt
+   ⚠️ 方法陷阱（本轮踩到并已修正）：临时树若放在**仓库工作树内部**，
+       `git apply` 以仓库根为路径前缀，会把每条 patch 判成
+       **"Skipped patch" 而 rc 仍为 0**（跳过不是错误）—— 这样得到的
+       "验证通过"是**假绿**。必须从仓库根加 `--directory=<贴入目录>` 贴，
+       并检查 stderr 里 skipped=0。
+6) A+B 工作树跑 B34 → rc=0；全脚本 test_poll_degradation **GREEN 91/91**
+
+【4】P0-2 现场事实（本轮新增，只读）
+--------------------------------------------------------------------------------
+时间：2026-09-29 18:36:31 +08:00
+工具：生产目录自带 reconcile_pre_launch.py
+      只调 fetch_open_orders / fetch_positions / fetch_balance 三个**读**接口；
+      不调用 create/cancel/edit；不写本地文件。
+结果：活跃批次 0 | 未结订单（双通道）0 | 活跃持仓 0 | 对账问题 0 | **rc=0**
+结论（限定该时刻）：该时点不存在"有仓无有效止损"，P0-2 未触发。
+**不得外推**：开仓后或程序行为变化后必须重新核对；本条是事实核对，不是发布批准。
+
+【5】P1-1 四条验收 → 证据（映射见 P0_P1_修复地图.md 第三节）
+--------------------------------------------------------------------------------
+① 发现持续轮询失败     → test_poll_degradation 单批/多批/陈旧未被掩盖等 → GREEN 88/88
+② 封住新 ENTRY         → test_new_signal_blocked_when_degraded + block2/26/33
+                          另 test_m2_m4_maintenance rc=0（走到 persist 闸门，非短路）
+③ 发出 critical 尝试   → block4（notify False 后有限重试）/ block8（None 不算送达）
+④ 存量继续 + 核实后恢复 → existing_sl_tp_and_monitor_not_touched /
+                          complete_recovery_after_failure / block5/14/23/28
+附 重启不得直接放行     → block7/12/13/24/29 + recover 5/5
+⚠️ 88/88 的适用范围：**仅证四条验收离线成立**；包 A 单独不可上线（【2.5】B34）。
+   B34（首轮未核验不得放闸）**归包 B** —— 包 A 单独跑它是红的。
+边界：全部为夹具/桩驱动的单进程受控测试；critical 的 True/False/None 是**桩注入**，
+      不证明真实 TG/邮件送达；未做真实高并发压测。
+
+【6】⚠️ 更正：第十一轮"生产→候选累计补丁"有方向性缺陷（供复审核对）
+--------------------------------------------------------------------------------
+第十一轮 production-to-candidate-72a6311.patch（17 文件）用的是 `git diff 4f0afb4 72a6311`。
+因候选与生产已分叉（生产独有 ab7e08b 等 5 个提交），该 diff 把**生产独有**的 7 个文件
+（.gitignore + 6 个 strategies_backtest/*）当成**反向补丁**包含进来 ——
+照此贴到生产会**回退生产自己的 backtest 功能**。
+`git apply --check rc=0` 只证明"能贴上"，**不证明方向正确**，此前的核对口径漏检了这一点。
+
+更正：以 merge-base 8c96867 为基准拆包（本目录两包），与生产独有文件**零重叠**；
+累计文件数由 17 修正为 **12**。
+按地图口径，这属**发布物缺陷**，不升级为 P0/P1，但必须在发布级审查前修正 —— 本清单即为修正。
+
+【7】全量 sweep（定性用，不作新工作项）
+--------------------------------------------------------------------------------
+命令：python _review_twelfth\sweep_runner.py
+结果：total=56  rc0=55  nonzero=1  elapsed=521s
+      唯一非零：test_orphan_guard.py rc=42（既有，与生产 HEAD 一致）
+本轮关键项（均 rc=0）：test_poll_degradation（含新 B34，GREEN 91/91）、
+      test_monitor_poll_recovery（31/31）、test_recover_semantics、
+      test_m2_m4_maintenance
+对比：第十一轮曾有 3 个非零（orphan_guard=42、m2_m4=1、recover_semantics=1）；
+      本轮修的是后两个的**归因与夹具** → 新增 rc=1 为零，且不是"改判定放水"：
+      断言一字未改，改的是测试替身没跟上候选新增契约。
+原始输出：sweep_output.txt
+
+【8】变异反证（本轮新增）
+--------------------------------------------------------------------------------
+把 trader `_finish_monitor_takeover` 的终局日志判定改成 `if False:` →
+    **仅** test_monitor_poll_recovery 的 S6k-5 变红，其余 30 项仍绿；随后还原。
+（第十一轮三条变异仍成立：告警门去 is True → S6k-1/2 红；写盘判据回退 → S6k-4 红；
+  文案回退批次级 → S6j-1c 红。）
+假绿实证（夹具修复的必要性）：修复前 `走到persist闸门=False`、`被降级闸门短路=True`、
+`critical=1`，而旧用例 `ret is None 且 create_order==0` 照样成立 → 之前是**假绿**；
+修复后走到 persist 闸门、0 critical，用例依然 PASS（断言未改）。
+
+【9】边界与残余（明确不做/未验证）
+--------------------------------------------------------------------------------
+- 完整发布门禁 run_test_gate.py **未执行**（rc=3：运行中生产 Bot 拒绝）；
+  需停机窗口或明确授权 --allow-live。**未跑门禁 ≠ 发布通过**。
+- **包 A 单独不可上线**（【2.5】B34 实证）；A+B 作为**一个不可拆的安全候选**
+  尚未完成送审，也未做逐项发布级审查；**未批准合并/部署/重启**。
+- 两次 critical 均失败后**无第 3 次、无持久化重试队列**，只余进程内日志；
+  **不得**声称 critical 最终可靠送达（P1-3 登记，本轮不扩建通知系统）。
+- save_batch_state 失败路径告警落在代次锁内的残余 —— 仍未动，交复审裁决。
+- 两个既有失败按地图属暂停清单的"无关测试基线清理"，本轮不处理。
+- 暂停清单（output_stalled 残留键、AST 整理、死代码删除、T3d、语义巡检系统、
+  通知措辞优化、无关测试基线清理）不进入修复队列。
+
+【10】复现命令
+--------------------------------------------------------------------------------
+    # 两包对生产的可应用性
+    cd G:\my-crypto-bot
+    git apply --check G:\my-crypto-bot-wt\_review_twelfth\pack-A-p1-1.patch      # 期望 rc=0
+
+    # P0-2 只读事实
+    cd G:\my-crypto-bot
+    .venv\Scripts\python.exe reconcile_pre_launch.py                            # 期望 rc=0
+
+    # 全量 sweep
+    cd G:\my-crypto-bot-wt
+    G:\my-crypto-bot\.venv\Scripts\python.exe _review_twelfth\sweep_runner.py   # 期望 55/56
+
+    # 两包能否重建工作树（必须从仓库根贴，见【3】5) 的陷阱）
+    G:\my-crypto-bot\.venv\Scripts\python.exe _review_twelfth\ab_rebuild_check.py
+                                                            # 期望 skipped=0、12/12 一致
+
+    # 工作树定向测试
+    G:\my-crypto-bot\.venv\Scripts\python.exe test_monitor_poll_recovery.py     # 期望 31/31
+    G:\my-crypto-bot\.venv\Scripts\python.exe test_poll_degradation.py          # 期望 rc=0 91/91
+
+    # B34 两态复现（包A 侧需先 git archive 72a6311 出临时树，再注入该用例）
+    python -c "import test_poll_degradation as m; m.RESULTS.clear();\
+      m.test_block34_takeover_alive_before_first_round_keeps_gate();\
+      raise SystemExit(0 if all(p for _,p in m.RESULTS) else 1)"
+      # 包A临时树 期望 rc=1（B34b/B34c 红）；工作树 期望 rc=0
+================================================================================

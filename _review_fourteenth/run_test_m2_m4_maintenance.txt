@@ -1,0 +1,124 @@
+.....2026-09-29 20:32:01,390 - root - INFO - ⚙️ [配置生效] RISK_MAX_ACTIVE_BATCHES=3 | RISK_MAX_ACTIVE_SYMBOLS=1 | RISK_DAILY_REALIZED_LOSS_LIMIT=0（默认，禁用） | MAX_LEVERAGE=100 | EMAIL_ALERT_ENABLED=True | EMAIL_ALERT_ONLY_WITH_POSITION=True | DAILY_REPORT_EMAIL_ENABLED=False | 致命事件白名单=['auth_blocked', 'crash', 'critical', 'health', 'liquidation_proximity', 'protection_lost', 'startup_breaker']
+2026-09-29 20:32:01,390 - root - INFO - ⚙️ [配置生效] 提醒：.env 仅在进程启动时读取，修改后必须重启本进程才生效（D10）
+..........2026-09-29 20:32:01,497 - root - INFO - ⚙️ [配置生效] RISK_MAX_ACTIVE_BATCHES=2 | RISK_MAX_ACTIVE_SYMBOLS=1 | RISK_DAILY_REALIZED_LOSS_LIMIT=0（默认，禁用） | MAX_LEVERAGE=100 | EMAIL_ALERT_ENABLED=True | EMAIL_ALERT_ONLY_WITH_POSITION=True | DAILY_REPORT_EMAIL_ENABLED=False | 致命事件白名单=['auth_blocked', 'crash', 'critical', 'health', 'liquidation_proximity', 'protection_lost', 'startup_breaker']
+2026-09-29 20:32:01,497 - root - INFO - ⚙️ [配置生效] 提醒：.env 仅在进程启动时读取，修改后必须重启本进程才生效（D10）
+.2026-09-29 20:32:01,498 - root - INFO - ⚙️ [配置生效] RISK_MAX_ACTIVE_BATCHES=3（默认） | RISK_MAX_ACTIVE_SYMBOLS=1（默认） | RISK_DAILY_REALIZED_LOSS_LIMIT=0（默认，禁用） | MAX_LEVERAGE=100（默认） | EMAIL_ALERT_ENABLED=True | EMAIL_ALERT_ONLY_WITH_POSITION=False | DAILY_REPORT_EMAIL_ENABLED=True | 致命事件白名单=['auth_blocked', 'crash', 'critical', 'health', 'liquidation_proximity', 'protection_lost', 'startup_breaker']
+2026-09-29 20:32:01,498 - root - INFO - ⚙️ [配置生效] 提醒：.env 仅在进程启动时读取，修改后必须重启本进程才生效（D10）
+.G:\my-crypto-bot-wt\test_m2_m4_maintenance.py:487: ResourceWarning: unclosed file <_io.TextIOWrapper name='C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\tmp_v0ry_mx\\tomb.json' mode='r' encoding='utf-8'>
+  tomb_now = json.load(open(tomb, 'r', encoding='utf-8'))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.G:\my-crypto-bot-wt\test_m2_m4_maintenance.py:645: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\tmpb_j5bfof\\trade_state.json'>
+  before = open(state, 'rb').read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+G:\my-crypto-bot-wt\test_m2_m4_maintenance.py:659: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\tmpb_j5bfof\\trade_state.json'>
+  after = open(state, 'rb').read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+G:\my-crypto-bot-wt\test_m2_m4_maintenance.py:645: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\tmp2j8pa97t\\trade_state.json'>
+  before = open(state, 'rb').read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+G:\my-crypto-bot-wt\test_m2_m4_maintenance.py:659: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\tmp2j8pa97t\\trade_state.json'>
+  after = open(state, 'rb').read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+G:\my-crypto-bot-wt\test_m2_m4_maintenance.py:645: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\tmp7cwntiqg\\trade_state.json'>
+  before = open(state, 'rb').read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+G:\my-crypto-bot-wt\test_m2_m4_maintenance.py:659: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\tmp7cwntiqg\\trade_state.json'>
+  after = open(state, 'rb').read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.G:\my-crypto-bot-wt\test_m2_m4_maintenance.py:532: ResourceWarning: unclosed file <_io.TextIOWrapper name='C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\tmp0gqrj79g\\tomb.json' mode='r' encoding='utf-8'>
+  tomb_now = json.load(open(tomb, 'r', encoding='utf-8'))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.G:\my-crypto-bot-wt\test_m2_m4_maintenance.py:598: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\tmpkm4x7xyg\\trade_state.json'>
+  broken_bytes = open(state, 'rb').read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+G:\my-crypto-bot-wt\test_m2_m4_maintenance.py:609: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\tmpkm4x7xyg\\trade_state.json'>
+  after_bytes = open(state, 'rb').read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+...G:\my-crypto-bot-wt\test_m2_m4_maintenance.py:450: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\tmpstqfr1le\\tomb.json'>
+  tomb_bytes_before = open(tomb, 'rb').read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+G:\my-crypto-bot-wt\test_m2_m4_maintenance.py:462: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\tmpstqfr1le\\tomb.json'>
+  tomb_bytes_after = open(tomb, 'rb').read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+....
+----------------------------------------------------------------------
+Ran 27 tests in 0.212s
+
+OK
+💡 检测到账户为 [单向持仓模式]
+🚀 【首仓模式】本批次 [batch_b2_5] 为 BUY 方向底仓进场。
+👉 开始为交易对 [BTCUSDT] 执行策略指令 (批次: batch_b2_5)...
+✅ 杠杆成功设置为: 50x
+🌐 当前最新市场价格: 50000.0 USDT
+
+🔍 [止损价合理性校验中...]
+止损校验通过
+
+🔍 [止盈价合理性校验中...]
+止盈校验通过
+
+📏 [数量、价格精度与保证金预算校验中...]
+💰 账户可用 USDT 余额: 10000.00 USDT
+📊 当前批次所需保证金: 33.60 USDT
+📊 已有活跃批次占用保证金: 0.00 USDT
+📊 总需求: 33.60 USDT
+📊 保证金使用率: 0.3%
+✅ 资金校验通过，余额充裕，开始发布条件挂单...
+
+🚫 [资金安全] 批次 `batch_b2_5` 骨架未确认落盘，已阻断全部下单（create_order=0）
+💡 检测到账户为 [单向持仓模式]
+🚀 【首仓模式】本批次 [batch_b2_5] 为 BUY 方向底仓进场。
+👉 开始为交易对 [BTCUSDT] 执行策略指令 (批次: batch_b2_5)...
+✅ 杠杆成功设置为: 50x
+🌐 当前最新市场价格: 50000.0 USDT
+
+🔍 [止损价合理性校验中...]
+止损校验通过
+
+🔍 [止盈价合理性校验中...]
+止盈校验通过
+
+📏 [数量、价格精度与保证金预算校验中...]
+💰 账户可用 USDT 余额: 10000.00 USDT
+📊 当前批次所需保证金: 33.60 USDT
+📊 已有活跃批次占用保证金: 0.00 USDT
+📊 总需求: 33.60 USDT
+📊 保证金使用率: 0.3%
+✅ 资金校验通过，余额充裕，开始发布条件挂单...
+
+🚫 [资金安全] 批次 `batch_b2_5` 骨架未确认落盘，已阻断全部下单（create_order=0）
+💡 检测到账户为 [单向持仓模式]
+🚀 【首仓模式】本批次 [batch_b2_5] 为 BUY 方向底仓进场。
+👉 开始为交易对 [BTCUSDT] 执行策略指令 (批次: batch_b2_5)...
+✅ 杠杆成功设置为: 50x
+🌐 当前最新市场价格: 50000.0 USDT
+
+🔍 [止损价合理性校验中...]
+止损校验通过
+
+🔍 [止盈价合理性校验中...]
+止盈校验通过
+
+📏 [数量、价格精度与保证金预算校验中...]
+💰 账户可用 USDT 余额: 10000.00 USDT
+📊 当前批次所需保证金: 33.60 USDT
+📊 已有活跃批次占用保证金: 0.00 USDT
+📊 总需求: 33.60 USDT
+📊 保证金使用率: 0.3%
+✅ 资金校验通过，余额充裕，开始发布条件挂单...
+
+🚫 [资金安全] 批次 `batch_b2_5` 骨架未确认落盘，已阻断全部下单（create_order=0）
+🚨 [D-009] 墓碑条目损坏（复活防护降级，禁止新建批次）: 1 条非法，示例 ['batch_bad']
+🚨 [D-009] 墓碑条目损坏（复活防护降级，禁止新建批次）: 1 条非法，示例 ['batch_bad']
+🚨 [D-009] 墓碑条目损坏（复活防护降级，禁止新建批次）: 1 条非法，示例 ['batch_x']
+🚨 [D-009] 墓碑条目损坏（复活防护降级，禁止新建批次）: 1 条非法，示例 ['batch_x']
+🪦 [D-009] 墓碑 DEGRADED：跳过 TTL 清理（不基于不可信数据改写墓碑，请人工修复）
+🚨 [D-009] trade_state.json 读取失败（账本损坏，Fail-Closed）: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+🚫 [D-009] 拒绝覆盖写入：trade_state.json 已损坏，账本内容不可信（保护现场待人工恢复）
+🚫 [状态持久化] 批次 `batch_new` (BTC/USDT:USDT) 未确认落盘：trade_state.json 已损坏，程序按 Fail-Closed 拒绝覆盖写入以保护现场（JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)）
+🚨 [D-009] trade_state.json 读取失败（账本损坏，Fail-Closed）: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+🚫 [D-009] 拒绝覆盖写入：trade_state.json 已损坏，账本内容不可信（保护现场待人工恢复）
+🚫 [状态持久化] 批次 `batch_new` (BTC/USDT:USDT) 未确认落盘：trade_state.json 已损坏，程序按 Fail-Closed 拒绝覆盖写入以保护现场（JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)）
+🚫 [状态持久化] 批次 batch_new 落盘失败告警已去重
+🚨 [D-009] 墓碑条目损坏（复活防护降级，禁止新建批次）: 2 条非法，示例 ['batch_bad', 'batch_old']
+🪦 [D-009] 墓碑 DEGRADED：跳过 TTL 清理（不基于不可信数据改写墓碑，请人工修复）

@@ -1,0 +1,7 @@
+apply A -> rc=0  skipped=0 
+apply B -> rc=0  skipped=0 
+EOL-ONLY R1R2_收敛审查_验收契约矩阵.md (norm_eq=True)
+EOL-ONLY test_monitor_poll_recovery.py (norm_eq=True)
+EOL-ONLY test_poll_degradation.py (norm_eq=True)
+EOL-ONLY trader_260725.py (norm_eq=True)
+files=12  raw_identical=8  norm_identical=12
