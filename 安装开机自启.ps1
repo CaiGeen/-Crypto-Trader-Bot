@@ -3,7 +3,7 @@
 
 注册两个任务：
   CryptoBot-Autostart     登录后 1 分钟 → 自启-启动Bot.bat（先等本地代理就绪再拉 bot）
-  CryptoBot-HealthPatrol  登录时 + 每 15 分钟 → 健康巡检.py（pythonw 静默；异常才告警，含出口 IP 白名单自检）
+  CryptoBot-HealthPatrol  登录时 + 每 15 分钟 → 健康巡检.py（pythonw 静默；异常才告警，含出口 IP 签名鉴权自检）
 
 关键点：ExecutionTimeLimit 必须为 0（无限）——否则 Windows 默认 3 天后会 Kill 任务，
         把长驻的 bot 一起杀掉（静默停机，且心跳会随即陈旧由巡检发现）。
@@ -60,7 +60,7 @@ $act2 = New-ScheduledTaskAction -Execute "$proj\.venv\Scripts\pythonw.exe" `
     -Argument "`"$proj\健康巡检.py`"" -WorkingDirectory $proj
 Register-ScheduledTask -TaskName 'CryptoBot-HealthPatrol' -Action $act2 `
     -Trigger @($trig2a, $trig2b) -Settings $settings -Principal $principal -Force `
-    -Description 'CryptoBot 健康巡检：每 15 分钟读 .heartbeat.json，守护链陈旧/代理不可达/bot 不存活/出口 IP 不在币安白名单时 TG+邮件告警（正常完全静默）' | Out-Null
+    -Description 'CryptoBot 健康巡检：每 15 分钟读 .heartbeat.json，守护链陈旧/代理不可达/bot 不存活/出口 IP 签名鉴权被拒（疑不在白名单或 key 权限异常）时 TG+邮件告警（正常完全静默）' | Out-Null
 Write-Host "已注册: CryptoBot-HealthPatrol（登录时 + 每 15 分钟）"
 
 Write-Host ''
