@@ -316,6 +316,40 @@ def check_r3_unknown_result_conservative():
 
 
 # --------------------------------------------------------------------------
+# 反例组4（R5 独立复审）：处置路径持久化失败 → 文案必须反映未确认，
+# 不得承诺“已置可补挂态”（假安全感）
+# --------------------------------------------------------------------------
+
+def check_r5_persist_failure_honest_message():
+    d, state_path = _fresh_state_file()
+    try:
+        _seed_batch(state_path)
+        states = _read_disk(state_path)
+        fake = _make_fake(state_path, states, fail_create=True)
+        fake._batch_net_position = lambda b: (0.43, 0.43)
+        # 注入：登记置终态已执行，但 save_batch_state 不落盘（返回 False）
+        fake.save_batch_state = lambda s, b, d2: False
+        ret = CryptoTrader.update_batch_sl(fake, BATCH, 55000.0)
+        crit = [m for lvl, m in fake.sent if lvl == "critical"]
+        reason = str(ret[1]) if isinstance(ret, (tuple, list)) and len(ret) > 1 else ""
+        disk = _read_disk(state_path)
+        report(
+            "R5-1 持久化失败 → 返回消息不得承诺“已置可补挂态”，须含『未确认』",
+            bool(crit) and "未确认" in reason and "已置可补挂态" not in reason,
+            f"critical={len(crit)}；reason 前100={reason[:100]!r}")
+        report(
+            "R5-2 持久化失败 → critical 正文亦须含『未确认』（同键消息一致）",
+            any("未确认" in m for m in crit),
+            f"critical 首条前100={crit[0][:100] if crit else None!r}")
+        report(
+            "R5-3 磁盘侧 current_sl_id 不得显示已置空（save 未落盘 = 事实未改）",
+            disk.get(SYMBOL, {}).get(BATCH, {}).get("current_sl_id") == OLD_SL_ID,
+            f"磁盘 current_sl_id={disk.get(SYMBOL, {}).get(BATCH, {}).get('current_sl_id')!r}")
+    finally:
+        _restore_state_file()
+
+
+# --------------------------------------------------------------------------
 # 健康阳性对照：撤旧 + 新单成功 → 行为与修前完全一致
 # --------------------------------------------------------------------------
 
@@ -357,6 +391,7 @@ CHECKS = [
     check_r1_replace_rejected_disposed,
     check_r2_no_validation_rejected_disposed,
     check_r3_unknown_result_conservative,
+    check_r5_persist_failure_honest_message,
     check_c1_happy_replace_unchanged,
     check_s1_all_failure_exits_disposed,
 ]

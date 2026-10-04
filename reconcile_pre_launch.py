@@ -306,21 +306,31 @@ def main():
         return s.replace('/', '').replace(':', '').replace('_', '')
 
     order_by_id = {o['id']: o for o in all_open_orders}
+    _sl_cover = {}   # R2b：（symbol归一, 实际持仓方向）→ {SL订单id: 有效覆盖量}
 
     for b in local_batches:
+        batch_side_n = _norm_side(b.get('side'))
+        # R4（独立复审）：hedge 模式下同 symbol 可有 long+short 两个持仓，
+        # 旧“首个 symbol 匹配 + break”会用 long 持仓误报 SELL 批次方向冲突（健康假阳性）。
+        # 改按同 symbol + 同方向匹配；只有当该 symbol 下全部非零持仓都与批次反向时才报冲突。
+        matching = [p for p in positions
+                    if _norm_symbol(p.get('symbol')) == _norm_symbol(b['symbol'])
+                    and float(p.get('contracts', 0) or 0) != 0]
+        same_dir = [p for p in matching if batch_side_n and _norm_side(p.get('side')) == batch_side_n]
+        diff_dir = [p for p in matching if batch_side_n and _norm_side(p.get('side'))
+                    and _norm_side(p.get('side')) != batch_side_n]
         has_position = False
         pos_side_n = ''
-        for p in positions:
-            if _norm_symbol(p.get('symbol')) == _norm_symbol(b['symbol']) and float(p.get('contracts', 0) or 0) != 0:
-                has_position = True
-                pos_side_n = _norm_side(p.get('side'))
-                batch_side_n = _norm_side(b.get('side'))
-                # Q13（原 275-277 死分支）：pos 'LONG' vs batch 'BUY' 直比恒不等 →
-                # 旧代码 pass 掉了。归一后核对：方向冲突 = 状态损坏（恢复会反向/双开）。
-                if pos_side_n and batch_side_n and pos_side_n != batch_side_n:
-                    issues.append(f"🚨 {b['symbol']} {b['batch_id']}: 持仓方向 {pos_side_n}"
-                                  f"与批次方向 {batch_side_n} 不一致（状态损坏，恢复前需人工判定）")
-                break
+        if same_dir:
+            has_position = True
+            pos_side_n = batch_side_n
+        elif matching and diff_dir:
+            has_position = True
+            pos_side_n = _norm_side(diff_dir[0].get('side'))
+            # Q13（原 275-277 死分支）：pos 'LONG' vs batch 'BUY' 直比恒不等 →
+            # 旧代码 pass 掉了。归一后核对：方向冲突 = 状态损坏（恢复会反向/双开）。
+            issues.append(f"🚨 {b['symbol']} {b['batch_id']}: 持仓方向 {pos_side_n}"
+                          f"与批次方向 {batch_side_n} 不一致（状态损坏，恢复前需人工判定）")
 
         if has_position and not b['current_sl_id']:
             issues.append(f"🚨 {b['symbol']} {b['batch_id']}: 有持仓但 current_sl_id=None（裸仓风险！"
@@ -337,10 +347,21 @@ def main():
                 if 'STOP' not in sl_type:
                     issues.append(f"🚨 {b['symbol']} {b['batch_id']}: SL {b['current_sl_id']} "
                                   f"type={sl_o.get('type')} 非止损类型（SL 无效，不提供保护）")
+                # R2（独立复审）：SL 单本身必须与批次同 symbol——id 命中 ≠ 保护本批。
+                # 旧实现只看 id、不看 symbol，SL 挂在别的 symbol 也判“有效”。
+                sl_sym_n = _norm_symbol(sl_o.get('symbol'))
+                if sl_sym_n and sl_sym_n != _norm_symbol(b['symbol']):
+                    issues.append(f"🚨 {b['symbol']} {b['batch_id']}: SL {b['current_sl_id']} "
+                                  f"symbol={sl_o.get('symbol')!r} 与批次 symbol 不一致（身份错配，"
+                                  f"SL 不保护本批仓位）")
                 sl_side = str(sl_o.get('side') or '').lower()
                 expect_side = ('sell' if pos_side_n == 'long'
                                else 'buy' if pos_side_n == 'short' else '')
-                if expect_side and sl_side and sl_side != expect_side:
+                if not sl_side:
+                    # R3（独立复审）：side 缺失 → 方向不可核验，不再静默放行（fail-closed）。
+                    issues.append(f"🚨 {b['symbol']} {b['batch_id']}: SL {b['current_sl_id']} "
+                                  f"缺 side 字段（方向不可核验，按无效保护处理）")
+                elif expect_side and sl_side != expect_side:
                     issues.append(f"🚨 {b['symbol']} {b['batch_id']}: SL {b['current_sl_id']} "
                                   f"方向错误（持仓 {pos_side_n} 期望 side={expect_side}，"
                                   f"实际 {sl_side}）——触发将反向开仓/无法止损")
@@ -355,12 +376,38 @@ def main():
                     expect_amt = 0.0
                 try:
                     sl_amt = float(sl_o.get('amount') or 0)
+                    # R3（独立复审）：NaN / inf 使比较恒假 → 旧代码静默放行。
+                    if sl_amt != sl_amt or sl_amt in (float('inf'), float('-inf')):
+                        raise ValueError('non-finite amount')
                 except (TypeError, ValueError):
                     sl_amt = 0.0
+                    issues.append(f"🚨 {b['symbol']} {b['batch_id']}: SL {b['current_sl_id']} "
+                                  f"amount 缺失/非法（{sl_o.get('amount')!r}），覆盖量不可核验")
+                # 账本口径对照（CE4）：本批 SL 必须覆盖本批已成交目标量（多批同才向
+                # 各自覆盖——不要求每个批次都覆盖总仓）。实际总仓聚合核验见下方 R2b。
                 if expect_amt > 0 and sl_amt + 1e-12 < expect_amt:
                     issues.append(f"🚨 {b['symbol']} {b['batch_id']}: SL {b['current_sl_id']} "
                                   f"覆盖不足（SL amount={sl_amt} < 已成交 {expect_amt}）"
                                   f"——部分仓位无保护")
+                # R2b（外部评审复核结论）：有效 SL 需累计到「symbol + 方向」的
+                # 持仓对照表——多批次同向持仓各自持有独立 SL 是健康配置；但按
+                # SL id 去重后的总有效覆盖量必须 ≥ 同方向实际总仓。
+                if (same_dir and 'STOP' in sl_type
+                        and sl_sym_n and sl_sym_n == _norm_symbol(b['symbol'])
+                        and sl_side and expect_side and sl_side == expect_side and sl_amt > 0):
+                    _sl_cover.setdefault((_norm_symbol(b['symbol']), pos_side_n), {})[b['current_sl_id']] = sl_amt
+
+    # R2b（外部评审复核结论）：「symbol + 方向」维度的有效 SL 总和必须 ≥ 实际
+    # 持仓量；SL id 去重防止同一保护单计入两批。逐批口径见上方 CE4。
+    for (_sym, _side), _sl_map in _sl_cover.items():
+        _total = sum(_sl_map.values())
+        _pos = 0.0
+        for p in positions:
+            if _norm_symbol(p.get('symbol')) == _sym and _norm_side(p.get('side')) == _side:
+                _pos += float(p.get('contracts', 0) or 0)
+        if _pos > 0 and _total + 1e-12 < _pos:
+            issues.append(f"🚨 {_sym} {_side}: 有效 SL 覆盖不足（合计 {_total} < 实际持仓 {_pos}）"
+                          f"——部分仓位无保护")
 
     # 4d. 本地有批次但交易所无持仓 = 残留状态
     # Q13：持仓拉取失败时跳过——positions=[] 会把「没拉到」误报成「已手动平仓」（假明细）
@@ -368,8 +415,11 @@ def main():
         print("  ⚠️ [Q13] 持仓拉取不完整，跳过 4d 残留核对（结论已由 UNKNOWN 承担）")
     else:
         for b in local_batches:
+            _b_side = _norm_side(b.get('side'))
             has_position = any(
-                _norm_symbol(p.get('symbol')) == _norm_symbol(b['symbol']) and float(p.get('contracts', 0) or 0) != 0
+                _norm_symbol(p.get('symbol')) == _norm_symbol(b['symbol'])
+                and (not _b_side or _norm_side(p.get('side')) == _b_side)
+                and float(p.get('contracts', 0) or 0) != 0
                 for p in positions
             )
             if not has_position and b['last_filled_count'] > 0:

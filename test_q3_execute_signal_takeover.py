@@ -46,6 +46,8 @@ import importlib.util
 import io
 import os
 import sys
+import threading
+import time
 import unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -207,6 +209,61 @@ def check_r3_monitor_start_fail_alerts():
         "R3-2 监控启动失败 → critical『监控线程启动失败』（修前：零告警无人接管）",
         any('监控线程启动失败' in t for t in crit),
         f"critical={len(crit)} 条；正文前100={crit[0][:100] if crit else None!r}")
+    report(
+        "R3-3 启动失败的批次进风险闸门（未决意图+降级；G1 复核）",
+        FIX.BATCH in fake._unresolved_intent_batches
+        and FIX.BATCH in fake._poll_degraded_batches,
+        f"unresolved={sorted(fake._unresolved_intent_batches)}；degraded={sorted(fake._poll_degraded_batches)}")
+
+
+# --------------------------------------------------------------------------
+# 反例4（R1 独立复审）：监控线程**初始化阶段**崩溃（Thread.start 成功但线程
+# 目标 8731-8831 段未捕获异常）→ 旧测试桩永不触达真实 _start_monitoring，
+# 缺口漏检 → 线程静默死亡、marker 残留、无 critical。修后对称于恢复路径：
+# critical + marker 清理 + 仍返回 batch_id
+# --------------------------------------------------------------------------
+
+def check_r4_monitor_init_crash_alerted_cleaned():
+    fake = FIX.make_fake()
+    fake._active_monitors_lock = threading.Lock()
+    fake._active_monitor_generations = {}
+    fake._active_monitors = set()
+    original_load = fake.load_all_states
+
+    def _load_states_in_monitor():
+        # 主线程照常读账本；监控子线程首次读账本即抛
+        if threading.current_thread() is threading.main_thread():
+            return original_load()
+        raise RuntimeError('monitor-init load fail')
+
+    fake.load_all_states = _load_states_in_monitor
+    fake._start_monitoring = lambda *a, **k: CryptoTrader._start_monitoring(fake, *a, **k)
+    buf = io.StringIO()
+    ret = None
+    with contextlib.redirect_stdout(buf):
+        ret = CryptoTrader.execute_signal(fake, FIX.FakeSignal())
+        time.sleep(1.0)  # 给监控线程留出崩溃与收尾窗口
+    crit = _criticals(fake)
+    marker_cleaned = FIX.BATCH not in fake._active_monitors
+    gen_cleaned = FIX.BATCH not in fake._active_monitor_generations
+
+    report(
+        "R4-1 初始化崩溃仍返回 batch_id（不得 return None 诱导盲重试）",
+        ret == FIX.BATCH,
+        f"ret={ret!r}")
+    report(
+        "R4-2 初始化崩溃 → critical『初始化阶段异常退出』（修前零告警）",
+        any('初始化阶段异常退出' in t for t in crit),
+        f"critical={len(crit)} 条；首条前100={crit[0][:100] if crit else None!r}")
+    report(
+        "R4-3 崩溃后监控登记（marker + 代次）已清理（修前残留）",
+        marker_cleaned and gen_cleaned,
+        f"marker={not marker_cleaned}；代次登记残留={not gen_cleaned}")
+    report(
+        "R4-4 初始化崩溃的批次进风险闸门（未决意图+降级；G1 复核）",
+        FIX.BATCH in fake._unresolved_intent_batches
+        and FIX.BATCH in fake._poll_degraded_batches,
+        f"unresolved={sorted(fake._unresolved_intent_batches)}；degraded={sorted(fake._poll_degraded_batches)}")
 
 
 # --------------------------------------------------------------------------
@@ -260,6 +317,7 @@ CHECKS = [
     check_r1_timesync_fail_keeps_takeover,
     check_r2_commit_return_checked,
     check_r3_monitor_start_fail_alerts,
+    check_r4_monitor_init_crash_alerted_cleaned,
     check_c1_happy_path_unchanged,
     check_s1_source_anchors,
 ]

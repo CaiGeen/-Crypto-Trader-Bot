@@ -165,9 +165,14 @@ def scenario_5():
            f"(returncode: {r.returncode})")
 
 
-if __name__ == '__main__':
+def main():
     _backup_lock()
     try:
+        # R6（独立复审）：备份失败必须中止——否则 scenario_1 会 os.remove 锁原件、
+        # finally 因 _LOCK_BACKUP_TAKEN=False 不恢复 = 原文件丢失（宁留勿删不成立）。
+        if not _LOCK_BACKUP_TAKEN:
+            print("❌ [Q8] 诊断锁备份失败——跳过全部场景（避免污染原件，非功能失败）")
+            sys.exit(2)
         scenario_1()
         scenario_2()
         scenario_3()
@@ -183,3 +188,7 @@ if __name__ == '__main__':
         sys.exit(1)
     print(f"✅ 全部 {len(RESULTS)} 个场景通过")
     print("P0-2v2 单实例锁验收完成")
+
+
+if __name__ == '__main__':
+    main()

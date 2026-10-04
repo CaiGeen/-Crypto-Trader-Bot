@@ -265,6 +265,123 @@ def check_c2_empty_still_passes():
         f"rc={rc}；含✅通过={('✅ 对账通过' in out)}")
 
 
+# ---------------------------------------------------------------------------
+# R2（独立复审）：SL 身份/覆盖——id 命中但 symbol 错配、或 SL 仅覆盖账本
+# 目标量而实际持仓更大 → 修前 rc=0（及修后 CE9 补强），修后必红
+# ---------------------------------------------------------------------------
+
+def check_r2_sl_symbol_mismatch():
+    orders = [dict(_orders()[0], symbol='ETH/USDT:USDT'), _orders()[1]]
+    rc, out = _run(local_state=_LOCAL_BATCH, orders=orders, positions=_POS_LONG)
+    report(
+        "R2a SL 单挂错 symbol → rc=1『身份错配』（修前按 id 命中即通过）",
+        rc == 1 and '身份错配' in out and '✅ 对账通过' not in out,
+        f"rc={rc}；含『身份错配』={('身份错配' in out)}；含✅通过={('✅ 对账通过' in out)}")
+
+
+def check_r2_sl_undercovers_real_position():
+    # 账本目标 0.01 & SL 0.01 都“合法”，但交易所实际持仓 0.1 —— 90% 无保护
+    positions = [dict(_POS_LONG[0], contracts=0.1)]
+    rc, out = _run(local_state=_LOCAL_BATCH, orders=_orders(), positions=positions)
+    report(
+        "R2b SL 只覆盖账本量、实际持仓 10 倍 → rc=1『覆盖不足』（修前恒过）",
+        rc == 1 and '覆盖不足' in out and '✅ 对账通过' not in out,
+        f"rc={rc}；含『覆盖不足』={('覆盖不足' in out)}；含✅通过={('✅ 对账通过' in out)}")
+
+
+# ---------------------------------------------------------------------------
+# R3（独立复审）：方向/数量字段缺失或非法 → UNKNOWN 必须进结论，不得静默放行
+# ---------------------------------------------------------------------------
+
+def check_r3_sl_side_missing():
+    orders = [dict(_orders()[0], side=''), _orders()[1]]
+    rc, out = _run(local_state=_LOCAL_BATCH, orders=orders, positions=_POS_LONG)
+    report(
+        "R3a SL 缺 side 字段 → rc=1『缺 side』（修前方向检查恒真，静默过）",
+        rc == 1 and '缺 side' in out and '✅ 对账通过' not in out,
+        f"rc={rc}；含『缺 side』={('缺 side' in out)}；含✅通过={('✅ 对账通过' in out)}")
+
+
+def check_r3_sl_amount_nan():
+    orders = [dict(_orders()[0], amount=float('nan')), _orders()[1]]
+    rc, out = _run(local_state=_LOCAL_BATCH, orders=orders, positions=_POS_LONG)
+    report(
+        "R3b SL amount=NaN → rc=1『非法』（修前 NaN 比较恒假，静默过）",
+        rc == 1 and '非法' in out and '✅ 对账通过' not in out,
+        f"rc={rc}；含『非法』={('非法' in out)}；含✅通过={('✅ 对账通过' in out)}")
+
+
+# ---------------------------------------------------------------------------
+# R4（独立复审）：hedge 同 symbol 双持仓 —— 旧“首个 symbol 匹配+break”会把
+# long 持仓施加到 SELL 批次报方向冲突（健康假阳性）；修后同向匹配 → rc=0
+# ---------------------------------------------------------------------------
+
+def check_r4_healthy_hedge_no_false_positive():
+    local = {
+        'BTC/USDT:USDT': {
+            'batch_L': dict(_LOCAL_BATCH['BTC/USDT:USDT']['batch_q13'],
+                            side='BUY', current_sl_id='sl_l', tp_order_id='tp_l',
+                            entry_orders=['e1']),
+            'batch_S': dict(_LOCAL_BATCH['BTC/USDT:USDT']['batch_q13'],
+                            side='SELL', current_sl_id='sl_s', tp_order_id='tp_s',
+                            entry_orders=['e2']),
+        }
+    }
+    positions = [
+        {'symbol': 'BTC/USDT:USDT', 'side': 'long', 'contracts': 0.01,
+         'entryPrice': 50000.0, 'unrealizedPnl': 0.0},
+        {'symbol': 'BTC/USDT:USDT', 'side': 'short', 'contracts': 0.01,
+         'entryPrice': 50000.0, 'unrealizedPnl': 0.0},
+    ]
+    orders = [
+        {'id': 'sl_l', 'symbol': 'BTC/USDT:USDT', 'type': 'STOP_MARKET',
+         'side': 'sell', 'amount': 0.01, 'status': 'open'},
+        {'id': 'tp_l', 'symbol': 'BTC/USDT:USDT', 'type': 'TAKE_PROFIT_MARKET',
+         'side': 'buy', 'amount': 0.01, 'status': 'open'},
+        {'id': 'sl_s', 'symbol': 'BTC/USDT:USDT', 'type': 'STOP_MARKET',
+         'side': 'buy', 'amount': 0.01, 'status': 'open'},
+        {'id': 'tp_s', 'symbol': 'BTC/USDT:USDT', 'type': 'TAKE_PROFIT_MARKET',
+         'side': 'sell', 'amount': 0.01, 'status': 'open'},
+    ]
+    rc, out = _run(local_state=local, orders=orders, positions=positions)
+    report(
+        "R4 健康 hedge（同 symbol 双向持仓、各自保护齐全）→ rc=0（修前误报 rc=1）",
+        rc == 0 and '✅ 对账通过' in out,
+        f"rc={rc}；含✅通过={('✅ 对账通过' in out)}")
+
+
+def check_r2c_same_direction_multibatch_aggregate_ok():
+    # ChatGPT 复核要点：A 批持仓 0.01、B 批持仓 0.02（同方向），各自 SL 各自覆盖 → 总仓 0.03
+    # 必须判健康；逐批 SL>=总仓 的口径会把两个健康批次全部误判。
+    local = {
+        'BTC/USDT:USDT': {
+            'batch_A': dict(_LOCAL_BATCH['BTC/USDT:USDT']['batch_q13'],
+                            side='BUY', current_sl_id='sl_a', tp_order_id='tp_a',
+                            entry_orders=['e1'], target_amounts=[0.01], last_filled_count=1),
+            'batch_B': dict(_LOCAL_BATCH['BTC/USDT:USDT']['batch_q13'],
+                            side='BUY', current_sl_id='sl_b', tp_order_id='tp_b',
+                            entry_orders=['e2'], target_amounts=[0.02], last_filled_count=1),
+        }
+    }
+    positions = [{'symbol': 'BTC/USDT:USDT', 'side': 'long', 'contracts': 0.03,
+                  'entryPrice': 50000.0, 'unrealizedPnl': 0.0}]
+    orders = [
+        {'id': 'sl_a', 'symbol': 'BTC/USDT:USDT', 'type': 'STOP_MARKET',
+         'side': 'sell', 'amount': 0.01, 'status': 'open'},
+        {'id': 'tp_a', 'symbol': 'BTC/USDT:USDT', 'type': 'TAKE_PROFIT_MARKET',
+         'side': 'buy', 'amount': 0.01, 'status': 'open'},
+        {'id': 'sl_b', 'symbol': 'BTC/USDT:USDT', 'type': 'STOP_MARKET',
+         'side': 'sell', 'amount': 0.02, 'status': 'open'},
+        {'id': 'tp_b', 'symbol': 'BTC/USDT:USDT', 'type': 'TAKE_PROFIT_MARKET',
+         'side': 'buy', 'amount': 0.02, 'status': 'open'},
+    ]
+    rc, out = _run(local_state=local, orders=orders, positions=positions)
+    report(
+        "R2c 同向双批各自 SL 聚合覆盖总仓 → rc=0（逐批 SL>=总仓 的口径会误判健康）",
+        rc == 0 and '✅ 对账通过' in out,
+        f"rc={rc}；含✅通过={('✅ 对账通过' in out)}")
+
+
 CHECKS = [
     check_ce1_bare_position_reverse,
     check_ce2_all_fetches_fail,
@@ -276,6 +393,12 @@ CHECKS = [
     check_s1_source_anchors,
     check_c1_happy_path_still_passes,
     check_c2_empty_still_passes,
+    check_r2_sl_symbol_mismatch,
+    check_r2_sl_undercovers_real_position,
+    check_r3_sl_side_missing,
+    check_r3_sl_amount_nan,
+    check_r4_healthy_hedge_no_false_positive,
+    check_r2c_same_direction_multibatch_aggregate_ok,
 ]
 
 

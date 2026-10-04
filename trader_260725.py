@@ -4037,6 +4037,9 @@ class CryptoTrader:
         返回追加到调用方失败消息的处置说明（str）。
         """
         if no_order_created:
+            # R5（独立复审）：持久化成败必须分档进文案——否则 save 失败时监控补挂
+            # 根本不会生效，却向运维承诺“已置可补挂态”= 假安全感。
+            _persist_problem = None
             try:
                 _entry = (((self.load_all_states().get(symbol, {}) or {})
                            .get(batch_id) or {}).get('protection_registry') or {}
@@ -4046,21 +4049,28 @@ class CryptoTrader:
                                           terminated_reason='q15_replace_failed_no_order')
                     print(f"  └─ 🔧 [Q15] 换挂失败意图残留已置终态 ABSENT（放行 F3 补挂）: {sl_identity}")
             except Exception as reg_e:
+                _persist_problem = f"意图残留清理失败（{reg_e}）"
                 print(f"⚠️ [Q15] 意图残留清理失败（补挂可能被保守挂起）: {reg_e}")
             try:
                 if b_data.get('current_sl_id'):
                     b_data['current_sl_id'] = None
                     if self.save_batch_state(symbol, batch_id, b_data) is not True:
+                        _persist_problem = "current_sl_id 置空未确认落盘"
                         print(f"⚠️ [Q15] current_sl_id 置空未确认落盘"
                               f"（save_batch_state 已按其契约告警）")
             except Exception as sv_e:
+                _persist_problem = f"current_sl_id 置空落盘异常（{sv_e}）"
                 print(f"⚠️ [Q15] current_sl_id 置空落盘异常: {sv_e}")
 
         try:
             if no_order_created:
                 _scope = "交易所当前无止损（裸奔窗口）"
-                _next = ("账本已置可补挂态，监控下一轮按 stop_steps 旧价自动补挂"
-                         "（既有多重闸门照常裁决）")
+                if _persist_problem:
+                    _next = ("账本恢复**未确认**落盘——监控按 stop_steps 自动补挂是否生效未知，"
+                             "请立即人工核实交易所 SL 实况并计划补挂")
+                else:
+                    _next = ("账本已置可补挂态，监控下一轮按 stop_steps 旧价自动补挂"
+                             "（既有多重闸门照常裁决）")
             else:
                 _scope = "新单结果未知，交易所可能无止损"
                 _next = "账本未改动（结果未知不盲目改写），请人工核实交易所该单实况"
@@ -4076,6 +4086,10 @@ class CryptoTrader:
             print(f"⚠️ [Q15] 裸奔窗口告警发送异常: {al_e}")
 
         if no_order_created:
+            if _persist_problem:
+                return (f"\n🛑 **换挂止损失败处置**：旧单已撤、新单未产生，交易所当前无止损。\n"
+                        f"⚠️ 账本恢复未确认（{_persist_problem}）——监控是否自动补挂不明，"
+                        f"请人工立即核实交易所该单实况；critical 已发出")
             return (f"\n🛑 **换挂止损失败处置**：旧单已撤、新单未产生，交易所当前无止损。\n"
                     f"🔧 已置意图残留终态 ABSENT + current_sl_id 置空，监控下一轮自动补挂旧价；"
                     f"critical 已发出")
@@ -7096,6 +7110,17 @@ class CryptoTrader:
                         level='critical')
                 except Exception:
                     pass
+                # G1（ChatGPT 评审）：启动失败的批次必须进未决风险闸门——
+                # _poll_degraded_batches / _unresolved_intent_batches 非空时
+                # execute_signal 全链路入口拒发新信号（fail-closed）。
+                try:
+                    self._unresolved_intent_batches.add(batch_id)
+                    self._poll_degraded_batches.add(batch_id)
+                    _ps = getattr(self, '_poll_fail_streak', None)
+                    if isinstance(_ps, dict):
+                        _ps[batch_id] = max(_ps.get(batch_id, 0), 1)
+                except Exception:
+                    pass
                 print(f"⚠️ [Q3] 监控线程启动失败（无人接管，已发 critical）: {_mt_e}")
 
             # —— 提交点之后 = 纯信息步骤：任何失败只记录，不改变接管与返回值 ——
@@ -8749,87 +8774,126 @@ class CryptoTrader:
             print(f"👀 批次 [{batch_id}] 监控已注册 (代次={_monitor_generation[:8]}，"
                   f"活跃监控数: {len(self._active_monitors)})")
 
-        def _is_current_monitor_generation():
-            with self._active_monitors_lock:
-                return self._active_monitor_generations.get(batch_id) == _monitor_generation
+        # R1（独立复审 2026-10-04）：初始化阶段（本行到主循环 try@8837 之前）的未捕获
+        # 异常，在 lifecycle=None（execute_signal 直调路径，7060-7084）下会静默杀死
+        # 监控线程——marker 已登记@8748、无 critical、execute_signal 已返回 batch_id。
+        # 恢复路径由 _run_monitor_takeover 的 except+finally@8716-8720 统一收尾；
+        # 本路径对称补齐：同代次的 marker 清理 + critical（无人接管必须可见）。
+        try:
+            def _is_current_monitor_generation():
+                with self._active_monitors_lock:
+                    return self._active_monitor_generations.get(batch_id) == _monitor_generation
 
-        has_entered_position = False
-        filled_layers = [False] * len(entry_orders)
-        canceled_layers = [False] * len(entry_orders)
+            has_entered_position = False
+            filled_layers = [False] * len(entry_orders)
+            canceled_layers = [False] * len(entry_orders)
 
-        terminal_orders = set()
-        fast_poll_count = 0
-        # R-B: 运行期周期自愈重查时间戳（每 registry_self_heal_interval 秒一次）
-        last_registry_self_heal_time = 0
-        # P1-2: 连续网络错误计数器（用于动态降速，避免加重限流）
-        consecutive_network_errors = 0
+            terminal_orders = set()
+            fast_poll_count = 0
+            # R-B: 运行期周期自愈重查时间戳（每 registry_self_heal_interval 秒一次）
+            last_registry_self_heal_time = 0
+            # P1-2: 连续网络错误计数器（用于动态降速，避免加重限流）
+            consecutive_network_errors = 0
 
-        # 🔥 R1/R2: 降级跟踪变量初始化（per-batch，测试 fake 可能不跑 __init__）
-        for _attr, _default in (
-                ('_poll_fail_streak', {}),
-                ('_poll_first_fail_time', {}),
-                ('_poll_last_success_time', {}),
-                ('_poll_degraded_batches', set()),
-                ('_poll_alert_attempted', {}),
-                ('_poll_alert_active', False)):
-            if not isinstance(getattr(self, _attr, None), type(_default)):
-                setattr(self, _attr, _default)
-        if not isinstance(getattr(self, '_poll_alert_lock', None), type(threading.Lock())):
-            self._poll_alert_lock = threading.Lock()
+            # 🔥 R1/R2: 降级跟踪变量初始化（per-batch，测试 fake 可能不跑 __init__）
+            for _attr, _default in (
+                    ('_poll_fail_streak', {}),
+                    ('_poll_first_fail_time', {}),
+                    ('_poll_last_success_time', {}),
+                    ('_poll_degraded_batches', set()),
+                    ('_poll_alert_attempted', {}),
+                    ('_poll_alert_active', False)):
+                if not isinstance(getattr(self, _attr, None), type(_default)):
+                    setattr(self, _attr, _default)
+            if not isinstance(getattr(self, '_poll_alert_lock', None), type(threading.Lock())):
+                self._poll_alert_lock = threading.Lock()
 
-        if filled_details is None or len(filled_details) != len(entry_orders):
-            filled_details = [0.0] * len(entry_orders)
+            if filled_details is None or len(filled_details) != len(entry_orders):
+                filled_details = [0.0] * len(entry_orders)
 
-        if layer_sl_params is None:
-            layer_sl_params = []
+            if layer_sl_params is None:
+                layer_sl_params = []
 
-        for i in range(last_filled_count):
-            if i < len(filled_layers):
-                filled_layers[i] = True
+            for i in range(last_filled_count):
+                if i < len(filled_layers):
+                    filled_layers[i] = True
 
-        if pending_sl_orders is None:
-            pending_sl_orders = []
+            if pending_sl_orders is None:
+                pending_sl_orders = []
 
-        latest_all = self.load_all_states()
-        latest_b_data = latest_all.get(symbol, {}).get(batch_id, {})
-        if latest_b_data:
-            if 'pending_sl_orders' in latest_b_data:
-                pending_sl_orders = latest_b_data.get('pending_sl_orders', [])
-            if 'prepared_tp_params' in latest_b_data:
-                prepared_tp_params = latest_b_data.get('prepared_tp_params', {})
-            if 'layer_sl_params' in latest_b_data:
-                layer_sl_params = latest_b_data.get('layer_sl_params', [])
+            latest_all = self.load_all_states()
+            latest_b_data = latest_all.get(symbol, {}).get(batch_id, {})
+            if latest_b_data:
+                if 'pending_sl_orders' in latest_b_data:
+                    pending_sl_orders = latest_b_data.get('pending_sl_orders', [])
+                if 'prepared_tp_params' in latest_b_data:
+                    prepared_tp_params = latest_b_data.get('prepared_tp_params', {})
+                if 'layer_sl_params' in latest_b_data:
+                    layer_sl_params = latest_b_data.get('layer_sl_params', [])
 
-        # 🔥 T1-C 收敛：冲突态接管优先于任何普通逻辑（禁止保护维护/撤单/清理）
-        _conf_reason = str(latest_b_data.get('close_reason') or '')
-        if _conf_reason == 'qty_conflict_settling':
-            _cok, _cwhy = self._finalize_qty_conflict(symbol, batch_id)
-            print(f"  └─ [T1-C] 数量冲突续跑 finalizer: {_cwhy}")
-            if not _cok:
-                time.sleep(min(5, 1))
-        elif _conf_reason == 'qty_conflict_manual_review':
-            if int(time.time()) % 600 < 5:
+            # 🔥 T1-C 收敛：冲突态接管优先于任何普通逻辑（禁止保护维护/撤单/清理）
+            _conf_reason = str(latest_b_data.get('close_reason') or '')
+            if _conf_reason == 'qty_conflict_settling':
+                _cok, _cwhy = self._finalize_qty_conflict(symbol, batch_id)
+                print(f"  └─ [T1-C] 数量冲突续跑 finalizer: {_cwhy}")
+                if not _cok:
+                    time.sleep(min(5, 1))
+            elif _conf_reason == 'qty_conflict_manual_review':
+                if int(time.time()) % 600 < 5:
+                    self.send_tg_notification(
+                        f"⚠️【数量冲突·待人工】批次 `{batch_id}` 已按实际成交量记账并"
+                        f"永久冻结（{_conf_reason}）。\n"
+                        f"💡 请人工核对交易所与台账数量后处理；系统不会自动撤单或清理。",
+                        level='critical')
+
+            print(f"👀 批次 [{batch_id}] 启动【批次独立隔离】实时风控监控...")
+            if pending_sl_orders:
+                print(f"  └─ ⚠️ 有待补挂止损的层: {pending_sl_orders}")
+
+            # 🔥 熔断计数器
+            sl_error_count = 0
+            MAX_SL_ERRORS = 10
+            SL_COOLDOWN_SECONDS = 60
+
+            # 🔥 部分减仓标记，避免重复打印
+            last_partial_reduce_log_time = 0
+
+            # 🔥 加载已有的失败计数
+            sl_fail_count = latest_b_data.get('sl_fail_count', {}) if latest_b_data else {}
+            MAX_SL_FAILS_PER_LAYER = 5
+        except Exception as _init_e:
+            if isinstance(_monitor_lifecycle, dict):
+                # lifecycle 路径：收尾归 _run_monitor_takeover 的 finally 统一接管
+                #（exit_reason 分类 + _finish_monitor_takeover 一站式），此处只透传。
+                raise
+            # lifecycle=None（execute_signal 直调路径）：本层负责收尾。
+            print(f"⚠️ [R1] 监控线程初始化阶段异常退出: {_init_e}")
+            try:
+                with self._active_monitors_lock:
+                    if self._active_monitor_generations.get(batch_id) == _monitor_generation:
+                        self._active_monitor_generations.pop(batch_id, None)
+                    self._active_monitors.discard(batch_id)
+            except Exception as _mk_e:
+                print(f"⚠️ [R1] 监控 marker 清理失败: {_mk_e}")
+            try:
                 self.send_tg_notification(
-                    f"⚠️【数量冲突·待人工】批次 `{batch_id}` 已按实际成交量记账并"
-                    f"永久冻结（{_conf_reason}）。\n"
-                    f"💡 请人工核对交易所与台账数量后处理；系统不会自动撤单或清理。",
+                    f"🚨【资金安全】批次 `{batch_id}` 监控线程初始化阶段异常退出（无人接管）\n"
+                    f"⚠️ ENTRY 单已在交易所、账本已落盘，但监控循环未启动\n"
+                    f"🔧 错误: {str(_init_e)[:160]}\n"
+                    f"🛠️ 请立即人工盯盘；重启后恢复流程（recover_active_batches）将接管该 active 批次。",
                     level='critical')
-
-        print(f"👀 批次 [{batch_id}] 启动【批次独立隔离】实时风控监控...")
-        if pending_sl_orders:
-            print(f"  └─ ⚠️ 有待补挂止损的层: {pending_sl_orders}")
-
-        # 🔥 熔断计数器
-        sl_error_count = 0
-        MAX_SL_ERRORS = 10
-        SL_COOLDOWN_SECONDS = 60
-
-        # 🔥 部分减仓标记，避免重复打印
-        last_partial_reduce_log_time = 0
-
-        # 🔥 加载已有的失败计数
-        sl_fail_count = latest_b_data.get('sl_fail_count', {}) if latest_b_data else {}
-        MAX_SL_FAILS_PER_LAYER = 5
+            except Exception as _al_e:
+                print(f"⚠️ [R1] 初始化异常告警发送失败: {_al_e}")
+            # G1（ChatGPT 评审）：初始化异常退出的批次进同款风险闸门
+            try:
+                self._unresolved_intent_batches.add(batch_id)
+                self._poll_degraded_batches.add(batch_id)
+                _ps = getattr(self, '_poll_fail_streak', None)
+                if isinstance(_ps, dict):
+                    _ps[batch_id] = max(_ps.get(batch_id, 0), 1)
+            except Exception:
+                pass
+            return
 
         # ================================================================
         # 🔥 主监控循环
