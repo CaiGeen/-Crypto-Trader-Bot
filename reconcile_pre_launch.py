@@ -28,7 +28,17 @@ from dotenv import load_dotenv
 from pathlib import Path
 
 # ==================== 配置 ====================
-STATE_FILE = "trade_state.json"
+# Q13（2026-10-04）：CWD 相对 → 脚本相对绝对路径。跑错目录会读到空/错账本，
+# 本地批次全盲 = fail-open（反向核对的成因之一），与标准启动链 CWD 钉死一致。
+STATE_FILE = str(Path(__file__).resolve().parent / "trade_state.json")
+
+
+def _norm_side(s):
+    """方向归一（Q13）：BUY/buy→long，SELL/sell→short，BID/ASK 归一，其余小写原样。"""
+    v = str(s or '').strip().lower()
+    return {'buy': 'long', 'sell': 'short', 'bid': 'long',
+            'ask': 'short'}.get(v, v)
+
 
 def load_local_state():
     """读取本地 trade_state.json"""
@@ -144,6 +154,7 @@ def main():
                     'protection_registry': b_data.get('protection_registry', {}),
                     'pending_sl_orders': b_data.get('pending_sl_orders', []),
                     'sl_fail_count': b_data.get('sl_fail_count', {}),
+                    'target_amounts': b_data.get('target_amounts', []),
                 })
         print(f"  活跃批次数: {len(local_batches)}")
         for b in local_batches:
@@ -168,6 +179,18 @@ def main():
 
     if symbols_to_query:
         all_open_orders, order_errors = fetch_all_open_orders(exchange, symbols_to_query)
+        # Q13（原 163-165 注释承诺「额外全量扫描」但未实现）：只查本地 symbol 时，
+        # 本地之外的孤儿单逃过 4a。补双通道全量扫描 + 去重合并；失败进 order_errors
+        #（UNKNOWN 不得通过）。
+        try:
+            _merged = {o['id']: o for o in all_open_orders}
+            for o in exchange.fetch_open_orders():
+                _merged.setdefault(o['id'], o)
+            for o in exchange.fetch_open_orders(params={'stop': True}):
+                _merged.setdefault(o['id'], o)
+            all_open_orders = list(_merged.values())
+        except Exception as e:
+            order_errors.append(f"fetch_all_fullscan: {e}")
     else:
         # 本地无批次，但仍需全量扫描确认无残留
         try:
@@ -220,6 +243,20 @@ def main():
     print(f"\n🔍 [4/4] 交叉对账分析 ...")
     issues = []
 
+    # Q13：UNKNOWN（拉取失败）必须进结论——只 print 不进 issues 会打印
+    # 「✅ 对账通过」且 rc=0（错误安全结论）。结果未知 ≠ 结果一致。
+    if order_errors:
+        issues.append(
+            f"🚨 [UNKNOWN] 获取未结订单失败/不完整（{len(order_errors)} 处）"
+            f"——结果未知，禁止判定对账通过：" + "；".join(order_errors[:3]))
+    if pos_errors:
+        issues.append(
+            f"🚨 [UNKNOWN] 获取持仓失败（{len(pos_errors)} 处）"
+            f"——结果未知，禁止判定对账通过：" + "；".join(pos_errors[:3]))
+    if order_errors or pos_errors:
+        print("  ⚠️ [UNKNOWN] 拉取不完整：依赖失败数据源的交叉对账明细已跳过"
+              "（避免误导性结论），修复网络/API 后重跑本脚本。")
+
     # 4a. 交易所订单 vs 本地状态
     local_order_ids = set()
     for b in local_batches:
@@ -244,13 +281,17 @@ def main():
             issues.append(f"🚨 交易所存在本地不认识的订单: ID={oid} type={otype}（潜在孤儿单）")
 
     # 4b. 本地有 SL/TP ID 但交易所没有 = 保护缺失
-    for b in local_batches:
-        if b['current_sl_id'] and b['current_sl_id'] not in exchange_order_ids:
-            issues.append(f"⚠️ {b['symbol']} {b['batch_id']}: local_sl_id={b['current_sl_id']} "
-                          f"在交易所未找到（SL 可能已被撤销/成交，本地状态需更新）")
-        if b['tp_order_id'] and b['tp_order_id'] not in exchange_order_ids:
-            issues.append(f"⚠️ {b['symbol']} {b['batch_id']}: local_tp_id={b['tp_order_id']} "
-                          f"在交易所未找到（TP 可能已被撤销/成交，本地状态需更新）")
+    # Q13：订单拉取失败时跳过——部分失败会把「没拉到」误报成「已撤销/成交」（假明细）
+    if order_errors:
+        print("  ⚠️ [Q13] 订单拉取不完整，跳过 4b 存在性核对（结论已由 UNKNOWN 承担）")
+    else:
+        for b in local_batches:
+            if b['current_sl_id'] and b['current_sl_id'] not in exchange_order_ids:
+                issues.append(f"⚠️ {b['symbol']} {b['batch_id']}: local_sl_id={b['current_sl_id']} "
+                              f"在交易所未找到（SL 可能已被撤销/成交，本地状态需更新）")
+            if b['tp_order_id'] and b['tp_order_id'] not in exchange_order_ids:
+                issues.append(f"⚠️ {b['symbol']} {b['batch_id']}: local_tp_id={b['tp_order_id']} "
+                              f"在交易所未找到（TP 可能已被撤销/成交，本地状态需更新）")
 
     # 4c. 本地有持仓但无 SL/TP = 裸仓风险
     # F3（2026-08-21）：本地 key 'BTCUSDT' vs ccxt 'BTC/USDT:USDT' 归一化比对（防误判无持仓）
@@ -264,17 +305,21 @@ def main():
             return (base + quote).replace('_', '')
         return s.replace('/', '').replace(':', '').replace('_', '')
 
+    order_by_id = {o['id']: o for o in all_open_orders}
+
     for b in local_batches:
         has_position = False
+        pos_side_n = ''
         for p in positions:
             if _norm_symbol(p.get('symbol')) == _norm_symbol(b['symbol']) and float(p.get('contracts', 0) or 0) != 0:
                 has_position = True
-                # 检查持仓方向是否匹配
-                pos_side = p.get('side', '').upper()
-                batch_side = b.get('side', '').upper()
-                if pos_side and batch_side and pos_side != batch_side:
-                    # hedge mode 下 side 可能是 LONG/SHORT，也可能空
-                    pass
+                pos_side_n = _norm_side(p.get('side'))
+                batch_side_n = _norm_side(b.get('side'))
+                # Q13（原 275-277 死分支）：pos 'LONG' vs batch 'BUY' 直比恒不等 →
+                # 旧代码 pass 掉了。归一后核对：方向冲突 = 状态损坏（恢复会反向/双开）。
+                if pos_side_n and batch_side_n and pos_side_n != batch_side_n:
+                    issues.append(f"🚨 {b['symbol']} {b['batch_id']}: 持仓方向 {pos_side_n}"
+                                  f"与批次方向 {batch_side_n} 不一致（状态损坏，恢复前需人工判定）")
                 break
 
         if has_position and not b['current_sl_id']:
@@ -283,15 +328,72 @@ def main():
         if has_position and not b['tp_order_id']:
             issues.append(f"⚠️ {b['symbol']} {b['batch_id']}: 有持仓但 tp_order_id=None（无止盈单）")
 
+        # Q13：SL 有效性/方向/覆盖量核验——存在 ≠ 有效（4b 只验 id 在场）。
+        # 订单数据不完整时 sl_o 缺席 → 跳过（UNKNOWN 已承担结论，不造假明细）。
+        if has_position and b['current_sl_id']:
+            sl_o = order_by_id.get(b['current_sl_id'])
+            if sl_o is not None:
+                sl_type = str(sl_o.get('type') or '').upper()
+                if 'STOP' not in sl_type:
+                    issues.append(f"🚨 {b['symbol']} {b['batch_id']}: SL {b['current_sl_id']} "
+                                  f"type={sl_o.get('type')} 非止损类型（SL 无效，不提供保护）")
+                sl_side = str(sl_o.get('side') or '').lower()
+                expect_side = ('sell' if pos_side_n == 'long'
+                               else 'buy' if pos_side_n == 'short' else '')
+                if expect_side and sl_side and sl_side != expect_side:
+                    issues.append(f"🚨 {b['symbol']} {b['batch_id']}: SL {b['current_sl_id']} "
+                                  f"方向错误（持仓 {pos_side_n} 期望 side={expect_side}，"
+                                  f"实际 {sl_side}）——触发将反向开仓/无法止损")
+                expect_amt = 0.0
+                try:
+                    t_amt = b.get('target_amounts') or []
+                    if t_amt:
+                        expect_amt = sum(float(x) for x in t_amt[:b['last_filled_count']])
+                    elif b['last_filled_count'] > 0:
+                        expect_amt = float(b.get('batch_total_amount') or 0)
+                except (TypeError, ValueError):
+                    expect_amt = 0.0
+                try:
+                    sl_amt = float(sl_o.get('amount') or 0)
+                except (TypeError, ValueError):
+                    sl_amt = 0.0
+                if expect_amt > 0 and sl_amt + 1e-12 < expect_amt:
+                    issues.append(f"🚨 {b['symbol']} {b['batch_id']}: SL {b['current_sl_id']} "
+                                  f"覆盖不足（SL amount={sl_amt} < 已成交 {expect_amt}）"
+                                  f"——部分仓位无保护")
+
     # 4d. 本地有批次但交易所无持仓 = 残留状态
-    for b in local_batches:
-        has_position = any(
-            _norm_symbol(p.get('symbol')) == _norm_symbol(b['symbol']) and float(p.get('contracts', 0) or 0) != 0
-            for p in positions
-        )
-        if not has_position and b['last_filled_count'] > 0:
-            issues.append(f"⚠️ {b['symbol']} {b['batch_id']}: 本地有 {b['last_filled_count']} 层成交记录"
-                          f"但交易所无持仓（仓位可能已手动平仓，本地状态需清理）")
+    # Q13：持仓拉取失败时跳过——positions=[] 会把「没拉到」误报成「已手动平仓」（假明细）
+    if pos_errors:
+        print("  ⚠️ [Q13] 持仓拉取不完整，跳过 4d 残留核对（结论已由 UNKNOWN 承担）")
+    else:
+        for b in local_batches:
+            has_position = any(
+                _norm_symbol(p.get('symbol')) == _norm_symbol(b['symbol']) and float(p.get('contracts', 0) or 0) != 0
+                for p in positions
+            )
+            if not has_position and b['last_filled_count'] > 0:
+                issues.append(f"⚠️ {b['symbol']} {b['batch_id']}: 本地有 {b['last_filled_count']} 层成交记录"
+                              f"但交易所无持仓（仓位可能已手动平仓，本地状态需清理）")
+
+    # 4e. 【反向核对 Q13】交易所有持仓 → 本地必须有对应活跃批次。
+    #     4c/4d 只遍历 local_batches：本地空/漏（含 STATE_FILE 跑错目录）时恒静默 = fail-open。
+    for p in positions:
+        p_contracts = float(p.get('contracts', 0) or 0)
+        if p_contracts == 0:
+            continue
+        p_side = _norm_side(p.get('side'))
+        covered = [b for b in local_batches
+                   if _norm_symbol(b['symbol']) == _norm_symbol(p.get('symbol'))]
+        if not covered:
+            issues.append(f"🚨 [反向核对] 交易所有持仓 {p.get('symbol')} "
+                          f"side={p.get('side') or '?'} contracts={p_contracts}，"
+                          f"本地无对应活跃批次——裸仓/孤儿持仓（无人接管）！恢复前必须查明来源")
+            continue
+        if p_side and not any(_norm_side(b.get('side')) == p_side for b in covered):
+            issues.append(f"🚨 [反向核对] 交易所有持仓 {p.get('symbol')} side={p_side}，"
+                          f"本地活跃批次方向={sorted({_norm_side(b.get('side')) or '?' for b in covered})}"
+                          f"——方向不匹配（状态损坏/对账键错位）")
 
     # ===== 汇总 =====
     print(f"\n{'=' * 70}")

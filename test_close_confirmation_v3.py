@@ -23,8 +23,15 @@ import ast
 import pathlib
 import sys
 
-sys.path.insert(0, r'G:\my-crypto-bot\.venv\Lib\site-packages')
-import ccxt  # noqa: E402
+# Q11：原为无条件 `sys.path.insert(0, r'G:\my-crypto-bot\.venv\Lib\site-packages')`
+# ——pytest 收集期把生产 venv 目录插到 sys.path 首位（即使 ccxt 已在 sys.modules，
+# 插入照样发生）。改按需回退：门禁用 venv 解释器，ccxt 恒可导入 → 正常路径零插入；
+# 仅独立用缺 ccxt 的解释器裸跑时才回退。
+try:
+    import ccxt  # noqa: E402, F401
+except ImportError:
+    sys.path.insert(0, r'G:\my-crypto-bot\.venv\Lib\site-packages')
+    import ccxt  # noqa: E402, F401
 
 DEFAULT_IMPL = pathlib.Path(r'G:\tmp\new_helpers_v3.py')
 V2_IMPL = pathlib.Path(r'G:\tmp\new_helpers_after.py')   # 负向对照

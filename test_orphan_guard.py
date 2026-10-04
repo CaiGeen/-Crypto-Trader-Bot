@@ -19,6 +19,13 @@ v2 设计：
   4: watchdog AST——停止杀进程树(taskkill /T) + 识别退出码 42 不进崩溃重启
 
 用法: .venv\\Scripts\\python.exe test_orphan_guard.py
+
+Q8（审计 v1.2 处置批次2「下次相关测试前」执行）：原实现场景1与收尾直接
+`os.remove` 诊断锁、无恢复——在生产目录跑门禁（维护窗口）会删掉在用的诊断
+锁文件且哨兵检不出（E1 同类）。现改为运行前备份原件、`finally` 恢复；
+`.bot_instance.lock` 同时纳入 run_test_gate.py 的 PRODUCTION_SENTINELS。
+澄清：诊断锁非互斥体（真互斥 = CreateMutexW 命名内核对象，删它不构成互斥
+绕过），但仍是状态文件，测试必须零污染。
 """
 import ast
 import os
@@ -35,6 +42,39 @@ def report(name, passed, detail=""):
 
 
 LOCK = bot_runner.LOCK_FILE
+# Q8：运行前的诊断锁原件（内容；None=原件不存在）。仅 _backup_lock() 置位。
+_LOCK_BACKUP = None
+_LOCK_BACKUP_TAKEN = False
+
+
+def _backup_lock():
+    """Q8：备份诊断锁原件。读取失败 → 不标记，收尾将不改动该文件（宁留勿删）。"""
+    global _LOCK_BACKUP, _LOCK_BACKUP_TAKEN
+    try:
+        if os.path.exists(LOCK):
+            with open(LOCK, 'r') as f:
+                _LOCK_BACKUP = f.read()
+        else:
+            _LOCK_BACKUP = None
+        _LOCK_BACKUP_TAKEN = True
+    except OSError as e:
+        print(f"⚠️ [Q8] 诊断锁原件读取失败，收尾将不改动该文件: {e}")
+
+
+def _restore_lock():
+    """Q8：finally 恢复原件——存在则回写原内容，原件不存在则删除测试残留。"""
+    if not _LOCK_BACKUP_TAKEN:
+        return
+    try:
+        if _LOCK_BACKUP is None:
+            if os.path.exists(LOCK):
+                os.remove(LOCK)
+        else:
+            with open(LOCK, 'w') as f:
+                f.write(_LOCK_BACKUP)
+        print(f"[Q8] 诊断锁已恢复原件状态（原件{'存在' if _LOCK_BACKUP is not None else '不存在'}）")
+    except OSError as e:
+        print(f"⚠️ [Q8] 诊断锁恢复失败: {e}")
 
 
 def write_lock(pid_text):
@@ -126,13 +166,16 @@ def scenario_5():
 
 
 if __name__ == '__main__':
-    scenario_1()
-    scenario_2()
-    scenario_3()
-    scenario_4()
-    scenario_5()
-    if os.path.exists(LOCK):
-        os.remove(LOCK)
+    _backup_lock()
+    try:
+        scenario_1()
+        scenario_2()
+        scenario_3()
+        scenario_4()
+        scenario_5()
+    finally:
+        # Q8：任何场景异常都必须恢复原件（原实现无恢复，删了生产诊断锁即污染）
+        _restore_lock()
     print("\n" + "#" * 60)
     failed = [n for n, p in RESULTS if not p]
     if failed:
