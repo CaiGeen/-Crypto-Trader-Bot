@@ -123,10 +123,13 @@ _POS_LONG = [{'symbol': 'BTC/USDT:USDT', 'side': 'long', 'contracts': 0.01,
               'entryPrice': 50000.0, 'unrealizedPnl': 0.0}]
 
 
-def _orders(sl_side='sell', sl_amount=0.01, sl_type='STOP_MARKET'):
+def _orders(sl_side='sell', sl_amount=0.01, sl_type='STOP_MARKET', sl_info=None):
+    # R7（外部评审）：SL 夹具带平仓语义（单向单 reduceOnly=true，与生产创建
+    # 路径一致——trader 4172/6686 单向 sl_params['reduceOnly']=True）。
     return [
         {'id': 'sl1', 'symbol': 'BTC/USDT:USDT', 'type': sl_type,
-         'side': sl_side, 'amount': sl_amount, 'status': 'open'},
+         'side': sl_side, 'amount': sl_amount, 'status': 'open',
+         'info': dict(sl_info if sl_info is not None else {'reduceOnly': 'true'})},
         {'id': 'tp1', 'symbol': 'BTC/USDT:USDT', 'type': 'TAKE_PROFIT_MARKET',
          'side': 'buy', 'amount': 0.01, 'status': 'open'},
     ]
@@ -334,12 +337,15 @@ def check_r4_healthy_hedge_no_false_positive():
          'entryPrice': 50000.0, 'unrealizedPnl': 0.0},
     ]
     orders = [
+        # R7：hedge 单带 positionSide（生产对冲创建路径 13279/14060）
         {'id': 'sl_l', 'symbol': 'BTC/USDT:USDT', 'type': 'STOP_MARKET',
-         'side': 'sell', 'amount': 0.01, 'status': 'open'},
+         'side': 'sell', 'amount': 0.01, 'status': 'open',
+         'info': {'positionSide': 'LONG'}},
         {'id': 'tp_l', 'symbol': 'BTC/USDT:USDT', 'type': 'TAKE_PROFIT_MARKET',
          'side': 'buy', 'amount': 0.01, 'status': 'open'},
         {'id': 'sl_s', 'symbol': 'BTC/USDT:USDT', 'type': 'STOP_MARKET',
-         'side': 'buy', 'amount': 0.01, 'status': 'open'},
+         'side': 'buy', 'amount': 0.01, 'status': 'open',
+         'info': {'positionSide': 'SHORT'}},
         {'id': 'tp_s', 'symbol': 'BTC/USDT:USDT', 'type': 'TAKE_PROFIT_MARKET',
          'side': 'sell', 'amount': 0.01, 'status': 'open'},
     ]
@@ -367,17 +373,61 @@ def check_r2c_same_direction_multibatch_aggregate_ok():
                   'entryPrice': 50000.0, 'unrealizedPnl': 0.0}]
     orders = [
         {'id': 'sl_a', 'symbol': 'BTC/USDT:USDT', 'type': 'STOP_MARKET',
-         'side': 'sell', 'amount': 0.01, 'status': 'open'},
+         'side': 'sell', 'amount': 0.01, 'status': 'open',
+         'info': {'reduceOnly': 'true'}},
         {'id': 'tp_a', 'symbol': 'BTC/USDT:USDT', 'type': 'TAKE_PROFIT_MARKET',
          'side': 'buy', 'amount': 0.01, 'status': 'open'},
         {'id': 'sl_b', 'symbol': 'BTC/USDT:USDT', 'type': 'STOP_MARKET',
-         'side': 'sell', 'amount': 0.02, 'status': 'open'},
+         'side': 'sell', 'amount': 0.02, 'status': 'open',
+         'info': {'reduceOnly': 'true'}},
         {'id': 'tp_b', 'symbol': 'BTC/USDT:USDT', 'type': 'TAKE_PROFIT_MARKET',
          'side': 'buy', 'amount': 0.02, 'status': 'open'},
     ]
     rc, out = _run(local_state=local, orders=orders, positions=positions)
     report(
         "R2c 同向双批各自 SL 聚合覆盖总仓 → rc=0（逐批 SL>=总仓 的口径会误判健康）",
+        rc == 0 and '✅ 对账通过' in out,
+        f"rc={rc}；含✅通过={('✅ 对账通过' in out)}")
+
+
+# ---------------------------------------------------------------------------
+# R7（外部评审反例）：positionSide + 平仓语义——与仓库现有止损判据对齐
+# （trader _check_protection_order_validity 7188-7200：hedge 看 positionSide，
+#   单向看 reduceOnly/closePosition）。修前 4c 完全不看 info → 反例 rc=0。
+# ---------------------------------------------------------------------------
+
+def check_r7_sl_position_side_mismatch():
+    # 外部评审实测反例：long 持仓 + sell SL，但 SL info.positionSide=SHORT——
+    # 该单平的是空仓、对本仓零保护，修前仍 rc=0「✅ 对账通过」。
+    orders = [dict(_orders()[0], info={'positionSide': 'SHORT', 'reduceOnly': 'false'}),
+              _orders()[1]]
+    rc, out = _run(local_state=_LOCAL_BATCH, orders=orders, positions=_POS_LONG)
+    report(
+        "R7a SL positionSide=SHORT 在 long 持仓 → rc=1『positionSide』"
+        "（修前 rc=0「✅ 对账通过」，错误 Hedge 保护放行）",
+        rc == 1 and 'positionSide' in out and '✅ 对账通过' not in out,
+        f"rc={rc}；含『positionSide』={('positionSide' in out)}；含✅通过={('✅ 对账通过' in out)}")
+
+
+def check_r7_sl_close_semantics_missing():
+    # 平仓语义缺失：无 positionSide 且 reduceOnly/closePosition 均非 true
+    # = 开仓单不是保护单（与 7196-7200 判据一致），修前不查。
+    orders = [dict(_orders()[0], info={'reduceOnly': 'false'}), _orders()[1]]
+    rc, out = _run(local_state=_LOCAL_BATCH, orders=orders, positions=_POS_LONG)
+    report(
+        "R7b SL 缺平仓语义（reduceOnly/closePosition 均非 true）→ rc=1『平仓语义』"
+        "（修前 rc=0）",
+        rc == 1 and '平仓语义' in out and '✅ 对账通过' not in out,
+        f"rc={rc}；含『平仓语义』={('平仓语义' in out)}；含✅通过={('✅ 对账通过' in out)}")
+
+
+def check_r7c_healthy_position_side_long():
+    # 健康对照：long 持仓 + sell SL + positionSide=LONG → 必须保持 rc=0
+    orders = [dict(_orders()[0], info={'positionSide': 'LONG', 'reduceOnly': 'false'}),
+              _orders()[1]]
+    rc, out = _run(local_state=_LOCAL_BATCH, orders=orders, positions=_POS_LONG)
+    report(
+        "R7c 健康 positionSide=LONG 在 long 持仓 → rc=0（防过度告警）恒绿",
         rc == 0 and '✅ 对账通过' in out,
         f"rc={rc}；含✅通过={('✅ 对账通过' in out)}")
 
@@ -399,6 +449,9 @@ CHECKS = [
     check_r3_sl_amount_nan,
     check_r4_healthy_hedge_no_false_positive,
     check_r2c_same_direction_multibatch_aggregate_ok,
+    check_r7_sl_position_side_mismatch,
+    check_r7_sl_close_semantics_missing,
+    check_r7c_healthy_position_side_long,
 ]
 
 

@@ -350,6 +350,66 @@ def check_r5_persist_failure_honest_message():
 
 
 # --------------------------------------------------------------------------
+# 反例组6（外部评审）：registry 写入失败、随后 save_batch_state 成功 →
+# 磁盘仍 PENDING_CREATE（F3 恒 hold 不补挂），但旧消息却称「已置 ABSENT、
+# 补挂已恢复」= 假安全感。修复 = _update_registry_checked 逐项确认落盘。
+# 夹具用生产语义（load_all_states 每次读盘），精确复现该窗口：
+#   撤旧 ABSENT（第 1 次，成功）→ 意图 PENDING（成功）→ create 拒绝
+#   → helper 置 ABSENT（第 2 次，注入失败）→ save 成功（写盘 PENDING）
+# --------------------------------------------------------------------------
+
+def check_r6_registry_persist_fail_honest():
+    d, state_path = _fresh_state_file()
+    try:
+        _seed_batch(state_path)
+        states = _read_disk(state_path)
+        fake = _make_fake(state_path, states, fail_create=True)
+        fake._batch_net_position = lambda b: (0.43, 0.43)
+        # 生产语义：load_all_states 每次真实读盘（_load_all_states_ex 2627-2631
+        # 即此语义）——registry 写失败的内存改动随丢弃，磁盘保持 PENDING_CREATE。
+        def _fresh_load():
+            with open(state_path, encoding='utf-8') as _f:
+                return json.load(_f)
+        fake.load_all_states = _fresh_load
+        fake._load_all_states_ex = lambda: (_fresh_load(), False, "")
+        # 注入：ABSENT 的第 2 次写盘失败（第 1 次 = 撤旧正常成功）
+        _real_persist = fake._persist_states
+        _absent_n = {'n': 0}
+
+        def _persist_fail_2nd_absent(all_s):
+            _st = (((all_s.get(SYMBOL) or {}).get(BATCH) or {})
+                   .get('protection_registry', {}).get(IDENT_SL, {}).get('state'))
+            if _st == 'ABSENT':
+                _absent_n['n'] += 1
+                if _absent_n['n'] >= 2:
+                    return False
+            return _real_persist(all_s)
+
+        fake._persist_states = _persist_fail_2nd_absent
+        ret = CryptoTrader.update_batch_sl(fake, BATCH, 55000.0)
+        crit = [m for lvl, m in fake.sent if lvl == "critical"]
+        reason = str(ret[1]) if isinstance(ret, (tuple, list)) and len(ret) > 1 else ""
+        disk = _read_disk(state_path)
+        verdict, _ = _f3_verdict_after(disk)
+        report(
+            "R6-1 registry 写失败 → 返回消息含『未确认』且不得承诺"
+            "『监控下一轮自动补挂旧价』（修前假安全感）",
+            "未确认" in reason and "监控下一轮自动补挂旧价" not in reason,
+            f"reason 前140={reason[:140]!r}")
+        report(
+            "R6-2 registry 写失败 → critical 正文亦须含『未确认』（与返回消息一致）",
+            any("未确认" in m for m in crit),
+            f"critical={len(crit)} 条；首条前110={crit[0][:110] if crit else None!r}")
+        report(
+            "R6-3 前提基座：磁盘 registry 仍 PENDING_CREATE → F3 裁决 'hold'"
+            "（证明旧消息的成功承诺与事实相反）",
+            _reg_state(disk) == "PENDING_CREATE" and verdict == "hold",
+            f"registry={_reg_state(disk)!r}；F3={verdict!r}；ABSENT 写盘尝试={_absent_n['n']} 次")
+    finally:
+        _restore_state_file()
+
+
+# --------------------------------------------------------------------------
 # 健康阳性对照：撤旧 + 新单成功 → 行为与修前完全一致
 # --------------------------------------------------------------------------
 
@@ -392,6 +452,7 @@ CHECKS = [
     check_r2_no_validation_rejected_disposed,
     check_r3_unknown_result_conservative,
     check_r5_persist_failure_honest_message,
+    check_r6_registry_persist_fail_honest,
     check_c1_happy_replace_unchanged,
     check_s1_all_failure_exits_disposed,
 ]

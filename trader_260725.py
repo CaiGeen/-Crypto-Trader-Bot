@@ -4039,15 +4039,26 @@ class CryptoTrader:
         if no_order_created:
             # R5（独立复审）：持久化成败必须分档进文案——否则 save 失败时监控补挂
             # 根本不会生效，却向运维承诺“已置可补挂态”= 假安全感。
+            # 外部评审（Q15-R6）：registry 更新与 id 清空必须**分别**确认——
+            # registry 写失败但后续 save 成功时，磁盘仍 PENDING_CREATE（F3 恒
+            # hold 不补挂），旧实现 _update_registry 不反映写盘结果 → 谎报
+            # “已置 ABSENT、补挂已恢复”。改用 _update_registry_checked（C1 契约：
+            # 仅 True = 已确认落盘，失败自带 intent_persist_failed critical）。
             _persist_problem = None
             try:
                 _entry = (((self.load_all_states().get(symbol, {}) or {})
                            .get(batch_id) or {}).get('protection_registry') or {}
                           ).get(sl_identity) or {}
                 if _entry.get('state') == 'PENDING_CREATE':
-                    self._update_registry(symbol, batch_id, sl_identity, state='ABSENT',
-                                          terminated_reason='q15_replace_failed_no_order')
-                    print(f"  └─ 🔧 [Q15] 换挂失败意图残留已置终态 ABSENT（放行 F3 补挂）: {sl_identity}")
+                    if self._update_registry_checked(
+                            symbol, batch_id, sl_identity, state='ABSENT',
+                            terminated_reason='q15_replace_failed_no_order') is True:
+                        print(f"  └─ 🔧 [Q15] 换挂失败意图残留已置终态 ABSENT（放行 F3 补挂）: {sl_identity}")
+                    else:
+                        # 写盘未确认 = F3 将继续拦截补挂——按未确认档上报
+                        _persist_problem = "registry ABSENT 置位未确认落盘（F3 仍拦截补挂）"
+                        print(f"⚠️ [Q15] registry ABSENT 置位未确认落盘"
+                              f"（补挂仍将被 F3 拦截，须人工核实）: {sl_identity}")
             except Exception as reg_e:
                 _persist_problem = f"意图残留清理失败（{reg_e}）"
                 print(f"⚠️ [Q15] 意图残留清理失败（补挂可能被保守挂起）: {reg_e}")
@@ -4055,11 +4066,15 @@ class CryptoTrader:
                 if b_data.get('current_sl_id'):
                     b_data['current_sl_id'] = None
                     if self.save_batch_state(symbol, batch_id, b_data) is not True:
-                        _persist_problem = "current_sl_id 置空未确认落盘"
+                        _msg = "current_sl_id 置空未确认落盘"
+                        _persist_problem = (f"{_persist_problem}；{_msg}" if _persist_problem
+                                            else _msg)
                         print(f"⚠️ [Q15] current_sl_id 置空未确认落盘"
                               f"（save_batch_state 已按其契约告警）")
             except Exception as sv_e:
-                _persist_problem = f"current_sl_id 置空落盘异常（{sv_e}）"
+                _msg = f"current_sl_id 置空落盘异常（{sv_e}）"
+                _persist_problem = (f"{_persist_problem}；{_msg}" if _persist_problem
+                                    else _msg)
                 print(f"⚠️ [Q15] current_sl_id 置空落盘异常: {sv_e}")
 
         try:
@@ -7100,16 +7115,9 @@ class CryptoTrader:
                 # 监控启动失败 = 该批次无人接管（资金安全）→ critical 必发；仍返回
                 # batch_id（ENTRY 已挂 + 账本 active，返回 None 会诱导盲重试双挂），
                 # 重启后 recover_active_batches 可接管该 active 批次。
-                try:
-                    self.send_tg_notification(
-                        f"🚨【资金安全】批次 `{batch_id}` 监控线程启动失败（无人接管）\n"
-                        f"⚠️ ENTRY 单已在交易所、账本已落盘，但监控循环未运行\n"
-                        f"🔧 错误: {str(_mt_e)[:160]}\n"
-                        f"🛠️ 请立即人工盯盘；重启后恢复流程（recover_active_batches）"
-                        f"将接管该 active 批次。",
-                        level='critical')
-                except Exception:
-                    pass
+                # 评审（Q3 通知窗口）：**先封闸、后在锁外通知**——通知（TG 网络）
+                # 可能阻塞数秒，通知期间两道闸门不得为空，否则另一信号可在裸奔
+                # 窗口内继续开新仓（实测反例：通知阻塞时新信号创建 3 层 ENTRY）。
                 # G1（ChatGPT 评审）：启动失败的批次必须进未决风险闸门——
                 # _poll_degraded_batches / _unresolved_intent_batches 非空时
                 # execute_signal 全链路入口拒发新信号（fail-closed）。
@@ -7119,6 +7127,16 @@ class CryptoTrader:
                     _ps = getattr(self, '_poll_fail_streak', None)
                     if isinstance(_ps, dict):
                         _ps[batch_id] = max(_ps.get(batch_id, 0), 1)
+                except Exception:
+                    pass
+                try:
+                    self.send_tg_notification(
+                        f"🚨【资金安全】批次 `{batch_id}` 监控线程启动失败（无人接管）\n"
+                        f"⚠️ ENTRY 单已在交易所、账本已落盘，但监控循环未运行\n"
+                        f"🔧 错误: {str(_mt_e)[:160]}\n"
+                        f"🛠️ 请立即人工盯盘；重启后恢复流程（recover_active_batches）"
+                        f"将接管该 active 批次。",
+                        level='critical')
                 except Exception:
                     pass
                 print(f"⚠️ [Q3] 监控线程启动失败（无人接管，已发 critical）: {_mt_e}")
@@ -8868,13 +8886,36 @@ class CryptoTrader:
                 raise
             # lifecycle=None（execute_signal 直调路径）：本层负责收尾。
             print(f"⚠️ [R1] 监控线程初始化阶段异常退出: {_init_e}")
+            # 评审（Q3 代次所有权 + 通知窗口）：
+            #  ① 清理与封闸必须受当前代次所有权约束——旧线程被新代次替换后崩溃，
+            #     不得删新代次的活跃 marker、不得给新代次置未决闸门、不得向其发
+            #     「无人接管」critical（责任归新代次，与 _finish_monitor_takeover
+            #     8696 的所有权检查对称）；
+            #  ② 本代次 owns 时：**先封闸、后在锁外通知**（通知可阻塞数秒）。
+            _owns = None
             try:
                 with self._active_monitors_lock:
-                    if self._active_monitor_generations.get(batch_id) == _monitor_generation:
+                    _cur_owner = self._active_monitor_generations.get(batch_id)
+                    _owns = (_cur_owner is None or _cur_owner == _monitor_generation)
+                    if _owns:
                         self._active_monitor_generations.pop(batch_id, None)
-                    self._active_monitors.discard(batch_id)
+                        self._active_monitors.discard(batch_id)
             except Exception as _mk_e:
                 print(f"⚠️ [R1] 监控 marker 清理失败: {_mk_e}")
+            if _owns is False:
+                print(f"  └─ ⏭️ [R1] 批次 [{batch_id}] 监控代次已被替换，"
+                      f"跳过 marker 清理/封闸/接管告警（所有权归新代次）")
+                return
+            # 先封闸（G1：未决意图+降级双闸，通知阻塞期间即刻生效）
+            try:
+                self._unresolved_intent_batches.add(batch_id)
+                self._poll_degraded_batches.add(batch_id)
+                _ps = getattr(self, '_poll_fail_streak', None)
+                if isinstance(_ps, dict):
+                    _ps[batch_id] = max(_ps.get(batch_id, 0), 1)
+            except Exception:
+                pass
+            # 后通知（锁外：with _active_monitors_lock 已释放）
             try:
                 self.send_tg_notification(
                     f"🚨【资金安全】批次 `{batch_id}` 监控线程初始化阶段异常退出（无人接管）\n"
@@ -8884,15 +8925,6 @@ class CryptoTrader:
                     level='critical')
             except Exception as _al_e:
                 print(f"⚠️ [R1] 初始化异常告警发送失败: {_al_e}")
-            # G1（ChatGPT 评审）：初始化异常退出的批次进同款风险闸门
-            try:
-                self._unresolved_intent_batches.add(batch_id)
-                self._poll_degraded_batches.add(batch_id)
-                _ps = getattr(self, '_poll_fail_streak', None)
-                if isinstance(_ps, dict):
-                    _ps[batch_id] = max(_ps.get(batch_id, 0), 1)
-            except Exception:
-                pass
             return
 
         # ================================================================

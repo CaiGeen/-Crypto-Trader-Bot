@@ -365,6 +365,36 @@ def main():
                     issues.append(f"🚨 {b['symbol']} {b['batch_id']}: SL {b['current_sl_id']} "
                                   f"方向错误（持仓 {pos_side_n} 期望 side={expect_side}，"
                                   f"实际 {sl_side}）——触发将反向开仓/无法止损")
+                # R7（外部评审反例）：positionSide + 平仓语义核验——对齐仓库现有
+                # 止损判据 _check_protection_order_validity（trader 7188-7200）：
+                #   positionSide 在场（对冲单/交易所标记）→ 必须与持仓方向一致
+                #   （long 持仓挂 positionSide=SHORT 的单平的是空仓 = 零保护，
+                #   修前 rc=0 放行）；对冲批次缺 positionSide → 方向不可核验；
+                #   单向无 positionSide → reduceOnly/closePosition 至少一个 true
+                #   （否则是开仓单非保护单）。不通过 → 逐批 issue 且不计入 R2b 聚合。
+                _sl_info = sl_o.get('info') or {}
+                _pside = str(_sl_info.get('positionSide') or '').strip().upper()
+                _sl_close_ok = True
+                _close_reason = ''
+                if _pside:
+                    if pos_side_n and _pside != pos_side_n.upper():
+                        _sl_close_ok = False
+                        _close_reason = (f"positionSide={_pside} 与持仓 "
+                                         f"{pos_side_n.upper()} 不一致（该单平的是 "
+                                         f"{_pside} 仓，不保护本持仓，无效保护）")
+                elif bool(b.get('is_hedge_mode')):
+                    _sl_close_ok = False
+                    _close_reason = "缺 positionSide 字段（对冲单方向不可核验，按无效保护处理）"
+                else:
+                    _ro = str(_sl_info.get('reduceOnly') or '').lower()
+                    _cp = str(_sl_info.get('closePosition') or '').lower()
+                    if _ro != 'true' and _cp != 'true':
+                        _sl_close_ok = False
+                        _close_reason = ("缺平仓语义（info.reduceOnly/closePosition 均非 true，"
+                                         "非保护单）")
+                if not _sl_close_ok:
+                    issues.append(f"🚨 {b['symbol']} {b['batch_id']}: SL {b['current_sl_id']} "
+                                  f"{_close_reason}")
                 expect_amt = 0.0
                 try:
                     t_amt = b.get('target_amounts') or []
@@ -392,9 +422,11 @@ def main():
                 # R2b（外部评审复核结论）：有效 SL 需累计到「symbol + 方向」的
                 # 持仓对照表——多批次同向持仓各自持有独立 SL 是健康配置；但按
                 # SL id 去重后的总有效覆盖量必须 ≥ 同方向实际总仓。
+                # R7：平仓语义核验（_sl_close_ok）不通过的 SL 不得计入覆盖。
                 if (same_dir and 'STOP' in sl_type
                         and sl_sym_n and sl_sym_n == _norm_symbol(b['symbol'])
-                        and sl_side and expect_side and sl_side == expect_side and sl_amt > 0):
+                        and sl_side and expect_side and sl_side == expect_side and sl_amt > 0
+                        and _sl_close_ok):
                     _sl_cover.setdefault((_norm_symbol(b['symbol']), pos_side_n), {})[b['current_sl_id']] = sl_amt
 
     # R2b（外部评审复核结论）：「symbol + 方向」维度的有效 SL 总和必须 ≥ 实际

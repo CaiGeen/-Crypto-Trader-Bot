@@ -198,6 +198,18 @@ def check_r2_commit_return_checked():
 
 def check_r3_monitor_start_fail_alerts():
     fake = FIX.make_fake()
+    # 评审反例：先发告警再封闸——通知阻塞时两道闸门均为空，另一信号可继续开新仓。
+    # 快照钉住「发『监控线程启动失败』告警那一刻」的闸门状态。
+    gate_snap = {'unresolved': None, 'degraded': None}
+    _orig_send = fake.send_tg_notification
+
+    def _send_snap(text, **kw):
+        if '监控线程启动失败' in str(text):
+            gate_snap['unresolved'] = set(fake._unresolved_intent_batches)
+            gate_snap['degraded'] = set(fake._poll_degraded_batches)
+        return _orig_send(text, **kw)
+
+    fake.send_tg_notification = _send_snap
     ret, out, _ = _run(fake, thread_cls=_BoomThread)
     crit = _criticals(fake)
 
@@ -214,6 +226,13 @@ def check_r3_monitor_start_fail_alerts():
         FIX.BATCH in fake._unresolved_intent_batches
         and FIX.BATCH in fake._poll_degraded_batches,
         f"unresolved={sorted(fake._unresolved_intent_batches)}；degraded={sorted(fake._poll_degraded_batches)}")
+    report(
+        "R3-4 先封闸后通知：发 critical 那一刻两道闸门已置位"
+        "（修前通知先行，通知阻塞=裸奔窗口）",
+        gate_snap['unresolved'] is not None and FIX.BATCH in gate_snap['unresolved']
+        and FIX.BATCH in gate_snap['degraded'],
+        f"通知时 unresolved={sorted(gate_snap['unresolved'])}；"
+        f"degraded={sorted(gate_snap['degraded'])}")
 
 
 # --------------------------------------------------------------------------
@@ -238,6 +257,17 @@ def check_r4_monitor_init_crash_alerted_cleaned():
 
     fake.load_all_states = _load_states_in_monitor
     fake._start_monitoring = lambda *a, **k: CryptoTrader._start_monitoring(fake, *a, **k)
+    # 评审反例：初始化失败出口也是先通知后封闸 → 快照通知瞬间闸门状态
+    gate_snap = {'unresolved': None, 'degraded': None}
+    _orig_send = fake.send_tg_notification
+
+    def _send_snap(text, **kw):
+        if '初始化阶段异常退出' in str(text):
+            gate_snap['unresolved'] = set(fake._unresolved_intent_batches)
+            gate_snap['degraded'] = set(fake._poll_degraded_batches)
+        return _orig_send(text, **kw)
+
+    fake.send_tg_notification = _send_snap
     buf = io.StringIO()
     ret = None
     with contextlib.redirect_stdout(buf):
@@ -264,6 +294,69 @@ def check_r4_monitor_init_crash_alerted_cleaned():
         FIX.BATCH in fake._unresolved_intent_batches
         and FIX.BATCH in fake._poll_degraded_batches,
         f"unresolved={sorted(fake._unresolved_intent_batches)}；degraded={sorted(fake._poll_degraded_batches)}")
+    report(
+        "R4-5 先封闸后通知：发 critical 那一刻两道闸门已置位"
+        "（修前通知先行，通知阻塞=裸奔窗口）",
+        gate_snap['unresolved'] is not None and FIX.BATCH in gate_snap['unresolved']
+        and FIX.BATCH in gate_snap['degraded'],
+        f"通知时 unresolved={sorted(gate_snap['unresolved'])}；"
+        f"degraded={sorted(gate_snap['degraded'])}")
+
+
+# --------------------------------------------------------------------------
+# 反例5（外部评审）：旧线程初始化失败时代次已被新线程替换——清理与封闸
+# 必须受当前代次所有权约束（8873-8875 旧实现只查登记删除，marker 删除与
+# 封闸无条件）。修前：新代次 marker 被误删 + 新代次被置未决闸门 + 误发
+# 「无人接管」critical；修后三项全部让位新代次。
+# --------------------------------------------------------------------------
+
+def check_r5_gen_ownership_on_init_crash():
+    fake = FIX.make_fake()
+    fake._active_monitors_lock = threading.Lock()
+    fake._active_monitor_generations = {}
+    fake._active_monitors = set()
+    original_load = fake.load_all_states
+    hijacked = {'done': False}
+
+    def _load_states_takeover_then_boom():
+        # 主线程（execute_signal 本体）照常；监控子线程首次读账本时，
+        # 模拟新代次已在本线程初始化期间完成接管登记，然后本（旧）线程崩溃
+        if threading.current_thread() is threading.main_thread():
+            return original_load()
+        if not hijacked['done']:
+            hijacked['done'] = True
+            with fake._active_monitors_lock:
+                fake._active_monitor_generations[FIX.BATCH] = 'gen_replacement'
+                fake._active_monitors.add(FIX.BATCH)
+        raise RuntimeError('init fail after replacement')
+
+    fake.load_all_states = _load_states_takeover_then_boom
+    fake._start_monitoring = lambda *a, **k: CryptoTrader._start_monitoring(fake, *a, **k)
+    with contextlib.redirect_stdout(io.StringIO()):
+        CryptoTrader.execute_signal(fake, FIX.FakeSignal())
+        time.sleep(1.0)
+
+    marker_kept = FIX.BATCH in fake._active_monitors
+    owner_kept = fake._active_monitor_generations.get(FIX.BATCH) == 'gen_replacement'
+    gate_empty = (FIX.BATCH not in fake._unresolved_intent_batches
+                  and FIX.BATCH not in fake._poll_degraded_batches)
+    no_takeover_crit = not any('初始化阶段异常退出' in t for t in _criticals(fake))
+
+    report(
+        "R5-1 代次被替换：新代次的活跃 marker 不得被旧代次误删"
+        "（修前无条件 discard → 新代次监控标记丢失）",
+        marker_kept and owner_kept,
+        f"marker 在场={marker_kept}；owner={fake._active_monitor_generations.get(FIX.BATCH)!r}")
+    report(
+        "R5-2 代次被替换：不得给新代次置未决/降级闸门"
+        "（修前无条件置闸 → 健康新代次被误伤）",
+        gate_empty,
+        f"unresolved={sorted(fake._unresolved_intent_batches)}；"
+        f"degraded={sorted(fake._poll_degraded_batches)}")
+    report(
+        "R5-3 代次被替换：不向新代次发『无人接管』critical（责任归新代次）",
+        no_takeover_crit,
+        f"critical={_criticals(fake)}")
 
 
 # --------------------------------------------------------------------------
@@ -318,6 +411,7 @@ CHECKS = [
     check_r2_commit_return_checked,
     check_r3_monitor_start_fail_alerts,
     check_r4_monitor_init_crash_alerted_cleaned,
+    check_r5_gen_ownership_on_init_crash,
     check_c1_happy_path_unchanged,
     check_s1_source_anchors,
 ]
