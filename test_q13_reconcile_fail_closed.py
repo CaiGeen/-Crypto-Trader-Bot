@@ -30,9 +30,14 @@ UNKNOWN（拉取失败）不得通过一律 rc≠0、补交易所→账本反向
   CE4 SL 覆盖不足（SL amount < 已成交）→ rc=1 覆盖告警；
   CE5 本地 symbol 之外孤儿单（163-170 只查本地 symbol → 4a 盲区）→ rc=1；
   S0 STATE_FILE 绝对路径；S1 结构锚点。
+- **R8（外部评审第三轮反例）**：账本 is_hedge_mode=True + SL 缺 positionSide
+  （带 reduceOnly=true）→ 4c「对冲单缺 positionSide → 拒绝」分支依赖批次
+  is_hedge_mode，但 local_batches 构造漏拷该字段 → 分支恒死，修前 rc=0；
+  修后 rc=1『positionSide』。
 - **健康阳性对照（恒绿）**：
   C1 正常对账（方向/覆盖/类型全对）→ rc=0 通过；
-  C2 空账本 + 空交易所 → rc=0 通过（防过度告警）。
+  C2 空账本 + 空交易所 → rc=0 通过（防过度告警）；
+  R8b 对冲批次 + positionSide=LONG 与持仓一致 → rc=0（防过度告警）。
 
 跑法：`.venv\\Scripts\\python.exe test_q13_reconcile_fail_closed.py`（rc=0 即全过）
 """
@@ -432,6 +437,39 @@ def check_r7c_healthy_position_side_long():
         f"rc={rc}；含✅通过={('✅ 对账通过' in out)}")
 
 
+def _hedge_local():
+    # R8（外部评审第三轮）：账本批次带 is_hedge_mode=True（生产 trade_state
+    # 批次级字段，trader 3628/3903 等大量消费）。
+    st = json.loads(json.dumps(_LOCAL_BATCH))
+    st['BTC/USDT:USDT']['batch_q13']['is_hedge_mode'] = True
+    return st
+
+
+def check_r8_hedge_batch_missing_position_side():
+    # 外部评审实测反例：账本 is_hedge_mode=True，SL 缺 positionSide、带
+    # reduceOnly=true——4c 的对冲拒绝分支（385 行 `b.get('is_hedge_mode')`）
+    # 依赖批次字段，而 local_batches 构造（145-158）漏拷 → 分支恒死，
+    # 修前 rc=0 宣称无裸仓（无法核实保护方向却给安全结论）。
+    orders = [dict(_orders()[0], info={'reduceOnly': 'true'}), _orders()[1]]
+    rc, out = _run(local_state=_hedge_local(), orders=orders, positions=_POS_LONG)
+    report(
+        "R8a 账本 is_hedge_mode=True + SL 缺 positionSide → rc=1『positionSide』"
+        "（修前 local_batches 丢字段 → 对冲分支恒死，rc=0「✅ 对账通过」）",
+        rc == 1 and 'positionSide' in out and '✅ 对账通过' not in out,
+        f"rc={rc}；含『positionSide』={('positionSide' in out)}；含✅通过={('✅ 对账通过' in out)}")
+
+
+def check_r8_healthy_hedge_position_side_long():
+    # 健康对照：对冲批次 + SL positionSide=LONG 与持仓一致 → 必须保持 rc=0
+    orders = [dict(_orders()[0], info={'positionSide': 'LONG', 'reduceOnly': 'false'}),
+              _orders()[1]]
+    rc, out = _run(local_state=_hedge_local(), orders=orders, positions=_POS_LONG)
+    report(
+        "R8b 健康对冲批次 positionSide=LONG → rc=0（防过度告警）恒绿",
+        rc == 0 and '✅ 对账通过' in out,
+        f"rc={rc}；含✅通过={('✅ 对账通过' in out)}")
+
+
 CHECKS = [
     check_ce1_bare_position_reverse,
     check_ce2_all_fetches_fail,
@@ -452,6 +490,8 @@ CHECKS = [
     check_r7_sl_position_side_mismatch,
     check_r7_sl_close_semantics_missing,
     check_r7c_healthy_position_side_long,
+    check_r8_hedge_batch_missing_position_side,
+    check_r8_healthy_hedge_position_side_long,
 ]
 
 

@@ -142,6 +142,9 @@ def main():
             for batch_id, b_data in batches.items():
                 if not b_data.get('is_active', False):
                     continue
+                # R8（外部评审第三轮）：is_hedge_mode 必须随批次保留——4c 对冲
+                # 拒绝分支（`b.get('is_hedge_mode')`）依赖它，漏拷 → 分支恒死，
+                # 对冲单缺 positionSide 也能 rc=0 宣称无裸仓。
                 local_batches.append({
                     'symbol': symbol,
                     'batch_id': batch_id,
@@ -155,6 +158,7 @@ def main():
                     'pending_sl_orders': b_data.get('pending_sl_orders', []),
                     'sl_fail_count': b_data.get('sl_fail_count', {}),
                     'target_amounts': b_data.get('target_amounts', []),
+                    'is_hedge_mode': bool(b_data.get('is_hedge_mode', False)),
                 })
         print(f"  活跃批次数: {len(local_batches)}")
         for b in local_batches:
