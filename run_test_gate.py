@@ -142,7 +142,10 @@ CASE_LINE_RE = re.compile(r'^\s*([✅❌])\s+(\w+)(:\s.*)?$')
 #   .patrol_alert.state.json 每轮巡检写           → 同上
 #   .notify_queue/           **目录根本不存在**（D-010 已迁移），首版哨兵盯了个空路径
 #   .heartbeat.json          每 60s              → 同上
-PRODUCTION_SENTINELS = ['trade_state.json', '.daily_report.state.json']
+# Q8（审计 v1.2 处置批次2）：.bot_instance.lock 纳入哨兵——测试删了它哨兵检不出
+# （E1 同类）。test_orphan_guard 已配原件备份/finally 恢复（净零改动）；原件不存在
+# 的目录（如 worktree）两侧同为 None，正常通过，残留/缺失即判 FAIL。
+PRODUCTION_SENTINELS = ['trade_state.json', '.daily_report.state.json', '.bot_instance.lock']
 PATROL_LOG = os.path.join('logs', 'patrol.log')
 # 测试输出顶着真实告警字样的行（这些行曾被写进生产 patrol.log）
 PATROL_TEST_MARKERS = (

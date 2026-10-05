@@ -19,7 +19,10 @@ import threading
 
 import ccxt
 
-sys.path.insert(0, r'G:/my-crypto-bot')
+# Q11：原为硬编码 `sys.path.insert(0, r'G:/my-crypto-bot')`——pytest 收集期把生产
+# 目录插到 sys.path 首位，worktree 下 `import test_v62_red_first`/`trader_260725`
+# 会解析到生产副本（测错对象 + sys.modules 缓存污染整个收集会话）。改 __file__ 相对。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_v62_red_first as R
 from test_v62_red_first import (FakeExchange62, FakeSelf62, mk_batch, bind,
                                 _order, _e511, SYM)
