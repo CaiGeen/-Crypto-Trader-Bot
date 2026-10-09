@@ -40,15 +40,15 @@
 
 移出原因：这些测试的被测对象是**评审期的提议实现、历史对照件或 staged 组装件**，依赖机器本地 `G:\tmp`，并非当前引擎 `trader_260725.py`（`969B8138`）。它们通过不能证明当前候选通过，故不再作为发布门禁。文件内容与断言**未改动**，仅移入本目录。
 
-| 文件 | 被测对象 | 现役对应（以现役引擎为被测） | 复活条件 | 工作树 SHA256（Windows/CRLF） |
+| 文件 | 被测对象 | 历史语义相关测试（覆盖口径另行核对） | 复活条件 | 工作树 SHA256（Windows/CRLF） |
 |---|---|---|---|---|
-| test_close_confirmation_v3.py | 提议实现 v3（被测对象 `G:\tmp\new_helpers_v3.py`，非生产代码）及负向对照 `new_helpers_after.py` | 现役 `test_close_confirmation_v6/v62.py`（仓内夹具，以现役引擎为被测） | 仅当需复核 v3 提议的 close 判据时复活，并把输入改为仓内夹具 | `616BE1B2B31D2E5C…` |
-| test_close_confirmation_v4.py | 提议实现 v4（`G:/tmp/new_helpers_v4.py`）；v3 负向对照；v3_entry 档案 | 现役 `test_close_confirmation_v6/v62.py` | 同上 | `69DD0620231CFA65…` |
-| test_close_confirmation_v5.py | 提议实现 v5（`G:/tmp/new_helpers_v5.py`）；v4/v3/v3_entry 对照 | 现役 `test_close_confirmation_v6/v62.py` | 同上 | `632D72F9A0792746…` |
-| test_position_close_confirmation.py | 提议实现 `G:\tmp\new_helpers_after.py`；负向对照 `new_helpers_naive.py`；`probe_position_shape.py` 实测 | 现役 `test_p5_closecancel` / `test_v62_red_first`（待逐断言核对） | 同上 | `DACDBAF6BFBB8015…` |
-| test_v62_green.py | v62 staged 组装版 `G:\tmp\v62_staged\trader_260725_v62_staged.py`（由 `G:\tmp\build_v62_staged.py` 生成，非仓库源码） | 现役 `test_v62_red_first.py`（仓内 v6.1 夹具） | 仅当 staged 构建链纳入仓库并审计后复活 | `2DB657A591C7119D…` |
+| test_close_confirmation_v3.py | 提议实现 v3（被测对象 `G:\tmp\new_helpers_v3.py`，非生产代码）及负向对照 `new_helpers_after.py` | `test_close_confirmation_v6/v62.py`（测仓内 helper 与文档代码块）；`test_v62_red_first.py`（测旧基线）。均非现役引擎直测 | 仅当需复核 v3 提议的 close 判据时复活，并把输入改为仓内夹具 | `616BE1B2B31D2E5C…` |
+| test_close_confirmation_v4.py | 提议实现 v4（`G:/tmp/new_helpers_v4.py`）；v3 负向对照；v3_entry 档案 | 同上 | 同上 | `69DD0620231CFA65…` |
+| test_close_confirmation_v5.py | 提议实现 v5（`G:/tmp/new_helpers_v5.py`）；v4/v3/v3_entry 对照 | 同上 | 同上 | `632D72F9A0792746…` |
+| test_position_close_confirmation.py | 提议实现 `G:\tmp\new_helpers_after.py`；负向对照 `new_helpers_naive.py`；`probe_position_shape.py` 实测 | `test_p5_closecancel` / `test_v62_red_first.py`（历史语义相关，非现役引擎直测） | 同上 | `DACDBAF6BFBB8015…` |
+| test_v62_green.py | v62 staged 组装版 `G:\tmp\v62_staged\trader_260725_v62_staged.py`（由 `G:\tmp\build_v62_staged.py` 生成，非仓库源码） | `test_v62_red_first.py`（历史基线） | 仅当 staged 构建链纳入仓库并审计后复活 | `2DB657A591C7119D…` |
 | test_v62_staged_integration.py | 同上 staged 组装件 | 同上 | 同上 | `87C8BF40233C76CE…` |
 
-**待核对（未在本轮处理）**：`ENTRY or []` 场景（v3 提议的入口缺陷）在现役测试中无同名断言；仅作为候选缺口登记，若确认引擎存在等价路径未被覆盖，单独立项。
+**ENTRY 入口路径（本轮收口）**：历史 `ENTRY or []` 缺陷（把不可判定快照退化成空列表）在候选引擎上**未复现**（离线探针 5/5：None／dict／字符串／查询异常均拒绝，合法空列表继续逐订单终态验证）。现役引擎该判据的负向回归由 `test_entry_gate_failclosed.py`（直接驱动 `trader_260725.py` 的 `_cancel_and_verify_entry_orders`）承担，不再只依据“无同名断言”。
 
 哈希值按 Windows 工作树中的文件字节计算（CRLF）；与 Git 对象库中规范化为 LF 的 blob 哈希不同。归档文件未改内容，仅从项目根移动至本目录。
