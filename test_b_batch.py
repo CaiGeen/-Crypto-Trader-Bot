@@ -77,6 +77,8 @@ class FakeExchange:
         self.scan_fail = False         # fetch_open_orders → NetworkError
         self.markets = None            # precision 注入（D-B1 容差）
         self._id_seq = 0
+        # Explicit historical ENTRY fact for the default already-filled batch.
+        self.seed_filled('E_BOOKED', 'LIMIT', 'BUY', 0.002, 85000.0)
 
     def _ev(self, label, detail=""):
         self.events.append((label, str(detail)))
@@ -210,6 +212,7 @@ def make_fake_b(env, ex):
     fake._converge_alert_counts = {}             # ⚠️ 不绑 → getattr MagicMock 非 None
     fake.tombstone_file = env.tomb_file
     fake.exchange = ex
+    fake._fee_float = CryptoTrader._fee_float
     fake._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
     fake.sent = []
     fake.send_tg_notification = lambda text, **kw: fake.sent.append(
@@ -254,7 +257,7 @@ def make_fake_b(env, ex):
 def _batch(**over):
     b = {
         'is_active': True, 'batch_id': BATCH, 'symbol': SYMBOL, 'side': 'BUY',
-        'is_hedge_mode': False, 'entry_orders': [], 'stop_steps': [55000.0],
+        'is_hedge_mode': False, 'entry_orders': ['E_BOOKED'], 'stop_steps': [55000.0],
         'take_profit_price': 60000.0, 'current_sl_id': 'sl1', 'tp_order_id': 'tp1',
         # 🔥 P5：限价平仓事务必有 close_op_id（finalizer 代际隔离依赖，生产契约）
         'close_op_id': 'OP1',
@@ -410,7 +413,7 @@ def t_proof_gate():
         # PRE_ENTRY：零敞口批次接受 scope=PRE_ENTRY
         with _Env() as env3:
             env3.write_state({SYMBOL: {BATCH: _batch(
-                last_filled_count=0, close_phase=0, pending_close=False,
+                entry_orders=[], last_filled_count=0, close_phase=0, pending_close=False,
                 is_programmatic_cancel=False, current_sl_id=None, tp_order_id=None,
                 settled_by_limit_close=False)}})
             fake3 = make_fake_b(env3, FakeExchange())
@@ -488,7 +491,7 @@ def t_converge_l1_l2_l3():
                                    intent=dict(L2_INTENT), role='SL', layer=2),
                 }),
             'batch_o': _batch(batch_id='batch_o', current_sl_id='oth1', tp_order_id=None,
-                              last_filled_count=0, close_phase=0, pending_close=False,
+                              entry_orders=[], last_filled_count=0, close_phase=0, pending_close=False,
                               is_programmatic_cancel=False, settled_by_limit_close=False,
                               protection_registry={}),
         }})

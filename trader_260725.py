@@ -1,4 +1,5 @@
 # trader_260725.py
+import copy
 import json
 import math
 import os
@@ -112,6 +113,31 @@ _ORDER_TERMINAL_STATUSES = frozenset({'closed', 'canceled', 'cancelled',
 # 返回条数达到单页上限即「可能截断、未覆盖全部记录」，一次查询不能证明完整
 # 窗口零成交 → 返回 UNKNOWN 保留账本与有效 SL（本轮不加分页请求）。
 MY_TRADES_PAGE_FULL = 500
+
+
+def _entry_quantity_evidence_valid(batch, index, evidence, statuses=('cost_pending',)):
+    """Only observed identity/direction and verified quantity may excuse missing cost."""
+    if not isinstance(evidence, dict) or evidence.get('status') not in statuses:
+        return False
+    ids, targets = batch.get('entry_orders'), batch.get('target_amounts')
+    if not isinstance(ids, list) or not isinstance(targets, list) or not (
+            0 <= index < len(ids) and index < len(targets)):
+        return False
+    side = str(batch.get('side') or '').upper()
+    if side not in ('BUY', 'SELL') or str(evidence.get('side') or '').upper() != side:
+        return False
+    oid = str(evidence.get('order_id') or '')
+    if not oid or not ids[index] or oid != str(ids[index]):
+        return False
+    values = (evidence.get('qty'), targets[index])
+    if any(isinstance(v, bool) for v in values):
+        return False
+    try:
+        qty, planned = map(float, values)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (math.isfinite(qty) and math.isfinite(planned) and qty > 0 and planned > 0
+            and abs(qty - planned) <= max(1e-8, planned * 1e-6))
 
 
 def _symbol_identity(s):
@@ -1568,7 +1594,7 @@ class CryptoTrader:
             targets = list(bb.get('target_amounts') or [])
             _sd = str(bb.get('side') or '').upper()
             exp_side = 'buy' if _sd == 'BUY' else ('sell' if _sd == 'SELL' else None)
-            fe = dict(bb.get('fill_evidence') or {})
+            fe = copy.deepcopy(bb.get('fill_evidence') or {})
             now = time.time()
             due = []
             for i in pending:
@@ -1579,6 +1605,7 @@ class CryptoTrader:
             return 0
 
         # 阶段二（锁外做网络 IO）：每层一次受限回查
+        targets_before_probe = list(targets)
         hits = []
         for i, oid in due:
             exp_qty = targets[i] if i < len(targets) else None
@@ -1617,12 +1644,24 @@ class CryptoTrader:
                 if i not in cp_now:
                     continue           # 已在别处补证完成 → 绝不重复计量
                 ent = dict(fe_now.get(str(i)) or {})
+                # Query results belong to the exact snapshot queried, not merely a layer number.
+                _ids_now = bb.get('entry_orders') or []
+                _targets_before = targets_before_probe
+                if (i >= len(_ids_now) or str(_ids_now[i]) != oid_i
+                        or i >= len(targets) or i >= len(_targets_before)
+                        or targets[i] != _targets_before[i]
+                        or str(bb.get('side') or '').upper() != _sd
+                        or ent != fe.get(str(i))
+                        or not _entry_quantity_evidence_valid(bb, i, ent)):
+                    escalated.append((i, None, None, 'stale_cost_probe_discarded'))
+                    continue
                 if st == 'qty_unverified':
-                    # 🔥 R6：原子升级留给 _record_fill_evidence（锁外调用，它自己
-                    # 持锁重读 + 同时派生 cost_pending_layers / qty_reconcile_pending
-                    # + critical 告警），本临界区不改状态 —— 避免「列表已移除但
-                    # status 未改」的中间态落盘。
-                    escalated.append((i, str(ent.get('order_id') or oid_i), qty, why))
+                    # Commit escalation under this same CAS; do not reopen a lock-free race.
+                    ent.update(status='qty_unverified', qty=qty, why=why,
+                               updated_at=now)
+                    fe_now[str(i)] = ent
+                    escalated.append((i, oid_i, qty, why))
+                    dirty = True
                     continue
                 if price is None:
                     # 仍未拿到有效价格（含 probe 失败）→ 节流重试
@@ -1654,21 +1693,21 @@ class CryptoTrader:
                 resolved += 1
                 dirty = True
             if dirty:
-                bb['cost_pending_layers'] = cp_now
                 bb['fill_evidence'] = fe_now
+                bb['cost_pending_layers'] = sorted(int(k) for k, v in fe_now.items()
+                    if isinstance(v, dict) and v.get('status') == 'cost_pending')
+                bb['qty_reconcile_pending'] = sorted(int(k) for k, v in fe_now.items()
+                    if isinstance(v, dict) and v.get('status') == 'qty_unverified')
                 if not self._persist_states(latest, read_corrupt=_rc_1659):
                     escalated = []           # 未落盘 → 状态未变，升级下轮重来
                     resolved = 0             # 不重复计量（队列保持原样）
-        # 🔥 R6：锁外升级（告警 + 两个待办列表派生 + 落盘，单次原子写）
+        # Only notifications occur outside the commit lock; no stale evidence writes here.
         for _i, _oid, _qty, _why in escalated:
             try:
-                _sd_b = str((bb or {}).get('side') or '')
-                _exp_b = targets[_i] if _i < len(targets) else None
-                self._record_fill_evidence(symbol, batch_id, _i, _oid, {
-                    'status': 'qty_unverified', 'qty': _qty,
-                    'side': 'buy' if _sd_b.upper() == 'BUY'
-                    else ('sell' if _sd_b.upper() == 'SELL' else ''),
-                    'planned': _exp_b, 'why': _why})
+                self.send_tg_notification(
+                    f"🚨【资金安全】批次 `{batch_id}`({symbol}) 第 {_i + 1} 层"
+                    f"补证未放行：{_why}；保留账本与保护，等待核对/重新补证。",
+                    level='critical')
             except Exception as _esc_e:
                 print(f"  └─ ❌ [F2/F3-R6] 数量核对升级失败（层 {_i + 1}）: {_esc_e}")
         return resolved
@@ -3459,14 +3498,14 @@ class CryptoTrader:
                                 _fe7 = batch_data.get('fill_evidence')
                                 _fe7 = dict(_fe7) if isinstance(_fe7, dict) else {}
                                 _restored7 = False
-                                _cp7 = set()
                                 for _i7 in range(_lfc7):
                                     _cur7 = _fd7[_i7] if _i7 < len(_fd7) else None
                                     if _price7_ok(_cur7):
                                         continue
                                     _ev7 = _fe7.get(str(_i7))
-                                    _evp7 = _price7_ok((_ev7 or {}).get('price')) \
-                                        if isinstance(_ev7, dict) else None
+                                    _trusted7 = _entry_quantity_evidence_valid(
+                                        batch_data, _i7, _ev7, ('confirmed', 'cost_pending'))
+                                    _evp7 = _price7_ok(_ev7.get('price')) if _trusted7 else None
                                     if _evp7:
                                         while len(_fd7) <= _i7:
                                             _fd7.append(0.0)
@@ -3474,24 +3513,25 @@ class CryptoTrader:
                                         _restored7 = True
                                     else:
                                         _rec7 = dict(_ev7) if isinstance(_ev7, dict) else {}
-                                        _eo7 = list(batch_data.get('entry_orders') or [])
                                         _rec7.update({
-                                            'status': 'cost_pending',
-                                            'why': 'missing_fill_price_evidence',
+                                            'status': 'cost_pending' if _trusted7 else 'qty_unverified',
+                                            'why': ('missing_fill_price_evidence' if _trusted7 else
+                                                    _rec7.get('why') or 'quantity_identity_unverified'),
                                             'idx': _i7,
-                                            'order_id': str(_eo7[_i7]) if _i7 < len(_eo7) else '',
+                                            # Ledger expectations are not observed identity.
+                                            'order_id': _rec7.get('order_id', ''),
                                             'updated_at': time.time(),
                                         })
                                         _fe7[str(_i7)] = _rec7
-                                        _cp7.add(_i7)
                                 if _restored7:
                                     batch_data['filled_details'] = _fd7
-                                if _cp7:
-                                    batch_data['fill_evidence'] = _fe7
-                                    batch_data['cost_pending_layers'] = sorted(
-                                        int(k) for k, v in _fe7.items()
-                                        if isinstance(v, dict)
-                                        and v.get('status') == 'cost_pending')
+                                batch_data['fill_evidence'] = _fe7
+                                batch_data['cost_pending_layers'] = sorted(
+                                    int(k) for k, v in _fe7.items()
+                                    if isinstance(v, dict) and v.get('status') == 'cost_pending')
+                                batch_data['qty_reconcile_pending'] = sorted(
+                                    int(k) for k, v in _fe7.items()
+                                    if isinstance(v, dict) and v.get('status') == 'qty_unverified')
                         except Exception as _prot7_e7:
                             # 复审（外审 7 非阻塞项）：保护块异常必须 **fail-closed**。
                             # 此处若 pass，已成交层的伪造 0 成本会原样落盘，违背本块
@@ -9828,7 +9868,8 @@ class CryptoTrader:
           * 只隔离 `OSError`（含 `PermissionError`）；其余异常照常外抛（分类恢复，
             不把所有未知异常都变成自动重试——转审第三轮边界 3）；
           * **失败不刷新成功心跳**、不伪造健康；**不写 `monitor_error`**、不阻塞轮询；
-          * 首报一次 + 每 300s 限频提醒 + 恢复通知（现有非阻塞 print/TG 惯例）；
+          * 首次失败 print + 尝试写入现有通知队列；持续失败每 300s print，
+            恢复也仅 print（不声称周期提醒或恢复均发送 TG）；
           * 不调用 `recover_active_batches`，不改全局 `monitor_error` 语义。
 
         返回 True = 心跳写入成功（或此前无失败记录），False = 本轮被隔离。
@@ -10058,7 +10099,8 @@ class CryptoTrader:
         #        全部保留；
         #      · 撤掉 `except BaseException` 捕获与函数末尾的 `_reraise` 再抛：
         #        异常（含处置层内抛出的 BaseException / 二次异常）直接穿出循环 →
-        #        `finally` 收尾 → 原样传播，「先收尾、后传播」交给语言语义。
+        #        `finally` 收尾 → 传播；仅在 finally 本身无异常时保留原异常。
+        #        保证进入收尾，不保证收尾每句都完成（finally 内异常可中断/替换原异常）。
         #    （`finally` 内禁止 continue —— 收尾块里没有任何 continue，续跑仍在
         #      循环内的处置层判断里完成，不会与收尾互相踩踏。）
         # ================================================================
@@ -13788,7 +13830,7 @@ class CryptoTrader:
                     if abs(_q - _pl) > max(1e-8, _pl * 1e-6):
                         continue                       # 数量与计划量不符
                     _es = str(_e.get('side') or '').upper()
-                    if _exp_side and _es and _es != _exp_side:
+                    if not _entry_quantity_evidence_valid(snapshot, _i, _e):
                         continue                       # 方向不符
                     _eid = _e.get('order_id')
                     if isinstance(_eo_all, list) and _i < len(_eo_all) and \
@@ -14278,8 +14320,9 @@ class CryptoTrader:
             def _cost_ok_of(b, n):
                 """🔥 F2/F3-R1：本批次里「成本待补证但数量证据已核实」的层集合。
 
-                与 _derive_close_txn_vars 的 _cost_ok 门逐条同判据（状态 /
-                层号边界 / 数量有限正数且≈计划量 / 方向 / 订单身份），
+                与 _derive_close_txn_vars 共用必需的观测身份/方向/数量证据校验；
+                本勘察另外维持 strict numeric 类型要求（不接受数值字符串），
+                并校验状态 / 层号边界 / 数量有限正数且≈计划量。
                 任一条不满足即不放行 —— 只放行缺成本这一种证据缺口，
                 其余拒绝条件原样保留。
                 """
@@ -14313,7 +14356,7 @@ class CryptoTrader:
                     if abs(float(_q) - float(_pl)) > max(1e-8, float(_pl) * 1e-6):
                         continue
                     _es = str(_e.get('side') or '').upper()
-                    if _exp_side and _es and _es != _exp_side:
+                    if not _entry_quantity_evidence_valid(b, _i, _e):
                         continue
                     _eid = _e.get('order_id')
                     if isinstance(_eo, list) and _i < len(_eo) and \
@@ -16016,9 +16059,36 @@ class CryptoTrader:
                     f"fee={_fee}）但成交未完整入账 → 拒绝清账，进入核对与接续路径。",
                     level='critical')
                 return {'ok': False, 'reason': 'ledger_fill_mismatch'}
+            # Zero residual position is not proof that every canceled ENTRY fill was booked.
+            _accounted = {}
+            _ids_book = _bd2.get('entry_orders')
+            _targets_book = _bd2.get('target_amounts')
+            if (not isinstance(_ids_book, list) or not isinstance(_targets_book, list)
+                    or len(_ids_book) < _last_filled or len(_targets_book) < _last_filled
+                    or _bd2.get('qty_reconcile_pending')):
+                return {'ok': False, 'reason': 'ledger_fill_mismatch'}
+            for _i in range(_last_filled):
+                _oid = str(_ids_book[_i] or '')
+                _q = self._fee_float(_targets_book[_i])
+                _price = self._fee_float(_fd[_i])
+                _e = (_bd2.get('fill_evidence') or {}).get(str(_i))
+                if (not _oid or _oid in _accounted or _q is None or _q <= 0
+                        or not ((_price is not None and _price > 0)
+                                or _entry_quantity_evidence_valid(_bd2, _i, _e))):
+                    return {'ok': False, 'reason': 'ledger_fill_mismatch'}
+                _accounted[_oid] = _q
+            _ev, _det = self._post_cancel_fill_evidence(
+                symbol, batch_id, _bd2, set(entry_ids) | set(_ids_book), calls,
+                accounted_quantities=_accounted)
+            if _ev != 'clear':
+                self._converge_alert(
+                    ('unaccounted_entry_post', symbol, batch_id),
+                    f"🚨【资金安全】批次 `{batch_id}`({symbol}) 撤后 ENTRY 成交"
+                    f"未与已入账数量核对一致：{_det}；拒绝清账，保留保护。",
+                    level='critical')
+                return {'ok': False, 'reason': 'entry_accounting_unconfirmed', 'evidence': _det}
             return {'ok': True, 'reason': 'filled_batch_ledger_ok',
-                    **({'evidence': '未决ENTRY解决证据: ' + _pend_ev}
-                       if _pend_ev else {})}
+                    'evidence': _det + (' | 未决ENTRY解决证据: ' + _pend_ev if _pend_ev else '')}
 
         # 未入场批次：必须「确认未成交」
         _evid, _detail = self._post_cancel_fill_evidence(
@@ -16041,7 +16111,8 @@ class CryptoTrader:
             level='critical')
         return {'ok': False, 'reason': 'fill_evidence_unknown', 'evidence': _detail}
 
-    def _algo_identity_evidence(self, symbol: str, algo_id: str, calls: dict):
+    def _algo_identity_evidence(self, symbol: str, algo_id: str, calls: dict,
+                                terminal_quantities=None):
         """R2：条件单(-2013) 的 **algoId → actualOrderId 身份核验**。
 
         探针实锤（见 _resolve_order_fees 尾注）：条件单迁 Algo Service 后，账本与
@@ -16104,7 +16175,7 @@ class CryptoTrader:
                     return 'unknown', (f'algo 成交量非法({algo_id}: '
                                        f'{_k}={_qty})'), ''
                 break
-        if _qty is not None and _qty > 0:
+        if _qty is not None and _qty > 0 and terminal_quantities is None:
             return 'filled', f'algo {_qty_key}={_qty}', ''
         # 3) 终态状态 —— 真实原文字段是 **algoStatus**（A1 四张原始返回实测）；
         #    state/status 仅作兼容别名（真实响应没有这两个字段）。
@@ -16116,7 +16187,8 @@ class CryptoTrader:
         _act_missing = 'actualOrderId' not in _rec
         _tt_missing = 'triggerTime' not in _rec or _rec.get('triggerTime') is None
         _act = '' if _act_missing else str(_rec.get('actualOrderId') or '')
-        if _state not in _CANCEL:
+        if _state not in _CANCEL and not (
+                terminal_quantities is not None and _state == 'FINISHED'):
             return 'unknown', (f'algo 状态不可判零成交({algo_id}: algoStatus='
                                f'{_state or "字段缺失"})'), _act
         if _act_missing or _tt_missing:
@@ -16161,22 +16233,32 @@ class CryptoTrader:
                                    f'不可解析'), _act
             if _af < 0:
                 return 'unknown', f'actualOrderId={_act} filled 非法负数({_af})', _act
-            if _af > 0:
+            if _af > 0 and terminal_quantities is None:
                 return 'filled', f'actualOrderId={_act} filled={_af}', _act
             _ast = str(_ao.get('status') or '').strip().lower()
             if _ast not in _ACT_TERMINAL:
                 return 'unknown', (f'actualOrderId={_act} 非终态('
-                                   f'status={_ast or "字段缺失"})'), _act
+                                    f'status={_ast or "字段缺失"})'), _act
+            if terminal_quantities is not None:
+                if _qty is not None and abs(_qty - _af) > max(1e-8, _af * 1e-6):
+                    return 'unknown', 'algo 与实际子订单成交量冲突', _act
+                terminal_quantities[str(algo_id)] = _af
+                if _af > 0:
+                    return 'filled', f'actualOrderId={_act} terminal filled={_af}', _act
             return 'zero', (f'已触发零成交({algo_id}: algoStatus={_state}, '
                             f'triggerTime={_tt}, actualOrderId={_act} 实际单 '
                             f'status={_ast} filled=0)'), _act
+        if terminal_quantities is not None:
+            if _qty is not None and _qty > 0:
+                return 'unknown', 'algo 成交量与未触发事实冲突', ''
+            terminal_quantities[str(algo_id)] = 0.0
         return 'zero', (f'合法未触发已撤({algo_id}: algoStatus={_state}, '
                         f'triggerTime=0, actualOrderId=空 → 从未产生实际单、'
                         f'不可能有成交；actualQty 按官方口径未成交不返回，'
                         f'未伪造为 0)'), ''
 
     def _post_cancel_fill_evidence(self, symbol: str, batch_id: str, b_data: dict,
-                                   entry_ids: set, calls: dict):
+                                   entry_ids: set, calls: dict, accounted_quantities=None):
         """撤后成交证据。返回 (status, detail)，status ∈ 'clear'|'found'|'unknown'。
 
         逐单 fetch_order 取终态成交量。**R2b（2026-10-08 复审）：普通订单分支
@@ -16236,6 +16318,8 @@ class CryptoTrader:
             # ③ 有效数量：缺失 ≠ 0；NaN/inf/负数 = 非法 → 拒绝
             if _o.get('filled') is None:
                 return 'unknown', f'{_oid} 缺 filled 字段（字段缺失 ≠ 零成交）'
+            if isinstance(_o.get('filled'), bool):
+                return 'unknown', f'{_oid} filled 为 bool，不是成交数量'
             try:
                 _filled = float(_o.get('filled'))
             except (TypeError, ValueError):
@@ -16244,10 +16328,33 @@ class CryptoTrader:
                 return 'unknown', f'{_oid} filled 非有限数({_o.get("filled")!r})'
             if _filled < 0:
                 return 'unknown', f'{_oid} filled 非法负数({_filled})'
+            if accounted_quantities is not None:
+                _booked = accounted_quantities.get(_oid, 0.0)
+                if abs(_filled - _booked) > max(1e-8, _booked * 1e-6):
+                    return 'found', f'{_oid} filled={_filled} 与入账={_booked} 不一致'
+                continue
             if _filled > 0:
                 return 'found', f'{_oid} filled={_filled}'
         if not _unknown:
-            return 'clear', f'{len(_ids)} 张入场单终态 fetched 且 filled=0'
+            return 'clear', (f'{len(_ids)} 张入场单终态成交量与入账逐单一致'
+                             if accounted_quantities is not None
+                             else f'{len(_ids)} 张入场单终态 fetched 且 filled=0')
+        if accounted_quantities is not None:
+            for _oid in list(_unknown):
+                _booked = accounted_quantities.get(_oid, 0.0)
+                if _booked <= 0:
+                    continue
+                _quantities = {}
+                _kind, _note, _act = self._algo_identity_evidence(
+                    symbol, _oid, calls, terminal_quantities=_quantities)
+                _actual = _quantities.get(_oid)
+                if _kind == 'unknown' or _actual is None:
+                    return 'unknown', f'{_oid} 已入账 ENTRY 终态数量未知：{_note}'
+                if abs(_actual - _booked) > max(1e-8, _booked * 1e-6):
+                    return 'found', f'{_oid} actual filled={_actual} 与入账={_booked} 不一致'
+                _unknown.remove(_oid)
+            if not _unknown:
+                return 'clear', f'{len(_ids)} 张 ENTRY 终态数量与已入账事实逐单一致（含 algo 身份链）'
         # 兜底一：成交明细（条件单的权威替代——已用 A1 正对照证明该查询有效）
         # 复审打回③：响应有效性与窗口覆盖完整性在放行前统一核验（见下）。
         _since, _win_ok = self._fill_window_cover(batch_id)
@@ -16270,7 +16377,7 @@ class CryptoTrader:
             if _n_bad:
                 _tr_bad = f'含非法行 {_n_bad} 条（行不可解析）'
         # 兜底二（R2）：先核条件单身份/终态，再按**实际单号**关联成交
-        _match_keys = set(_ids)
+        _match_keys = set(_unknown) if accounted_quantities is not None else set(_ids)
         _zero_notes, _unknown_notes = [], []
         for _oid in sorted(_unknown):
             _st, _note, _act = self._algo_identity_evidence(symbol, _oid, calls)
@@ -16349,10 +16456,16 @@ class CryptoTrader:
         if not isinstance(b_data, dict):
             return None  # 批次已不存在（可能已被并发 clear），无需收敛
         # ① 两源扫描
+        def _valid_scan(response):
+            return (isinstance(response, list) and all(
+                isinstance(order, dict) and order.get('id') for order in response))
+
         try:
-            _normal = self._safe_api_call(self.exchange.fetch_open_orders, symbol) or []
+            _normal = self._safe_api_call(self.exchange.fetch_open_orders, symbol)
             _stops = self._safe_api_call(self.exchange.fetch_open_orders, symbol,
-                                         params={'stop': True}) or []
+                                         params={'stop': True})
+            if not _valid_scan(_normal) or not _valid_scan(_stops):
+                raise ValueError('两源扫描返回未知或非法响应（必须是含订单 id 的列表，允许 []）')
         except Exception as e:
             self._converge_alert(('scan_unknown', symbol, batch_id),
                                   f"🚨【资金安全】批次 `{batch_id}`({symbol}) 收敛扫描失败"
@@ -16607,10 +16720,13 @@ class CryptoTrader:
                                             'stopPrice': _o.get('stopPrice')})
         # ④ D-B2 单次复扫：撤单后重扫两源，本批次相关单必须清零
         try:
-            _n2 = self._safe_api_call(self.exchange.fetch_open_orders, symbol) or []
+            _pc_calls['fetch_open_orders'] = _pc_calls.get('fetch_open_orders', 0) + 1
+            _n2 = self._safe_api_call(self.exchange.fetch_open_orders, symbol)
+            _pc_calls['fetch_open_orders'] = _pc_calls.get('fetch_open_orders', 0) + 1
             _s2 = self._safe_api_call(self.exchange.fetch_open_orders, symbol,
-                                      params={'stop': True}) or []
-            _pc_calls['fetch_open_orders'] = _pc_calls.get('fetch_open_orders', 0) + 2
+                                      params={'stop': True})
+            if not _valid_scan(_n2) or not _valid_scan(_s2):
+                raise ValueError('两源复扫返回未知或非法响应（必须是含订单 id 的列表，允许 []）')
         except Exception as e:
             self._converge_alert(('rescan_unknown', symbol, batch_id),
                                   f"🚨【资金安全】批次 `{batch_id}`({symbol}) 撤单后复扫失败"
@@ -16687,8 +16803,9 @@ class CryptoTrader:
                                      'fetch_open_orders 默认 retries=5，algo 查询 '
                                      'retries=2、身份链 fetch_order(actualOrderId) '
                                      'retries=4），失败尝试同样占用预算'
-                                     '（-2011/-2013/unknown order 属不重试终态码，'
-                                     '只计 1 次尝试）；失败路径保留本地摘要 '
+                                      '（ccxt.OrderNotFound 由包装层直接抛出；'
+                                      '错误字符串局部不重试仅作用于本撤单路径，'
+                                      '不能把所有 -2013 都算一次尝试）；失败路径保留本地摘要 '
                                      '（calls *_err）。② 包装层尝试 —— '
                                      '_API_METRICS.record(ok=True/False) 在 '
                                      '_safe_api_call 的每次 attempt（含重试）各入'

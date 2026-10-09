@@ -72,7 +72,7 @@ class Ex:
 
     def _mk(self, oid, otype='STOP_MARKET', amount=1.0, stop=75001.0,
             status='open', filled=0.0, side='sell', **k):
-        o = {'id': oid, 'status': status, 'filled': filled, 'amount': amount,
+        o = {'id': oid, 'symbol': SYM, 'status': status, 'filled': filled, 'amount': amount,
              'type': otype, 'stopPrice': stop, 'side': side,
              'average': stop, 'price': stop,
              # SG3-P1 校验走 info.positionSide（hedge 模式）
@@ -1612,8 +1612,8 @@ def c24_clear_unreadable_uses_per_read_triple():
 
 def c25_filled_layer_missing_price_guard_and_be():
     """外部复审第 7 轮·②：已成交层缺价绝不静默补零当已知成本——
-    (a) 无可信证据 → save 后该层登记 cost_pending（blocked 依赖成本的 /be/结算）；
-    (b) 有 fill_evidence.price → 恢复进 filled_details；
+    (a) 无可信数量/身份证据 → save 后该层登记 qty_unverified（禁止安全退出/结算）；
+    (b) 身份/方向/数量已确认且有 fill_evidence.price → 恢复进 filled_details；
     (c) 已成交层 fd=0 时 `/be` 必须在**撤旧止损之前**拒绝（False、SL1 原样、
         零 cancel/零 create、critical 告警）。"""
     _reg = {
@@ -1626,7 +1626,7 @@ def c25_filled_layer_missing_price_guard_and_be():
             'id_known': True, 'role': 'SL', 'layer': 0,
             'intent': {'qty': 1.0, 'stop_price': '75001.0'}},
     }
-    # (a) 缺价且无可信证据 → 登记 cost_pending
+    # (a) 缺价且无可信数量/身份证据 → 不冒充「仅缺成本」
     t, ex = make_trader(tempfile.mkdtemp(prefix='mres_'))
     bd = _batch(entry_orders=['E1'], target_amounts=[1.0],
                 last_filled_count=1, total_entry_fee=0.0,
@@ -1641,15 +1641,17 @@ def c25_filled_layer_missing_price_guard_and_be():
     assert ok is True, '缺价保存被拒（应可写并登记待确认）: %r' % (ok,)
     with open(trader_260725.STATE_FILE, encoding='utf-8') as f:
         b = json.load(f).get(SYM, {}).get(BID, {})
-    assert 0 in [int(x) for x in (b.get('cost_pending_layers') or [])], \
-        '已成交层缺价未登记 cost_pending（被静默当已知成本）: %r' % (
-            b.get('cost_pending_layers'),)
+    assert b.get('cost_pending_layers') == [], '未知数量不得冒充仅缺成本'
+    assert b.get('qty_reconcile_pending') == [0], '缺可信证据未登记数量待核对'
+    assert b['fill_evidence']['0']['status'] == 'qty_unverified'
+    assert t._derive_close_txn_vars(b, BID)[0] is False, '未知数量仍放行安全退出'
     # (b) 有可信证据 → 恢复到 filled_details
     t2, ex2 = make_trader(tempfile.mkdtemp(prefix='mres_'))
     bd2 = _batch(entry_orders=['E1'], target_amounts=[1.0],
                  last_filled_count=1, total_entry_fee=0.0,
                  fill_evidence={'0': {'status': 'cost_pending', 'idx': 0,
-                                      'order_id': 'E1', 'price': 76620.0}},
+                                      'order_id': 'E1', 'price': 76620.0,
+                                      'side': 'buy', 'qty': 1.0}},
                  protection_registry=_reg)
     bd2.pop('filled_details', None)
     _seed(t2, bd2)

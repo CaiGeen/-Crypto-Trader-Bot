@@ -466,6 +466,10 @@ def f_filled_batch_still_clears():
         'total_entry_fee': 0.15, 'target_amounts': [1.0],
     })
     ex.orders.pop('E1')          # 入场单已成交，不在挂单里
+    # U2: a filled ledger is not exchange evidence; provide the actual terminal child.
+    ex.algo_orders['E1'].update(algoStatus='FINISHED', triggerTime=1,
+                                actualOrderId='A1')
+    ex._mk('A1', status='closed', filled=1.0)
     ex.open_orders = [ex.orders['SL1']]
     proof = t._converge_batch_orders_before_clear(SYM, BID)
     check('F1 已成交已平仓批次 → 仍可收敛（不要求零成交）',

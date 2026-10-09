@@ -36,10 +36,13 @@ class Ex:
         self.create_calls = []
         self.positions = []
         self.open_orders = []
+        # Default _lp_batch has one historical filled ENTRY; give it exchange evidence.
+        self._mk('E1', amount=0.002, status='closed', filled=0.002, avg=76620.0)
+        self.orders['E1']['side'] = 'buy'
 
     def _mk(self, oid, otype='STOP_MARKET', amount=0.002, stop=75001.0,
             status='open', filled=0.0, avg=None, _gone=False):
-        o = {'id': oid, 'status': status, 'filled': filled, 'amount': amount,
+        o = {'id': oid, 'symbol': SYM, 'status': status, 'filled': filled, 'amount': amount,
              'type': otype, 'stopPrice': stop, 'side': 'sell',
              'average': avg if avg is not None else stop, 'price': stop}
         if _gone:
