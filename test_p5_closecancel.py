@@ -151,6 +151,20 @@ def make_trader(tmp):
     t._record_realized_pnl = _isolated_pnl
     t._min_api_interval = 0
     t.ip_file = os.path.join(str(tmp), 'last_ip.txt')
+    # ⚠️ 实盘止血（2026-10-06，IP 变更邮件风暴根因）：
+    # 本夹具建的是**真 CryptoTrader**，真起 `_start_monitoring` 的用例首轮即命中
+    # IP 定时守卫（trader:9001-9004，`last_ip_check_time=0` → `now-0>300` 恒真）
+    # → `_check_ip_periodically` **真打公网 IP** → 新临时目录 `last_known_ip=None`
+    # ≠ 当前 IP → `_record_ip_change(source='periodic_check')` → 写 last_ip.txt 后
+    # **走真 SMTP 发信**（本文件原先未桩 `_send_email_alert`，且测试进程不加载
+    # .env → email_gate 的 EMAIL_ALERT_ONLY_WITH_POSITION 未设置 → 裁决
+    # position_gate_disabled = 放行）。
+    # 实证：Temp\p5_*\last_ip.txt 写入时刻与用户收到的邮件时刻**秒级吻合**，
+    # 每跑本文件发 5 封「⚠️ IP 地址变化告警」。
+    # 三条一起下（入口关闸 + 取数断源 + 出口兜底），测试一律零外发。
+    t.IP_CHECK_ENABLED = False
+    t._get_public_ip = lambda: None
+    t._send_email_alert = lambda *a, **k: False
     t.sent_tg = []
     t.send_tg_notification = lambda text, **k: t.sent_tg.append(str(text))
     return t, ex

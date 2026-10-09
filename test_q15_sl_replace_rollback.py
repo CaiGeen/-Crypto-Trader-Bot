@@ -141,7 +141,7 @@ def _make_fake(state_path, states, fail_create):
     fake._state_lock = threading.Lock()
     fake.load_all_states = lambda: states
     fake._load_all_states_ex = lambda: (states, False, "")
-    fake._persist_states = lambda all_s: CryptoTrader._persist_states(fake, all_s)
+    fake._persist_states = lambda all_s, **_k: CryptoTrader._persist_states(fake, all_s, **_k)
     # save_batch_state 必须绑真实实现：处置落盘（current_sl_id 置空）走它。
     # ⚠️ 连带 _merge_batch_state 也必须绑真实——它不在既有夹具绑定清单里
     # （N6 从不调 save_batch_state 所以从未暴露），漏绑 → merge 返回 MagicMock →
@@ -376,14 +376,14 @@ def check_r6_registry_persist_fail_honest():
         _real_persist = fake._persist_states
         _absent_n = {'n': 0}
 
-        def _persist_fail_2nd_absent(all_s):
+        def _persist_fail_2nd_absent(all_s, **_k):
             _st = (((all_s.get(SYMBOL) or {}).get(BATCH) or {})
                    .get('protection_registry', {}).get(IDENT_SL, {}).get('state'))
             if _st == 'ABSENT':
                 _absent_n['n'] += 1
                 if _absent_n['n'] >= 2:
                     return False
-            return _real_persist(all_s)
+            return _real_persist(all_s, **_k)
 
         fake._persist_states = _persist_fail_2nd_absent
         ret = CryptoTrader.update_batch_sl(fake, BATCH, 55000.0)

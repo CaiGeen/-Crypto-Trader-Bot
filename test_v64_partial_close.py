@@ -176,7 +176,7 @@ def make_trader(states, actual_pos=2.0, lazy_market=False):
     def load_all_states():
         return copy.deepcopy(t._states)
 
-    def _persist_states(all_states):
+    def _persist_states(all_states, **_k):
         if not t._persist_ok:
             return False
         t._states.clear()

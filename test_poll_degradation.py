@@ -34,6 +34,22 @@ _BLOCK = threading.Event()
 BATCH = PR.BATCH
 ENTRY_ID = PR.ENTRY_ID
 
+# R5门禁（漏项⑦）状态账本**会话级恢复目标**：下面 27 处 finally 原本恢复到
+# `PR._real_state_file`（解释器启动时捕获的**默认** `trade_state.json`，相对
+# cwd = 仓库根）。部分用例经 takeover 路径（trader_260725.py L4239/L7905）把
+# **真实** `_start_monitoring` 落在 daemon 线程里持续跑（「进程退出收尸」的
+# 既有设计），该线程下一轮 `_persist_states`（REAL_HELPERS 真绑定，见
+# test_monitor_poll_recovery.py L64/L233）读的是**当下**全局 STATE_FILE——
+# 测试 finally 已把全局恢复成默认 → 线程越界写仓库根账本。
+# 脚本模式窗口仅毫秒（一直靠运气干净）；pytest 收集段整会话常驻 → 必然越界：
+#   门禁哨兵实录 trade_state.json 1916→1917 字节、tmp_pytest_watch.out
+#   26 处 os.replace/copy2 栈全部同源（本文件 L77 → _start_monitoring →
+#   _record_fill_evidence → _persist_states）。
+# 恢复目标改为会话级 temp：越界线程与后续用例永远够不到默认账本。
+# 判据零改动（27 处仅换恢复目标；每用例开头仍各自 mkdtemp 指向独立 sp）。
+_SESSION_STATE = os.path.join(
+    tempfile.mkdtemp(prefix='pd_session_'), 'trade_state.json')
+
 RESULTS = []
 
 
@@ -125,7 +141,7 @@ def test_single_batch_persistent_failure_alerts_and_marks_degraded():
                BATCH in fake._poll_degraded_batches,
                f'degraded={fake._poll_degraded_batches}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── T2: 新信号实际被拦（execute_signal → ENTRY create_order 拒绝）──────────
@@ -195,7 +211,7 @@ class _EntryFake:
         self.persisted[batch_id] = copy.deepcopy(data)
         return True
 
-    def _persist_states(self, all_states):
+    def _persist_states(self, all_states, **_k):
         if not getattr(self, 'persist_ok', True):
             return False          # 注入写盘失败
         # all_states 是 {symbol: {batch: data}}；替身内部按 {batch: data} 存，
@@ -209,6 +225,11 @@ class _EntryFake:
 
     def load_all_states(self):
         return {SYMBOL: {bid: copy.deepcopy(b) for bid, b in self.persisted.items()}}
+
+    def _load_all_states_ex(self):
+        # per-read 三元组（外部复审第 6 轮迁移）：与 load_all_states 同源，
+        # 损坏恒 False（本文件账本由用例直写，不存在损坏态）。
+        return self.load_all_states(), False, ""
 
     def _safe_api_call(self, fn, *a, **k):
         return fn(*a, **k)
@@ -330,7 +351,7 @@ def test_multi_batch_one_success_one_failure():
         report('T3b 另一批次仍降级（不被解锁）',
                'batch_other' in degraded, f'degraded={degraded}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── T4: 失败后的完整恢复（成交识别 + 保护处理完成）────────────────────────
@@ -362,7 +383,7 @@ def test_complete_recovery_after_failure():
                BATCH in fake._poll_degraded_batches,
                f'成交后 degraded={fake._poll_degraded_batches}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── T5: 通知异常不得杀监控（守卫测）────────────────────────────────────────
@@ -385,7 +406,7 @@ def test_notification_exception_kills_nothing():
         report('T5 通知异常未杀监控（驱动未因告警异常中断）',
                rounds >= 3 and err is None, f'驱动轮次={rounds} err={err!r}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── T6: 已有 SL/TP 和监控不被暂停逻辑触碰 ────────────────────────────────
@@ -434,7 +455,7 @@ def test_existing_sl_tp_and_monitor_not_touched():
                f"降级计数={fake._poll_fail_streak.get(BATCH)}"
                f"（≥3 → 线程在持续轮询而非死亡）")
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -466,7 +487,7 @@ def test_block1_fetch_order_failure_keeps_degraded():
                BATCH in fake._poll_degraded_batches,
                f'识别失败后 degraded={fake._poll_degraded_batches}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── 阻断2：暂停检查后、第一层 ENTRY 创建前才降级 → 必须拦住 ────────────────
@@ -506,7 +527,7 @@ def test_block3_per_batch_stale_not_masked_by_other_batch():
                f'A degraded={fake._poll_degraded_batches}；'
                f'全局 last_success_time 为"现在"')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── 阻断4：通知返回 False（未抛异常）后仍应有限重试 ────────────────────────
@@ -530,7 +551,7 @@ def test_block4_alert_retry_on_notify_false():
                len(calls) >= 2,
                f'6 轮失败内告警尝试次数={len(calls)}（应 ≥2 → 有重试）')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -562,7 +583,7 @@ def test_block5_unfilled_entry_does_not_block_recovery():
                f'恢复后 degraded={fake._poll_degraded_batches}'
                f'（pending_sl_orders=[0] 为未成交层预备项，不得阻止解锁）')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── 阻断6：部分层已创建时不得返回 CLEAN_REJECT ───────────────────────────
@@ -662,7 +683,7 @@ def test_block7_restart_reverify_blocks_new_entry():
                len(ef.create_calls) == 0,
                f'create 次数={len(ef.create_calls)}，返回={ret!r}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── 口径：send_tg_notification 返回 None（未配 TG）不得记成已送达 ────────
@@ -686,7 +707,7 @@ def test_block8_notify_none_is_not_delivered():
         report('B8b 通知返回 None 时仍有有限重试',
                len(calls) >= 2, f'6 轮内尝试={len(calls)} 次（应 ≥2）')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── 口径：真实双批次时序（A 失败、B 成功）不得被 B 遮住 A 的陈旧 ────────
@@ -717,7 +738,7 @@ def test_block9_real_dual_batch_stale():
                f'A degraded={fake._poll_degraded_batches}；'
                f'last_success_time={fake._poll_last_success_time}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── B10/B11：CLEAN_REJECT 的落盘与接管（第四轮复审阻断3）─────────────────
@@ -892,7 +913,7 @@ def test_block12_reverify_inconsistent_success():
                ok is False and fake._ready is False,
                f'recover={ok!r}，_ready={fake._ready}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── B13：有持仓但无有效 SL 锚点 → 重证不通过（第四轮复审阻断2）──────────
@@ -916,7 +937,7 @@ def test_block13_reverify_position_without_sl():
                ok is False and fake._ready is False,
                f'recover={ok!r}，_ready={fake._ready}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── B14：止损失败 → 保持暂停（第四轮复审阻断1）──────────────────────────
@@ -945,7 +966,7 @@ def test_block14_sl_failure_keeps_paused():
                BATCH in fake._poll_degraded_batches,
                f'degraded={fake._poll_degraded_batches}（应仍含本批次）')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 def _bind_real_reconcile(f):
@@ -1005,9 +1026,12 @@ def test_block15_unknown_create_real_monitor_takeover():
             mf.exchange.fetch_open_orders.return_value = []      # 已不在未结 = 已成交
             mf.exchange.fetch_order.return_value = {
                 'id': REAL_OID, 'status': 'closed', 'average': 58000.0,
+                'side': 'buy',   # R5门禁：方向观测证据（LONG 批次入场单=buy）
                 'info': {'cumQuote': '24940', 'executedQty': '0.43', 'updateTime': 1}}
             mf._get_current_position_amt = lambda *a, **k: 0.43
-            PR._drive(mf, None, max_rounds=3)
+            _drive_monitor_with_reconciled_ids(
+                mf, [REAL_OID], [55000.0], [0.43], PR._layer_sl_params(),
+                max_rounds=3)
             report('B15c 真实监控按真实 ID 识别该 ENTRY 成交并进入补挂保护路径',
                    mf.exchange.fetch_order.call_count >= 1
                    and len(mf.sl_place_calls) >= 1,
@@ -1015,7 +1039,7 @@ def test_block15_unknown_create_real_monitor_takeover():
                    f'补挂路径进入={len(mf.sl_place_calls)} 次'
                    f'（fetch_order=0 即监控认不出该 ENTRY）')
         finally:
-            trader_260725.STATE_FILE = PR._real_state_file
+            trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── B16：SL 在交易所消失但本地 ID 未清（第五轮复审阻断2）─────────────────
@@ -1044,7 +1068,7 @@ def test_block16_sl_vanished_on_exchange():
                ok is False and fake._ready is False,
                f'recover={ok!r}，_ready={fake._ready}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── B17：SL 方向错 / 覆盖不足 / 覆盖量不明（第五轮复审阻断2）─────────────
@@ -1084,10 +1108,38 @@ def test_block17_sl_direction_and_coverage():
                    ok is False and fake._ready is False,
                    f'recover={ok!r}，_ready={fake._ready}')
         finally:
-            trader_260725.STATE_FILE = PR._real_state_file
+            trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── B20/B21/B22：接管参数逐层一致 + 连续时序（第六轮复审阻断1）───────────
+def _drive_monitor_with_reconciled_ids(fake, entry_orders, stop_steps,
+                                       target_amounts, layer_sl_params,
+                                       max_rounds=3):
+    """用接管的真实 ENTRY ID 驱动监控，不退回 PR._drive 的固定 e1 fixture。
+
+    F2/F3 会严格校验响应 ID 与本层账本 ID。旧 _drive 固定传 ENTRY_ID='e1'，
+    而 B15c/B21 的响应来自真实收编 ID；因此旧驱动制造 identity_mismatch，
+    是 harness 输入不一致，不是生产拒绝有效成交证据。
+    """
+    calls = {'n': 0}
+
+    def _sleep(_sec):
+        calls['n'] += 1
+        if calls['n'] > max_rounds:
+            raise PR._StopLoop()
+
+    with mock.patch.object(trader_260725.time, 'sleep', _sleep):
+        try:
+            CryptoTrader._start_monitoring(
+                fake, SYMBOL, BATCH, list(entry_orders), list(stop_steps),
+                60000.0, None, None, sum(target_amounts), list(target_amounts),
+                {'positionSide': 'LONG', 'leverage': 100}, True, 'BUY',
+                0, None, 0.0, None, {}, list(layer_sl_params))
+        except PR._StopLoop:
+            pass
+    return calls['n']
+
+
 def _reconciled_run():
     """跑到「创建抛未知异常 → 真实对账」这一步的替身。"""
     f, sig = _two_layer_fake()
@@ -1157,9 +1209,14 @@ def test_block21_continuous_timeline_fill_then_protection():
         mf.exchange.fetch_open_orders.return_value = []      # 已不在未结 = 已成交
         mf.exchange.fetch_order.return_value = {
             'id': REAL_OID, 'status': 'closed', 'average': 58000.0,
+            'side': 'buy',   # R5门禁：方向观测证据（LONG 批次入场单=buy）
             'info': {'cumQuote': '24940', 'executedQty': '0.43', 'updateTime': 1}}
         mf._get_current_position_amt = lambda *a, **k2: 0.43
-        PR._drive(mf, None, max_rounds=3)
+        _drive_monitor_with_reconciled_ids(
+            mf, list(k.get('entry_orders') or []),
+            list(k.get('stop_steps') or [55000.0]),
+            list(k.get('target_amounts') or [0.43]),
+            list(k.get('layer_sl_params') or []), max_rounds=3)
         report('B21a 连续时序：收编 ID → 成交识别 → 进入补挂保护路径',
                mf.exchange.fetch_order.call_count >= 1 and len(mf.sl_place_calls) >= 1,
                f'fetch_order={mf.exchange.fetch_order.call_count}，'
@@ -1168,7 +1225,7 @@ def test_block21_continuous_timeline_fill_then_protection():
         report('B21b 连续时序：监控未因越界异常退出（未写 monitor_error）',
                not me, f'monitor_error={me}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 def test_block22_takeover_refused_when_persist_unconfirmed():
@@ -1257,7 +1314,7 @@ def test_block24_restart_rejects_unresolved_skeleton():
                BATCH in fake._unresolved_intent_batches,
                f'未决意图={fake._unresolved_intent_batches}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── B25：Hedge Mode SL 反例——错 positionSide / 错类型 / NaN / inf 覆盖量 ──
@@ -1291,7 +1348,7 @@ def test_block25_hedge_sl_variants():
                    ok is False and fake._ready is False,
                    f'recover={ok!r}，_ready={fake._ready}')
         finally:
-            trader_260725.STATE_FILE = PR._real_state_file
+            trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── B26：收编成功但参数不完整 → 无监控时仍禁止新 ENTRY（第七轮复审阻断1）──
@@ -1378,7 +1435,7 @@ def test_block27_non_stop_and_missing_pside():
                    ok is False and fake._ready is False,
                    f'recover={ok!r}，_ready={fake._ready}')
         finally:
-            trader_260725.STATE_FILE = PR._real_state_file
+            trader_260725.STATE_FILE = _SESSION_STATE
 
 
 def _ccxt_order(kind='STOP_MARKET', side='SELL', amount=0.43,
@@ -1435,7 +1492,7 @@ def test_block28_unresolved_gate_release_path():
                BATCH not in fake._unresolved_intent_batches,
                f'未决意图={fake._unresolved_intent_batches}（应为空）')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── B29：重证必须读恢复后最新账本（刚收编的批次不得仍判未决）──────────
@@ -1479,7 +1536,7 @@ def test_block29_reverify_uses_post_recovery_ledger():
                f'未决意图={fake._unresolved_intent_batches}（应为空），'
                f'load_all_states 调用={seq["n"]} 次，recover={ok!r}（仅作参考）')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── B30：未知结果期间先置闸门；监控延迟退出后恢复闸门（S6）──────────────
@@ -1661,7 +1718,7 @@ def test_block32_info_contract_fixture():
                f'recover={ok!r}，_ready={fake._ready}，'
                f'顶层 type={good.get("type")!r}，info.type={good["info"]["type"]!r}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
     # 32b 手工止盈夹具（TAKE_PROFIT_MARKET + stopPrice + positionSide 正确）→ 不得 READY
     for label, order in (
@@ -1684,7 +1741,7 @@ def test_block32_info_contract_fixture():
                    ok is False and fake._ready is False,
                    f'recover={ok!r}，_ready={fake._ready}')
         finally:
-            trader_260725.STATE_FILE = PR._real_state_file
+            trader_260725.STATE_FILE = _SESSION_STATE
 
 
 # ── B34：收编+参数有效+线程存活，但首轮业务核验未完成 → 闸门不得解除 ──────
@@ -1839,7 +1896,7 @@ def test_block35_position_unknown_keeps_degraded_gate():
                len(created) >= 1,
                f'返回={ret2!r}，create 调用={len(created)}')
     finally:
-        trader_260725.STATE_FILE = PR._real_state_file
+        trader_260725.STATE_FILE = _SESSION_STATE
 
 
 def main():

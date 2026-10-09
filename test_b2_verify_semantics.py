@@ -74,7 +74,7 @@ def _bind_helpers(fake, states):
     # ⚠️ _persist_states 用 **True 桩**而非真实实现：真实实现会写 STATE_FILE，而本文件
     # 没有像 test_protection_write_gates 那样重定向 STATE_FILE → 会碰真实账本文件。
     # 桩供给的是「磁盘写入成功」这一环境结果，不是替生产决定判据（判据仍在 `is not True`）。
-    fake._persist_states = lambda all_s: True
+    fake._persist_states = lambda all_s, **_k: True
     fake._commit_protection_with_g3 = (
         lambda *a, **k: CryptoTrader._commit_protection_with_g3(fake, *a, **k))
     # B2-0 新增统一入口（红灯阶段未实现 → 跳过绑定，调用走 MagicMock 自动 mock 恒 FAIL）

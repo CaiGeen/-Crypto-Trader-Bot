@@ -129,7 +129,7 @@ def make_fake(store, ex):
     # G3 已改用「本次读取」三元组接口（ChatGPT 复审⑤）：(数据, 是否损坏, 详情)
     # 与上面的 load_all_states 桩同源：默认**本次读取可信、未损坏**。
     fake._load_all_states_ex = lambda: (store.load(), False, "")
-    fake._persist_states = lambda all_s: store.persist(all_s)
+    fake._persist_states = lambda all_s, **_k: store.persist(all_s)
     fake.save_batch_state = lambda s, b, d: CryptoTrader.save_batch_state(fake, s, b, d)
     # P0 Batch C（2026-08-29）：save/clear 重写后新增 helper —— 未绑定时
     # _merge_batch_state 返回 MagicMock 污染 store（batch 落盘为空 dict，registry

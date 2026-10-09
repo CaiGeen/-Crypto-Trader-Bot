@@ -103,6 +103,11 @@ class FakeExchange:
             return dict(self.archive[oid])
         raise ccxt.OrderNotFound(f"Unknown order sent {oid}")
 
+    def fetch_my_trades(self, symbol, since=None, limit=None, params=None, **kw):
+        """成交明细（生产 ccxt 必有）。默认夹具事实：无成交。
+        需要「有成交」语义的用例用 self.trades 注入，不得靠缺方法制造 UNKNOWN。"""
+        return [dict(t) for t in getattr(self, 'trades', [])]
+
     def create_order(self, symbol=None, type=None, side=None, amount=None,
                      price=None, params=None, **kw):
         self._id_seq += 1
@@ -226,7 +231,19 @@ def make_fake_b(env, ex):
              # 🔥 P5：FULL_FILL 共享 finalizer（结算段已从 monitor 抽到该函数；
              # 未绑定 → MagicMock 静默吞掉 → 撤 TP/clear 全不发生，测试假红）
              '_finalize_limit_full_fill', '_claim_settlement_reported',
-             '_batch_net_position', '_notify_snapshot')
+             '_batch_net_position', '_notify_snapshot',
+             # 🔥 F2/F3（真实成交价入账 + 成本待补证）：finalizer 结算段新增了
+             # 成本门槛调用。漏绑 → 自动 mock → 解包 2 元组抛 ValueError
+             # （实测 "not enough values to unpack (expected 2, got 0)"）→
+             # finalizer 中断 → 撤 TP/clear 全不发生 → B1/B0 假红。
+             '_resolve_entry_fill_evidence', '_record_fill_evidence',
+             '_backfill_entry_costs', '_settlement_cost_gate',
+             '_defer_settlement_for_cost', '_finalize_cost_pending_settlement',
+             # 🔥 事故修复 2026-10-06（转审第三轮）：清账收敛新增的四个 helper。
+             # 漏绑 → MagicMock 顶替 → ②贡献闸门 / ③'撤后事实复核被**静默掏空**
+             # （实测 _owned_ids 变 MagicMock → `in` 恒 False → 他批次被误判 L3 孤儿）。
+             '_batch_position_contribution', '_post_cancel_fact_check',
+             '_post_cancel_fill_evidence', '_fill_window_since_ms')
     for _n in _bind:
         if hasattr(CryptoTrader, _n):
             setattr(fake, _n, (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(

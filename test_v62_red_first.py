@@ -278,7 +278,7 @@ class FakeSelf62:
         # （R2-g 的磁盘 reason 判定会失真）——改为 deepcopy + persist 成功才写回。
         return copy.deepcopy(self._states)
 
-    def _persist_states(self, all_states):
+    def _persist_states(self, all_states, **_k):
         # 🔒 GREEN 修正：历史快照用 deepcopy——避免后续嵌套 registry 修改
         # 污染已记录的 persist 历史（dict(v) 浅拷贝不够）。
         self.persisted.append(copy.deepcopy(all_states))

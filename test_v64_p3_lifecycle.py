@@ -219,7 +219,7 @@ def _make_runner(states, position=0.002, fetch_order_result='open',
         t._state_corrupted = False
         return copy.deepcopy(t._states)
 
-    def _persist_states(all_states):
+    def _persist_states(all_states, **_k):
         t._states.clear()
         t._states.update(all_states)
         return True

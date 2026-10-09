@@ -50,7 +50,7 @@ class PersistFake:
         # G3/默认读取已改用「本次读取」三元组接口（ChatGPT 复审⑤）
         return CryptoTrader._load_all_states_ex(self)
 
-    def _persist_states(self, all_states):
+    def _persist_states(self, all_states, **_k):
         return CryptoTrader._persist_states(self, all_states)
 
     def _load_tombstones(self):
@@ -159,7 +159,7 @@ def scenario_persist_failure_returns_false():
     with tempfile.TemporaryDirectory() as d:
         state = os.path.join(d, 'trade_state.json')
         fake = PersistFake()
-        fake._persist_states = lambda all_states: False
+        fake._persist_states = lambda all_states, **_k: False
         with mock.patch.object(trader_260725, 'STATE_FILE', state):
             ok = CryptoTrader.save_batch_state(
                 fake, SYMBOL, 'b_persist_failed', {'is_active': True})

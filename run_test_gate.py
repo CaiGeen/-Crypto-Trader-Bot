@@ -70,11 +70,18 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 # 根目录 pytest 忽略列表：策略回测/单测驱动脚本/归档/送审附件不是被测对象。
 # ⚠ `--ignore` 不是通配符而是**路径前缀**（实测 `--ignore=送审附件_*` 无效，
 # 仍报 4 个 collection error 并中断整轮），所以送审附件目录必须运行时枚举展开。
+# 2026-10-08 R5（漏项⑦）：`TG恢复包_*` 封存交付物同理 —— 其中
+# TG恢复包_v3_20261007\test_tg_diagnostics.py **模块级** `sys.exit(asyncio.run(main()))`
+# 被 pytest 收集即 SystemExit → INTERNALERROR → exit=3（R1–R4 基线实测）。
+# 排除对象是**封存包目录**，不是任何现役测试文件。
 PYTEST_STATIC_IGNORES = [
     'strategies_backtest',
     'trader_test.py',
     'tests_archive',
 ]
+
+# 运行时枚举的目录前缀（--ignore 只认路径前缀，通配无效）：
+RUNTIME_IGNORE_PREFIXES = ('送审附件_', 'TG恢复包_')
 
 
 def build_pytest_args():
@@ -82,7 +89,8 @@ def build_pytest_args():
     try:
         ignores += sorted(
             d for d in os.listdir(ROOT)
-            if d.startswith('送审附件_') and os.path.isdir(os.path.join(ROOT, d)))
+            if d.startswith(RUNTIME_IGNORE_PREFIXES)
+            and os.path.isdir(os.path.join(ROOT, d)))
     except OSError:
         pass
     args = ['-m', 'pytest']
