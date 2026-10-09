@@ -47,7 +47,7 @@ import threading
 import ccxt
 
 # ── 显式可注入路径（环境解耦）─────────────────────────────────────
-PROJECT_DIR = os.environ.get('V62_PROJECT_DIR', r'G:/my-crypto-bot')
+PROJECT_DIR = os.environ.get('V62_PROJECT_DIR', os.path.dirname(os.path.abspath(__file__)))
 HELPER_PATH = (os.environ.get('V62_HELPER_OVERRIDE')
                or os.path.join(PROJECT_DIR, '送审附件_v6.1', 'new_helpers_v6.py'))
 # 🔒 v6.2 落产后再基线（2026-09-01）：RED 用例的判别对象是【旧生产】。生产文件已被
