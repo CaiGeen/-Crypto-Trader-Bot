@@ -168,7 +168,7 @@ def _make_fake(state_path, states):
     # G3 改用读取三元组接口（ChatGPT 复审⑤）：返回「本次读取」的
     # (data, corrupted, detail)。默认**不损坏**，与上面 load_all_states 桩同源。
     fake._load_all_states_ex = lambda: (states, False, "")
-    fake._persist_states = lambda all_s: CryptoTrader._persist_states(fake, all_s)
+    fake._persist_states = lambda all_s, **_k: CryptoTrader._persist_states(fake, all_s, **_k)
     fake._update_registry = lambda s, b, i, **f: CryptoTrader._update_registry(fake, s, b, i, **f)
     # ⚠️ C1/G1 三条包装**必须**绑真实实现（第 8 次 MagicMock 陷阱）：
     # 漏绑 → MagicMock 返回值不是 True → `is not True` 恒成立 → 门禁在**无注入**时也拦下单，
@@ -346,7 +346,7 @@ def _inject_confirm_write_failure(fake):
     """只让含 CONFIRMED 的落盘失败；意图写盘（PENDING_CREATE 等）照常成功。"""
     real = fake._persist_states
 
-    def _persist(all_s):
+    def _persist(all_s, **_k):
         for bs in (all_s or {}).values():
             for b in bs.values():
                 if not isinstance(b, dict):
@@ -354,7 +354,7 @@ def _inject_confirm_write_failure(fake):
                 for e in (b.get("protection_registry") or {}).values():
                     if isinstance(e, dict) and e.get("state") == "CONFIRMED":
                         return False
-        return real(all_s)
+        return real(all_s, **_k)
 
     fake._persist_states = _persist
 

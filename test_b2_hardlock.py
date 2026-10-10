@@ -67,6 +67,8 @@ def make_fake(states):
     fake._api_cooldown_until = 0
     fake._states = states
     fake.load_all_states = lambda: states
+
+    fake._load_all_states_ex = lambda: (states, False, "")
     fake.save_batch_state = lambda s, b, d: states.setdefault(s, {}).update({b: d})
     fake.send_tg_notification = lambda text, **kw: fake.sent.append((kw.get('level', 'info'), str(text)))
     fake.sent = []

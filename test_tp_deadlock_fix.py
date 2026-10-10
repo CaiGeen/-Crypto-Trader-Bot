@@ -76,6 +76,8 @@ def _make_fake(states):
     fake.send_tg_notification = lambda text, **kw: fake.sent.append((kw.get('level', 'info'), str(text)))
     fake.save_batch_state = lambda s, b, d: fake.saved.append(dict(d))
     fake.load_all_states = lambda: states
+
+    fake._load_all_states_ex = lambda: (states, False, "")
     fake._update_registry = lambda s, b, i, **f: CryptoTrader._update_registry(fake, s, b, i, **f)
 
     # C1/G1（契约 §24.3）：创建路径改走 _update_registry_checked，

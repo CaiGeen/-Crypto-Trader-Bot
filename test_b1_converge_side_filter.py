@@ -107,7 +107,7 @@ class Ex:
 
     def _mk(self, oid, otype='STOP_MARKET', amount=1.0, stop=75001.0,
             status='open', filled=0.0, avg=None):
-        o = {'id': oid, 'status': status, 'filled': filled, 'amount': amount,
+        o = {'id': oid, 'symbol': SYM, 'status': status, 'filled': filled, 'amount': amount,
              'type': otype, 'stopPrice': stop, 'side': 'sell',
              'average': avg if avg is not None else stop, 'price': stop}
         self.orders[oid] = o
@@ -315,6 +315,8 @@ def t3_same_direction_multi_batch_still_converges():
     b['monitor_error'] = False
     _state_write(t, {SYM: {'batch_A': a, 'batch_B': b}})
     ex.positions = [_pos('long', 1.0)]
+    # U2: the target's historical ENTRY is booked and has authoritative terminal quantity.
+    ex._mk('E_LONG', otype='LIMIT', amount=1.0, status='closed', filled=1.0)
     ex._mk('SL_A', otype='STOP_MARKET', amount=1.0, stop=75001.0)
     ex._mk('E_batch_A', otype='LIMIT', amount=1.0, stop=76620.0)
     ex.open_orders = [ex.orders['SL_A'], ex.orders['E_batch_A']]

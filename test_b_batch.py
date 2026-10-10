@@ -77,6 +77,8 @@ class FakeExchange:
         self.scan_fail = False         # fetch_open_orders → NetworkError
         self.markets = None            # precision 注入（D-B1 容差）
         self._id_seq = 0
+        # Explicit historical ENTRY fact for the default already-filled batch.
+        self.seed_filled('E_BOOKED', 'LIMIT', 'BUY', 0.002, 85000.0)
 
     def _ev(self, label, detail=""):
         self.events.append((label, str(detail)))
@@ -102,6 +104,11 @@ class FakeExchange:
         if oid in self.archive:
             return dict(self.archive[oid])
         raise ccxt.OrderNotFound(f"Unknown order sent {oid}")
+
+    def fetch_my_trades(self, symbol, since=None, limit=None, params=None, **kw):
+        """成交明细（生产 ccxt 必有）。默认夹具事实：无成交。
+        需要「有成交」语义的用例用 self.trades 注入，不得靠缺方法制造 UNKNOWN。"""
+        return [dict(t) for t in getattr(self, 'trades', [])]
 
     def create_order(self, symbol=None, type=None, side=None, amount=None,
                      price=None, params=None, **kw):
@@ -205,6 +212,7 @@ def make_fake_b(env, ex):
     fake._converge_alert_counts = {}             # ⚠️ 不绑 → getattr MagicMock 非 None
     fake.tombstone_file = env.tomb_file
     fake.exchange = ex
+    fake._fee_float = CryptoTrader._fee_float
     fake._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
     fake.sent = []
     fake.send_tg_notification = lambda text, **kw: fake.sent.append(
@@ -226,7 +234,19 @@ def make_fake_b(env, ex):
              # 🔥 P5：FULL_FILL 共享 finalizer（结算段已从 monitor 抽到该函数；
              # 未绑定 → MagicMock 静默吞掉 → 撤 TP/clear 全不发生，测试假红）
              '_finalize_limit_full_fill', '_claim_settlement_reported',
-             '_batch_net_position', '_notify_snapshot')
+             '_batch_net_position', '_notify_snapshot',
+             # 🔥 F2/F3（真实成交价入账 + 成本待补证）：finalizer 结算段新增了
+             # 成本门槛调用。漏绑 → 自动 mock → 解包 2 元组抛 ValueError
+             # （实测 "not enough values to unpack (expected 2, got 0)"）→
+             # finalizer 中断 → 撤 TP/clear 全不发生 → B1/B0 假红。
+             '_resolve_entry_fill_evidence', '_record_fill_evidence',
+             '_backfill_entry_costs', '_settlement_cost_gate',
+             '_defer_settlement_for_cost', '_finalize_cost_pending_settlement',
+             # 🔥 事故修复 2026-10-06（转审第三轮）：清账收敛新增的四个 helper。
+             # 漏绑 → MagicMock 顶替 → ②贡献闸门 / ③'撤后事实复核被**静默掏空**
+             # （实测 _owned_ids 变 MagicMock → `in` 恒 False → 他批次被误判 L3 孤儿）。
+             '_batch_position_contribution', '_post_cancel_fact_check',
+             '_post_cancel_fill_evidence', '_fill_window_since_ms')
     for _n in _bind:
         if hasattr(CryptoTrader, _n):
             setattr(fake, _n, (lambda _n=_n: lambda *a, **k: getattr(CryptoTrader, _n)(
@@ -237,7 +257,7 @@ def make_fake_b(env, ex):
 def _batch(**over):
     b = {
         'is_active': True, 'batch_id': BATCH, 'symbol': SYMBOL, 'side': 'BUY',
-        'is_hedge_mode': False, 'entry_orders': [], 'stop_steps': [55000.0],
+        'is_hedge_mode': False, 'entry_orders': ['E_BOOKED'], 'stop_steps': [55000.0],
         'take_profit_price': 60000.0, 'current_sl_id': 'sl1', 'tp_order_id': 'tp1',
         # 🔥 P5：限价平仓事务必有 close_op_id（finalizer 代际隔离依赖，生产契约）
         'close_op_id': 'OP1',
@@ -393,7 +413,7 @@ def t_proof_gate():
         # PRE_ENTRY：零敞口批次接受 scope=PRE_ENTRY
         with _Env() as env3:
             env3.write_state({SYMBOL: {BATCH: _batch(
-                last_filled_count=0, close_phase=0, pending_close=False,
+                entry_orders=[], last_filled_count=0, close_phase=0, pending_close=False,
                 is_programmatic_cancel=False, current_sl_id=None, tp_order_id=None,
                 settled_by_limit_close=False)}})
             fake3 = make_fake_b(env3, FakeExchange())
@@ -471,7 +491,7 @@ def t_converge_l1_l2_l3():
                                    intent=dict(L2_INTENT), role='SL', layer=2),
                 }),
             'batch_o': _batch(batch_id='batch_o', current_sl_id='oth1', tp_order_id=None,
-                              last_filled_count=0, close_phase=0, pending_close=False,
+                              entry_orders=[], last_filled_count=0, close_phase=0, pending_close=False,
                               is_programmatic_cancel=False, settled_by_limit_close=False,
                               protection_registry={}),
         }})

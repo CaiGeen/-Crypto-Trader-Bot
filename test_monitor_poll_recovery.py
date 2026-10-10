@@ -94,6 +94,28 @@ REAL_HELPERS = (
     # 未绑定 → MagicMock，verdict 恒非字符串 → 落账被静默跳过，S6i-3/S6j-2 假红、
     # 且看不出是替身问题（打印的是 `写入失败（<MagicMock ...>）`）。
     "_write_monitor_error_if_owner",
+    # ── F2/F3（真实成交价入账 + 成本待补证）新增的 6 个辅助 ─────────────────
+    # 它们在**成交分支内**被调用；未绑定 → 返回 MagicMock → 解包 4 元组抛
+    # "not enough values to unpack (expected 4, got 0)" → 被既有 except 吞成
+    # 「补查开仓订单状态失败」→ 成交识别静默中止 → T1b 假红。绑真实实现后
+    # 语义与生产一致（本文件 seed 无 cost_pending → 补证调用零请求、零网络）。
+    "_resolve_entry_fill_evidence", "_record_fill_evidence",
+    "_backfill_entry_costs", "_settlement_cost_gate",
+    "_defer_settlement_for_cost", "_finalize_cost_pending_settlement",
+    # ── R3 禁止清账内存锁（S6g-1 保真度修复）────────────────────────────────
+    # 未绑定 → 自动 mock：收尾段读锁恒 truthy → 误判超限跳过清账（S6g-1 clear=0
+    # 假红）。绑定真实 get/set/drop + `_no_clear_latches`（底层字典访问器），
+    # 配合 `_make_fake` 里显式置空的 `_monitor_resume_no_clear_latches`。
+    "_no_clear_latches", "_no_clear_latch_get", "_no_clear_latch_set",
+    "_no_clear_latch_drop",
+    # ── R5 复审打回修复（2026-10-08）新增的两个自包含方法辅助 ─────────────────
+    # 同型保真度坑（本文件第七/第八个）：未绑定 → 裸 MagicMock ——
+    # `_persist_guard_arrays()` 返回 MagicMock 混进 S6b 真实落盘的
+    # json.dump → `Object of type MagicMock is not JSON serializable`（落盘 0 次、
+    # handoff=False）；`_fill_window_cover()` 返回 MagicMock 解包 2 元组抛
+    # ValueError → classify_failed → S6f-3/S6f-5「恢复中止」同源。
+    # 绑真实实现 = S6g-1 同型修复，判据零改动。
+    "_fill_window_cover", "_persist_guard_arrays",
 )
 
 
@@ -137,6 +159,11 @@ def _make_fake(state_path, states):
     ex.amount_to_precision.side_effect = lambda s, v: v
     ex.price_to_precision.side_effect = lambda s, v: v
     fake.exchange = ex
+    # ⚠️ 保真度：_fee_float 是 @staticmethod（REAL_HELPERS 的「传 self」形态不适用）。
+    # 漏绑 → 自动 mock → 返回 MagicMock → `f > 0` 抛 TypeError → 被成交分支的
+    # except 吞成「补查开仓订单状态失败」→ 路径静默不执行（F2/F3 在填充链引入了
+    # 这一依赖，故此处显式绑真实实现）。
+    fake._fee_float = CryptoTrader._fee_float
 
     fake.sent = []
     fake.send_tg_notification = lambda text, **kw: fake.sent.append(
@@ -178,6 +205,13 @@ def _make_fake(state_path, states):
     fake._finally_cleanup_decision = lambda s, b: ('skip', None)
     fake._unresolved_intent_batches = set()
     fake._poll_degraded_batches = set()
+    # ── R3 禁止清账内存锁（S6g-1 保真度修复，2026-10-08）────────────────────
+    # fake 是裸 MagicMock：`_no_clear_latch_get` 未绑定 → 自动 mock 返回 truthy
+    # 对象 → 收尾段 `_fin_no_clear_latch` 恒真 → 误判「续跑已耗尽」跳过清账
+    # → S6g-1 阳性对照 clear=0 假红（本文件实测第六个同型坑，与前五个坑同族）。
+    # 锁字典必须显式置空（真实实现里 `or {}` 挡不住 getattr 自动 mock），方法绑
+    # 真实实现；S6g 判据（decision/cancel_limit/converge/clear ≥1）原样保留。
+    fake._monitor_resume_no_clear_latches = {}
     fake._poll_fail_streak = {}
     fake._poll_first_fail_time = {}
     fake._poll_alert_lock = threading.RLock()
@@ -192,7 +226,7 @@ def _make_fake(state_path, states):
     # 就会抛「Object of type MagicMock is not JSON serializable」并让落盘失败，
     # 那是**测试替身保真度问题、不是产品行为**（第五个坑）。真实落盘语义见另一份文件。
     fake.saved = []
-    def _record_save(s, b, d):
+    def _record_save(s, b, d, **_k):
         # 写盘契约（save_batch_state docstring）：仅返回 True 表示已持久化。
         # 记录式桩沿用 append，但必须回 True —— 回 None 会被 `is True` 判成
         # 落盘失败，那是**桩的保真度问题**，不是被测行为。
@@ -274,8 +308,11 @@ def check_t1_recovers_and_places_sl_after_failed_round():
             [],
         ]
         # 入场单已成交（监控靠 fetch_order 判定）
+        # R5门禁（漏项⑦）：按已定方案补真实夹具字段 side（方向观测证据，
+        # LONG 批次入场单 = buy）——side 缺失会被 side_evidence_missing 正确拒绝。
         ex.fetch_order.return_value = {
             "id": ENTRY_ID, "status": "closed", "average": 58000.0,
+            "side": "buy",
             "info": {"cumQuote": "24940", "executedQty": "0.43", "updateTime": 1},
         }
 
@@ -442,8 +479,8 @@ def check_s6_complete_first_business_cycle():
         saves = []
         _real_save_batch_state = CryptoTrader.save_batch_state
 
-        def durable_save(symbol, batch_id, data):
-            ok = _real_save_batch_state(fake, symbol, batch_id, data)
+        def durable_save(symbol, batch_id, data, **_k):
+            ok = _real_save_batch_state(fake, symbol, batch_id, data, **_k)
             if ok is True:
                 saves.append(dict(_disk(state_path).get(symbol, {}).get(batch_id, {}) or {}))
             return ok
@@ -645,7 +682,7 @@ def _s6f_drive(sl_type, *, amount=0.43, close_position="false"):
 
         saves = []
 
-        def durable_save(symbol, batch_id, data):
+        def durable_save(symbol, batch_id, data, **_k):
             states.setdefault(symbol, {})[batch_id] = dict(data)
             saves.append(dict(data))
             return True
@@ -907,7 +944,7 @@ def _s6i_run(replace_generation):
             {"id": ENTRY_ID, "status": "open"}]
         saves = []
 
-        def durable_save(symbol, batch_id, data):
+        def durable_save(symbol, batch_id, data, **_k):
             states.setdefault(symbol, {})[batch_id] = dict(data)
             saves.append(dict(data))
             return True
@@ -1016,7 +1053,7 @@ def _s6j_run(register_during_notify):
             {"id": ENTRY_ID, "status": "open"}]
         saves = []
 
-        def durable_save(symbol, batch_id, data):
+        def durable_save(symbol, batch_id, data, **_k):
             states.setdefault(symbol, {})[batch_id] = dict(data)
             saves.append(dict(data))
             return True
@@ -1226,7 +1263,7 @@ def _s6k_run(send_return, save_return=True, finish_return=True):
 
         saves = []
 
-        def durable_save(symbol, batch_id, data):
+        def durable_save(symbol, batch_id, data, **_k):
             if save_return is not True:
                 return save_return        # 未确认落盘：连记录都不该有
             states.setdefault(symbol, {})[batch_id] = dict(data)

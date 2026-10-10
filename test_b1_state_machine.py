@@ -84,7 +84,7 @@ def _bind_helpers(fake, states):
     # states 为共享引用，本 fake 不做真实落盘——但 **必须返回 True**：
     # G1 门禁读 `_persist_states` 的返回值（无异常 ≠ 已落盘），返回 None 会被判为
     # 「写入失败」→ Fail-Closed 拦下单 → T5/T6/T9 假红。此处语义 = 「模拟落盘成功」。
-    fake._persist_states = lambda all_s: True
+    fake._persist_states = lambda all_s, **_k: True
     for _n in ('_final_pre_create_check', '_commit_protection_with_g3',
                '_g3a_converge_race_order', '_g3_cancel_race_order',
                '_g3_log_position_recheck', '_find_registry_identity_by_order_id',

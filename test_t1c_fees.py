@@ -30,9 +30,21 @@ TMP = tempfile.mkdtemp(prefix='t1c_')
 
 
 # ── 轻量 resolver harness（__new__ 绕 __init__，纯函数离线）──────────────
+# _safe_api_call 的控制参数（retries/delay/auth_probe）由真实实现消费、不会转发给
+# 端点；F2/F3-R3 起费用解析显式传 retries=2（有界请求预算），桩必须同形剥离，
+# 否则端点收到未知 kwargs 抛 TypeError → 全部降级 query_failed（假红）。
+_CTL_KW = ('retries', 'delay', 'auth_probe')
+
+
+def _passthrough_api(fn, *a, **k):
+    for _c in _CTL_KW:
+        k.pop(_c, None)
+    return fn(*a, **k)
+
+
 def _resolver_trader(fills_by_oid=None, algo_by_id=None, fail=False):
     t = CryptoTrader.__new__(CryptoTrader)
-    t._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
+    t._safe_api_call = _passthrough_api
     t._fills_by_oid = fills_by_oid or {}
     t._algo_by_id = algo_by_id or {}
     t._fail = fail
@@ -291,7 +303,10 @@ def f11_four_path_wiring_locked():
     src = open(os.path.abspath(trader_260725.__file__), encoding='utf-8').read()
     n_direct = src.count('self._compute_settlement_fees(')
     n_helper = src.count('self._settle_protection_fill(')
-    assert n_direct == 3, 'finalizer/市价直调 + helper 内调用 = 3（实际 %d）' % n_direct
+    # 2026-10-06 F2/F3：+1 = 成本待补证 finalizer（_finalize_cost_pending_settlement）
+    # 复用同一解析器直调。新增结算路径时本计数**必须**显式加一——它防的是
+    # 「有人在 record 前自算费用」；下面第 316 行的语义锁才是不变量。
+    assert n_direct == 4, 'finalizer/市价直调 + helper 内调用 + 成本待补证 finalizer = 4（实际 %d）' % n_direct
     assert n_helper == 2, 'SL 与 TP 各调用 1 次 _settle_protection_fill（实际 %d）' % n_helper
     assert '_resolve_order_fees' in src, 'resolver 缺失'
     assert 'total_fees = total_entry_fee + exit_fee' not in src, 'SL/TP 旧全量扣减残留'
@@ -401,7 +416,7 @@ def _settle_batch(**extra):
 def make_settlement_trader():
     t = CryptoTrader.__new__(CryptoTrader)
     t._state_lock = threading.RLock()
-    t._safe_api_call = lambda fn, *a, **k: fn(*a, **k)
+    t._safe_api_call = _passthrough_api
     t.exchange = type('Ex', (), {})()
     t.exchange.fetch_my_trades_calls = 0
     t.exchange.fetch_my_trades = lambda *a, **k: (

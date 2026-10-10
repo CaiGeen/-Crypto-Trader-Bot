@@ -379,7 +379,8 @@ class TombstoneEntryIntegrityTests(unittest.TestCase):
         fake._load_all_states_ex = (
             lambda: trader_260725.CryptoTrader._load_all_states_ex(fake))
         fake._persist_states = (
-            lambda all_states: trader_260725.CryptoTrader._persist_states(fake, all_states))
+            lambda all_states, **_k: trader_260725.CryptoTrader._persist_states(
+                fake, all_states, **_k))
         # 必须绑定真实墓碑读取：MagicMock 会吞掉 _load_tombstones 与
         # _tombstones_degraded，使"条目损坏 → DEGRADED"路径被静默跳过（假绿）。
         fake._load_tombstones = (
@@ -516,7 +517,7 @@ class TombstoneEntryIntegrityTests(unittest.TestCase):
             buf = io.StringIO()
             with mock.patch.object(trader_260725, 'STATE_FILE', state):
                 # 第一次：墓碑写成功，账本写失败（"第二次写盘失败"）
-                fake._persist_states = lambda s: False
+                fake._persist_states = lambda s, **_k: False
                 with contextlib.redirect_stdout(buf):
                     rc1 = trader_260725.CryptoTrader.clear_batch_state(
                         fake, self.SYMBOL, 'batch_z', proof=proof)

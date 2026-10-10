@@ -47,7 +47,7 @@ import threading
 import ccxt
 
 # ── 显式可注入路径（环境解耦）─────────────────────────────────────
-PROJECT_DIR = os.environ.get('V62_PROJECT_DIR', r'G:/my-crypto-bot')
+PROJECT_DIR = os.environ.get('V62_PROJECT_DIR', os.path.dirname(os.path.abspath(__file__)))
 HELPER_PATH = (os.environ.get('V62_HELPER_OVERRIDE')
                or os.path.join(PROJECT_DIR, '送审附件_v6.1', 'new_helpers_v6.py'))
 # 🔒 v6.2 落产后再基线（2026-09-01）：RED 用例的判别对象是【旧生产】。生产文件已被
@@ -278,7 +278,7 @@ class FakeSelf62:
         # （R2-g 的磁盘 reason 判定会失真）——改为 deepcopy + persist 成功才写回。
         return copy.deepcopy(self._states)
 
-    def _persist_states(self, all_states):
+    def _persist_states(self, all_states, **_k):
         # 🔒 GREEN 修正：历史快照用 deepcopy——避免后续嵌套 registry 修改
         # 污染已记录的 persist 历史（dict(v) 浅拷贝不够）。
         self.persisted.append(copy.deepcopy(all_states))

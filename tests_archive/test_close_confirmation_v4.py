@@ -110,7 +110,7 @@ class FakeSelf:
             raise RuntimeError('load_all_states failed (simulated)')
         return self._states
 
-    def _persist_states(self, all_states):
+    def _persist_states(self, all_states, **_k):
         self.persisted.append({k: {b: dict(v) for b, v in s.items()}
                                for k, s in all_states.items()})
 

@@ -245,7 +245,7 @@ def make_fake(states, open_orders):
     # G3b/G3a 链同绑（_persist_states 桩 + states 共享引用，registry 语义由 B2 套件覆盖）。
     import threading as _th
     fake._state_lock = _th.Lock()          # 生产同款非重入锁
-    fake._persist_states = lambda all_s: True  # G1 门禁读返回值；None 会被判为写入失败
+    fake._persist_states = lambda all_s, **_k: True  # G1 门禁读返回值；None 会被判为写入失败
                                           # → Fail-Closed 恢复单也拦 → 假红
     for _n in ('_final_pre_create_check', '_commit_protection_with_g3',
                '_g3a_converge_race_order', '_g3_cancel_race_order',

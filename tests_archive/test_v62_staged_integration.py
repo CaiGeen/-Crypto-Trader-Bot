@@ -96,7 +96,7 @@ V62 = R._extract_functions(
 class _PersistAtFake(FakeSelf62):
     """扩展：第 N 次 _persist_states 精确失败（BEGIN 成功但 commit 失败等时序）。"""
 
-    def _persist_states(self, all_states):
+    def _persist_states(self, all_states, **_k):
         self.persisted.append(copy.deepcopy(all_states))
         if getattr(self, '_persist_fail_at', None) is not None:
             self._persist_call_count = getattr(self, '_persist_call_count', 0) + 1

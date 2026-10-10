@@ -33,8 +33,22 @@
 
 ## 备注
 
-- 另有 4 个从未提交的旧文件仍在项目根（当时通过、未动）：
-  `test_close_confirmation_v3/v4/v5.py`、`test_position_close_confirmation.py`
-  ——属 v6/v62 之前的旧版确认测试，现仍在回归池且 rc=0；如后续要瘦身可同样处理。
-- 回归基线自本目录生效：`for f in test_*.py` = 42 文件，期望 **41 rc=0 +
-  1 非零（test_orphan_guard，仅沙箱）**。
+- 下方 C 组所列 4 个旧版确认测试已移入本目录；不再位于项目根目录，也不属于现行发布门禁。
+- 上述回归基线是本归档记录建立时的历史快照（42 文件），不代表当前根目录测试数量或现行发布门禁结果。
+
+## C 组：R5 发布门禁移出（2026-10-10，保留历史归档）
+
+移出原因：这些测试的被测对象是**评审期的提议实现、历史对照件或 staged 组装件**，依赖机器本地 `G:\tmp`，并非当前引擎 `trader_260725.py`（`969B8138`）。它们通过不能证明当前候选通过，故不再作为发布门禁。文件内容与断言**未改动**，仅移入本目录。
+
+| 文件 | 被测对象 | 历史语义相关测试（覆盖口径另行核对） | 复活条件 | 工作树 SHA256（Windows/CRLF） |
+|---|---|---|---|---|
+| test_close_confirmation_v3.py | 提议实现 v3（被测对象 `G:\tmp\new_helpers_v3.py`，非生产代码）及负向对照 `new_helpers_after.py` | `test_close_confirmation_v6/v62.py`（测仓内 helper 与文档代码块）；`test_v62_red_first.py`（测旧基线）。均非现役引擎直测 | 仅当需复核 v3 提议的 close 判据时复活，并把输入改为仓内夹具 | `616BE1B2B31D2E5C…` |
+| test_close_confirmation_v4.py | 提议实现 v4（`G:/tmp/new_helpers_v4.py`）；v3 负向对照；v3_entry 档案 | 同上 | 同上 | `69DD0620231CFA65…` |
+| test_close_confirmation_v5.py | 提议实现 v5（`G:/tmp/new_helpers_v5.py`）；v4/v3/v3_entry 对照 | 同上 | 同上 | `632D72F9A0792746…` |
+| test_position_close_confirmation.py | 提议实现 `G:\tmp\new_helpers_after.py`；负向对照 `new_helpers_naive.py`；`probe_position_shape.py` 实测 | `test_p5_closecancel` / `test_v62_red_first.py`（历史语义相关，非现役引擎直测） | 同上 | `DACDBAF6BFBB8015…` |
+| test_v62_green.py | v62 staged 组装版 `G:\tmp\v62_staged\trader_260725_v62_staged.py`（由 `G:\tmp\build_v62_staged.py` 生成，非仓库源码） | `test_v62_red_first.py`（历史基线） | 仅当 staged 构建链纳入仓库并审计后复活 | `2DB657A591C7119D…` |
+| test_v62_staged_integration.py | 同上 staged 组装件 | 同上 | 同上 | `87C8BF40233C76CE…` |
+
+**ENTRY 入口路径（本轮收口）**：历史 `ENTRY or []` 缺陷（把不可判定快照退化成空列表）在候选引擎上**未复现**（离线探针 5/5：None／dict／字符串／查询异常均拒绝，合法空列表继续逐订单终态验证）。现役引擎该判据的负向回归由 `test_entry_gate_failclosed.py`（直接驱动 `trader_260725.py` 的 `_cancel_and_verify_entry_orders`）承担，不再只依据“无同名断言”。
+
+哈希值按 Windows 工作树中的文件字节计算（CRLF）；与 Git 对象库中规范化为 LF 的 blob 哈希不同。归档文件未改内容，仅从项目根移动至本目录。

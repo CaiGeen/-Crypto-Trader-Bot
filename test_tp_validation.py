@@ -74,10 +74,12 @@ def make_fake(states):
     fake._api_cooldown_until = 0
     fake._states = states
     fake.load_all_states = lambda: states
+
+    fake._load_all_states_ex = lambda: (states, False, "")
     fake.save_batch_state = lambda s, b, d: states.setdefault(s, {}).update({b: d})
     # 账本写：内存闭环模拟「磁盘正常」（真实 .bak/原子写契约由 test_r12 6 项覆盖）。
     # 不绑会让 `... is not True` 恒成立 → 清理被误拦 → T5c 假红。
-    fake._persist_states = lambda all_states: True
+    fake._persist_states = lambda all_states, **_k: True
     # 墓碑四件套必须真实：第十三轮起 clear_batch_state 检查 _persist_tombstones
     # 的布尔返回，未绑定的 MagicMock 恒非 True → 清理被当成落盘失败拦截。
     # 语义由 test_c_batch(23) / test_m2_m4(24) 覆盖，此处只要求真实落盘闭环。
