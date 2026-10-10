@@ -10,6 +10,7 @@ watchdog.py - 量化交易 Bot 守护进程
 
 import json
 import os
+import re
 import sys
 import time
 import signal
@@ -138,6 +139,65 @@ def log_message(msg: str):
 _bot_log_lock = threading.Lock()
 _bot_log_fh = None
 _bot_log_day = None
+_bot_log_failure_notice_lock = threading.Lock()
+_bot_log_failure_notice_at = 0.0
+BOT_LOG_FAILURE_NOTICE_INTERVAL = 60
+
+# Only these single-line, explicitly routine signatures may be hidden after a
+# confirmed write+flush. Incident snapshots, errors, and multiline details do
+# not match these anchored expressions.
+_NORMAL_TG_EMPTY_POLL_RE = re.compile(
+    r"^\[TGDIAG\] \[REQ\] getUpdates 轮询成功 状态=200 "
+    r"耗时=\d+(?:\.\d+)?s 更新数=0$"
+)
+_NORMAL_RATE_SUMMARY_RE = re.compile(
+    r"^📊 \[限流观测\] 近\d+s 调用: "
+    r"(?:无|[A-Za-z0-9_×, ]+) \| 估算weight≈\d+"
+    r"(?: USED-WEIGHT 最新=\d+ 峰值60s=\d+)?"
+    r"(?: ORDER-10S 最新=\d+ 峰值60s=\d+)?"
+    r"(?: ORDER-1M 最新=\d+ 峰值60s=\d+)?$"
+)
+_NORMAL_HEALTH_SNAPSHOT_RE = re.compile(
+    r"^\[TGDIAG\] \[TASK\] updater\.running=True app\.running=True "
+    r"task\.exists=True done=False cancelled=False exc=None "
+    r"wait_at=\[[^\r\n]*\]$"
+)
+
+
+def _is_normal_diagnostic_line(line: str) -> bool:
+    """True only for known routine one-line diagnostics (no newline included)."""
+    text = str(line).rstrip("\r\n")
+    return any(pattern.fullmatch(text) for pattern in (
+        _NORMAL_TG_EMPTY_POLL_RE,
+        _NORMAL_RATE_SUMMARY_RE,
+        _NORMAL_HEALTH_SNAPSHOT_RE,
+    ))
+
+
+def _notify_bot_log_failure():
+    """Rate-limited, non-blocking console-only warning; never writes another log."""
+    global _bot_log_failure_notice_at
+    acquired = False
+    try:
+        acquired = _bot_log_failure_notice_lock.acquire(False)
+        if not acquired:
+            return
+        now = time.monotonic()
+        if now - _bot_log_failure_notice_at < BOT_LOG_FAILURE_NOTICE_INTERVAL:
+            return
+        _bot_log_failure_notice_at = now
+    except Exception:
+        return
+    finally:
+        if acquired:
+            try:
+                _bot_log_failure_notice_lock.release()
+            except Exception:
+                pass
+    try:
+        _CONSOLE_QUEUE.put_nowait("⚠️ 主程序日志落盘失败；本行已回退显示控制台\n")
+    except Exception:
+        pass
 
 
 def _bot_log_path(day: str = None) -> str:
@@ -162,8 +222,8 @@ def _prune_bot_logs():
         pass
 
 
-def write_bot_log(line: str):
-    """把主程序 stdout 的一行写入当日交易日志（跨天自动切换文件）。"""
+def write_bot_log(line: str) -> bool:
+    """把主程序 stdout 的一行写入当日交易日志；返回写入并 flush 的结果。"""
     global _bot_log_fh, _bot_log_day
     try:
         day = datetime.now().strftime("%Y%m%d")
@@ -183,8 +243,10 @@ def write_bot_log(line: str):
             stamp = datetime.now().strftime("%H:%M:%S")
             _bot_log_fh.write(f"[{stamp}] {str(line).rstrip(chr(10) + chr(13))}\n")
             _bot_log_fh.flush()
+        return True
     except Exception:
-        pass
+        _notify_bot_log_failure()
+        return False
 
 
 def close_bot_log():
@@ -436,7 +498,9 @@ def monitor_process(process):
     """
     try:
         for line in process.stdout:
-            write_bot_log(line)      # #4：落盘优先（取证不依赖控制台）
+            logged = write_bot_log(line)  # 只有确认落盘后才允许省略常规行
+            if logged and _is_normal_diagnostic_line(line):
+                continue
             try:                      # 入队显示；队满则丢行（文件已有全量）
                 _CONSOLE_QUEUE.put_nowait(line)
             except Exception:
