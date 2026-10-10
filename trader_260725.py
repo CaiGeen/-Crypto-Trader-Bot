@@ -8237,7 +8237,7 @@ class CryptoTrader:
             # —— 提交点之后 = 纯信息步骤：任何失败只记录，不改变接管与返回值 ——
             try:
                 print(f"\n📊 {len(entry_orders)} 层开仓条件单布置完毕，本批次总配额数量: {batch_total_amount}")
-                print("💡 说明：止盈与止损挂单参数已预生成，成交后立即挂出（1秒内）。\n")
+                print("💡 说明：止盈与止损挂单参数已预生成；识别成交后按现有流程创建并核验保护单。\n")
 
                 remaining_margin = usdt_free - total_required_margin - used_margin
                 margin_usage_ratio = (total_required_margin + used_margin) / usdt_free * 100 if usdt_free > 0 else 0
@@ -12996,7 +12996,7 @@ class CryptoTrader:
     def _place_prepared_orders_immediately(self, symbol, batch_id, idx, batch_filled_amount,
                                            prepared_tp_params, layer_sl_params,
                                            is_hedge_mode, params_base, stop_steps):
-        """🔥 成交后立即使用预生成的参数挂止盈和止损单（1秒内完成）
+        """成交被识别后，按现有流程使用预生成参数创建并核验止盈和止损单。
         注意：此方法只在 current_sl_id 为 None 时调用，即首次成交时
         B1/P0-2 语义（规格 §3.2/§5.1/§6.3/§13）：意图先落盘 → create → verify(kind) → 状态迁移：
           verify success → CONFIRMED + Commit（current_sl_id/tp_order_id）
