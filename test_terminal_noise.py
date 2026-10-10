@@ -21,6 +21,7 @@ def _route(monkeypatch, lines, write_ok=True):
 
 def test_known_routine_lines_hidden_only_after_confirmed_log(monkeypatch):
     routine = [
+        "[TGDIAG] [REQ] getUpdates 进入 do_request（尚未知是否发出）\n",
         "[TGDIAG] [REQ] getUpdates 轮询成功 状态=200 耗时=10.23s 更新数=0\n",
         "📊 [限流观测] 近60s 调用: fetch_order×2 | 估算weight≈2"
         " USED-WEIGHT 最新=10 峰值60s=20\n",
@@ -40,6 +41,8 @@ def test_incidents_business_multiline_and_unknown_remain_visible(monkeypatch):
         "Traceback (most recent call last):\n  File \"bot.py\", line 1\n",
         "📊 [限流观测] this format is not recognized\n",
         "[TGDIAG] [REQ] getUpdates 轮询成功 状态=429 耗时=1.1s 更新数=0\n",
+        "[TGDIAG] [REQ] getUpdates 异常【已尝试往返】类型链=ReadTimeout 耗时=30.00s\n",
+        "[TGDIAG] [REQ] getUpdates 进入 do_request（尚未知是否发出） extra\n",
         "[TGDIAG] [TASK] updater.running=True app.running=True task.exists=True "
         "done=False cancelled=True exc=None wait_at=[]\n",
     ]

@@ -150,6 +150,9 @@ _NORMAL_TG_EMPTY_POLL_RE = re.compile(
     r"^\[TGDIAG\] \[REQ\] getUpdates 轮询成功 状态=200 "
     r"耗时=\d+(?:\.\d+)?s 更新数=0$"
 )
+_NORMAL_TG_REQUEST_START_RE = re.compile(
+    r"^\[TGDIAG\] \[REQ\] getUpdates 进入 do_request（尚未知是否发出）$"
+)
 _NORMAL_RATE_SUMMARY_RE = re.compile(
     r"^📊 \[限流观测\] 近\d+s 调用: "
     r"(?:无|[A-Za-z0-9_×, ]+) \| 估算weight≈\d+"
@@ -169,6 +172,7 @@ def _is_normal_diagnostic_line(line: str) -> bool:
     text = str(line).rstrip("\r\n")
     return any(pattern.fullmatch(text) for pattern in (
         _NORMAL_TG_EMPTY_POLL_RE,
+        _NORMAL_TG_REQUEST_START_RE,
         _NORMAL_RATE_SUMMARY_RE,
         _NORMAL_HEALTH_SNAPSHOT_RE,
     ))
