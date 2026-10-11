@@ -380,9 +380,12 @@ class PollAlertBudget:
             self._persist_candidate(candidate)
             return False
 
-    def close_without_recovery(self, event_id: str, reason: str,
-                               now: float | None = None) -> bool:
+    def finish_batch_without_recovery(self, event_id: str, batch_id: str,
+                                      reason: str,
+                                      now: float | None = None) -> bool:
+        """Retire one terminal batch without closing siblings' incident budget."""
         now = time.time() if now is None else float(now)
+        batch_id = str(batch_id) if batch_id is not None else "unknown"
         with self._lock:
             if not self._available:
                 return False
@@ -390,9 +393,23 @@ class PollAlertBudget:
             event = self._find_event(candidate, event_id)
             if event is None or event.get("status") != "OPEN":
                 return False
-            event["status"] = "CLOSED"
-            event["resolution"] = str(reason)[:200]
-            event["resolved_at"] = now
+            batches = event.get("batches", [])
+            if batch_id not in batches:
+                return True
+            event["batches"] = [item for item in batches if item != batch_id]
+            observation = event.get("recovery_observation")
+            if isinstance(observation, dict):
+                observation.get("success_rounds", {}).pop(batch_id, None)
+            if not event["batches"]:
+                event["status"] = "CLOSED"
+                event["resolution"] = str(reason)[:200]
+                event["resolved_at"] = now
+            else:
+                event.setdefault("terminal_batches", []).append({
+                    "batch_id": batch_id,
+                    "reason": str(reason)[:200],
+                    "at": now,
+                })
             event["updated_at"] = now
             return self._persist_candidate(candidate)
 

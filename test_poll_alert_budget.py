@@ -290,6 +290,73 @@ def test_cross_batch_failure_resets_window_and_each_batch_needs_two_rounds(tmp_p
     assert budget.open_event_id() is None
 
 
+def test_terminal_sibling_does_not_close_shared_event_or_reset_email_budget(
+        tmp_path, monkeypatch):
+    trader = CryptoTrader.__new__(CryptoTrader)
+    trader._poll_alert_lock = threading.Lock()
+    trader._poll_alert_active = True
+    trader._poll_alert_attempted = {}
+    trader._poll_degraded_batches = set()
+    trader._poll_alert_budget = _manager(tmp_path)
+    trader._send_email_alert_calls = []
+    trader._send_email_alert = lambda *a, **kw: (
+        trader._send_email_alert_calls.append(kw) or True)
+    trader._tg_messages = []
+    trader._send_poll_degraded_tg = lambda text: (
+        trader._tg_messages.append(text) or "ACCEPTED")
+    clock = [1002.0]
+    monkeypatch.setattr(trader_260725.time, "time", lambda: clock[0])
+
+    event_id, _ = trader._poll_alert_budget.open_or_update("batch-a", now=1000)
+    assert trader._poll_alert_budget.open_or_update("batch-b", now=1001) == (
+        event_id, False)
+    CryptoTrader._alert_poll_degraded(trader, 3, 120, "batch-a")
+    assert len(trader._send_email_alert_calls) == 1
+    assert len(trader._tg_messages) == 1
+    clock[0] = 1003.0
+    assert not trader._poll_alert_budget.record_recovery_success(
+        event_id, "batch-a", "full success", now=1003)
+
+    # B's monitor reaches terminal evidence one second later. A is still active
+    # and has only one success round, so only B should leave the shared event.
+    clock[0] = 1004.0
+    CryptoTrader._finish_poll_alert_event(
+        trader, "batch-b reached terminal evidence", send_recovery=False,
+        batch_id="batch-b")
+    assert trader._poll_alert_budget.open_event_id() == event_id
+    assert trader._poll_alert_budget.open_batches() == {"batch-a"}
+    assert trader._poll_alert_active is True
+
+    # A fails before its own alert threshold; that must retain E1's exhausted
+    # email slot rather than permit a second message when the threshold arrives.
+    clock[0] = 1010.0
+    CryptoTrader._interrupt_poll_alert_recovery(trader, "batch-a")
+    clock[0] = 2130.0
+    CryptoTrader._alert_poll_degraded(trader, 3, 130, "batch-a")
+    assert trader._poll_alert_budget.open_event_id() == event_id
+    assert len(trader._send_email_alert_calls) == 1
+    assert len(trader._poll_alert_budget.attempts(event_id, "email")) == 1
+
+
+def test_all_terminal_batches_close_event_without_recovery_notice(tmp_path):
+    trader = CryptoTrader.__new__(CryptoTrader)
+    trader._poll_alert_lock = threading.Lock()
+    trader._poll_alert_active = True
+    trader._poll_degraded_batches = set()
+    trader._poll_alert_budget = _manager(tmp_path)
+    event_id, _ = trader._poll_alert_budget.open_or_update("batch-a", now=1)
+
+    CryptoTrader._finish_poll_alert_event(
+        trader, "only affected batch ended", send_recovery=False,
+        batch_id="batch-a")
+
+    assert trader._poll_alert_budget.open_event_id() is None
+    event = trader._poll_alert_budget._find_event(
+        trader._poll_alert_budget._state, event_id)
+    assert event["status"] == "CLOSED"
+    assert trader._poll_alert_active is False
+
+
 def test_restart_resets_recovery_proof_but_keeps_attempt_budget(tmp_path):
     path = os.path.join(str(tmp_path), ".poll_alert.state.json")
     budget = PollAlertBudget(path)

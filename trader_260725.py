@@ -1208,12 +1208,14 @@ class CryptoTrader:
                 self._poll_alert_active = False
                 return
             if not send_recovery:
-                if budget.open_batches().intersection(self._poll_degraded_batches):
+                if batch_id is None:
+                    print("⚠️ [POLL] 忽略缺少批次标识的终态通知收尾")
                     return
-                if not budget.close_without_recovery(event_id, reason):
-                    print(f"⚠️ [POLL] 终态关闭未落盘，保留通知事件: {budget.error}")
+                if not budget.finish_batch_without_recovery(
+                        event_id, batch_id, reason):
+                    print(f"⚠️ [POLL] 终态批次收尾未落盘，保留通知事件: {budget.error}")
                     return
-                self._poll_alert_active = False
+                self._poll_alert_active = budget.open_event_id() is not None
                 return
             if (batch_id is None or batch_id in self._poll_degraded_batches):
                 return
