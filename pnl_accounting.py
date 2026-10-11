@@ -233,6 +233,12 @@ def build_single_direction_funding_allocation(
     baseline plus a complete userTrades audit excludes unexplained/manual fills.
     The conservation tolerance is one 1e-8 USDT Income History unit, never
     multiplied by the number of batches. Larger drift remains unallocated.
+
+    KNOWN_LIMITATION: account-wide trade audit is capped at seven days and one
+    response of fewer than 1000 fills; longer/denser histories remain
+    UNALLOCATED. UPGRADE_TRIGGER: any confirmed batch baseline older than seven
+    days at funding time, or an audit response reaching 1000 rows, requires a
+    separately tested bounded cursor/pagination implementation before widening.
     """
     if not isinstance(task, Mapping) or not isinstance(all_tasks, Mapping):
         raise AccountingEvidenceError("funding_task_ledger_invalid")
