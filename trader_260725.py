@@ -16843,7 +16843,11 @@ class CryptoTrader:
                 _xf, _xs, _xn = self._resolve_order_fees(
                     target_symbol,
                     {'kind': 'regular', 'order_id': str(order.get('id') or '')},
-                    confirmed_filled_amount, actual_exit_fee, order_snapshot=order)
+                    confirmed_filled_amount, actual_exit_fee, order_snapshot=order,
+                    expected_side=('SELL' if side == 'BUY' else 'BUY'),
+                    expected_position_side=(
+                        ('LONG' if side == 'BUY' else 'SHORT')
+                        if target_b_data.get('is_hedge_mode', False) else 'BOTH'))
                 if _xf is None:
                     _xf, _xs = actual_exit_fee, 'estimated'
                 return {'exit_fee': _xf, 'exit_fee_source': _xs}

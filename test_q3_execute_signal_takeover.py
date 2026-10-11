@@ -98,8 +98,17 @@ class _BoomThread:
         raise RuntimeError('can not start new thread')
 
 
+def _disable_funding_baseline(fake):
+    # This suite covers execute/monitor handoff, not Funding baseline capture.
+    # The MagicMock fixture's implicit helper return would persist a nested lock
+    # as batch data and make deepcopy fail before the behavior under test.
+    fake._capture_funding_position_baseline = lambda *_a, **_k: (_ for _ in ()).throw(
+        RuntimeError('Funding baseline not part of Q3 fixture'))
+
+
 def _run(fake, thread_cls=_RecordingThread):
     _RecordingThread.created.clear()
+    _disable_funding_baseline(fake)
     buf = io.StringIO()
     with mock.patch.object(trader_260725.threading, 'Thread', thread_cls):
         with contextlib.redirect_stdout(buf):
@@ -244,6 +253,7 @@ def check_r3_monitor_start_fail_alerts():
 
 def check_r4_monitor_init_crash_alerted_cleaned():
     fake = FIX.make_fake()
+    _disable_funding_baseline(fake)
     fake._active_monitors_lock = threading.Lock()
     fake._active_monitor_generations = {}
     fake._active_monitors = set()
@@ -312,6 +322,7 @@ def check_r4_monitor_init_crash_alerted_cleaned():
 
 def check_r5_gen_ownership_on_init_crash():
     fake = FIX.make_fake()
+    _disable_funding_baseline(fake)
     fake._active_monitors_lock = threading.Lock()
     fake._active_monitor_generations = {}
     fake._active_monitors = set()
