@@ -197,6 +197,14 @@ def test_revision_promotion_is_idempotent_and_preserves_history():
     assert apply_authoritative_revision(stats, "BTC:close-1", evidence) is True
     assert len(stats["accounting_v2"]["revisions"]) == 1
     assert stats["accounting_v2"]["revisions"]["BTC:close-1:r1"]["prior_record"]["net_pnl"] == 0.5
+    # Recovery may reload a durable revision ledger alongside a stale trade
+    # projection; replay must repair the projection without adding a revision.
+    stats["trades"][0].update(net_pnl=0.5, accounting_status="PENDING_RECONCILIATION",
+                              pnl_source="local_provisional", pnl_not_authoritative=True)
+    assert apply_authoritative_revision(stats, "BTC:close-1", evidence) is True
+    assert stats["trades"][0]["net_pnl"] == 0.91
+    assert stats["trades"][0]["accounting_status"] == "AUTHORITATIVE_FINAL"
+    assert len(stats["accounting_v2"]["revisions"]) == 1
 
 
 def test_incomplete_revision_cannot_promote_provisional_record():

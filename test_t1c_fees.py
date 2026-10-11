@@ -76,6 +76,37 @@ def _fill(qty, commission, asset='USDT', order='X', tid=1):
                      'commissionAsset': asset}}
 
 
+def test_invalid_fill_identity_never_enters_authoritative_cache():
+    # A complete quantity and commission do not make a fill authoritative when
+    # the response omits market/direction/time/position identity.
+    t = _resolver_trader(fills_by_oid={
+        'L1': [_fill(0.002, 0.0389, order='L1')]
+    })
+    fee, source, note = t._resolve_order_fees(
+        SYM, {'kind': 'regular', 'order_id': 'L1'}, 0.002, 0.1,
+        order_snapshot={'executedQty': '0.002', 'filled': 0.002},
+        expected_side='BUY', expected_position_side='BOTH')
+    assert source == 'estimated'
+    assert note == 'fills_identity_incomplete'
+    assert fee == pytest.approx(0.1)
+    assert not getattr(t, '_pnl_fee_trade_evidence', {})
+
+
+def test_complete_fill_identity_remains_eligible_for_actual_fee():
+    row = _fill(0.002, 0.0389, order='L1', tid='trade-1')
+    row.update(symbol=SYM, side='buy', timestamp=1234)
+    row['info'].update(symbol='BTCUSDT', side='BUY', positionSide='BOTH', time=1234)
+    t = _resolver_trader(fills_by_oid={'L1': [row]})
+    t.exchange.market = lambda _symbol: {'id': 'BTCUSDT'}
+    fee, source, note = t._resolve_order_fees(
+        SYM, {'kind': 'regular', 'order_id': 'L1'}, 0.002, 0.1,
+        order_snapshot={'executedQty': '0.002', 'filled': 0.002},
+        expected_side='BUY', expected_position_side='BOTH')
+    assert fee == pytest.approx(0.0389)
+    assert source == 'actual' and note == ''
+    assert t._pnl_fee_trade_evidence[(SYM, 'L1')][0]['trade_id'] == 'trade-1'
+
+
 # ── F1：普通单直查 actual ────────────────────────────────────────────────
 def f1_regular_order_direct_actual():
     t = _resolver_trader(fills_by_oid={'L1': [_fill(0.002, 0.0389, order='L1')]})
@@ -424,6 +455,18 @@ def make_settlement_trader():
         t.exchange.__dict__.update(fetch_my_trades_calls=t.exchange.fetch_my_trades_calls + 1) or [])
     t.exchange.fapiPrivateGetAlgoOrder = lambda params, **k: {'actualOrderId': ''}
     return t
+
+
+def test_settlement_fees_preserve_funding_baseline_contract():
+    trader = make_settlement_trader()
+    baseline = {'captured_at_ms': 100, 'market_id': 'BTCUSDT',
+                'long_qty': '0', 'short_qty': '0'}
+    batch = _settle_batch(funding_position_baseline=baseline)
+    fees = trader._compute_settlement_fees(
+        SYM, batch, 0.002, {'kind': 'regular', 'order_id': 'exit-1'}, 0.01,
+        order_snapshot={'executedQty': '0.002', 'filled': 0.002})
+    assert fees['funding_position_baseline'] == baseline
+    assert fees['funding_baseline_complete'] is True
 
 
 

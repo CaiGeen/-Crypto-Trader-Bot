@@ -731,8 +731,7 @@ def apply_authoritative_revision(stats: dict, dedup_key: str, revision: Mapping)
     if not isinstance(revisions, dict):
         raise AccountingEvidenceError("revision_ledger_invalid")
     revision_key = f"{dedup_key}:{revision_id}"
-    if revision_key in revisions:
-        return True
+    already_recorded = revision_key in revisions
     snapshot = copy.deepcopy(record)
     evidence_complete = revision.get("income_complete") is True
     commission_ok = revision.get("commission_reconciled") is True
@@ -761,22 +760,23 @@ def apply_authoritative_revision(stats: dict, dedup_key: str, revision: Mapping)
             allocation_complete=True)
     rounded_net = (net.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_EVEN)
                    if net is not None else None)
-    revisions[revision_key] = {
-        "dedup_key": dedup_key,
-        "revision_id": revision_id,
-        "received_at": revision.get("received_at"),
-        "status": "AUTHORITATIVE_FINAL" if net is not None else "PENDING_RECONCILIATION",
-        "prior_record": snapshot,
-        "evidence_refs": list(revision.get("evidence_refs") or []),
-        "fx_proofs": copy.deepcopy(revision.get("fx_proofs") or []),
-        "components": {
-            "realized_usdt": str(revision.get("realized_usdt")),
-            "funding_usdt": str(revision.get("funding_usdt")),
-            "commission_usdt": str(revision.get("commission_usdt")),
-            "rebate_usdt": str(revision.get("rebate_usdt")),
-        },
-        "valuation_label": revision.get("valuation_label") or "USDT",
-    }
+    if not already_recorded:
+        revisions[revision_key] = {
+            "dedup_key": dedup_key,
+            "revision_id": revision_id,
+            "received_at": revision.get("received_at"),
+            "status": "AUTHORITATIVE_FINAL" if net is not None else "PENDING_RECONCILIATION",
+            "prior_record": snapshot,
+            "evidence_refs": list(revision.get("evidence_refs") or []),
+            "fx_proofs": copy.deepcopy(revision.get("fx_proofs") or []),
+            "components": {
+                "realized_usdt": str(revision.get("realized_usdt")),
+                "funding_usdt": str(revision.get("funding_usdt")),
+                "commission_usdt": str(revision.get("commission_usdt")),
+                "rebate_usdt": str(revision.get("rebate_usdt")),
+            },
+            "valuation_label": revision.get("valuation_label") or "USDT",
+        }
     if net is None:
         record["pnl_not_authoritative"] = True
         record["accounting_status"] = "PENDING_RECONCILIATION"

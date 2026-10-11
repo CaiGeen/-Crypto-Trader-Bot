@@ -406,6 +406,19 @@ def test_funding_fill_reader_requires_real_unique_ids_and_execution_times():
             "BTCUSDT", "order-1", "entry", "BUY", "LONG", 0.4)
 
 
+def test_entry_fill_accepts_observed_algo_to_actual_order_mapping():
+    trader = CryptoTrader.__new__(CryptoTrader)
+    status, price, qty, _why = trader._resolve_entry_fill_evidence(
+        {"id": "actual-1", "side": "buy", "average": 100,
+         "filled": 0.4,
+         "info": {"algoId": "algo-1", "actualOrderId": "actual-1",
+                  "executedQty": "0.4", "side": "BUY"}},
+        0.4, expected_side="buy", expected_order_id="algo-1")
+    assert status == "confirmed"
+    assert price == 100
+    assert qty == 0.4
+
+
 def test_production_funding_builder_uses_rate_history_and_full_trade_audit():
     entry = {"trade_id": "entry-1", "order_id": "entry-order", "symbol": "BTCUSDT",
              "side": "BUY", "position_side": "LONG", "qty": "1",

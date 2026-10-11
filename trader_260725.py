@@ -2684,7 +2684,17 @@ class CryptoTrader:
             return ('qty_unverified', None, qty,
                     'identity_evidence_missing（响应无 id/info.orderId——订单身份不可'
                     '观测核验，不得以账本期望订单号充作观测证据，待人工数量核对）')
-        if expected_order_id and str(_oid) != str(expected_order_id):
+        # Conditional order responses may expose the triggered exchange order
+        # as orderId while retaining the requested algo identity separately.
+        # Accept that mapping only when both IDs are present in the same response.
+        _mapped_actual_id = str(info.get('actualOrderId')
+                                or (order_detail or {}).get('actualOrderId') or '')
+        _observed_algo_id = str(info.get('algoId')
+                                or (order_detail or {}).get('algoId') or '')
+        _identity_matches = (str(_oid) == str(expected_order_id)
+                             or (_mapped_actual_id == str(_oid)
+                                 and _observed_algo_id == str(expected_order_id)))
+        if expected_order_id and not _identity_matches:
             return ('qty_unverified', None, qty,
                     f'order_identity_mismatch（响应 id={_oid} ≠ 账本 {expected_order_id}）')
 
@@ -3194,7 +3204,8 @@ class CryptoTrader:
         return True, 'ok'
 
     def _resolve_order_fees(self, symbol, order_ref, expected_qty,
-                            estimated_fee, order_snapshot=None):
+                            estimated_fee, order_snapshot=None,
+                            expected_side=None, expected_position_side=None):
         """🔥 v6.4-T1-C：单订单手续费解析——actual 优先，fail-soft（绝不抛出）。
 
         order_ref: {'kind': 'regular'|'algo', 'order_id': str}
@@ -3266,11 +3277,43 @@ class CryptoTrader:
             total_qty = 0.0
             _sum = 0.0
             commission_valid = True      # 阻断 3：任一 fill 手续费非法 → 不参与 actual
+            evidence_identity_complete = True
             fill_evidence = []
+            seen_trade_ids = set()
+            market = self.exchange.market(symbol) if hasattr(self.exchange, 'market') else {}
+            expected_market_id = str((market or {}).get('id') or
+                                     str(symbol).replace('/', '').split(':', 1)[0])
             for _t in fills:
                 _info = _t.get('info', {}) if isinstance(_t, dict) else {}
-                total_qty += (self._fee_float(_t.get('amount'))
-                              or self._fee_float(_info.get('qty')) or 0.0)
+                _qty = (self._fee_float(_info.get('qty'))
+                        or self._fee_float(_t.get('amount')))
+                total_qty += _qty or 0.0
+                _trade_id = str(_info.get('id') or _t.get('id') or '')
+                _row_order_id = str(_info.get('orderId') or _t.get('order') or '')
+                _row_symbol = str(_info.get('symbol') or '')
+                if not _row_symbol:
+                    _row_symbol = str(_t.get('symbol') or '').replace('/', '').split(':', 1)[0]
+                _row_side = str(_info.get('side') or _t.get('side') or '').upper()
+                _row_position_side = str(_info.get('positionSide') or '').upper()
+                if not _row_position_side and expected_position_side == 'BOTH':
+                    _row_position_side = 'BOTH'
+                _row_time = _info.get('time') or _t.get('timestamp')
+                try:
+                    _time_valid = int(_row_time) > 0
+                except (TypeError, ValueError):
+                    _time_valid = False
+                if (not _trade_id or _trade_id in seen_trade_ids
+                        or _row_order_id != real_oid
+                        or _row_symbol != expected_market_id
+                        or _row_side not in ('BUY', 'SELL')
+                        or (expected_side and _row_side != str(expected_side).upper())
+                        or _row_position_side not in ('LONG', 'SHORT', 'BOTH')
+                        or (expected_position_side
+                            and _row_position_side != expected_position_side)
+                        or _qty is None or _qty <= 0 or not _time_valid):
+                    evidence_identity_complete = False
+                if _trade_id:
+                    seen_trade_ids.add(_trade_id)
                 _c = self._fee_float(_info.get('commission'))
                 if _c is None:
                     commission_valid = False
@@ -3278,26 +3321,20 @@ class CryptoTrader:
                     _sum += _c
                 assets.add(str(_info.get('commissionAsset') or ''))
                 fill_evidence.append({
-                    'trade_id': str(_info.get('id') or _t.get('id') or ''),
-                    'order_id': str(_info.get('orderId') or _t.get('order') or real_oid),
-                    'symbol': str(_info.get('symbol') or symbol),
-                    'side': str(_info.get('side') or _t.get('side') or '').upper(),
-                    'position_side': str(_info.get('positionSide') or '').upper(),
-                    'qty': str(_info.get('qty') or _t.get('amount') or ''),
+                    'trade_id': _trade_id,
+                    'order_id': _row_order_id,
+                    'symbol': _row_symbol,
+                    'side': _row_side,
+                    'position_side': _row_position_side,
+                    'qty': str(_qty) if _qty is not None else '',
+                    'expected_order_qty': str(expected_qty),
                     'price': str(_info.get('price') or _t.get('price') or ''),
                     'quote_qty': str(_info.get('quoteQty') or _t.get('cost') or ''),
                     'commission': str(_info.get('commission') or ''),
                     'commission_asset': str(_info.get('commissionAsset') or '').upper(),
-                    'time': _info.get('time') or _t.get('timestamp'),
+                    'time': _row_time,
                     'realized_pnl': str(_info.get('realizedPnl') or ''),
                 })
-            if fill_evidence:
-                cache = getattr(self, '_pnl_fee_trade_evidence', None)
-                if not isinstance(cache, dict):
-                    cache = {}
-                    self._pnl_fee_trade_evidence = cache
-                cache[(str(symbol), str(real_oid))] = fill_evidence
-                cache[(str(symbol), str(oid))] = fill_evidence
             total_fee = _sum if commission_valid else None
 
             exp = self._fee_float(expected_qty)
@@ -3332,6 +3369,18 @@ class CryptoTrader:
             if abs(auth_f - exp) > max(1e-8, exp * 1e-6) \
                     or abs(total_qty - auth_f) > max(1e-8, auth_f * 1e-6):
                 return _deg('qty_mismatch')
+            if not evidence_identity_complete:
+                return _deg('fills_identity_incomplete')
+            # Only quantity-complete, identity/direction-verified fills may enter
+            # the durable Income reconciliation evidence cache. Failed probes stay
+            # diagnostic-only and can never become an authoritative trade input.
+            if fill_evidence:
+                cache = getattr(self, '_pnl_fee_trade_evidence', None)
+                if not isinstance(cache, dict):
+                    cache = {}
+                    self._pnl_fee_trade_evidence = cache
+                cache[(str(symbol), str(real_oid))] = fill_evidence
+                cache[(str(symbol), str(oid))] = fill_evidence
             if assets != {'USDT'}:
                 return _deg('non_usdt_commission')
             if not commission_valid:
@@ -3544,7 +3593,11 @@ class CryptoTrader:
                                  if i < len(fds) else 0.0)
                     fee_i, src_i, note_i = self._resolve_order_fees(
                         symbol, {'kind': 'algo', 'order_id': str(_oid or '')},
-                        exp_qty, est_layer)
+                        exp_qty, est_layer,
+                        expected_side=str(b_data.get('side') or 'BUY').upper(),
+                        expected_position_side=(
+                            ('LONG' if str(b_data.get('side') or 'BUY').upper() == 'BUY'
+                             else 'SHORT') if b_data.get('is_hedge_mode') else 'BOTH'))
                     trade_evidence.extend(dict(x, role='entry') for x in
                         getattr(self, '_pnl_fee_trade_evidence', {})
                         .get((str(symbol), str(_oid)), []))
@@ -3569,7 +3622,12 @@ class CryptoTrader:
 
             exit_fee, exit_source, exit_note = self._resolve_order_fees(
                 symbol, exit_order_ref, settlement_qty, estimated_exit_fee,
-                order_snapshot=order_snapshot)
+                order_snapshot=order_snapshot,
+                expected_side=('SELL' if str(b_data.get('side') or 'BUY').upper() == 'BUY'
+                               else 'BUY'),
+                expected_position_side=(
+                    ('LONG' if str(b_data.get('side') or 'BUY').upper() == 'BUY'
+                     else 'SHORT') if b_data.get('is_hedge_mode') else 'BOTH'))
             _exit_ref = exit_order_ref or {}
             _exit_id = str(_exit_ref.get('order_id') or '')
             if _exit_ref.get('kind') == 'algo' and isinstance(order_snapshot, dict):
@@ -3609,6 +3667,11 @@ class CryptoTrader:
                 'funding_fill_events': list(b_data.get('funding_fill_events') or []),
                 'funding_events_complete': bool(
                     b_data.get('funding_event_evidence_complete') is True),
+                'funding_position_baseline': b_data.get('funding_position_baseline'),
+                'funding_baseline_complete': bool(
+                    isinstance(b_data.get('funding_position_baseline'), dict)
+                    and b_data.get('funding_position_baseline').get('captured_at_ms')
+                    and b_data.get('funding_position_baseline').get('market_id')),
                 'reduction_events': list(b_data.get('funding_reduction_events') or []),
                 'realized_reduce_amount': realized,
                 'is_hedge_mode': bool(b_data.get('is_hedge_mode', False)),
@@ -7372,19 +7435,9 @@ class CryptoTrader:
                 f"💡 {detail}\n请核对交易所实际仓位与挂单后人工处理。",
                 level='critical')
             return False, f'partial_confirm_{verdict}'
-        try:
-            reduction_events = self._fetch_funding_fill_events(
-                symbol, order_id, 'exit', reduce_side,
-                ('LONG' if side == 'BUY' else 'SHORT') if is_hedge else 'BOTH',
-                confirmed_amount)
-            reduction_evidence_complete = True
-        except Exception as funding_error:
-            # Funding evidence is accounting-only: retain the confirmed reduction
-            # and continue the normal protection resize; never block safe exit.
-            reduction_events = []
-            reduction_evidence_complete = False
-            print(f"⚠️ [Funding ledger] partial close {order_id} evidence unavailable: "
-                  f"{funding_error}")
+        # Funding evidence is audit-only and is fetched after protection resize.
+        reduction_events = []
+        reduction_evidence_complete = False
         # CAS 持久化净账本 + reason→partial_resize_pending（rollback 事务模板：
         # 锁内重读 → 校验 op_id/phase → 同一锁段写账本 → _persist_states）
         with self._state_lock:
@@ -7430,6 +7483,35 @@ class CryptoTrader:
             self._release_resize_inflight(batch_id)
         if not ok_r:
             return False, msg_r
+        try:
+            reduction_events = self._fetch_funding_fill_events(
+                symbol, order_id, 'exit', reduce_side,
+                ('LONG' if side == 'BUY' else 'SHORT') if is_hedge else 'BOTH',
+                confirmed_amount)
+            reduction_evidence_complete = True
+        except Exception as funding_error:
+            print(f"⚠️ [Funding ledger] partial close {order_id} evidence unavailable: "
+                  f"{funding_error}")
+        with self._state_lock:
+            latest, _rc_5904, _ = self._load_all_states_ex()
+            current = (latest.get(symbol, {}) or {}).get(batch_id)
+            if isinstance(current, dict) and current.get('close_op_id') == close_op_id:
+                try:
+                    current['funding_reduction_events'] = self._merge_funding_fill_events(
+                        current.get('funding_reduction_events') or [], reduction_events)
+                except Exception:
+                    reduction_evidence_complete = False
+                if reduction_evidence_complete:
+                    missing = [str(x) for x in
+                               (current.get('funding_event_missing_orders') or [])
+                               if str(x) != str(order_id)]
+                    current['funding_event_missing_orders'] = missing
+                    current['funding_event_evidence_complete'] = bool(
+                        not missing and isinstance(
+                            current.get('funding_position_baseline'), dict))
+                else:
+                    current['funding_event_evidence_complete'] = False
+                self._persist_states(latest, read_corrupt=_rc_5904)
         return True, 'partial_committed'
 
     def _resize_protection_after_partial(self, symbol, batch_id, close_op_id, net_qty,
@@ -11774,19 +11856,10 @@ class CryptoTrader:
                                             expected_side=_side_exp,
                                             expected_order_id=order_id)
 
-                                    try:
-                                        if _ev_status == 'qty_unverified':
-                                            raise ValueError('entry_fill_quantity_unverified')
-                                        _funding_events = self._fetch_funding_fill_events(
-                                            symbol, order_id, 'entry', _side_exp,
-                                            ('LONG' if side == 'BUY' else 'SHORT')
-                                            if is_hedge_mode else 'BOTH', _ev_qty)
-                                        _funding_complete = True
-                                    except Exception as _funding_error:
-                                        _funding_events = []
-                                        _funding_complete = False
-                                        print(f"⚠️ [Funding ledger] entry order {order_id} "
-                                              f"evidence unavailable: {_funding_error}")
+                                    # The Funding audit is deferred until after
+                                    # protection maintenance below.
+                                    _funding_events = []
+                                    _funding_complete = False
 
                                     if _ev_status == 'qty_unverified':
                                         # 分支③：数量未知 / 不匹配 → 不入账、不按计划量计数、
@@ -11827,8 +11900,7 @@ class CryptoTrader:
                                             {'status': 'cost_pending', 'why': _ev_why,
                                               'qty': _ev_qty, 'planned': target_amounts[idx],
                                               'side': _side_exp, 'order_status': ord_status,
-                                              'funding_events': _funding_events,
-                                              'funding_event_complete': _funding_complete})
+                                              })
                                         print(f"⏳ [批次 {batch_id}] 第 {idx + 1} 层已成交"
                                               f"（数量已核实 {_ev_qty}，真实成交价待补证）"
                                               f": {_ev_why}")
@@ -11857,8 +11929,7 @@ class CryptoTrader:
                                              'price': executed_price, 'qty': _ev_qty,
                                               'planned': target_amounts[idx],
                                               'side': _side_exp, 'order_status': ord_status,
-                                              'funding_events': _funding_events,
-                                              'funding_event_complete': _funding_complete},
+                                               },
                                             alert=False)
 
                                     # 🔥 收集新成交层
@@ -11890,6 +11961,32 @@ class CryptoTrader:
                                         )
                                     else:
                                         print(f"  └─ ⚡ 已存在止损单，等待主循环合并更新")
+
+                                    # Funding evidence is audit-only: never wait for
+                                    # userTrades before protective-order maintenance.
+                                    try:
+                                        _entry_info = ord_detail.get('info') or {}
+                                        _actual_order_id = str(
+                                            _entry_info.get('actualOrderId')
+                                            or ord_detail.get('actualOrderId') or '')
+                                        if not _actual_order_id:
+                                            raise ValueError('entry_actual_order_id_missing')
+                                        _funding_events = self._fetch_funding_fill_events(
+                                            symbol, _actual_order_id, 'entry', _side_exp,
+                                            ('LONG' if side == 'BUY' else 'SHORT')
+                                            if is_hedge_mode else 'BOTH', _ev_qty)
+                                        _funding_complete = True
+                                    except Exception as _funding_error:
+                                        _funding_events = []
+                                        _funding_complete = False
+                                        print(f"⚠️ [Funding ledger] entry order {order_id} "
+                                              f"evidence unavailable: {_funding_error}")
+                                    self._record_fill_evidence(
+                                        symbol, batch_id, idx, order_id,
+                                        {'status': _ev_status, 'why': _ev_why,
+                                         'funding_events': _funding_events,
+                                         'funding_event_complete': _funding_complete},
+                                        alert=False)
 
                                 # ========== 🔥 修复：正确的 elif 分支 ==========
                                 elif ord_status in ['canceled', 'expired', 'rejected']:
