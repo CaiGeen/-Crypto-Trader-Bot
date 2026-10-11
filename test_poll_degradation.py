@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import trader_260725
 from trader_260725 import CryptoTrader
+from poll_alert_state import PollAlertBudget
 import test_monitor_poll_recovery as PR
 
 SYMBOL = PR.SYMBOL
@@ -72,6 +73,12 @@ def _init_poll_tracking(fake):
     fake._poll_alert_lock = threading.Lock()
     fake._poll_alert_active = False
     fake._poll_alert_attempted = {}
+    fake._poll_alert_budget = PollAlertBudget(os.path.join(
+        tempfile.mkdtemp(prefix='pd_notify_'), '.poll_alert.state.json'))
+    fake._poll_email_calls = []
+    fake._send_email_alert = lambda *a, **k: (fake._poll_email_calls.append(k) or True)
+    fake._send_poll_degraded_tg = lambda text: (
+        fake.sent.append(('critical', str(text))) or 'ACCEPTED')
     fake._ready = True
     fake._not_ready_reason = ""
     # 绑定新增告警方法（MagicMock 不会自动绑未在 REAL_HELPERS 中的新方法）
@@ -397,11 +404,10 @@ def test_notification_exception_kills_nothing():
         fake = PR._make_fake(sp, states)
         _init_poll_tracking(fake)
 
-        def _boom(text, **k):
+        def _boom(text):
             raise RuntimeError('TG 发送失败')
-        fake.send_tg_notification = _boom
-        fake._send_email_alert = mock.MagicMock(
-            side_effect=RuntimeError('邮件失败'))
+        fake._send_poll_degraded_tg = _boom
+        fake._send_email_alert = mock.MagicMock(return_value=True)
         rounds, err = _drive_failing(fake, 5)
         report('T5 通知异常未杀监控（驱动未因告警异常中断）',
                rounds >= 3 and err is None, f'驱动轮次={rounds} err={err!r}')
@@ -530,7 +536,7 @@ def test_block3_per_batch_stale_not_masked_by_other_batch():
         trader_260725.STATE_FILE = _SESSION_STATE
 
 
-# ── 阻断4：通知返回 False（未抛异常）后仍应有限重试 ────────────────────────
+# ── 阻断4：明确失败受冷却和事件预算约束 ───────────────────────────────────
 def test_block4_alert_retry_on_notify_false():
     d = tempfile.mkdtemp(prefix='blk4_')
     sp = os.path.join(d, 'trade_state.json')
@@ -541,15 +547,24 @@ def test_block4_alert_retry_on_notify_false():
         _init_poll_tracking(fake)
         calls = []
 
-        def _returns_false(text, **k):
-            calls.append(k.get('level'))
-            return False      # 通知失败但不抛异常
-        fake.send_tg_notification = _returns_false
+        def _returns_failed(text):
+            calls.append('critical')
+            return 'FAILED'
+        fake._send_poll_degraded_tg = _returns_failed
         fake.exchange.fetch_open_orders.side_effect = RuntimeError('持续失败')
         PR._drive(fake, None, max_rounds=6)
-        report('B4a 通知返回 False 后仍有有限重试',
-               len(calls) >= 2,
-               f'6 轮失败内告警尝试次数={len(calls)}（应 ≥2 → 有重试）')
+        event_id = fake._poll_alert_budget.open_event_id()
+        _last = fake._poll_alert_budget.attempts(event_id, 'tg')[-1]['at']
+        with mock.patch.object(trader_260725.time, 'time', return_value=_last + 899):
+            CryptoTrader._alert_poll_degraded(fake, 6, 200, BATCH)
+        report('B4a 900秒冷却内不重复尝试TG', len(calls) == 1,
+               f'冷却前告警尝试次数={len(calls)}（应为1）')
+        with mock.patch.object(trader_260725.time, 'time', return_value=_last + 900):
+            CryptoTrader._alert_poll_degraded(fake, 9, 300, BATCH)
+        report('B4b 明确失败且冷却到期可重试一次', len(calls) == 2,
+               f'冷却到期告警尝试次数={len(calls)}（应为2）')
+        report('B4c 重试不重复发送邮件', len(fake._poll_email_calls) == 1,
+               f'邮件发送路径次数={len(fake._poll_email_calls)}（应为1）')
     finally:
         trader_260725.STATE_FILE = _SESSION_STATE
 
@@ -686,7 +701,7 @@ def test_block7_restart_reverify_blocks_new_entry():
         trader_260725.STATE_FILE = _SESSION_STATE
 
 
-# ── 口径：send_tg_notification 返回 None（未配 TG）不得记成已送达 ────────
+# ── 口径：结果未知不得重发；保留额度证据 ──────────────────────────────────
 def test_block8_notify_none_is_not_delivered():
     d = tempfile.mkdtemp(prefix='blk8_')
     sp = os.path.join(d, 'trade_state.json')
@@ -696,16 +711,16 @@ def test_block8_notify_none_is_not_delivered():
         fake = PR._make_fake(sp, PR._disk(sp))
         _init_poll_tracking(fake)
         calls = []
-        fake.send_tg_notification = (
-            lambda text, **k: (calls.append(k.get('level')), None)[1])  # 返回 None
+        fake._send_poll_degraded_tg = lambda text: (calls.append(text) or 'UNKNOWN')
         fake.exchange.fetch_open_orders.side_effect = RuntimeError('持续失败')
         PR._drive(fake, None, max_rounds=6)
-        report('B8a 通知返回 None → 不得记成已送达（保留重试）',
-               fake._poll_alert_active is False,
-               f'_poll_alert_active={fake._poll_alert_active}'
-               f'（应 False → 保留重试资格），尝试次数={len(calls)}')
-        report('B8b 通知返回 None 时仍有有限重试',
-               len(calls) >= 2, f'6 轮内尝试={len(calls)} 次（应 ≥2）')
+        event_id = fake._poll_alert_budget.open_event_id()
+        _history = fake._poll_alert_budget.attempts(event_id, 'tg')
+        report('B8a UNKNOWN 不冒充送达且保留结果态',
+               len(_history) == 1 and _history[0]['status'] == 'UNKNOWN',
+               f'tg_history={_history!r}')
+        report('B8b UNKNOWN 不自动重复发送避免重复投递',
+               len(calls) == 1, f'6轮内TG发送尝试={len(calls)}（应为1）')
     finally:
         trader_260725.STATE_FILE = _SESSION_STATE
 
