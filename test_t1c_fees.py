@@ -18,6 +18,7 @@ import json
 import os
 import tempfile
 import threading
+import pytest
 from datetime import datetime
 from datetime import timezone, timedelta
 
@@ -796,9 +797,12 @@ def f28_four_paths_and_daily_report_separation():
            'exit_note': '', 'fee_note': 'fee_unknown'}
     note_line, label = CryptoTrader._pnl_display_label(bad)
     assert label == '估算净盈亏' and '费用未对账' in note_line, (note_line, label)
-    good = dict(bad, fee_note='', entry_fee_source='actual', exit_fee_source='actual')
+    good = dict(bad, fee_note='', entry_fee_source='actual', exit_fee_source='actual',
+                accounting_status='AUTHORITATIVE_FINAL',
+                pnl_source='binance_income_history', income_complete=True,
+                commission_reconciled=True, funding_allocated=True, fx_complete=True)
     note_line2, label2 = CryptoTrader._pnl_display_label(good)
-    assert label2 == '最终净盈亏' and note_line2 == '', (note_line2, label2)
+    assert label2 == '交易所已实现口径净盈亏' and note_line2 == '', (note_line2, label2)
     # ③ 行为调用日报：权威总额与非权威金额必须分离
     tmp = tempfile.mkdtemp(prefix='t1c_f28_')
     t, ex = p5.make_trader(tmp)
@@ -809,17 +813,48 @@ def f28_four_paths_and_daily_report_separation():
     _today = (datetime.now(BEIJING_TZ) - timedelta(days=1)).strftime('%Y-%m-%d')
     json.dump({'trades': [
         {'time': f'{_today} 09:00:00', 'batch_id': 'a1', 'symbol': SYM,
-         'side': 'BUY', 'mode': '限价平仓', 'net_pnl': 10.0},
+         'side': 'BUY', 'mode': '限价平仓', 'net_pnl': 10.0,
+         'accounting_status': 'AUTHORITATIVE_FINAL',
+         'pnl_source': 'binance_income_history', 'income_complete': True,
+         'commission_reconciled': True, 'funding_allocated': True, 'fx_complete': True},
         {'time': f'{_today} 10:00:00', 'batch_id': 'a2', 'symbol': SYM,
          'side': 'BUY', 'mode': '市价平仓', 'net_pnl': -4.0,
          'pnl_not_authoritative': True, 'fee_metadata_error': True},
     ]}, open(stats_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
     t._send_daily_report(stats_file=stats_path)
     out = '\n'.join(sent)
-    assert '昨日已实现盈亏' in out, out[:300]
+    assert '昨日交易所已实现口径净盈亏' in out, out[:300]
     assert '`+10.00`' in out, f'权威总额必须只含权威记录（+10.00）: {out[:400]}'
-    assert '费用未对账（非权威）' in out, f'必须单列非权威段: {out[:400]}'
+    assert '账务未对账（非权威）' in out, f'必须单列非权威段: {out[:400]}'
     assert '`-4.00`' in out, out[:400]
+
+
+def f29_income_revision_promotes_same_record_idempotently():
+    tmp = tempfile.mkdtemp(prefix='t1c_f29_')
+    t, _ = p5.make_trader(tmp)
+    stats_path = os.path.join(tmp, 'trade_stats.json')
+    json.dump({'trades': [{'dedup_key': 'BTCUSDT:close-1', 'net_pnl': 0.5,
+                           'pnl_not_authoritative': True,
+                           'accounting_status': 'PENDING_RECONCILIATION'}]},
+              open(stats_path, 'w', encoding='utf-8'))
+    revision = {'revision_id': 'r1', 'income_complete': True,
+                'commission_reconciled': True, 'funding_allocated': True,
+                 'fx_complete': True, 'realized_usdt': '1', 'funding_usdt': '0.1',
+                 'commission_usdt': '-0.2', 'commission_entry_usdt': '-0.1',
+                 'commission_exit_usdt': '-0.1', 'rebate_usdt': '0.01',
+                'evidence_refs': ['income:REALIZED_PNL:1']}
+    assert t._apply_pnl_accounting_revision('BTCUSDT:close-1', revision,
+                                            stats_file=stats_path) == (True, 'ok')
+    assert t._apply_pnl_accounting_revision('BTCUSDT:close-1', revision,
+                                            stats_file=stats_path) == (True, 'ok')
+    data = json.load(open(stats_path, encoding='utf-8'))
+    assert len(data['trades']) == 1
+    assert data['trades'][0]['net_pnl'] == pytest.approx(0.91)
+    assert data['trades'][0]['accounting_status'] == 'AUTHORITATIVE_FINAL'
+    assert data['trades'][0]['entry_fee_source'] == 'actual'
+    assert data['trades'][0]['exit_fee_source'] == 'actual'
+    assert CryptoTrader._is_pnl_authoritative(data['trades'][0]) is True
+    assert len(data['accounting_v2']['revisions']) == 1
 
 
 

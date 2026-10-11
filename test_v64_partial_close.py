@@ -216,6 +216,13 @@ def make_trader(states, actual_pos=2.0, lazy_market=False):
     t._gate_alert_clear = lambda identity: None
     for name, fn in BINDS.items():
         setattr(t, name, types.MethodType(fn, t))
+    # Funding evidence failures are accounting-only and must not alter the
+    # confirmed reduction/resize state transition.
+    def _funding_query_fails(*_args, **_kwargs):
+        raise RuntimeError('injected funding ledger failure')
+    t._fetch_funding_fill_events = _funding_query_fails
+    t._merge_funding_fill_events = lambda existing, incoming: (
+        list(existing or []) + list(incoming or []))
     return t
 
 
@@ -272,6 +279,8 @@ def t01_partial_commit_full_chain_and_no_fill_rejection():
     assert ok is True, msg
     b2 = t2._states[SYM]['batch_A']
     assert abs(b2['realized_reduce_amount'] - 0.5) < 1e-9
+    assert b2.get('funding_event_evidence_complete') is False, \
+        '缺失 Funding 证据只降级账务完整性，不得阻断已确认减仓/保护 resize'
     assert abs(b2['realized_reduce_cost'] - 50.0) < 1e-6, b2['realized_reduce_cost']
     assert b2['close_phase'] == 0 and b2['pending_close'] is False
     assert b2['is_programmatic_cancel'] is False and b2['close_reason'] == ''

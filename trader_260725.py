@@ -1,5 +1,7 @@
 # trader_260725.py
 import copy
+import hashlib
+from decimal import Decimal
 import json
 import math
 import os
@@ -23,6 +25,16 @@ from poll_alert_state import (
     PollAlertBudget,
     POLL_ALERT_TG_RETRY_SECONDS,
     POLL_ALERT_RECOVERY_QUIET_SECONDS,
+)
+from pnl_accounting import (
+    AccountingEvidenceError,
+    apply_authoritative_revision,
+    build_single_direction_funding_allocation,
+    convert_mark_minute,
+    income_identity,
+    mark_revision_pending,
+    reconcile_income_facts,
+    reserve_request,
 )
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -1426,6 +1438,7 @@ class CryptoTrader:
         返回 bool：True=已记录（含 dedup 命中=幂等成功），False=写盘失败
         （P5 finalizer 依赖此返回值：失败必须保持 phase=2，绝不 clear——否则
         成交记录永久丢失）。"""
+        temp_name = None
         try:
             base_dir = os.path.dirname(os.path.abspath(__file__))
             stats_file = stats_file or os.path.join(base_dir, "trade_stats.json")
@@ -1436,7 +1449,9 @@ class CryptoTrader:
                         with open(stats_file, "r", encoding="utf-8") as f:
                             stats = json.load(f)
                     except Exception:
-                        stats = {}
+                        return False
+                    if not isinstance(stats, dict) or not isinstance(stats.get('trades', []), list):
+                        return False
                 if dedup_key and any(r.get('dedup_key') == dedup_key
                                      for r in stats.get('trades', []) or []):
                     return True  # 幂等：同订单 PnL 已记录（finalizer 接管/重试语义）
@@ -1449,6 +1464,7 @@ class CryptoTrader:
                     "avg_price": round(float(avg_price), 4),
                     "exit_price": round(float(exit_price), 4),
                     "net_pnl": round(float(net_pnl), 4),
+                    "local_provisional_net_pnl": round(float(net_pnl), 4),
                     "mode": mode,
                 }
                 if dedup_key:
@@ -1484,6 +1500,54 @@ class CryptoTrader:
                                     _meta_ok = False        # 必需金额非法
                                     continue
                                 record[k] = round(float(v), 6)
+                            elif k == 'trade_evidence':
+                                if not isinstance(v, list) or any(
+                                        not isinstance(x, dict) for x in v):
+                                    _meta_ok = False
+                                else:
+                                    record[k] = [dict(x) for x in v]
+                            elif k == 'reduction_events':
+                                if not isinstance(v, list) or any(
+                                        not isinstance(x, dict) for x in v):
+                                    _meta_ok = False
+                                else:
+                                    record[k] = [dict(x) for x in v]
+                            elif k == 'funding_fill_events':
+                                if not isinstance(v, list) or any(
+                                        not isinstance(x, dict) for x in v):
+                                    _meta_ok = False
+                                else:
+                                    record[k] = [dict(x) for x in v]
+                            elif k == 'realized_reduce_amount':
+                                try:
+                                    amount = float(v)
+                                except (TypeError, ValueError):
+                                    _meta_ok = False
+                                    continue
+                                if not math.isfinite(amount) or amount < 0:
+                                    _meta_ok = False
+                                else:
+                                    record[k] = amount
+                            elif k == 'is_hedge_mode':
+                                if not isinstance(v, bool):
+                                    _meta_ok = False
+                                else:
+                                    record[k] = v
+                            elif k == 'funding_events_complete':
+                                if not isinstance(v, bool):
+                                    _meta_ok = False
+                                else:
+                                    record[k] = v
+                            elif k == 'funding_baseline_complete':
+                                if not isinstance(v, bool):
+                                    _meta_ok = False
+                                else:
+                                    record[k] = v
+                            elif k == 'funding_position_baseline':
+                                if v is not None and not isinstance(v, dict):
+                                    _meta_ok = False
+                                else:
+                                    record[k] = dict(v) if isinstance(v, dict) else None
                             else:
                                 record[k] = str(v or '')
                         if any(k not in record for k in
@@ -1495,15 +1559,886 @@ class CryptoTrader:
                             record['fee_metadata_error'] = True
                         if 'fee_unknown' in str(record.get('fee_note') or ''):
                             record['pnl_not_authoritative'] = True
+                # T1-C actual fees do not establish the selected Income History
+                # gross/funding/rebate accounting authority. A durable later
+                # reconciliation may promote this record only after all gates pass.
+                if not self._is_pnl_authoritative(record):
+                    record['pnl_not_authoritative'] = True
+                    record.setdefault('accounting_status', 'PENDING_RECONCILIATION')
+                    record.setdefault('pnl_source', 'local_provisional')
                 stats.setdefault("trades", []).append(record)
+                accounting = stats.setdefault('accounting_v2', {})
+                if not isinstance(accounting, dict):
+                    return False
+                tasks = accounting.setdefault('tasks', {})
+                if not isinstance(tasks, dict):
+                    return False
+                if dedup_key:
+                    ev = record.get('trade_evidence') or []
+                    entry_times, exit_times = [], []
+                    for item in ev:
+                        try:
+                            t_ms = int(item.get('time'))
+                            if t_ms > 0:
+                                (entry_times if item.get('role') == 'entry'
+                                 else exit_times).append(t_ms)
+                        except (TypeError, ValueError):
+                            continue
+                    complete_trade_window = bool(entry_times and exit_times)
+                    funding_events = list(record.get('funding_fill_events') or [])
+                    funding_events.extend(
+                        {key: item.get(key) for key in
+                         ('trade_id', 'order_id', 'symbol', 'side',
+                          'position_side', 'qty', 'time', 'role')}
+                        for item in ev)
+                    events_by_id = {}
+                    event_conflict = False
+                    for item in funding_events:
+                        trade_id = str(item.get('trade_id') or '')
+                        if not trade_id:
+                            event_conflict = True
+                            continue
+                        canonical = {key: item.get(key) for key in
+                                     ('trade_id', 'order_id', 'symbol', 'side',
+                                      'position_side', 'qty', 'time', 'role')}
+                        previous = events_by_id.get(trade_id)
+                        if previous is not None and previous != canonical:
+                            event_conflict = True
+                        events_by_id[trade_id] = canonical
+                    funding_events = list(events_by_id.values())
+                    reduction_events = record.get('reduction_events') or []
+                    try:
+                        reduction_qty = sum((Decimal(str(x.get('qty')))
+                                             for x in reduction_events), Decimal(0))
+                        recorded_reduction = Decimal(str(
+                            record.get('realized_reduce_amount', 0) or 0))
+                        reductions_complete = (
+                            reduction_qty == recorded_reduction
+                            and all(x.get('trade_id') and x.get('order_id')
+                                    and x.get('symbol') and x.get('side')
+                                    and x.get('position_side') and x.get('time')
+                                    for x in reduction_events))
+                    except Exception:
+                        reductions_complete = False
+                    events_complete = bool(
+                        complete_trade_window and reductions_complete
+                        and record.get('funding_events_complete') is True
+                        and record.get('funding_baseline_complete') is True
+                        and isinstance(record.get('funding_position_baseline'), dict)
+                        and record.get('is_hedge_mode') is not None
+                        and funding_events and not event_conflict
+                        and all(x.get('trade_id') and x.get('order_id')
+                                and x.get('symbol') and x.get('side')
+                                and x.get('position_side') and x.get('qty')
+                                and x.get('time') and x.get('role') in ('entry', 'exit')
+                                for x in funding_events))
+                    now_ms = int(time.time() * 1000)
+                    close_time_ms = max(exit_times) if exit_times else now_ms
+                    milestones = (0, 60, 300, 900, 3600, 21600, 86400,
+                                  72 * 3600, 7 * 24 * 3600)
+                    due_times = [close_time_ms + seconds * 1000
+                                 for seconds in milestones]
+                    account_scope = hashlib.sha256(
+                        str(getattr(getattr(self, 'exchange', None), 'apiKey', '')
+                            or 'unconfigured').encode()
+                    ).hexdigest()[:16]
+                    task = tasks.get(str(dedup_key))
+                    if task is None:
+                        task = {
+                            'dedup_key': str(dedup_key), 'account_scope': account_scope,
+                            'batch_id': str(batch_id), 'symbol': str(symbol),
+                            'side': str(side), 'mode': str(mode),
+                            'is_hedge_mode': record.get('is_hedge_mode'),
+                            'funding_position_baseline':
+                                record.get('funding_position_baseline'),
+                            'funding_baseline_complete':
+                                record.get('funding_baseline_complete') is True,
+                            'event_evidence_complete': events_complete,
+                            'reduction_events': reduction_events,
+                            'realized_reduce_amount': record.get(
+                                'realized_reduce_amount', 0),
+                            'prior_reduction_unknown': bool(pnl_partial)
+                                or not events_complete,
+                            'close_order_id': str(dedup_key).rsplit(':', 1)[-1],
+                            'created_at_ms': now_ms,
+                            'income_start_ms': min(entry_times) if entry_times else None,
+                            'close_time_ms': close_time_ms,
+                            'trade_evidence': ev,
+                            'funding_events': funding_events,
+                            'status': 'PENDING', 'attempts': 0,
+                            'next_retry_at_ms': now_ms,
+                            'finality_at_ms': close_time_ms + 72 * 3600 * 1000,
+                            'stop_auto_at_ms': close_time_ms + 7 * 24 * 3600 * 1000,
+                            'income_cursor_ms': min(entry_times) if entry_times else None,
+                            'income_scan_target_ms': None,
+                            'income_window_ms': 7 * 24 * 3600 * 1000,
+                            'due_times_ms': due_times, 'due_index': 0,
+                            'retry_count': 0,
+                            'income_facts': {}, 'income_row_hashes': {}, 'fx_facts': {},
+                            'revisions': 0, 'notification_claimed': False,
+                            'blocking_reasons': ([] if complete_trade_window else
+                                                 ['entry_or_exit_trade_time_missing']),
+                        }
+                        tasks[str(dedup_key)] = task
+                    else:
+                        # Re-entry for the same close never resets cursor, schedule,
+                        # evidence already collected, or one-shot notification claim.
+                        known = {str(x.get('trade_id'))
+                                 for x in task.get('trade_evidence', [])}
+                        for item in ev:
+                            if str(item.get('trade_id')) not in known:
+                                task.setdefault('trade_evidence', []).append(item)
+                        task['event_evidence_complete'] = bool(
+                            task.get('event_evidence_complete') and events_complete)
+                        known_events = {str(x.get('trade_id')): x
+                                        for x in task.get('funding_events', [])}
+                        for item in funding_events:
+                            key = str(item.get('trade_id'))
+                            if key in known_events and known_events[key] != item:
+                                task['event_evidence_complete'] = False
+                            known_events[key] = item
+                        task['funding_events'] = list(known_events.values())
+                        task['prior_reduction_unknown'] = bool(
+                            task.get('prior_reduction_unknown') or pnl_partial
+                            or not events_complete)
+                        task['reduction_events'] = self._merge_funding_fill_events(
+                            task.get('reduction_events') or [], reduction_events)
+                        task['realized_reduce_amount'] = max(
+                            float(task.get('realized_reduce_amount') or 0),
+                            float(record.get('realized_reduce_amount') or 0))
                 with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(stats_file), delete=False, encoding="utf-8") as tf:
-                    json.dump(stats, tf, ensure_ascii=False, indent=2)
                     temp_name = tf.name
+                    json.dump(stats, tf, ensure_ascii=False, indent=2)
+                    tf.flush()
+                    os.fsync(tf.fileno())
+                with open(temp_name, 'r', encoding='utf-8') as verify:
+                    persisted = json.load(verify)
+                if not isinstance(persisted, dict) or not isinstance(
+                        persisted.get('trades'), list):
+                    raise ValueError('trade_stats_temp_validation_failed')
                 os.replace(temp_name, stats_file)
+                temp_name = None
             return True
         except Exception as e:
             print(f"⚠️ [盈亏记录] 写入失败: {e}")
             return False
+        finally:
+            if temp_name and os.path.exists(temp_name):
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+
+    def _apply_pnl_accounting_revision(self, dedup_key, revision, stats_file=None):
+        """Atomically project a reconciliation revision into the existing stats ledger.
+
+        Network evidence collection must happen before this call and outside
+        _state_lock. Corrupt/missing trade_stats is never replaced with an empty
+        document. Revision IDs are idempotent; the trade row is not duplicated.
+        """
+        if stats_file is None:
+            stats_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "trade_stats.json")
+        temp_name = None
+        try:
+            with self._state_lock:
+                if not os.path.exists(stats_file):
+                    return False, 'stats_missing'
+                try:
+                    with open(stats_file, "r", encoding="utf-8") as f:
+                        stats = json.load(f)
+                except Exception:
+                    return False, 'stats_corrupt'
+                if not isinstance(stats, dict) or not isinstance(stats.get('trades'), list):
+                    return False, 'stats_corrupt'
+                promoted = apply_authoritative_revision(stats, str(dedup_key), revision)
+                with tempfile.NamedTemporaryFile(
+                        "w", dir=os.path.dirname(stats_file), delete=False,
+                        encoding="utf-8") as tf:
+                    temp_name = tf.name
+                    json.dump(stats, tf, ensure_ascii=False, indent=2)
+                    tf.flush()
+                    os.fsync(tf.fileno())
+                with open(temp_name, 'r', encoding='utf-8') as verify:
+                    persisted = json.load(verify)
+                if not isinstance(persisted, dict) or not isinstance(
+                        persisted.get('trades'), list):
+                    raise ValueError('trade_stats_temp_validation_failed')
+                os.replace(temp_name, stats_file)
+                temp_name = None
+                return promoted, ('ok' if promoted else 'evidence_incomplete')
+        except Exception as e:
+            return False, f'persist_failed:{type(e).__name__}'
+        finally:
+            if temp_name and os.path.exists(temp_name):
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+
+    def _mutate_pnl_stats(self, mutator, stats_file=None):
+        """Single-writer atomic mutation for PnL tasks and their trade projection."""
+        stats_file = stats_file or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                'trade_stats.json')
+        temp_name = None
+        try:
+            with self._state_lock:
+                if not os.path.exists(stats_file):
+                    return False, 'stats_missing', None
+                try:
+                    with open(stats_file, 'r', encoding='utf-8') as f:
+                        stats = json.load(f)
+                except Exception:
+                    return False, 'stats_corrupt', None
+                if not isinstance(stats, dict) or not isinstance(stats.get('trades'), list):
+                    return False, 'stats_corrupt', None
+                result = mutator(stats)
+                with tempfile.NamedTemporaryFile('w', dir=os.path.dirname(stats_file),
+                                                 delete=False, encoding='utf-8') as tf:
+                    json.dump(stats, tf, ensure_ascii=False, indent=2)
+                    tf.flush()
+                    os.fsync(tf.fileno())
+                    temp_name = tf.name
+                with open(temp_name, 'r', encoding='utf-8') as verify:
+                    persisted = json.load(verify)
+                if not isinstance(persisted, dict) or not isinstance(
+                        persisted.get('trades'), list):
+                    raise ValueError('trade_stats_temp_validation_failed')
+                os.replace(temp_name, stats_file)
+                temp_name = None
+                return True, 'ok', result
+        except Exception as e:
+            return False, f'persist_failed:{type(e).__name__}', None
+        finally:
+            if temp_name and os.path.exists(temp_name):
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+
+    def _pnl_reconciliation_loop(self):
+        """Bounded low-priority reconciler; never participates in order/protection paths."""
+        stop_event = getattr(self, '_pnl_reconcile_stop', None)
+        if stop_event is None:
+            stop_event = threading.Event()
+            self._pnl_reconcile_stop = stop_event
+        while not stop_event.is_set():
+            try:
+                self._run_one_pnl_reconciliation()
+            except Exception as e:
+                print(f'⚠️ [PnL reconciliation] worker iteration failed: {type(e).__name__}: {e}')
+            stop_event.wait(15)
+
+    def start_pnl_reconciliation(self):
+        """Start one restart-safe background reconciler after position recovery."""
+        thread = getattr(self, '_pnl_reconcile_thread', None)
+        if thread is not None and thread.is_alive():
+            return False
+        self._pnl_reconcile_stop = threading.Event()
+        thread = threading.Thread(target=self._pnl_reconciliation_loop,
+                                  name='pnl-income-reconciliation', daemon=True)
+        self._pnl_reconcile_thread = thread
+        thread.start()
+        return True
+
+    @staticmethod
+    def _pnl_consume_budget(budget, weight):
+        """Reserve one physical request before entering the retrying API gate."""
+        try:
+            reserve_request(budget, int(weight))
+        except RuntimeError as e:
+            raise RuntimeError(str(e)) from e
+
+    def _pnl_income_window(self, task, start_ms, end_ms, budget):
+        """One bounded Income History page; all HTTP attempts go through the shared API gate."""
+        if end_ms < start_ms or end_ms - start_ms > 7 * 24 * 3600 * 1000:
+            raise ValueError('income_window_out_of_range')
+        endpoint = getattr(self.exchange, 'fapiPrivateGetIncome', None)
+        if endpoint is None:
+            raise RuntimeError('income_endpoint_unavailable')
+        market_lookup = getattr(self.exchange, 'market', None)
+        if not callable(market_lookup):
+            raise RuntimeError('income_market_metadata_unavailable')
+        market = market_lookup(task['symbol'])
+        if (not isinstance(market, dict) or market.get('swap') is not True
+                or market.get('linear') is not True
+                or str(market.get('settle') or '').upper() != 'USDT'
+                or not market.get('id')):
+            raise RuntimeError('income_market_not_usdm_swap')
+        market_id = str(market['id'])
+        params = {'symbol': market_id, 'startTime': int(start_ms),
+                  'endTime': int(end_ms), 'limit': 1000}
+        rows = self._safe_api_call(
+            endpoint, params, retries=1, request_weight=30,
+            attempt_observer=lambda weight: self._pnl_consume_budget(budget, weight))
+        if not isinstance(rows, list):
+            raise ValueError('income_response_not_list')
+        return rows
+
+    def _pnl_fx_symbol(self, asset):
+        asset = str(asset or '').upper()
+        markets = getattr(self.exchange, 'markets', None)
+        if not isinstance(markets, dict):
+            raise RuntimeError('markets_unavailable')
+        candidates = [m for m in markets.values() if isinstance(m, dict)
+                      and m.get('swap') is True
+                      and m.get('linear') is True
+                      and str(m.get('base') or '').upper() == asset
+                      and str(m.get('quote') or '').upper() == 'USDT'
+                      and str(m.get('settle') or '').upper() == 'USDT']
+        if len(candidates) != 1:
+            raise RuntimeError('usdm_mark_market_missing_or_ambiguous')
+        return str(candidates[0].get('symbol') or '')
+
+    def _pnl_fx_for_row(self, row, task, budget):
+        asset = str(row.get('asset') or '').upper()
+        amount = row.get('income')
+        event_ms = int(row.get('time'))
+        if asset == 'USDT':
+            return Decimal(str(amount)), {'source': 'identity', 'asset': 'USDT',
+                                          'event_time_ms': event_ms}
+        minute = event_ms // 60_000 * 60_000
+        key = f"{asset}:{minute}"
+        stored = task.get('fx_facts', {}).get(key)
+        if isinstance(stored, dict):
+            value = Decimal(str(amount)) * Decimal(str(stored['close']))
+            return value, dict(stored)
+        symbol = self._pnl_fx_symbol(asset)
+        candles = self._safe_api_call(self.exchange.fetch_ohlcv, symbol, '1m',
+                                      minute, 1, {'price': 'mark'}, retries=1,
+                                      request_weight=1,
+                                      attempt_observer=lambda weight:
+                                      self._pnl_consume_budget(budget, weight))
+        value, proof = convert_mark_minute(amount, asset, event_ms, candles,
+                                           now_ms=int(time.time() * 1000))
+        proof.update({
+            'symbol': symbol, 'market_type': 'USD-M-mark',
+            'fetched_at_ms': int(time.time() * 1000),
+            'raw_response_hash': hashlib.sha256(json.dumps(
+                candles, sort_keys=True, separators=(',', ':'), default=str
+            ).encode()).hexdigest(),
+        })
+        task.setdefault('fx_facts', {})[key] = proof
+        task.setdefault('last_errors', {}).pop(f'fx:{asset}:{event_ms}', None)
+        return value, proof
+
+    def _pnl_build_funding_allocations(self, task, all_tasks, funding_rows, budget):
+        """Derive direction pools from exact funding rates and audited exposures."""
+        if not funding_rows:
+            return {}
+        event_times = sorted({int(row['time']) for row in funding_rows})
+        same_scope = [candidate for candidate in all_tasks.values()
+                      if isinstance(candidate, dict)
+                      and candidate.get('account_scope') == task.get('account_scope')
+                      and str(candidate.get('symbol') or '').replace('/', '').split(':', 1)[0]
+                      == str(task.get('symbol') or '').replace('/', '').split(':', 1)[0]
+                      and int(candidate.get('income_start_ms') or 0) <= event_times[-1]]
+        baselines = [candidate.get('funding_position_baseline')
+                     for candidate in same_scope
+                     if candidate.get('funding_baseline_complete') is True
+                     and isinstance(candidate.get('funding_position_baseline'), dict)]
+        if not baselines:
+            raise AccountingEvidenceError('funding_position_baseline_missing')
+        audit_start = min(int(b['captured_at_ms']) for b in baselines)
+        audit_end = event_times[-1]
+        if audit_start >= audit_end or audit_end - audit_start > 7 * 24 * 3600 * 1000:
+            raise AccountingEvidenceError('funding_account_trade_audit_window_invalid')
+
+        trades = self._safe_api_call(
+            self.exchange.fetch_my_trades, task['symbol'], audit_start, 1000,
+            {'until': audit_end}, retries=1, request_weight=5,
+            attempt_observer=lambda weight: self._pnl_consume_budget(budget, weight))
+        if not isinstance(trades, list) or len(trades) >= 1000:
+            raise AccountingEvidenceError('funding_account_trade_audit_incomplete')
+        audit_rows = []
+        for trade in trades:
+            if not isinstance(trade, dict):
+                raise AccountingEvidenceError('funding_account_trade_audit_row_invalid')
+            info = trade.get('info') if isinstance(trade.get('info'), dict) else {}
+            audit_rows.append({
+                'trade_id': str(info.get('id') or trade.get('id') or ''),
+                'order_id': str(info.get('orderId') or trade.get('order') or ''),
+                'symbol': str(info.get('symbol') or ''),
+                'side': str(info.get('side') or trade.get('side') or '').upper(),
+                'position_side': (str(info.get('positionSide') or '').upper()
+                                  or ('BOTH' if task.get('is_hedge_mode') is False else '')),
+                'qty': str(info.get('qty') or trade.get('amount') or ''),
+                'time': info.get('time') or trade.get('timestamp'),
+            })
+        account_trade_audit = {
+            'complete': True, 'start_ms': audit_start,
+            'end_ms': audit_end, 'trades': audit_rows,
+        }
+        fetch_rates = getattr(self.exchange, 'fetch_funding_rate_history', None)
+        if not callable(fetch_rates):
+            raise AccountingEvidenceError('funding_rate_history_unavailable')
+        rates = self._safe_api_call(
+            fetch_rates, task['symbol'], event_times[0], 1000,
+            {'until': event_times[-1]}, retries=1, request_weight=1,
+            attempt_observer=lambda weight: self._pnl_consume_budget(budget, weight))
+        if not isinstance(rates, list) or len(rates) >= 1000:
+            raise AccountingEvidenceError('funding_rate_history_incomplete')
+        rates_by_time = {}
+        for rate_row in rates:
+            info = rate_row.get('info') if isinstance(rate_row, dict) \
+                and isinstance(rate_row.get('info'), dict) else {}
+            try:
+                rate_time = int(info.get('fundingTime') or rate_row.get('timestamp'))
+            except (TypeError, ValueError):
+                raise AccountingEvidenceError('funding_rate_time_missing')
+            if rate_time in rates_by_time:
+                raise AccountingEvidenceError('funding_rate_time_duplicate')
+            rates_by_time[rate_time] = info
+
+        allocation_proofs = {}
+        states = self.load_all_states()
+        active_batch_ids = []
+        augmented_tasks = dict(all_tasks)
+        target_market = str(task['symbol']).replace('/', '').split(':', 1)[0]
+        for symbol, batches in states.items():
+            if not isinstance(batches, dict):
+                continue
+            for batch_id, batch in batches.items():
+                if not isinstance(batch, dict) or not batch.get('is_active') \
+                        or str(batch.get('symbol') or symbol).replace('/', '').split(':', 1)[0] \
+                        != target_market:
+                    continue
+                batch_id = str(batch_id)
+                active_batch_ids.append(batch_id)
+                baseline = batch.get('funding_position_baseline')
+                fills = list(batch.get('funding_fill_events') or [])
+                reductions = list(batch.get('funding_reduction_events') or [])
+                entry_times = [int(event['time']) for event in fills
+                               if isinstance(event, dict) and event.get('role') == 'entry'
+                               and event.get('time') is not None]
+                start_ms = min(entry_times) if entry_times else (
+                    int(baseline.get('captured_at_ms'))
+                    if isinstance(baseline, dict)
+                    and baseline.get('captured_at_ms') is not None else 0)
+                augmented_tasks[f'active:{batch_id}'] = {
+                    'account_scope': task.get('account_scope'),
+                    'symbol': str(batch.get('symbol') or symbol),
+                    'batch_id': batch_id, 'side': batch.get('side'),
+                    'income_start_ms': start_ms,
+                    'close_time_ms': event_times[-1],
+                    'event_evidence_complete':
+                        batch.get('funding_event_evidence_complete') is True,
+                    'prior_reduction_unknown':
+                        batch.get('funding_event_evidence_complete') is not True,
+                    'funding_baseline_complete':
+                        batch.get('funding_baseline_complete') is True,
+                    'funding_position_baseline': baseline,
+                    'realized_reduce_amount': batch.get('realized_reduce_amount', 0),
+                    'funding_events': fills,
+                    'reduction_events': reductions,
+                }
+        for row in funding_rows:
+            event_ms = int(row['time'])
+            info = rates_by_time.get(event_ms)
+            if not isinstance(info, dict):
+                raise AccountingEvidenceError('funding_rate_counterpart_missing')
+            symbol_id = str(info.get('symbol') or '')
+            market_id = str(self.exchange.market(task['symbol']).get('id') or '')
+            if symbol_id != market_id:
+                raise AccountingEvidenceError('funding_rate_symbol_unverified')
+            mark_price = info.get('markPrice')
+            funding_rate = info.get('fundingRate')
+            if mark_price in (None, '') or funding_rate in (None, ''):
+                raise AccountingEvidenceError('funding_rate_or_mark_missing')
+            income_key, identified = income_identity(task['account_scope'], row)
+            if not identified:
+                raise AccountingEvidenceError('funding_income_identity_missing')
+            proof = build_single_direction_funding_allocation(
+                task, augmented_tasks, row, mark_price, funding_rate,
+                account_trade_audit={
+                    **account_trade_audit,
+                    'end_ms': event_ms,
+                    'trades': [x for x in audit_rows
+                               if x.get('time') is not None and int(x['time']) <= event_ms],
+                },
+                active_batch_ids=[batch_id for batch_id in active_batch_ids
+                                  if int(augmented_tasks[f'active:{batch_id}'].get(
+                                      'income_start_ms') or 0) <= event_ms])
+            proof['funding_rate_source'] = 'USD-M-fundingRate-history'
+            proof['funding_rate_raw'] = str(funding_rate)
+            proof['mark_price_raw'] = str(mark_price)
+            allocation_proofs[income_key] = proof
+        return allocation_proofs
+
+    def _run_one_pnl_reconciliation(self, stats_file=None):
+        """Advance one durable task within six physical requests / weight 90."""
+        stats_file = stats_file or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                               'trade_stats.json')
+        now_ms = int(time.time() * 1000)
+        chosen = {}
+
+        def _claim(stats):
+            tasks = (stats.get('accounting_v2') or {}).get('tasks')
+            if not isinstance(tasks, dict):
+                return None
+            for key, task in sorted(tasks.items(), key=lambda item: item[1].get('created_at_ms', 0)):
+                if not isinstance(task, dict):
+                    continue
+                if task.get('status') in ('STOPPED', 'UNKNOWN'):
+                    continue
+                due_times = task.get('due_times_ms') or []
+                due_index = int(task.get('due_index') or 0)
+                if due_index >= len(due_times):
+                    task['auto_rescan_stopped'] = True
+                    continue
+                if now_ms > int(task.get('stop_auto_at_ms') or 0) + 15_000:
+                    if task.get('status') != 'AUTHORITATIVE_FINAL':
+                        task['status'] = 'STOPPED'
+                        task.setdefault('blocking_reasons', []).append(
+                            'auto_rescan_window_expired')
+                    task['auto_rescan_stopped'] = True
+                    continue
+                if int(task.get('next_retry_at_ms') or 0) > now_ms:
+                    continue
+                if task.get('status') == 'PROCESSING' and int(task.get('lease_until_ms') or 0) > now_ms:
+                    continue
+                task['status'] = 'PROCESSING'
+                task['lease_until_ms'] = now_ms + 120_000
+                task['attempts'] = int(task.get('attempts') or 0) + 1
+                chosen.update({'key': key, 'task': copy.deepcopy(task),
+                               'tasks': copy.deepcopy(tasks)})
+                return key
+            return None
+
+        ok, why, _ = self._mutate_pnl_stats(_claim, stats_file)
+        if not ok or not chosen:
+            return False
+        key, task = chosen['key'], chosen['task']
+        budget = {'attempts': 0, 'weight': 0}
+        try:
+            if task.get('income_start_ms') is None or not task.get('trade_evidence'):
+                raise AccountingEvidenceError('trade_window_evidence_missing')
+            due_times = task.get('due_times_ms') or []
+            due_index = int(task.get('due_index') or 0)
+            if due_index >= len(due_times) or now_ms < int(due_times[due_index]):
+                self._set_pnl_task(key, {'status': 'PENDING', 'lease_until_ms': 0,
+                                         'next_retry_at_ms': int(due_times[due_index])
+                                         if due_index < len(due_times) else int(task['stop_auto_at_ms'])},
+                                   stats_file, budget)
+                return False
+            target = int(task.get('income_scan_target_ms') or 0)
+            cursor = int(task.get('income_cursor_ms') or task['income_start_ms'])
+            if target <= 0:
+                target = min(now_ms, int(task['stop_auto_at_ms']))
+                task['income_scan_target_ms'] = target
+                cursor = int(task['income_start_ms'])
+            if cursor < target:
+                width = int(task.get('income_window_ms') or 7 * 24 * 3600 * 1000)
+                pass_facts = {}
+                market = self.exchange.market(task['symbol'])
+                market_id = str(market['id'])
+
+                def _block(reason):
+                    blockers = task.setdefault('blocking_reasons', [])
+                    if reason not in blockers:
+                        blockers.append(reason)
+
+                def _quarantine(raw, reason):
+                    payload = json.dumps(raw, sort_keys=True, separators=(',', ':'),
+                                         ensure_ascii=False, default=str)
+                    digest = hashlib.sha256(payload.encode()).hexdigest()
+                    task.setdefault('quarantined_income', {})[digest] = {
+                        'reason': reason, 'payload': raw}
+                    _block(reason)
+
+                while cursor < target:
+                    if cursor >= target:
+                        break
+                    query_start = max(int(task['income_start_ms']), cursor - 60_000)
+                    end_ms = min(target, cursor + width - 60_001)
+                    try:
+                        page = self._pnl_income_window(task, query_start, end_ms, budget)
+                    except RuntimeError as budget_error:
+                        if 'budget_exhausted' not in str(budget_error):
+                            raise
+                        break
+                    facts = task.setdefault('income_facts', {})
+                    for row in page:
+                        if not isinstance(row, dict):
+                            _quarantine(row, 'income_row_invalid')
+                            continue
+                        try:
+                            row_time = int(row.get('time'))
+                        except (TypeError, ValueError):
+                            _quarantine(row, 'income_time_invalid')
+                            continue
+                        if row_time < query_start or row_time > end_ms:
+                            _quarantine(row, 'income_row_outside_requested_window')
+                        if not str(row.get('incomeType') or '').strip():
+                            _quarantine(row, 'income_type_missing')
+                            continue
+                        if row.get('incomeType') not in (
+                                'REALIZED_PNL', 'FUNDING_FEE', 'COMMISSION',
+                                'COMMISSION_REBATE'):
+                            ignored = task.setdefault('ignored_income_types', {})
+                            income_type = str(row.get('incomeType'))
+                            ignored[income_type] = int(ignored.get(income_type) or 0) + 1
+                            continue
+                        row_symbol = str(row.get('symbol') or '')
+                        if row_symbol and row_symbol != market_id:
+                            _block('income_symbol_mismatch')
+                        if not row_symbol:
+                            _block('income_symbol_missing')
+                        source_key, complete_id = income_identity(task['account_scope'], row)
+                        prior_this_pass = pass_facts.get(source_key)
+                        if prior_this_pass is not None and prior_this_pass != row:
+                            if 'income_duplicate_identity_conflict' not in task.setdefault(
+                                    'blocking_reasons', []):
+                                task['blocking_reasons'].append(
+                                    'income_duplicate_identity_conflict')
+                        pass_facts[source_key] = row
+                        # A changed row seen on a later complete rescan is an
+                        # exchange correction; its source key remains stable and
+                        # the revision digest captures the changed payload.
+                        facts[source_key] = row
+                        task.setdefault('income_row_hashes', {})[source_key] = hashlib.sha256(
+                            json.dumps(row, sort_keys=True, separators=(',', ':'),
+                                       ensure_ascii=False, default=str).encode()
+                        ).hexdigest()
+                        if not complete_id:
+                            _block('income_tran_id_missing')
+                    if len(page) >= 1000:
+                        if width <= 120_000:
+                            _block('income_page_overflow_min_granularity')
+                            retry_count = int(task.get('retry_count') or 0) + 1
+                            task['retry_count'] = retry_count
+                            delay_ms = min(900_000, 60_000 *
+                                           (2 ** min(retry_count - 1, 4)))
+                            task['status'] = 'PENDING'
+                            task['lease_until_ms'] = 0
+                            task['next_retry_at_ms'] = now_ms + delay_ms
+                            self._set_pnl_task(key, task, stats_file, budget)
+                            return False
+                        width = max(120_000, width // 2)
+                        task['income_window_ms'] = width
+                        continue
+                    cursor = end_ms + 1
+                task['income_cursor_ms'] = cursor
+                task['income_window_ms'] = width
+                if cursor < target:
+                    task['status'] = 'PENDING'
+                    task['lease_until_ms'] = 0
+                    task['next_retry_at_ms'] = now_ms + 60_000
+                    self._set_pnl_task(key, task, stats_file, budget)
+                    return False
+
+            rows = list((task.get('income_facts') or {}).values())
+            expected_ids = {str(x.get('trade_id')) for x in task['trade_evidence']
+                            if x.get('trade_id')}
+            relevant = [r for r in rows if str(r.get('tradeId') or '') in expected_ids
+                        or r.get('incomeType') == 'FUNDING_FEE']
+            # Fetch historical mark quotes within the same shared per-pass budget.
+            missing_fx = [r for r in relevant if str(r.get('asset') or '').upper() != 'USDT'
+                          and f"{str(r.get('asset') or '').upper()}:{int(r.get('time')) // 60000 * 60000}"
+                          not in (task.get('fx_facts') or {})]
+            for row in missing_fx:
+                try:
+                    self._pnl_fx_for_row(row, task, budget)
+                except RuntimeError as budget_error:
+                    if 'budget_exhausted' in str(budget_error):
+                        break
+                    task.setdefault('last_errors', {})[
+                        f"fx:{str(row.get('asset') or '').upper()}:{int(row.get('time'))}"] = type(budget_error).__name__
+                except Exception as e:
+                    task.setdefault('last_errors', {})[
+                        f"fx:{str(row.get('asset') or '').upper()}:{int(row.get('time'))}"] = type(e).__name__
+            remaining_fx = [r for r in relevant if str(r.get('asset') or '').upper() != 'USDT'
+                            and f"{str(r.get('asset') or '').upper()}:{int(r.get('time')) // 60000 * 60000}"
+                            not in (task.get('fx_facts') or {})]
+            if remaining_fx:
+                retry_count = int(task.get('retry_count') or 0) + 1
+                task['retry_count'] = retry_count
+                task['status'] = 'PENDING'
+                task['lease_until_ms'] = 0
+                delay_ms = min(900_000, 60_000 * (2 ** min(retry_count - 1, 4)))
+                task['next_retry_at_ms'] = now_ms + delay_ms
+                self._set_pnl_task(key, task, stats_file, budget)
+                return False
+            def _fx(amount, asset, event_ms):
+                asset = str(asset or '').upper()
+                if asset == 'USDT':
+                    return Decimal(str(amount)), {'source': 'identity', 'asset': 'USDT'}
+                minute = int(event_ms) // 60_000 * 60_000
+                quote = task.get('fx_facts', {}).get(f'{asset}:{minute}')
+                if not isinstance(quote, dict):
+                    raise AccountingEvidenceError('fx_quote_missing')
+                price = Decimal(str(quote['close']))
+                return Decimal(str(amount)) * price, quote
+
+            funding_pools = task.get('funding_direction_allocations')
+            reconciliation_error = None
+            funding_rows = [r for r in relevant if r.get('incomeType') == 'FUNDING_FEE']
+            if funding_rows and not funding_pools:
+                try:
+                    funding_pools = self._pnl_build_funding_allocations(
+                        task, chosen.get('tasks') or {}, funding_rows, budget)
+                    task['funding_direction_allocations'] = funding_pools
+                except Exception as funding_error:
+                    reconciliation_error = str(funding_error)
+            revision_values = None
+            if not reconciliation_error:
+                try:
+                    revision_values = reconcile_income_facts(
+                        task, rows, fx_value=_fx, funding_allocations=funding_pools,
+                        income_complete=(cursor >= target and not task.get('blocking_reasons')))
+                except AccountingEvidenceError as evidence_error:
+                    reconciliation_error = str(evidence_error)
+            if now_ms < int(task.get('finality_at_ms') or now_ms):
+                task['status'] = 'AWAITING_FINALITY'
+                task['due_index'] = due_index + 1
+                task['income_cursor_ms'] = int(task['income_start_ms'])
+                task['income_scan_target_ms'] = None
+                next_due = (int(due_times[task['due_index']])
+                            if task['due_index'] < len(due_times)
+                            else int(task['stop_auto_at_ms']))
+                task['next_retry_at_ms'] = next_due
+                task['lease_until_ms'] = 0
+                self._set_pnl_task(key, task, stats_file, budget)
+                return False
+            if due_index < min(7, len(due_times) - 1):
+                task['due_index'] = due_index + 1
+                task['income_cursor_ms'] = int(task['income_start_ms'])
+                task['income_scan_target_ms'] = None
+                task['status'] = 'PENDING'
+                task['lease_until_ms'] = 0
+                task['next_retry_at_ms'] = int(due_times[task['due_index']])
+                self._set_pnl_task(key, task, stats_file, budget)
+                return False
+            if reconciliation_error:
+                task['last_reconciliation_error'] = reconciliation_error
+                task['lease_until_ms'] = 0
+                if task.get('last_revision_id'):
+                    def _revoke_stale(stats):
+                        return mark_revision_pending(
+                            stats, key, reconciliation_error,
+                            datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S'))
+                    revoke_ok, revoke_reason, _ = self._mutate_pnl_stats(
+                        _revoke_stale, stats_file)
+                    if not revoke_ok:
+                        raise OSError(f'pending_revision_persist_failed:{revoke_reason}')
+                if due_index < len(due_times) - 1:
+                    task['status'] = 'WAIT_RECONCILIATION'
+                    task['due_index'] = due_index + 1
+                    task['income_cursor_ms'] = int(task['income_start_ms'])
+                    task['income_scan_target_ms'] = None
+                    task['next_retry_at_ms'] = int(due_times[task['due_index']])
+                else:
+                    task['status'] = 'UNKNOWN'
+                    task['blocking_reasons'] = sorted(set(
+                        task.get('blocking_reasons', []) + [reconciliation_error]))
+                    task['due_index'] = len(due_times)
+                self._set_pnl_task(key, task, stats_file, budget)
+                return False
+            revision_material = json.dumps(
+                {'income': task.get('income_facts', {}),
+                 'income_hashes': task.get('income_row_hashes', {}),
+                 'fx': task.get('fx_facts', {}),
+                 'funding_allocations': task.get('funding_direction_allocations', {})},
+                sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+            revision_id = hashlib.sha256(revision_material.encode()).hexdigest()[:20]
+            revision = dict(revision_values)
+            revision.update({
+                'revision_id': revision_id,
+                'received_at': datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+                'evidence_refs': sorted(task.get('income_facts', {}).keys()),
+                'valuation_label': ('按 Binance USDⓈ-M 历史标记价折算'
+                                    if task.get('fx_facts') else 'USDT'),
+            })
+            persist_ok, persist_reason, _ = self._set_pnl_task(
+                key, task, stats_file, budget)
+            if not persist_ok:
+                raise OSError(f'reconciliation_checkpoint_failed:{persist_reason}')
+            promoted = {'value': False}
+            def _finalize(stats):
+                revisions_before = len((stats.get('accounting_v2') or {}).get(
+                    'revisions', {}))
+                promoted['value'] = apply_authoritative_revision(stats, key, revision)
+                live = stats['accounting_v2']['tasks'][key]
+                revisions_after = len(stats['accounting_v2'].get('revisions', {}))
+                live['revisions'] = int(live.get('revisions') or 0) + max(
+                    0, revisions_after - revisions_before)
+                live['last_revision_id'] = revision_id
+                live['status'] = 'AUTHORITATIVE_FINAL' if promoted['value'] else 'PENDING'
+                live['lease_until_ms'] = 0
+                live['due_index'] = min(due_index + 1, len(due_times))
+                live['next_retry_at_ms'] = (
+                    int(due_times[live['due_index']])
+                    if live['due_index'] < len(due_times)
+                    else int(live['stop_auto_at_ms']))
+                return promoted['value']
+            final_ok, final_reason, _ = self._mutate_pnl_stats(_finalize, stats_file)
+            if not final_ok:
+                raise OSError(f'authoritative_revision_persist_failed:{final_reason}')
+            if promoted['value']:
+                self._claim_pnl_completion_notice(key, stats_file)
+            return promoted['value']
+        except Exception as e:
+            attempts = int(task.get('retry_count') or 0) + 1
+            delay = min(900_000, 60_000 * (2 ** min(attempts - 1, 4)))
+            task['retry_count'] = attempts
+            task['last_error'] = f'{type(e).__name__}:{str(e)[:120]}'
+            task['status'] = 'PENDING'
+            task['lease_until_ms'] = 0
+            task['next_retry_at_ms'] = now_ms + delay
+            self._set_pnl_task(key, task, stats_file, budget)
+            return False
+
+    def _set_pnl_task(self, key, replacement, stats_file=None, budget=None):
+        def _update(stats):
+            tasks = (stats.get('accounting_v2') or {}).get('tasks')
+            if not isinstance(tasks, dict) or key not in tasks:
+                raise ValueError('pnl_task_missing')
+            live = tasks[key]
+            if not isinstance(live, dict) or not isinstance(replacement, dict):
+                raise ValueError('pnl_task_invalid')
+            live.update(replacement)
+            if budget is not None:
+                if not budget.get('_accounted'):
+                    live['api_attempts_total'] = int(live.get('api_attempts_total') or 0) + int(
+                        budget.get('attempts') or 0)
+                    live['api_weight_total'] = int(live.get('api_weight_total') or 0) + int(
+                        budget.get('weight') or 0)
+                    live['last_api_pass'] = {k: v for k, v in budget.items()
+                                             if not k.startswith('_')}
+                    budget['_accounted'] = True
+        return self._mutate_pnl_stats(_update, stats_file)
+
+    def _claim_pnl_completion_notice(self, key, stats_file=None):
+        claimed = {'value': False}
+        notice = {}
+        def _claim(stats):
+            accounting = stats.get('accounting_v2') or {}
+            task = accounting.get('tasks', {}).get(key)
+            if (not isinstance(task, dict)
+                    or task.get('status') != 'AUTHORITATIVE_FINAL'):
+                return False
+            claim_key = ':'.join((str(task.get('account_scope') or ''),
+                                  str(task.get('symbol') or ''),
+                                  str(task.get('batch_id') or '')))
+            claims = accounting.setdefault('completion_notice_claims', {})
+            if not isinstance(claims, dict) or claims.get(claim_key):
+                task['notification_claimed'] = True
+                return False
+            claims[claim_key] = {'claimed_at_ms': int(time.time() * 1000),
+                                 'task_key': key}
+            task['notification_claimed'] = True
+            claimed['value'] = True
+            notice.update({'batch_id': task.get('batch_id'), 'symbol': task.get('symbol')})
+            return True
+        ok, _, _ = self._mutate_pnl_stats(_claim, stats_file)
+        if ok and claimed['value']:
+            try:
+                self.send_tg_notification(
+                    f'✅ 账务补证完成：批次 `{notice.get("batch_id")}` '
+                    f'({notice.get("symbol")})，交易所已实现口径净盈亏已更新。')
+            except Exception as e:
+                print(f'⚠️ [PnL reconciliation] completion TG failed: {e}')
+
 
     # 🔥 T1-C（v1.3+补充条款）：fee_breakdown 白名单（模块级常量，resolver 与
     # 落盘层共用同一契约）。
@@ -1514,12 +2449,25 @@ class CryptoTrader:
 
     @staticmethod
     def _is_pnl_authoritative(fees) -> bool:
-        """手续费权威性唯一判定入口（四条结算路径 + 日报 + D-006 共用）。
+        """统一权威性门：只有已 final 的 Income History 投影可称权威。
 
-        任一手续费不可得 / 非有限 / source 非法 / 显式 fee_unknown → 非权威。"""
+        T1-C 的 actual commission 只证明成交费用本身；不能证明 REALIZED_PNL、
+        funding、rebate、历史 FX 或 Income 窗口完整。缺 reconciliation metadata
+        的旧值和本地 gross/fee 估算一律仅作 provisional display。
+        """
         if not isinstance(fees, dict):
             return False
+        if fees.get('accounting_status') != 'AUTHORITATIVE_FINAL':
+            return False
+        if fees.get('pnl_source') != 'binance_income_history':
+            return False
+        for evidence_key in ('income_complete', 'commission_reconciled',
+                             'funding_allocated', 'fx_complete'):
+            if fees.get(evidence_key) is not True:
+                return False
         if str(fees.get('fee_note') or '') == 'fee_unknown':
+            return False
+        if fees.get('fee_metadata_error'):
             return False
         for k in ('entry_fee', 'exit_fee'):
             v = fees.get(k)
@@ -1528,7 +2476,7 @@ class CryptoTrader:
             if v != v or v in (float('inf'), float('-inf')):
                 return False
         for k in ('entry_fee_source', 'exit_fee_source'):
-            if fees.get(k) not in ('actual', 'estimated'):
+            if fees.get(k) != 'actual':
                 return False
         return True
 
@@ -1536,12 +2484,130 @@ class CryptoTrader:
     def _pnl_display_label(fees):
         """统一展示口径：返回 (note_line, label)。非权威时不得写「最终净盈亏」。"""
         if CryptoTrader._is_pnl_authoritative(fees):
-            return "", "最终净盈亏"
+            return "", "交易所已实现口径净盈亏"
         return "🧾 费用未对账：本条为估算，不作为权威净盈亏\n", "估算净盈亏"
 
     _FEE_BREAKDOWN_KEYS = ('entry_fee', 'entry_fee_source', 'entry_note',
                            'entry_fee_total', 'exit_fee', 'exit_fee_source',
-                           'exit_note', 'fee_note')
+                           'exit_note', 'fee_note', 'trade_evidence',
+                           'reduction_events', 'realized_reduce_amount',
+                           'is_hedge_mode', 'funding_fill_events',
+                           'funding_position_baseline', 'funding_baseline_complete',
+                           'funding_events_complete')
+
+    def _fetch_funding_fill_events(self, symbol, order_id, role, side,
+                                   position_side, expected_qty):
+        """Return exact userTrades facts for one confirmed order; never guess times."""
+        rows = self._safe_api_call(
+            self.exchange.fetch_my_trades, symbol, None, None,
+            {'orderId': str(order_id)}, retries=2)
+        if not isinstance(rows, list) or not rows:
+            raise ValueError('funding_order_trades_missing')
+        market = self.exchange.market(symbol)
+        expected_market_id = str((market or {}).get('id') or
+                                 str(symbol).replace('/', '').split(':', 1)[0])
+        events = []
+        seen = set()
+        total = Decimal(0)
+        for trade in rows:
+            if not isinstance(trade, dict):
+                raise ValueError('funding_trade_invalid')
+            info = trade.get('info') or {}
+            trade_id = str(info.get('id') or trade.get('id') or '')
+            row_order = str(info.get('orderId') or trade.get('order') or '')
+            row_symbol = str(info.get('symbol') or symbol)
+            row_side = str(info.get('side') or trade.get('side') or '').upper()
+            row_position_side = str(info.get('positionSide') or '').upper()
+            if not row_position_side and position_side.upper() == 'BOTH':
+                # Binance's one-way UM userTrades payloads may omit positionSide;
+                # BOTH is justified only by the caller's verified account mode.
+                row_position_side = 'BOTH'
+            qty = info.get('qty') or trade.get('amount')
+            stamp = info.get('time') or trade.get('timestamp')
+            if (not trade_id or trade_id in seen or row_order != str(order_id)
+                    or row_symbol != expected_market_id or row_side != side.upper()
+                    or row_position_side not in ('LONG', 'SHORT', 'BOTH')
+                    or row_position_side != position_side.upper()
+                    or stamp is None):
+                raise ValueError('funding_trade_identity_incomplete')
+            try:
+                qty_dec = Decimal(str(qty))
+                stamp_ms = int(stamp)
+            except Exception as exc:
+                raise ValueError('funding_trade_qty_or_time_invalid') from exc
+            if not qty_dec.is_finite() or qty_dec <= 0 or stamp_ms <= 0:
+                raise ValueError('funding_trade_qty_or_time_invalid')
+            seen.add(trade_id)
+            total += qty_dec
+            events.append({
+                'trade_id': trade_id, 'order_id': row_order,
+                'symbol': expected_market_id, 'side': row_side,
+                'position_side': row_position_side, 'qty': str(qty_dec),
+                'time': stamp_ms, 'role': role,
+            })
+        expected = Decimal(str(expected_qty))
+        if abs(total - expected) > max(Decimal('0.00000001'), expected * Decimal('0.000001')):
+            raise ValueError('funding_trade_qty_mismatch')
+        return events
+
+    @staticmethod
+    def _merge_funding_fill_events(existing, incoming):
+        """Idempotently merge immutable fill identities; conflicts fail closed."""
+        merged = {str(x.get('trade_id')): dict(x) for x in (existing or [])
+                  if isinstance(x, dict) and x.get('trade_id')}
+        for event in incoming:
+            key = str(event['trade_id'])
+            if key in merged and merged[key] != event:
+                raise ValueError('funding_trade_identity_conflict')
+            merged[key] = dict(event)
+        return sorted(merged.values(), key=lambda x: (int(x['time']), str(x['trade_id'])))
+
+    def _capture_funding_position_baseline(self, symbol, is_hedge_mode):
+        """One read-only per-symbol position snapshot before this batch's orders."""
+        # Anchor before the request, not after its response: a fill racing the
+        # position snapshot must be included in the later audit window or cause
+        # a conservative mismatch, never disappear between snapshot and cursor.
+        baseline_started_at_ms = int(time.time() * 1000)
+        positions = self._safe_api_call(
+            self.exchange.fetch_positions, [symbol], retries=1)
+        if not isinstance(positions, list):
+            raise ValueError('funding_position_baseline_unreadable')
+        market = self.exchange.market(symbol)
+        market_id = str((market or {}).get('id') or
+                        str(symbol).replace('/', '').split(':', 1)[0])
+        amounts = {'LONG': Decimal(0), 'SHORT': Decimal(0)}
+        for position in positions:
+            if not isinstance(position, dict):
+                raise ValueError('funding_position_row_invalid')
+            info = position.get('info') if isinstance(position.get('info'), dict) else {}
+            raw_symbol = str(info.get('symbol') or '')
+            unified_symbol = str(position.get('symbol') or '')
+            if raw_symbol != market_id and unified_symbol != symbol:
+                continue
+            raw_amount = info.get('positionAmt')
+            if raw_amount not in (None, ''):
+                signed_qty = Decimal(str(raw_amount))
+            else:
+                contracts = position.get('contracts')
+                if contracts in (None, ''):
+                    raise ValueError('funding_position_amount_missing')
+                qty = Decimal(str(contracts))
+                side_name = str(position.get('side') or '').lower()
+                if side_name not in ('long', 'short'):
+                    raise ValueError('funding_position_side_missing')
+                signed_qty = qty if side_name == 'long' else -qty
+            if not signed_qty.is_finite():
+                raise ValueError('funding_position_amount_invalid')
+            position_side = str(info.get('positionSide') or '').upper()
+            if is_hedge_mode:
+                if position_side not in ('LONG', 'SHORT'):
+                    raise ValueError('funding_hedge_position_side_missing')
+                amounts[position_side] += abs(signed_qty)
+            else:
+                amounts['LONG' if signed_qty >= 0 else 'SHORT'] += abs(signed_qty)
+        return {'captured_at_ms': baseline_started_at_ms,
+                'long_qty': str(amounts['LONG']), 'short_qty': str(amounts['SHORT']),
+                'market_id': market_id}
 
     @staticmethod
     def _fee_float(v):
@@ -1669,6 +2735,11 @@ class CryptoTrader:
             record = dict(ev)
             record['status'] = str(ev.get('status') or '')
             record['order_id'] = str(order_id)
+            if 'funding_events' in ev:
+                record['funding_events'] = [dict(x) for x in
+                                            (ev.get('funding_events') or [])]
+                record['funding_event_complete'] = bool(
+                    ev.get('funding_event_complete'))
             # 🔥 F2/F3-P1（八复审）：证据里的 order_id 取自**账本期望值**，
             # 不得冒充观测结果 —— 标注身份来源；响应缺 side/id（或回查失败）
             # 的记录只能停在 qty_unverified（结算门与前缀门一票否决）。
@@ -1683,6 +2754,19 @@ class CryptoTrader:
                        or prev.get('why') != record.get('why'))
             fe[key] = record
             bb['fill_evidence'] = fe
+            if 'funding_event_complete' in ev:
+                existing_events = bb.get('funding_fill_events') or []
+                try:
+                    bb['funding_fill_events'] = self._merge_funding_fill_events(
+                        existing_events, record.get('funding_events') or [])
+                except Exception:
+                    bb['funding_event_evidence_complete'] = False
+                if not record.get('funding_event_complete'):
+                    bb['funding_event_evidence_complete'] = False
+                    missing = list(bb.get('funding_event_missing_orders') or [])
+                    if str(order_id) not in {str(x) for x in missing}:
+                        missing.append(str(order_id))
+                    bb['funding_event_missing_orders'] = missing
             bb['cost_pending_layers'] = sorted(
                 int(k) for k, v in fe.items()
                 if isinstance(v, dict) and v.get('status') == 'cost_pending')
@@ -2182,6 +3266,7 @@ class CryptoTrader:
             total_qty = 0.0
             _sum = 0.0
             commission_valid = True      # 阻断 3：任一 fill 手续费非法 → 不参与 actual
+            fill_evidence = []
             for _t in fills:
                 _info = _t.get('info', {}) if isinstance(_t, dict) else {}
                 total_qty += (self._fee_float(_t.get('amount'))
@@ -2192,6 +3277,27 @@ class CryptoTrader:
                 else:
                     _sum += _c
                 assets.add(str(_info.get('commissionAsset') or ''))
+                fill_evidence.append({
+                    'trade_id': str(_info.get('id') or _t.get('id') or ''),
+                    'order_id': str(_info.get('orderId') or _t.get('order') or real_oid),
+                    'symbol': str(_info.get('symbol') or symbol),
+                    'side': str(_info.get('side') or _t.get('side') or '').upper(),
+                    'position_side': str(_info.get('positionSide') or '').upper(),
+                    'qty': str(_info.get('qty') or _t.get('amount') or ''),
+                    'price': str(_info.get('price') or _t.get('price') or ''),
+                    'quote_qty': str(_info.get('quoteQty') or _t.get('cost') or ''),
+                    'commission': str(_info.get('commission') or ''),
+                    'commission_asset': str(_info.get('commissionAsset') or '').upper(),
+                    'time': _info.get('time') or _t.get('timestamp'),
+                    'realized_pnl': str(_info.get('realizedPnl') or ''),
+                })
+            if fill_evidence:
+                cache = getattr(self, '_pnl_fee_trade_evidence', None)
+                if not isinstance(cache, dict):
+                    cache = {}
+                    self._pnl_fee_trade_evidence = cache
+                cache[(str(symbol), str(real_oid))] = fill_evidence
+                cache[(str(symbol), str(oid))] = fill_evidence
             total_fee = _sum if commission_valid else None
 
             exp = self._fee_float(expected_qty)
@@ -2410,6 +3516,7 @@ class CryptoTrader:
                                  or lfc > len(b_data.get('filled_details') or [])
                                  or lfc > len(b_data.get('entry_orders') or []))
             _exit_unknown = False
+            trade_evidence = []
             prior_reduction = settlement_qty < net_qty - 1e-12
             if ledger_incomplete:
                 remaining = total_entry_fee * ((net_cost / gross_cost) if gross_cost > 0 else 0.0)
@@ -2438,6 +3545,9 @@ class CryptoTrader:
                     fee_i, src_i, note_i = self._resolve_order_fees(
                         symbol, {'kind': 'algo', 'order_id': str(_oid or '')},
                         exp_qty, est_layer)
+                    trade_evidence.extend(dict(x, role='entry') for x in
+                        getattr(self, '_pnl_fee_trade_evidence', {})
+                        .get((str(symbol), str(_oid)), []))
                     if fee_i is None:        # 连保守估算都不可得 → unknown
                         _unknown = True
                         fee_i = est_layer
@@ -2460,6 +3570,13 @@ class CryptoTrader:
             exit_fee, exit_source, exit_note = self._resolve_order_fees(
                 symbol, exit_order_ref, settlement_qty, estimated_exit_fee,
                 order_snapshot=order_snapshot)
+            _exit_ref = exit_order_ref or {}
+            _exit_id = str(_exit_ref.get('order_id') or '')
+            if _exit_ref.get('kind') == 'algo' and isinstance(order_snapshot, dict):
+                _exit_id = str(order_snapshot.get('actualOrderId') or _exit_id)
+            trade_evidence.extend(dict(x, role='exit') for x in
+                getattr(self, '_pnl_fee_trade_evidence', {})
+                .get((str(symbol), _exit_id), []))
             if exit_fee is None:             # unknown：退回调调用方保守估算
                 exit_fee = self._fee_float(estimated_exit_fee)
                 if exit_fee is None:
@@ -2488,7 +3605,13 @@ class CryptoTrader:
                 'entry_fee': entry_fee, 'entry_fee_source': entry_source,
                 'entry_note': entry_note, 'entry_fee_total': total_entry_fee,
                 'exit_fee': exit_fee, 'exit_fee_source': exit_source,
-                'exit_note': exit_note,
+                'exit_note': exit_note, 'trade_evidence': trade_evidence,
+                'funding_fill_events': list(b_data.get('funding_fill_events') or []),
+                'funding_events_complete': bool(
+                    b_data.get('funding_event_evidence_complete') is True),
+                'reduction_events': list(b_data.get('funding_reduction_events') or []),
+                'realized_reduce_amount': realized,
+                'is_hedge_mode': bool(b_data.get('is_hedge_mode', False)),
                 'fee_note': 'fee_unknown' if _fee_unknown else '',
             }
             # 出口防御：金额必须有限；非有限时回退账本有限估算，并在 fee_note
@@ -2543,23 +3666,37 @@ class CryptoTrader:
                 stats = json.load(f)
         except Exception:
             return 0.0, PNL_STATUS_STATS_CORRUPT
-        if not isinstance(stats, dict) or not isinstance(stats.get("trades", []), list):
+        if not isinstance(stats, dict) or not isinstance(stats.get("trades"), list):
             return 0.0, PNL_STATUS_STATS_CORRUPT
         today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
         total = 0.0
         unknown_fee = False      # 🔥 T1-C 阻断 2：未知/非法费用 ⇒ 汇总不可作为权威
         for t in stats["trades"]:
             if not isinstance(t, dict):
-                continue
+                return 0.0, PNL_STATUS_STATS_CORRUPT
             t_time = t.get("time")
-            if not isinstance(t_time, str) or not t_time.startswith(today):
+            try:
+                parsed_time = datetime.strptime(t_time, "%Y-%m-%d %H:%M:%S")
+                pnl_value = float(t["net_pnl"])
+            except (TypeError, ValueError, KeyError, OverflowError):
+                return 0.0, PNL_STATUS_STATS_CORRUPT
+            if not math.isfinite(pnl_value):
+                return 0.0, PNL_STATUS_STATS_CORRUPT
+            if parsed_time.strftime("%Y-%m-%d") != today:
                 continue
-            if t.get("pnl_not_authoritative") or t.get("fee_metadata_error"):
+            if (t.get("pnl_not_authoritative") or t.get("fee_metadata_error")
+                    or t.get("accounting_status") != "AUTHORITATIVE_FINAL"
+                    or t.get("pnl_source") != "binance_income_history"
+                    or any(t.get(k) is not True for k in
+                           ("income_complete", "commission_reconciled",
+                            "funding_allocated", "fx_complete"))):
                 unknown_fee = True
             try:
-                total += float(t.get("net_pnl", 0.0))
-            except (TypeError, ValueError):
-                continue
+                total += pnl_value
+            except (TypeError, ValueError, OverflowError):
+                return 0.0, PNL_STATUS_STATS_CORRUPT
+            if not math.isfinite(total):
+                return 0.0, PNL_STATUS_STATS_CORRUPT
         if unknown_fee:
             # 已知「某条 PnL 的费用不可知」→ Fail-Closed：调用方不得按普通权威
             # 净收益放行（D-006 日亏损闸门同哲学：未知状态 ≠ 允许）
@@ -2694,21 +3831,35 @@ class CryptoTrader:
             total_pnl = 0.0
             _unknown_pnl = 0.0        # T1-C P0-2：未对账费用记录（非权威）
             _unknown_n = 0
+            _stats_unreadable = False
             if os.path.exists(stats_file):
                 try:
                     with open(stats_file, "r", encoding="utf-8") as f:
                         stats = json.load(f)
+                    if not isinstance(stats, dict) or not isinstance(stats.get('trades'), list):
+                        raise ValueError('trade_stats_schema_invalid')
                     for t in stats.get("trades", []):
+                        if not isinstance(t, dict):
+                            raise ValueError('trade_stats_row_invalid')
                         if str(t.get("time", "")).startswith(report_date):
                             today_trades.append(t)
-                            if t.get("pnl_not_authoritative") or t.get("fee_metadata_error"):
+                            if (t.get("pnl_not_authoritative") or t.get("fee_metadata_error")
+                                    or t.get("accounting_status") != "AUTHORITATIVE_FINAL"
+                                    or t.get("pnl_source") != "binance_income_history"
+                                    or any(t.get(k) is not True for k in
+                                           ("income_complete", "commission_reconciled",
+                                            "funding_allocated", "fx_complete"))):
                                 # 证据保留，但不计入权威总额（费用未对账 → 非权威）
                                 _unknown_pnl += float(t.get("net_pnl", 0.0))
                                 _unknown_n += 1
                             else:
                                 total_pnl += float(t.get("net_pnl", 0.0))
-                except Exception:
-                    pass
+                except Exception as e:
+                    _stats_unreadable = True
+                    today_trades = []
+                    total_pnl = _unknown_pnl = 0.0
+                    _unknown_n = 0
+                    print(f"⚠️ [日报] trade_stats 不可读，盈亏总额不可判定: {e}")
 
             snapshot = self._build_position_snapshot()
 
@@ -2726,16 +3877,29 @@ class CryptoTrader:
                 f"📊 昨日平仓: `{len(today_trades)}` 笔\n"
             )
             if today_trades:
-                msg += f"💰 昨日已实现盈亏: `{total_pnl:+.2f}` USDT\n"
+                if _stats_unreadable:
+                    msg += "💰 昨日盈亏：`不可判定`（账本读取失败）\n"
+                else:
+                    msg += f"💰 昨日交易所已实现口径净盈亏: `{total_pnl:+.2f}` USDT\n"
                 if _unknown_n:
-                    msg += (f"\n⚠️ **另有 {_unknown_n} 笔费用未对账（非权威）**："
+                    msg += (f"\n⚠️ **另有 {_unknown_n} 笔账务未对账（非权威）**："
                             f"合计估算 `{_unknown_pnl:+.2f}` USDT，未计入上方权威总额\n")
                 msg += "📝 明细（最近5笔）：\n"
                 for t in today_trades[-5:]:
                     emoji = "🟢" if t['net_pnl'] >= 0 else "🔴"
-                    msg += f"  {emoji} `{t['symbol']}` {t['side']} {t['mode']} | `{t['net_pnl']:+.2f}` USDT\n"
+                    row_authoritative = (not t.get('pnl_not_authoritative')
+                        and t.get('accounting_status') == 'AUTHORITATIVE_FINAL'
+                        and t.get('pnl_source') == 'binance_income_history')
+                    label = ('交易所已实现口径' if row_authoritative else '估算（非权威）')
+                    if t.get('valuation_label') and row_authoritative:
+                        label += f"；{t['valuation_label']}"
+                    msg += (f"  {emoji} `{t['symbol']}` {t['side']} {t['mode']} | "
+                            f"`{t['net_pnl']:+.2f}` USDT ({label})\n")
             else:
-                msg += f"💰 昨日已实现盈亏: `0.00` USDT（无平仓）\n"
+                if _stats_unreadable:
+                    msg += "💰 昨日盈亏：`不可判定`（账本读取失败）\n"
+                else:
+                    msg += f"💰 昨日交易所已实现口径净盈亏: `0.00` USDT（无平仓）\n"
 
             msg += f"\n{balance_txt}"
             if snapshot:
@@ -3154,7 +4318,8 @@ class CryptoTrader:
         return base_cooldown
 
     def _safe_api_call(self, func, *args, retries=5, delay=2, auth_probe=False,
-                       no_retry_patterns=(), **kwargs):
+                       no_retry_patterns=(), attempt_observer=None,
+                       request_weight=1, **kwargs):
         # 🔥 D-010 Batch 2（ChatGPT 钉死约束 1）：AUTH_BLOCKED 入口闸门——
         # 位于 for retry loop 与 try 之前，raise 于 try 外。锁定期内下方 -1021 分支的
         # load_time_difference() 直连物理不可达（AST + 动态 mock 双验证，test S1/S5）。
@@ -3172,6 +4337,11 @@ class CryptoTrader:
         for i in range(retries):
             # 🔥 每次重试都检查全局熔断（感知其他线程设置的冷却）
             self._wait_for_api_cooldown()
+            # Reconciliation may supply a durable per-pass observer. Reserve before
+            # every physical call (including a retry), outside the retry handler so
+            # budget exhaustion cannot itself be retried.
+            if attempt_observer is not None:
+                attempt_observer(int(request_weight))
             # 🔥 v6.4-P4c：本次尝试的 frozen headers（在 semaphore 临界区内快照；
             # 请求未达 Binance/本地抛错时为空 dict——口径：所有 _safe_api_call 调用
             # 尝试均入账，若本次响应提供 header 则同步记录）
@@ -3248,6 +4418,8 @@ class CryptoTrader:
                             # 🔥 v6.4-P4d：成功与失败都必须在临界区内完成 snapshot+record
                             # （失败路径原先在 semaphore 释放后才 record——同一 race）；
                             # 调用前清空共享 header 栏（同 R16 语义）
+                            if attempt_observer is not None:
+                                attempt_observer(1)  # USDⓈ-M server-time request weight
                             with self._api_semaphore:
                                 self.exchange.last_response_headers = {}
                                 try:
@@ -6200,6 +7372,19 @@ class CryptoTrader:
                 f"💡 {detail}\n请核对交易所实际仓位与挂单后人工处理。",
                 level='critical')
             return False, f'partial_confirm_{verdict}'
+        try:
+            reduction_events = self._fetch_funding_fill_events(
+                symbol, order_id, 'exit', reduce_side,
+                ('LONG' if side == 'BUY' else 'SHORT') if is_hedge else 'BOTH',
+                confirmed_amount)
+            reduction_evidence_complete = True
+        except Exception as funding_error:
+            # Funding evidence is accounting-only: retain the confirmed reduction
+            # and continue the normal protection resize; never block safe exit.
+            reduction_events = []
+            reduction_evidence_complete = False
+            print(f"⚠️ [Funding ledger] partial close {order_id} evidence unavailable: "
+                  f"{funding_error}")
         # CAS 持久化净账本 + reason→partial_resize_pending（rollback 事务模板：
         # 锁内重读 → 校验 op_id/phase → 同一锁段写账本 → _persist_states）
         with self._state_lock:
@@ -6215,6 +7400,17 @@ class CryptoTrader:
             reduce_cost_delta = confirmed_amount * pre_net_cost / pre_net_qty
             b2['realized_reduce_amount'] = float(
                 b2.get('realized_reduce_amount', 0.0) or 0.0) + confirmed_amount
+            try:
+                b2['funding_reduction_events'] = self._merge_funding_fill_events(
+                    b2.get('funding_reduction_events') or [], reduction_events)
+            except Exception:
+                reduction_evidence_complete = False
+            if not reduction_evidence_complete:
+                b2['funding_event_evidence_complete'] = False
+                missing = list(b2.get('funding_event_missing_orders') or [])
+                if str(order_id) not in {str(x) for x in missing}:
+                    missing.append(str(order_id))
+                b2['funding_event_missing_orders'] = missing
             b2['realized_reduce_cost'] = float(
                 b2.get('realized_reduce_cost', 0.0) or 0.0) + reduce_cost_delta
             b2['close_reason'] = 'partial_resize_pending'
@@ -6582,10 +7778,50 @@ class CryptoTrader:
             pre_net_qty, pre_net_cost = self._batch_net_position(b)
             if confirmed_filled > pre_net_qty + 1e-12:
                 return False, f'confirm_exceeds_net（{confirmed_filled} > {pre_net_qty}）'
+            order_id = str(b.get('limit_close_order_id') or '')
+            side = (b.get('side') or 'BUY').upper()
+            is_hedge = bool(b.get('is_hedge_mode', False))
+        reduction_events = []
+        reduction_evidence_complete = False
+        try:
+            if not order_id:
+                raise ValueError('closecancel_order_identity_missing')
+            reduction_events = self._fetch_funding_fill_events(
+                symbol, order_id, 'exit', 'sell' if side == 'BUY' else 'buy',
+                ('LONG' if side == 'BUY' else 'SHORT') if is_hedge else 'BOTH',
+                confirmed_filled)
+            reduction_evidence_complete = True
+        except Exception as funding_error:
+            print(f"⚠️ [Funding ledger] closecancel {order_id} evidence unavailable: "
+                  f"{funding_error}")
+        with self._state_lock:
+            try:
+                latest, _rc_6274, _ = self._load_all_states_ex()
+            except Exception as e:
+                return False, f'state_unreadable（{e}）'
+            b = (latest.get(symbol, {}) or {}).get(batch_id)
+            if not isinstance(b, dict) or (b.get('close_op_id') or '') != (close_op_id or '') \
+                    or int(b.get('close_phase', 0) or 0) != 1 \
+                    or b.get('close_reason') != 'limit_pending_normal':
+                return False, 'state_changed（已归属/已迁移，绝不双计）'
+            pre_net_qty, pre_net_cost = self._batch_net_position(b)
+            if confirmed_filled > pre_net_qty + 1e-12:
+                return False, f'confirm_exceeds_net（{confirmed_filled} > {pre_net_qty}）'
             reduce_cost_delta = (confirmed_filled * pre_net_cost / pre_net_qty
                                  if pre_net_qty > 0 else 0.0)
             b['realized_reduce_amount'] = float(
                 b.get('realized_reduce_amount', 0.0) or 0.0) + confirmed_filled
+            try:
+                b['funding_reduction_events'] = self._merge_funding_fill_events(
+                    b.get('funding_reduction_events') or [], reduction_events)
+            except Exception:
+                reduction_evidence_complete = False
+            if not reduction_evidence_complete:
+                b['funding_event_evidence_complete'] = False
+                missing = list(b.get('funding_event_missing_orders') or [])
+                if order_id not in {str(x) for x in missing}:
+                    missing.append(order_id)
+                b['funding_event_missing_orders'] = missing
             b['realized_reduce_cost'] = float(
                 b.get('realized_reduce_cost', 0.0) or 0.0) + reduce_cost_delta
             b['close_reason'] = 'limit_cancel_restore_pending'
@@ -7829,6 +9065,17 @@ class CryptoTrader:
                         order_type='STOP_MARKET', stop_price=_fp),
                     'updated_at': time.time(),
                 }
+            funding_baseline = None
+            funding_baseline_complete = False
+            try:
+                funding_baseline = self._capture_funding_position_baseline(
+                    symbol, is_hedge_mode)
+                funding_baseline_complete = True
+            except Exception as baseline_error:
+                # Accounting evidence is optional for the order path. Preserve the
+                # existing open/exit flow, but never let this batch claim Funding authority.
+                print(f"⚠️ [Funding ledger] baseline unavailable for {batch_id}: "
+                      f"{baseline_error}")
             # B2-6（§6.3 + Case F）：骨架持久化 entry_layers/entry_stop_steps 元数据——
             # 崩溃恢复收编 ENTRY 后重建 entry_orders/stop_steps/layer_sl_params 的权威映射
             # （registry 条目只含 layer 序号，不含 SL 价格；此处补全层→SL 映射）
@@ -7853,6 +9100,11 @@ class CryptoTrader:
                 'is_hedge_mode': is_hedge_mode,
                 'last_filled_count': 0,
                 'filled_details': [],
+                'funding_fill_events': [],
+                'funding_position_baseline': funding_baseline,
+                'funding_baseline_complete': funding_baseline_complete,
+                'funding_event_evidence_complete': funding_baseline_complete,
+                'funding_event_missing_orders': [],
                 'total_entry_fee': 0.0,
                 'user_modified': False,
                 'pending_sl_orders': [],
@@ -10522,6 +11774,20 @@ class CryptoTrader:
                                             expected_side=_side_exp,
                                             expected_order_id=order_id)
 
+                                    try:
+                                        if _ev_status == 'qty_unverified':
+                                            raise ValueError('entry_fill_quantity_unverified')
+                                        _funding_events = self._fetch_funding_fill_events(
+                                            symbol, order_id, 'entry', _side_exp,
+                                            ('LONG' if side == 'BUY' else 'SHORT')
+                                            if is_hedge_mode else 'BOTH', _ev_qty)
+                                        _funding_complete = True
+                                    except Exception as _funding_error:
+                                        _funding_events = []
+                                        _funding_complete = False
+                                        print(f"⚠️ [Funding ledger] entry order {order_id} "
+                                              f"evidence unavailable: {_funding_error}")
+
                                     if _ev_status == 'qty_unverified':
                                         # 分支③：数量未知 / 不匹配 → 不入账、不按计划量计数、
                                         # 不为该层新挂保护；**保留既有有效保护**（不撤任何
@@ -10531,7 +11797,9 @@ class CryptoTrader:
                                             symbol, batch_id, idx, order_id,
                                             {'status': 'qty_unverified', 'why': _ev_why,
                                              'qty': _ev_qty, 'planned': target_amounts[idx],
-                                             'side': _side_exp, 'order_status': ord_status})
+                                             'side': _side_exp, 'order_status': ord_status,
+                                             'funding_events': _funding_events,
+                                             'funding_event_complete': _funding_complete})
                                         print(f"🛑 [批次 {batch_id}] 第 {idx + 1} 层成交数量"
                                               f"证据未通过，禁止按计划量入账: {_ev_why}")
                                         continue
@@ -10557,8 +11825,10 @@ class CryptoTrader:
                                         self._record_fill_evidence(
                                             symbol, batch_id, idx, order_id,
                                             {'status': 'cost_pending', 'why': _ev_why,
-                                             'qty': _ev_qty, 'planned': target_amounts[idx],
-                                             'side': _side_exp, 'order_status': ord_status})
+                                              'qty': _ev_qty, 'planned': target_amounts[idx],
+                                              'side': _side_exp, 'order_status': ord_status,
+                                              'funding_events': _funding_events,
+                                              'funding_event_complete': _funding_complete})
                                         print(f"⏳ [批次 {batch_id}] 第 {idx + 1} 层已成交"
                                               f"（数量已核实 {_ev_qty}，真实成交价待补证）"
                                               f": {_ev_why}")
@@ -10585,8 +11855,10 @@ class CryptoTrader:
                                             symbol, batch_id, idx, order_id,
                                             {'status': 'confirmed', 'why': _ev_why,
                                              'price': executed_price, 'qty': _ev_qty,
-                                             'planned': target_amounts[idx],
-                                             'side': _side_exp, 'order_status': ord_status},
+                                              'planned': target_amounts[idx],
+                                              'side': _side_exp, 'order_status': ord_status,
+                                              'funding_events': _funding_events,
+                                              'funding_event_complete': _funding_complete},
                                             alert=False)
 
                                     # 🔥 收集新成交层
@@ -11670,6 +12942,7 @@ class CryptoTrader:
                         # 🔥 记录已实现盈亏 + 附带剩余持仓快照
                         self._record_realized_pnl(batch_id, symbol, side, batch_filled_amount,
                                                   batch_entry_vwap, sl_exit_price, net_pnl, "止损",
+                                                  dedup_key=f'{symbol}:{batch_id}:SL:{current_sl_id}',
                                                   pnl_partial=_sl['qty_conflict'],
                                                   fee_breakdown=fees)
                         self._notify_snapshot(batch_id)
@@ -11888,6 +13161,7 @@ class CryptoTrader:
                         # 🔥 记录已实现盈亏 + 附带剩余持仓快照
                         self._record_realized_pnl(batch_id, symbol, side, batch_filled_amount,
                                                   batch_entry_vwap, tp_exit_price, net_pnl, "止盈",
+                                                  dedup_key=f'{symbol}:{batch_id}:TP:{tp_order_id}',
                                                   pnl_partial=_tp['qty_conflict'],
                                                   fee_breakdown=fees)
                         self._notify_snapshot(batch_id)
@@ -15596,6 +16870,7 @@ class CryptoTrader:
             _pnl_partial = confirmed_filled_amount < current_filled_amount - 1e-12
             self._record_realized_pnl(batch_id, target_symbol, side, confirmed_filled_amount,
                                       avg_price, actual_price, actual_net_pnl, "市价平仓",
+                                      dedup_key=f'{target_symbol}:{batch_id}:market:{close_op_id}',
                                       pnl_partial=_pnl_partial, fee_breakdown=fees)
             self._notify_snapshot(batch_id)
 
