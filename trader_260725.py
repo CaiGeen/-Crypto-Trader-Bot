@@ -2742,9 +2742,12 @@ class CryptoTrader:
             fe = dict(bb.get('fill_evidence') or {})
             key = str(int(idx))
             prev = fe.get(key) if isinstance(fe.get(key), dict) else {}
-            record = dict(ev)
-            record['status'] = str(ev.get('status') or '')
-            record['order_id'] = str(order_id)
+            # Supplemental writes (for example delayed Funding evidence) must
+            # merge into, not replace, the durable fill/quantity proof.
+            record = dict(prev)
+            record.update(ev)
+            record['status'] = str(ev.get('status') or prev.get('status') or '')
+            record['order_id'] = str(order_id or prev.get('order_id') or '')
             if 'funding_events' in ev:
                 record['funding_events'] = [dict(x) for x in
                                             (ev.get('funding_events') or [])]
@@ -7863,19 +7866,10 @@ class CryptoTrader:
             order_id = str(b.get('limit_close_order_id') or '')
             side = (b.get('side') or 'BUY').upper()
             is_hedge = bool(b.get('is_hedge_mode', False))
+        # Funding is supplemental audit evidence. Persist the confirmed reduction
+        # and restore protection first; the caller performs this query afterward.
         reduction_events = []
-        reduction_evidence_complete = False
-        try:
-            if not order_id:
-                raise ValueError('closecancel_order_identity_missing')
-            reduction_events = self._fetch_funding_fill_events(
-                symbol, order_id, 'exit', 'sell' if side == 'BUY' else 'buy',
-                ('LONG' if side == 'BUY' else 'SHORT') if is_hedge else 'BOTH',
-                confirmed_filled)
-            reduction_evidence_complete = True
-        except Exception as funding_error:
-            print(f"⚠️ [Funding ledger] closecancel {order_id} evidence unavailable: "
-                  f"{funding_error}")
+        reduction_evidence_complete = confirmed_filled <= 0
         with self._state_lock:
             try:
                 latest, _rc_6274, _ = self._load_all_states_ex()
@@ -7898,7 +7892,7 @@ class CryptoTrader:
                     b.get('funding_reduction_events') or [], reduction_events)
             except Exception:
                 reduction_evidence_complete = False
-            if not reduction_evidence_complete:
+            if confirmed_filled > 0:
                 b['funding_event_evidence_complete'] = False
                 missing = list(b.get('funding_event_missing_orders') or [])
                 if order_id not in {str(x) for x in missing}:
@@ -7910,6 +7904,41 @@ class CryptoTrader:
             if not self._persist_states(latest, read_corrupt=_rc_6274):
                 return False, 'persist_failed'
             return True, 'attributed'
+
+    def _capture_closecancel_funding_after_restore(self, symbol, batch_id,
+                                                   close_op_id, order_id, qty):
+        """Backfill non-critical Funding evidence only after protection is restored."""
+        latest = self.load_all_states()
+        batch = (latest.get(symbol, {}) or {}).get(batch_id)
+        if not isinstance(batch, dict):
+            return False
+        side = str(batch.get('side') or 'BUY').upper()
+        hedge = bool(batch.get('is_hedge_mode', False))
+        try:
+            events = self._fetch_funding_fill_events(
+                symbol, order_id, 'exit', 'sell' if side == 'BUY' else 'buy',
+                ('LONG' if side == 'BUY' else 'SHORT') if hedge else 'BOTH', qty)
+        except Exception as exc:
+            print(f"⚠️ [Funding ledger] closecancel {order_id} evidence unavailable: {exc}")
+            return False
+        with self._state_lock:
+            states, corrupt, _ = self._load_all_states_ex()
+            current = (states.get(symbol, {}) or {}).get(batch_id)
+            if not isinstance(current, dict) \
+                    or str(current.get('close_op_id') or '') != str(close_op_id or ''):
+                return False
+            try:
+                current['funding_reduction_events'] = self._merge_funding_fill_events(
+                    current.get('funding_reduction_events') or [], events)
+            except Exception:
+                return False
+            missing = [str(x) for x in
+                       (current.get('funding_event_missing_orders') or [])
+                       if str(x) != str(order_id)]
+            current['funding_event_missing_orders'] = missing
+            current['funding_event_evidence_complete'] = bool(
+                not missing and isinstance(current.get('funding_position_baseline'), dict))
+            return bool(self._persist_states(states, read_corrupt=corrupt))
 
     def _resume_closecancel_restore(self, symbol, batch_id, owner_op_id):
         """🔥 P5：limit_cancel_restore_pending 确定态恢复——只续保护单恢复，
@@ -8307,7 +8336,13 @@ class CryptoTrader:
                 symbol, batch_id, close_op_id, float(filled))
             if not ok_a:
                 return False, msg_a
-            return self._resume_closecancel_restore(symbol, batch_id, close_op_id)
+            restored = self._resume_closecancel_restore(symbol, batch_id, close_op_id)
+            if restored[0]:
+                # Only query Funding after the remaining position's protection
+                # has been restored; query failures cannot delay that transition.
+                self._capture_closecancel_funding_after_restore(
+                    symbol, batch_id, close_op_id, order_id, float(filled))
+            return restored
         if verdict == 'CONFIRMED_FULL':
             return self._finalize_limit_full_fill(symbol, batch_id, order_id)
         # PENDING / UNKNOWN / NOT_CONFIRMED → Fail-Closed
@@ -11795,6 +11830,7 @@ class CryptoTrader:
 
                     # 🔥 收集本次轮询中新成交的层
                     newly_filled_layers = []
+                    _funding_audit_pending = []
                     # 🔥 R1/R2 阻断1：本轮是否有订单状态未知（回查失败）
                     _poll_orders_unresolved = False
                     _poll_sl_validated = False
@@ -11962,31 +11998,9 @@ class CryptoTrader:
                                     else:
                                         print(f"  └─ ⚡ 已存在止损单，等待主循环合并更新")
 
-                                    # Funding evidence is audit-only: never wait for
-                                    # userTrades before protective-order maintenance.
-                                    try:
-                                        _entry_info = ord_detail.get('info') or {}
-                                        _actual_order_id = str(
-                                            _entry_info.get('actualOrderId')
-                                            or ord_detail.get('actualOrderId') or '')
-                                        if not _actual_order_id:
-                                            raise ValueError('entry_actual_order_id_missing')
-                                        _funding_events = self._fetch_funding_fill_events(
-                                            symbol, _actual_order_id, 'entry', _side_exp,
-                                            ('LONG' if side == 'BUY' else 'SHORT')
-                                            if is_hedge_mode else 'BOTH', _ev_qty)
-                                        _funding_complete = True
-                                    except Exception as _funding_error:
-                                        _funding_events = []
-                                        _funding_complete = False
-                                        print(f"⚠️ [Funding ledger] entry order {order_id} "
-                                              f"evidence unavailable: {_funding_error}")
-                                    self._record_fill_evidence(
-                                        symbol, batch_id, idx, order_id,
-                                        {'status': _ev_status, 'why': _ev_why,
-                                         'funding_events': _funding_events,
-                                         'funding_event_complete': _funding_complete},
-                                        alert=False)
+                                    _funding_audit_pending.append(
+                                        (idx, order_id, ord_detail, _side_exp, _ev_status,
+                                         _ev_why, _ev_qty))
 
                                 # ========== 🔥 修复：正确的 elif 分支 ==========
                                 elif ord_status in ['canceled', 'expired', 'rejected']:
@@ -13940,6 +13954,36 @@ class CryptoTrader:
                             self.send_tg_notification(risk_update_msg, reply_markup=reply_markup)
 
                         last_filled_count = batch_filled_count
+
+                    # Funding audit is intentionally after this cycle's SL/TP
+                    # maintenance. A slow/failed userTrades request must not delay
+                    # resizing protection for newly filled layers.
+                    for (_fund_idx, _fund_algo_id, _fund_order_detail,
+                         _fund_side, _fund_status, _fund_why,
+                         _fund_qty) in _funding_audit_pending:
+                        try:
+                            _fund_info = _fund_order_detail.get('info') or {}
+                            _actual_order_id = str(
+                                _fund_info.get('actualOrderId')
+                                or _fund_order_detail.get('actualOrderId') or '')
+                            if not _actual_order_id:
+                                raise ValueError('entry_actual_order_id_missing')
+                            _funding_events = self._fetch_funding_fill_events(
+                                symbol, _actual_order_id, 'entry', _fund_side,
+                                ('LONG' if side == 'BUY' else 'SHORT')
+                                if is_hedge_mode else 'BOTH', _fund_qty)
+                            _funding_complete = True
+                        except Exception as _funding_error:
+                            _funding_events = []
+                            _funding_complete = False
+                            print(f"⚠️ [Funding ledger] entry order {_fund_algo_id} "
+                                  f"evidence unavailable: {_funding_error}")
+                        self._record_fill_evidence(
+                            symbol, batch_id, _fund_idx, _fund_algo_id,
+                            {'status': _fund_status, 'why': _fund_why,
+                             'funding_events': _funding_events,
+                             'funding_event_complete': _funding_complete},
+                            alert=False)
 
                     # 🔥 R1/R2（ChatGPT 第四轮复审）：恢复判定 —— **分开两个判据**，
                     # 且必须在本轮止损/止盈维护**之后**、循环层级执行（未成交批次不进入

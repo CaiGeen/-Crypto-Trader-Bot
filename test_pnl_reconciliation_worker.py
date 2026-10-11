@@ -419,6 +419,61 @@ def test_entry_fill_accepts_observed_algo_to_actual_order_mapping():
     assert qty == 0.4
 
 
+def test_funding_fill_evidence_update_preserves_cost_pending_exit_proof():
+    trader = CryptoTrader.__new__(CryptoTrader)
+    trader._state_lock = threading.RLock()
+    state = {"BTC/USDT:USDT": {"B1": {
+        "side": "BUY", "entry_orders": ["algo-1"], "target_amounts": [0.001],
+        "last_filled_count": 1, "filled_details": [0.0],
+        "cost_pending_layers": [0], "qty_reconcile_pending": [],
+        "fill_evidence": {"0": {
+            "status": "cost_pending", "why": "cost_unavailable",
+            "qty": 0.001, "side": "buy", "order_id": "algo-1",
+            "identity_observed": True,
+        }},
+    }}}
+    trader._load_all_states_ex = lambda: (state, False, "")
+    trader._persist_states = lambda *_a, **_k: True
+    before = state["BTC/USDT:USDT"]["B1"]["fill_evidence"]["0"]
+    assert trader_260725._entry_quantity_evidence_valid(
+        state["BTC/USDT:USDT"]["B1"], 0, before)
+
+    CryptoTrader._record_fill_evidence(
+        trader, "BTC/USDT:USDT", "B1", 0, "algo-1",
+        {"status": "cost_pending", "why": "cost_unavailable",
+         "funding_events": [{"trade_id": "t1"}],
+         "funding_event_complete": True}, alert=False)
+    after = state["BTC/USDT:USDT"]["B1"]["fill_evidence"]["0"]
+    assert after["qty"] == 0.001 and after["side"] == "buy"
+    assert after["funding_events"] == [{"trade_id": "t1"}]
+    assert trader_260725._entry_quantity_evidence_valid(
+        state["BTC/USDT:USDT"]["B1"], 0, after)
+
+
+def test_closecancel_attribution_commits_without_funding_query():
+    trader = CryptoTrader.__new__(CryptoTrader)
+    trader._state_lock = threading.RLock()
+    batch = {"close_op_id": "op-1", "close_phase": 1,
+             "close_reason": "limit_pending_normal", "limit_close_order_id": "ord-1",
+             "side": "BUY", "is_hedge_mode": False, "is_active": True,
+             "target_amounts": [0.002], "filled_details": [100.0],
+             "entry_orders": ["entry-1"], "last_filled_count": 1,
+             "realized_reduce_amount": 0.0, "funding_reduction_events": []}
+    state = {"BTC/USDT:USDT": {"B1": batch}}
+    trader._load_all_states_ex = lambda: (state, False, "")
+    trader._persist_states = lambda *_a, **_k: True
+    trader._batch_net_position = lambda _batch: (0.002, 0.2)
+    trader._fetch_funding_fill_events = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("Funding query ran before attribution/protection"))
+
+    ok, reason = CryptoTrader._commit_closecancel_attribution(
+        trader, "BTC/USDT:USDT", "B1", "op-1", 0.001)
+    assert ok and reason == "attributed"
+    assert batch["realized_reduce_amount"] == pytest.approx(0.001)
+    assert batch["close_reason"] == "limit_cancel_restore_pending"
+    assert "ord-1" in batch["funding_event_missing_orders"]
+
+
 def test_production_funding_builder_uses_rate_history_and_full_trade_audit():
     entry = {"trade_id": "entry-1", "order_id": "entry-order", "symbol": "BTCUSDT",
              "side": "BUY", "position_side": "LONG", "qty": "1",
