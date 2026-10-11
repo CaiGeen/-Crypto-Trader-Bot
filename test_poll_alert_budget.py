@@ -29,7 +29,10 @@ def test_poll_incident_caps_email_and_tg_including_recovery(tmp_path):
     tg1 = budget.reserve(event_id, "tg", "initial", now=1002)
     assert tg1
     assert budget.finish(event_id, "tg", tg1, "ACCEPTED", now=1004)
-    assert budget.resolve(event_id, "existing full recovery predicate passed", now=2000)
+    assert not budget.record_recovery_success(event_id, "batch-a", "full recovery", now=1880)
+    assert not budget.record_recovery_success(event_id, "batch-b", "full recovery", now=1880)
+    assert not budget.record_recovery_success(event_id, "batch-a", "full recovery", now=2000)
+    assert budget.record_recovery_success(event_id, "batch-b", "full recovery", now=2000)
 
     tg2 = budget.reserve(event_id, "tg", "recovery", now=2001)
     assert tg2
@@ -60,8 +63,11 @@ def test_inflight_or_unknown_attempt_is_never_reissued(tmp_path):
     tg = budget.reserve(event_id, "tg", "initial", now=2)
     assert tg
     assert budget.finish(event_id, "tg", tg, "UNKNOWN", now=3)
+    assert not budget.finish(event_id, "tg", tg, "ACCEPTED", now=4)
+    assert budget.attempts(event_id, "tg")[0]["status"] == "UNKNOWN"
     assert budget.reserve(event_id, "tg", "retry", now=5000) is None
-    assert budget.resolve(event_id, "recovered", now=6000)
+    assert not budget.record_recovery_success(event_id, "batch-a", "recovered", now=6000)
+    assert budget.record_recovery_success(event_id, "batch-a", "recovered", now=6120)
     assert budget.reserve(event_id, "tg", "recovery", now=6001) is None
 
 
@@ -135,14 +141,15 @@ def test_recovery_uses_remaining_tg_slot_and_never_email(tmp_path):
     event_id, _ = budget.open_or_update("batch-a", now=1)
     tg1 = budget.reserve(event_id, "tg", "initial", now=2)
     assert tg1 and budget.finish(event_id, "tg", tg1, "ACCEPTED", now=3)
-    assert budget.resolve(event_id, "existing full recovery predicate passed", now=4)
+    assert not budget.record_recovery_success(event_id, "batch-a", "full recovery", now=4)
+    assert budget.record_recovery_success(event_id, "batch-a", "full recovery", now=124)
     recovery = budget.reserve(event_id, "tg", "recovery", now=5)
     assert recovery
     assert budget.finish(event_id, "tg", recovery, "ACCEPTED", now=6)
     assert budget.reserve(event_id, "email", "initial", now=7) is None
 
 
-def test_trader_recovery_path_uses_budgeted_plain_tg_only(tmp_path):
+def test_trader_recovery_path_uses_budgeted_plain_tg_only(tmp_path, monkeypatch):
     trader = CryptoTrader.__new__(CryptoTrader)
     trader._poll_alert_lock = threading.Lock()
     trader._poll_alert_active = True
@@ -159,8 +166,17 @@ def test_trader_recovery_path_uses_budgeted_plain_tg_only(tmp_path):
     assert first and trader._poll_alert_budget.finish(
         event_id, "tg", first, "ACCEPTED", now=3)
     trader._poll_degraded_batches.clear()
+    clock = [100.0]
+    monkeypatch.setattr(trader_260725.time, "time", lambda: clock[0])
     CryptoTrader._finish_poll_alert_event(
-        trader, "full existing recovery predicate passed", send_recovery=True)
+        trader, "full existing recovery predicate passed", send_recovery=True,
+        batch_id="batch-a")
+    assert trader._poll_alert_budget.open_event_id() == event_id
+    assert trader._tg_messages == []
+    clock[0] = 220.0
+    CryptoTrader._finish_poll_alert_event(
+        trader, "full existing recovery predicate passed", send_recovery=True,
+        batch_id="batch-a")
 
     history = trader._poll_alert_budget.attempts(event_id, "tg")
     assert [item["purpose"] for item in history] == ["initial", "recovery"]
@@ -189,24 +205,121 @@ def test_open_incident_rehydrates_degraded_batches_after_restart(tmp_path):
     assert restarted._poll_alert_budget.open_event_id() == event_id
 
 
-def test_brief_relapse_reuses_resolved_incident_budget(tmp_path):
-    budget = _manager(tmp_path)
-    event_id, _ = budget.open_or_update("batch-a", now=100)
-    email = budget.reserve(event_id, "email", "initial", now=101)
-    assert email and budget.finish(event_id, "email", email, "SUBMITTED", now=102)
-    tg = budget.reserve(event_id, "tg", "initial", now=101)
-    assert tg and budget.finish(event_id, "tg", tg, "ACCEPTED", now=102)
-    assert budget.resolve(event_id, "full recovery predicate", now=200)
+def test_failure_before_alert_threshold_interrupts_recovery_and_preserves_budget(
+        tmp_path, monkeypatch):
+    trader = CryptoTrader.__new__(CryptoTrader)
+    trader._poll_alert_lock = threading.Lock()
+    trader._poll_alert_active = True
+    trader._poll_degraded_batches = {"batch-a"}
+    trader._poll_alert_attempted = {}
+    trader._poll_alert_budget = _manager(tmp_path)
+    trader._send_email_alert_calls = []
+    trader._send_email_alert = lambda *a, **kw: (
+        trader._send_email_alert_calls.append(kw) or True)
+    trader._tg_messages = []
+    trader._send_poll_degraded_tg = lambda text: (
+        trader._tg_messages.append(text) or "ACCEPTED")
+    clock = [1000.0]
+    monkeypatch.setattr(trader_260725.time, "time", lambda: clock[0])
 
-    reopened_id, is_new = budget.open_or_update("batch-b", now=300)
-    assert reopened_id == event_id and not is_new
-    assert budget.open_batches() == {"batch-a", "batch-b"}
-    assert budget.reserve(event_id, "email", "initial", now=301) is None
-    assert budget.reserve(event_id, "tg", "initial", now=301) is None
-    assert budget.reserve(event_id, "tg", "retry", now=301) is None
+    CryptoTrader._alert_poll_degraded(trader, 3, 120, "batch-a")
+    event_id = trader._poll_alert_budget.open_event_id()
+    assert event_id
+    assert len(trader._send_email_alert_calls) == 1
+    assert len(trader._tg_messages) == 1
 
-    # Once the explicit quiet interval has elapsed, a genuinely later
-    # degradation receives a new incident and fresh bounded budget.
-    assert budget.resolve(event_id, "full recovery predicate", now=400)
-    new_id, is_new = budget.open_or_update("batch-c", now=521)
+    # First complete success starts observation, but does not resolve yet.
+    trader._poll_degraded_batches.clear()
+    clock[0] = 2000.0
+    CryptoTrader._finish_poll_alert_event(
+        trader, "full success", send_recovery=True, batch_id="batch-a")
+    assert trader._poll_alert_budget.open_event_id() == event_id
+    assert len(trader._tg_messages) == 1
+
+    # A first failed query breaks observation immediately, before the normal
+    # three-round external-alert threshold is reached.
+    clock[0] = 2010.0
+    CryptoTrader._interrupt_poll_alert_recovery(trader, "batch-a")
+    clock[0] = 2070.0
+    CryptoTrader._interrupt_poll_alert_recovery(trader, "batch-a")
+    clock[0] = 2130.0
+    CryptoTrader._interrupt_poll_alert_recovery(trader, "batch-a")
+    CryptoTrader._alert_poll_degraded(trader, 3, 130, "batch-a")
+    assert trader._poll_alert_budget.open_event_id() == event_id
+    assert len(trader._send_email_alert_calls) == 1
+    assert len(trader._tg_messages) == 1
+
+    # Positive control: two complete rounds spanning 120 stable seconds finish
+    # the same event. A later failure after that stable recovery may open a new
+    # event and consume a fresh email slot.
+    trader._poll_degraded_batches.clear()
+    clock[0] = 2200.0
+    CryptoTrader._finish_poll_alert_event(
+        trader, "full success", send_recovery=True, batch_id="batch-a")
+    assert trader._poll_alert_budget.open_event_id() == event_id
+    clock[0] = 2320.0
+    CryptoTrader._finish_poll_alert_event(
+        trader, "full success", send_recovery=True, batch_id="batch-a")
+    assert trader._poll_alert_budget.open_event_id() is None
+    assert len(trader._tg_messages) == 2
+
+    clock[0] = 2441.0
+    new_id, is_new = trader._poll_alert_budget.open_or_update("batch-a")
     assert is_new and new_id != event_id
+    CryptoTrader._alert_poll_degraded(trader, 3, 130, "batch-a")
+    assert len(trader._send_email_alert_calls) == 2
+
+
+def test_cross_batch_failure_resets_window_and_each_batch_needs_two_rounds(tmp_path):
+    budget = _manager(tmp_path)
+    event_id, _ = budget.open_or_update("batch-a", now=1)
+    assert budget.open_or_update("batch-b", now=2) == (event_id, False)
+    assert not budget.record_recovery_success(event_id, "batch-a", "ok", now=10)
+    assert not budget.record_recovery_success(event_id, "batch-a", "ok", now=130)
+    assert budget.open_event_id() == event_id
+
+    # B's first failure is below its normal alert threshold but still joins the
+    # incident and resets A's apparent recovery.
+    assert budget.note_poll_failure("batch-b", now=131)
+    assert "batch-b" in budget.open_batches()
+    assert not budget.record_recovery_success(event_id, "batch-a", "ok", now=200)
+    assert not budget.record_recovery_success(event_id, "batch-a", "ok", now=320)
+    assert not budget.record_recovery_success(event_id, "batch-b", "ok", now=321)
+    assert budget.open_event_id() == event_id
+    assert budget.record_recovery_success(event_id, "batch-b", "ok", now=440)
+    assert budget.open_event_id() is None
+
+
+def test_restart_resets_recovery_proof_but_keeps_attempt_budget(tmp_path):
+    path = os.path.join(str(tmp_path), ".poll_alert.state.json")
+    budget = PollAlertBudget(path)
+    event_id, _ = budget.open_or_update("batch-a", now=1)
+    email = budget.reserve(event_id, "email", "initial", now=2)
+    assert email and budget.finish(event_id, "email", email, "SUBMITTED", now=3)
+    assert not budget.record_recovery_success(event_id, "batch-a", "ok", now=10)
+
+    restarted = PollAlertBudget(path)
+    assert restarted.reconcile_batches({"batch-a"}, now=500)
+    state = restarted._find_event(restarted._state, event_id)
+    assert state["recovery_observation"] is None
+    assert len(restarted.attempts(event_id, "email")) == 1
+    assert not restarted.record_recovery_success(event_id, "batch-a", "ok", now=501)
+    assert restarted.record_recovery_success(event_id, "batch-a", "ok", now=621)
+    assert restarted.open_event_id() is None
+    assert restarted.reserve(event_id, "email", "initial", now=622) is None
+
+
+def test_failure_shortly_after_stable_resolution_reopens_same_budget(tmp_path):
+    budget = _manager(tmp_path)
+    event_id, _ = budget.open_or_update("batch-a", now=1)
+    email = budget.reserve(event_id, "email", "initial", now=2)
+    assert email and budget.finish(event_id, "email", email, "SUBMITTED", now=3)
+    assert not budget.record_recovery_success(event_id, "batch-a", "ok", now=10)
+    assert budget.record_recovery_success(event_id, "batch-a", "ok", now=130)
+    assert budget.open_event_id() is None
+
+    # The first failure arrives within the existing 120-second quiet interval;
+    # it reopens the same event immediately, even though alerting may be delayed.
+    assert budget.note_poll_failure("batch-a", now=140)
+    assert budget.open_event_id() == event_id
+    assert budget.reserve(event_id, "email", "initial", now=270) is None

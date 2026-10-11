@@ -23,6 +23,7 @@ POLL_ALERT_MAX_EMAIL_ATTEMPTS = 1
 POLL_ALERT_MAX_TG_ATTEMPTS = 2
 POLL_ALERT_TG_RETRY_SECONDS = 900
 POLL_ALERT_RECOVERY_QUIET_SECONDS = 120
+POLL_ALERT_RECOVERY_REQUIRED_ROUNDS = 2
 
 
 def _atomic_write(path: str, text: str) -> None:
@@ -137,6 +138,7 @@ class PollAlertBudget:
                     event = last
                     event["status"] = "OPEN"
                     event["reopened_at"] = now
+                    event["recovery_observation"] = None
             is_new = event is None
             if event is None:
                 event = {
@@ -147,6 +149,7 @@ class PollAlertBudget:
                     "batches": [],
                     "attempts": {"email": [], "tg": []},
                     "channel_skipped": {},
+                    "recovery_observation": None,
                 }
                 candidate["events"].append(event)
             batch_id = str(batch_id) if batch_id is not None else "unknown"
@@ -245,6 +248,11 @@ class PollAlertBudget:
 
     def finish(self, event_id: str, channel: str, attempt_id: str,
                outcome: str, now: float | None = None) -> bool:
+        """Record a result for an attempt still RESERVED/IN_FLIGHT.
+
+        UNKNOWN is deliberately terminal in this version: late transport results
+        are not callback-reconciled, so no second delivery is risked.
+        """
         now = time.time() if now is None else float(now)
         if outcome not in ("IN_FLIGHT", "SUBMITTED", "ACCEPTED", "FAILED", "UNKNOWN", "SKIPPED"):
             return False
@@ -274,11 +282,103 @@ class PollAlertBudget:
             event = self._find_event(candidate, event_id)
             if event is None or event.get("status") != "OPEN":
                 return False
+            observation = event.get("recovery_observation")
+            rounds = observation.get("success_rounds", {}) if isinstance(observation, dict) else {}
+            if (not isinstance(observation, dict)
+                    or now - float(observation.get("started_at", now))
+                    < POLL_ALERT_RECOVERY_QUIET_SECONDS
+                    or not event.get("batches")
+                    or any(int(rounds.get(batch, 0)) < POLL_ALERT_RECOVERY_REQUIRED_ROUNDS
+                           for batch in event["batches"])):
+                return False
             event["status"] = "RESOLVED"
             event["resolution"] = str(reason)[:200]
             event["resolved_at"] = now
             event["updated_at"] = now
             return self._persist_candidate(candidate)
+
+    def note_poll_failure(self, batch_id: str,
+                          now: float | None = None) -> bool:
+        """Interrupt a pending notification-recovery window on any poll failure."""
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            if not self._available:
+                return False
+            candidate = copy.deepcopy(self._state)
+            event = next((e for e in reversed(candidate["events"])
+                          if e.get("status") == "OPEN"), None)
+            reopened = False
+            if event is None and candidate["events"]:
+                last = candidate["events"][-1]
+                resolved_at = last.get("resolved_at")
+                if (last.get("status") == "RESOLVED"
+                        and isinstance(resolved_at, (int, float))
+                        and now - resolved_at <= POLL_ALERT_RECOVERY_QUIET_SECONDS):
+                    # A relapse during the quiet interval belongs to the same
+                    # incident even if its alert threshold is reached later.
+                    event = last
+                    event["status"] = "OPEN"
+                    event["reopened_at"] = now
+                    event["recovery_observation"] = None
+                    reopened = True
+            if event is None:
+                return False
+            batch_id = str(batch_id) if batch_id is not None else "unknown"
+            added_batch = batch_id not in event.get("batches", [])
+            if added_batch:
+                event.setdefault("batches", []).append(batch_id)
+            observation = event.get("recovery_observation")
+            if not isinstance(observation, dict) and not added_batch and not reopened:
+                return True
+            event["recovery_observation"] = None
+            event["last_recovery_interruption_at"] = now
+            event["updated_at"] = now
+            return self._persist_candidate(candidate)
+
+    def record_recovery_success(self, event_id: str, batch_id: str,
+                                reason: str, now: float | None = None,
+                                quiet_seconds: float = POLL_ALERT_RECOVERY_QUIET_SECONDS,
+                                required_rounds: int = POLL_ALERT_RECOVERY_REQUIRED_ROUNDS
+                                ) -> bool:
+        """Record a complete successful poll; resolve only after stable all-batch proof.
+
+        Returns True only when every batch in the incident has at least the
+        required consecutive full-success rounds and the uninterrupted
+        observation window has elapsed. Any poll failure resets the window.
+        """
+        now = time.time() if now is None else float(now)
+        batch_id = str(batch_id) if batch_id is not None else "unknown"
+        with self._lock:
+            if not self._available:
+                return False
+            candidate = copy.deepcopy(self._state)
+            event = self._find_event(candidate, event_id)
+            if (event is None or event.get("status") != "OPEN"
+                    or batch_id not in event.get("batches", [])):
+                return False
+            observation = event.get("recovery_observation")
+            if not isinstance(observation, dict):
+                observation = {"started_at": now, "success_rounds": {}}
+            rounds = observation.setdefault("success_rounds", {})
+            rounds[batch_id] = int(rounds.get(batch_id, 0)) + 1
+            observation["last_success_at"] = now
+            event["recovery_observation"] = observation
+            event["updated_at"] = now
+
+            all_batches = event.get("batches", [])
+            stable = (now - float(observation.get("started_at", now))
+                      >= float(quiet_seconds))
+            enough_rounds = bool(all_batches) and all(
+                int(rounds.get(affected_batch, 0)) >= int(required_rounds)
+                for affected_batch in all_batches)
+            if stable and enough_rounds:
+                event["status"] = "RESOLVED"
+                event["resolution"] = str(reason)[:200]
+                event["resolved_at"] = now
+                event["updated_at"] = now
+                return self._persist_candidate(candidate)
+            self._persist_candidate(candidate)
+            return False
 
     def close_without_recovery(self, event_id: str, reason: str,
                                now: float | None = None) -> bool:
@@ -310,8 +410,13 @@ class PollAlertBudget:
                 return set()
             retained = [b for b in event.get("batches", []) if b in active_batch_ids]
             if retained:
-                if retained != event.get("batches"):
+                if (retained != event.get("batches")
+                        or isinstance(event.get("recovery_observation"), dict)):
                     event["batches"] = retained
+                    # A restart or changed active-batch set breaks proof of a
+                    # continuous, currently observed recovery window. Budgets
+                    # and attempt history remain untouched.
+                    event["recovery_observation"] = None
                     event["updated_at"] = now
                     if not self._persist_candidate(candidate):
                         return set()
