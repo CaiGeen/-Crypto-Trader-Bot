@@ -7,6 +7,7 @@ import random
 import shutil
 import tempfile
 import time
+import concurrent.futures
 import ccxt
 import threading
 import asyncio
@@ -18,6 +19,11 @@ from dotenv import load_dotenv
 from parser import TradeSignal, parse_signal_from_json
 from health_progress import current_instance_id, write_progress, remove_batch
 import email_gate
+from poll_alert_state import (
+    PollAlertBudget,
+    POLL_ALERT_TG_RETRY_SECONDS,
+    POLL_ALERT_RECOVERY_QUIET_SECONDS,
+)
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -421,8 +427,7 @@ _STOP_ORDER_TYPES = frozenset({
 })
 # POLL_STALE_ALERT_SECONDS：数据陈旧达到该时长亦判定降级（逐批计算）
 POLL_STALE_ALERT_SECONDS = 120.0
-# POLL_ALERT_RETRY_INTERVAL：持续故障时的补充提醒最小间隔（秒），防告警风暴
-POLL_ALERT_RETRY_INTERVAL = 900
+# 轮询降级 TG 重试间隔与事件级额度定义在 poll_alert_state.py；该间隔不是次数上限。
 
 
 def _sl_order_verdict(order, expected_side, position_side, required_amount,
@@ -651,6 +656,7 @@ class CryptoTrader:
         self._poll_alert_lock = threading.Lock()
         self._poll_alert_active = False       # 本故障周期是否已【成功送达】告警
         self._poll_alert_attempted = {}       # batch_id → 上次尝试提醒时间（限频用）        # F4b（事件3通知风暴，2026-08-21）：进程启动时刻——自愈 MISMATCH 针对启动前历史条目
+        self._poll_alert_budget = PollAlertBudget()
         # （updated_at < _process_start_ts）降级为 info 不告警：重启时的状态同步 ≠ 新资金风险。
         # 边界：升级告警（连续 10 轮 ≈5 分钟仍查不到）不降级——持续查不到是真实异常，须人工核实。
         self._process_start_ts = time.time()
@@ -1093,53 +1099,185 @@ class CryptoTrader:
             return False
 
     def _alert_poll_degraded(self, streak, stale, batch_id=None):
-        """R1/R2: 监控降级 critical 告警。
+        """Send a bounded, durable, account-wide notification for poll degradation.
 
-        ChatGPT 第二轮复审阻断4：通知**返回 False**（未抛异常）时不能把
-        `_poll_alert_active` 永久占住，否则既不重试、也不让其它批次报出。
-        故：状态转换在同一把锁下完成（按批次记账 + 全局是否已提醒），发送留锁外；
-        仅在**发送确实成功**时才置"已提醒"；失败则留下次重试的机会
-        （限频由 streak 递增 + 时间间隔双重约束，避免告警风暴）。
+        One open incident is shared by affected batches. Budget reservations are
+        persisted before I/O; email is attempted once, TG at most twice (a failed
+        first attempt may retry after the cooldown, or the remaining slot may be
+        used for recovery). Notification failures never change poll/trade state.
         """
+        budget = getattr(self, '_poll_alert_budget', None)
+        if budget is None:
+            budget = self._poll_alert_budget = PollAlertBudget()
+        msg = (f"🚨【资金安全】监控降级告警\n"
+               f"📉 连续失败 {streak} 轮 / 数据陈旧 {stale:.0f}s\n"
+               f"💡 程序无法可靠获取订单数据，已暂停新增风险。\n"
+               f"⚠️ 交易所实际仓位与保护单状态需人工核对；"
+               f"程序无法在查询不可用时替你确认或补齐止损。")
+        now = time.time()
         with self._poll_alert_lock:
-            _bid = batch_id
-            if self._poll_alert_active and _bid is not None:
-                # 有限提醒：距上次尝试不足 POLL_ALERT_RETRY_INTERVAL 则跳过
-                _last_try = self._poll_alert_attempted.get(_bid, 0.0)
-                if _last_try > 0 and (time.time() - _last_try) < POLL_ALERT_RETRY_INTERVAL:
-                    return
-                if _last_try > 0:
-                    # 已提醒过，本次是"持续故障"补充提醒：清标志以便重发
-                    self._poll_alert_active = False
-            elif self._poll_alert_active:
-                return  # 本故障周期已成功提醒过（无批次标识的调用）
-        # 锁外发送（不持锁，避免通知阻塞监控）
-        try:
-            ok = self.send_tg_notification(
-                f"🚨【资金安全】监控降级告警\n"
-                f"📉 连续失败 {streak} 轮 / 数据陈旧 {stale:.0f}s\n"
-                f"💡 程序无法可靠获取订单数据，已暂停新增风险。\n"
-                f"⚠️ 交易所实际仓位与保护单状态需人工核对；"
-                f"程序无法在查询不可用时替你确认或补齐止损。\n"
-                f"ℹ️ 本条为尝试投递；未确认送达时会重试。",
-                level='critical')
-        except Exception as e:
-            print(f"⚠️ [POLL] 降级告警发送异常（不影响监控，下轮重试）: {e}")
-            return
-        # 🔥 ChatGPT 第三轮复审：仅 `ok is True` 才算送达。
-        # send_tg_notification 未配置 TG 时返回 None（不是 False），邮件又是
-        # 异步尝试、返回值不代表邮件已投递 —— 故 None/False/其它一律按未送达，
-        # 保留重试资格，不能记成"已成功送达"。
-        if ok is not True:
-            print(f"⚠️ [POLL] 降级告警未确认送达（返回 {ok!r}，下轮重试）")
-            with self._poll_alert_lock:
-                if batch_id is not None:
-                    self._poll_alert_attempted[batch_id] = time.time()
-            return
-        with self._poll_alert_lock:
+            if not budget.available:
+                print(f"🚨 [POLL] 通知预算状态不可用，按Fail-Closed不外发: {budget.error}")
+                return
+            event_id, is_new = budget.open_or_update(batch_id, now)
+            if event_id is None:
+                print(f"🚨 [POLL] 通知事件无法持久化，按Fail-Closed不外发: {budget.error}")
+                return
+            msg = f"{msg}\n🆔 事件：{event_id}"
+            if is_new:
+                print(f"🚨 [POLL] 打开持久化监控降级事件 {event_id}")
             self._poll_alert_active = True
-            if batch_id is not None:
-                self._poll_alert_attempted[batch_id] = time.time()
+            self._poll_alert_attempted[batch_id] = now
+
+            _email_history = budget.attempts(event_id, 'email')
+            _email_attempt = None
+            if not _email_history:
+                _email_attempt = budget.reserve(event_id, 'email', 'initial', now)
+
+            _tg_history = budget.attempts(event_id, 'tg')
+            if not _tg_history:
+                _tg_purpose = 'initial'
+            elif (_tg_history[-1].get('status') == 'FAILED'
+                  and now - float(_tg_history[-1].get('at', now))
+                  >= POLL_ALERT_TG_RETRY_SECONDS):
+                _tg_purpose = 'retry'
+            else:
+                _tg_purpose = None
+            _tg_attempt = (budget.reserve(event_id, 'tg', _tg_purpose, now)
+                           if _tg_purpose else None)
+
+        if _email_attempt:
+            try:
+                _email_ok = self._send_email_alert(
+                    f"🚨【资金安全】\n{msg}",
+                    subject="🚨 资金安全告警", event="critical")
+                # wait=False True means only that the SMTP thread was submitted.
+                # The one-email budget is consumed regardless of eventual result.
+                budget.finish(event_id, 'email', _email_attempt,
+                              'SUBMITTED' if _email_ok is True else 'SKIPPED')
+            except Exception as exc:
+                budget.finish(event_id, 'email', _email_attempt, 'UNKNOWN')
+                print(f"⚠️ [POLL] 邮件尝试结果未知（本事件不再重发）: {exc}")
+        elif not _email_history:
+            print("⚠️ [POLL] 邮件额度预占失败或状态不可写；本次不启动邮件")
+
+        if _tg_attempt:
+            try:
+                _tg_result = self._send_poll_degraded_tg(msg)
+            except Exception as exc:
+                _tg_result = 'UNKNOWN'
+                print(f"⚠️ [POLL] TG通知异常，结果未知且不自动重发: {exc}")
+            budget.finish(event_id, 'tg', _tg_attempt, _tg_result)
+            if _tg_result != 'ACCEPTED':
+                print(f"⚠️ [POLL] TG降级通知结果={_tg_result}；仅明确失败可在冷却后重试")
+        elif _tg_purpose and not budget.available:
+            print(f"⚠️ [POLL] TG额度预占失败；本次不启动TG通知: {budget.error}")
+
+    def _send_poll_degraded_tg(self, text: str) -> str:
+        """One plain-text TG request; distinguish definite failure from in-flight timeout."""
+        if not (getattr(self, 'tg_bot', None) and getattr(self, 'chat_id', None)
+                and getattr(self, 'loop', None)):
+            return 'SKIPPED'
+        future = None
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.tg_bot.send_message(chat_id=self.chat_id, text=text), self.loop)
+            future.result(timeout=5)
+            return 'ACCEPTED'
+        except concurrent.futures.TimeoutError as exc:
+            print(f"⚠️ [POLL] TG请求超时，无法确认服务端是否已接受: {exc}")
+            return 'UNKNOWN'
+        except Exception as exc:
+            print(f"⚠️ [POLL] TG降级通知发送失败: {exc}")
+            # Only an explicit Telegram rejection proves non-delivery. Network
+            # and transport errors may happen after server acceptance.
+            return ('FAILED' if future is None or isinstance(exc, BadRequest)
+                    else 'UNKNOWN')
+
+    def _finish_poll_alert_event(self, reason: str, send_recovery: bool,
+                                 batch_id=None) -> None:
+        """Observe full recovery; resolve only after 2 rounds and 120s stability."""
+        budget = getattr(self, '_poll_alert_budget', None)
+        if budget is None:
+            return
+        event_id = None
+        attempt_id = None
+        with self._poll_alert_lock:
+            event_id = budget.open_event_id()
+            if event_id is None:
+                self._poll_alert_active = False
+                return
+            if not send_recovery:
+                if batch_id is None:
+                    print("⚠️ [POLL] 忽略缺少批次标识的终态通知收尾")
+                    return
+                if not budget.finish_batch_without_recovery(
+                        event_id, batch_id, reason):
+                    print(f"⚠️ [POLL] 终态批次收尾未落盘，保留通知事件: {budget.error}")
+                    return
+                self._poll_alert_active = budget.open_event_id() is not None
+                return
+            if (batch_id is None or batch_id in self._poll_degraded_batches):
+                return
+            _resolved = budget.record_recovery_success(
+                event_id, batch_id, reason,
+                quiet_seconds=POLL_ALERT_RECOVERY_QUIET_SECONDS)
+            if not _resolved:
+                if not budget.available:
+                    print(f"⚠️ [POLL] 恢复观察状态未落盘，保留通知事件: {budget.error}")
+                return
+            attempt_id = budget.reserve(event_id, 'tg', 'recovery')
+            self._poll_alert_active = False
+        recovery_text = (f"✅ [监控恢复] 轮询降级事件已解除。\n"
+                         f"恢复依据：至少连续两轮完整核验且稳定观察"
+                         f"{POLL_ALERT_RECOVERY_QUIET_SECONDS}秒通过（{reason}）。\n"
+                         f"本消息仅说明现有完整监控恢复判据已通过；"
+                         f"不表示账户空仓或不存在交易风险。")
+        if attempt_id:
+            try:
+                _result = self._send_poll_degraded_tg(recovery_text)
+            except Exception as exc:
+                _result = 'UNKNOWN'
+                print(f"⚠️ [POLL] 恢复TG通知异常，结果未知: {exc}")
+            budget.finish(event_id, 'tg', attempt_id, _result)
+            if _result != 'ACCEPTED':
+                print(f"⚠️ [POLL] 恢复通知结果={_result}（共享事件TG额度，不补发邮件）")
+        else:
+            print("ℹ️ [POLL] 故障事件已恢复；无剩余TG额度，恢复仅记录本地")
+
+    def _interrupt_poll_alert_recovery(self, batch_id) -> None:
+        """Any affected-batch query/business failure breaks recovery stability."""
+        budget = getattr(self, '_poll_alert_budget', None)
+        if budget is None:
+            return
+        with self._poll_alert_lock:
+            if not budget.note_poll_failure(batch_id):
+                if not budget.available:
+                    print(f"⚠️ [POLL] 恢复观察中断状态未落盘: {budget.error}")
+
+    def _reconcile_poll_alert_batches(self, all_states: dict) -> None:
+        """Reattach persisted notification incidents only to still-active batches."""
+        budget = getattr(self, '_poll_alert_budget', None)
+        if budget is None:
+            budget = self._poll_alert_budget = PollAlertBudget()
+        active_ids = {
+            str(batch_id)
+            for batches in (all_states or {}).values()
+            if isinstance(batches, dict)
+            for batch_id, state in batches.items()
+            if isinstance(state, dict) and state.get('is_active') is True
+        }
+        if not budget.available:
+            print(f"🚨 [POLL] 持久通知状态不可用，故障通知将Fail-Closed: {budget.error}")
+            return
+        resumed = budget.reconcile_batches(active_ids)
+        with self._poll_alert_lock:
+            self._poll_degraded_batches.update(resumed)
+            for batch_id in resumed:
+                self._poll_fail_streak[batch_id] = max(
+                    self._poll_fail_streak.get(batch_id, 0), 1)
+                self._poll_first_fail_time.setdefault(batch_id, time.time())
+            self._poll_alert_active = bool(resumed)
 
     def send_tg_notification(self, text: str, reply_markup=None, level: str = 'info'):
         """
@@ -4254,6 +4392,10 @@ class CryptoTrader:
             except Exception:
                 pass
             return False
+
+        # Only reconcile notification incidents after trade-state readability
+        # has been proven; an unreadable ledger is not evidence of zero batches.
+        CryptoTrader._reconcile_poll_alert_batches(self, all_states)
 
         for symbol, symbol_batches in all_states.items():
             for batch_id, b_data in symbol_batches.items():
@@ -9800,6 +9942,7 @@ class CryptoTrader:
         generation = lifecycle['generation']
         terminal = self._monitor_terminal_evidence(lifecycle['symbol'], batch_id)
         should_alert = False
+        poll_terminal = False
         if not isinstance(getattr(self, '_poll_fail_streak', None), dict):
             self._poll_fail_streak = {}
         if not hasattr(self, '_poll_alert_lock'):
@@ -9816,6 +9959,7 @@ class CryptoTrader:
                     self._poll_fail_streak.pop(batch_id, None)
                     if not self._poll_degraded_batches:
                         self._poll_alert_active = False
+                    poll_terminal = True
                 phase = 'terminal'
             else:
                 self._unresolved_intent_batches.add(batch_id)
@@ -9829,6 +9973,12 @@ class CryptoTrader:
                 lifecycle['phase'] = phase
             self._active_monitor_generations.pop(batch_id, None)
             self._active_monitors.discard(batch_id)
+        if not terminal:
+            CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
+        if poll_terminal:
+            CryptoTrader._finish_poll_alert_event(self,
+                "受影响批次已不再处于活跃监控状态", send_recovery=False,
+                batch_id=batch_id)
         if should_alert:
             # 🔥 第十一轮复审口径4：这是 critical 的**第 2 次也是最后一次**尝试
             #    （第 1 次 = 异常分支里的退出告警）。两次都没确认送达时**没有**后续
@@ -10119,6 +10269,7 @@ class CryptoTrader:
                         time.sleep(3)
                         latest_b_data = (self.load_all_states().get(symbol, {})
                                          or {}).get(batch_id, {})
+                        CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                         continue
                     if _cf_reason_loop == 'qty_conflict_manual_review':
                         if int(time.time()) % 600 < 5:
@@ -10130,6 +10281,7 @@ class CryptoTrader:
                         time.sleep(20)
                         latest_b_data = (self.load_all_states().get(symbol, {})
                                          or {}).get(batch_id, {})
+                        CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                         continue
                     # 🔥 根据活跃批次数量动态计算轮询间隔
                     sleep_interval = self._calculate_monitoring_interval()
@@ -10164,6 +10316,7 @@ class CryptoTrader:
                         break
                     if _g1_state == 'unknown':
                         print(f"  └─ ⏸️ [生命周期] 账本 UNKNOWN（损坏），本轮跳过全部轮询副作用")
+                        CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                         continue
                     self._sync_time_if_needed()
 
@@ -10262,12 +10415,17 @@ class CryptoTrader:
                         open_orders_map = {str(ord['id']): ord for ord in open_orders}
                         consecutive_network_errors = 0
                     except AuthBlockedError as abe:
+                        CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                         # 🔥 D-010 T4：盲区休眠——300s 纯本地等待（零 API），醒来重读锁文件，
                         # 仍锁继续睡（闸门在 _safe_api_call 入口本地读 auth_blocked.json，无网络请求）
                         print(f"🔒 [盲区安全模式] 监控轮询跳过（{AUTH_BLIND_SLEEP_SECONDS}s 后重查锁状态）: {abe}")
                         time.sleep(AUTH_BLIND_SLEEP_SECONDS)
                         continue
                     except Exception as e:
+                        # Reset a pending notification recovery window on the
+                        # very first failure, not only when the alert threshold
+                        # is reached below.
+                        CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                         consecutive_network_errors += 1
                         # 🔥 R1/R2: 逐批失败跟踪（恢复须在业务处理后，不在此宣称）
                         _streak = self._poll_fail_streak.get(batch_id, 0) + 1
@@ -10287,11 +10445,12 @@ class CryptoTrader:
                         _stale = max(_since_ok, _since_fail)
                         if _streak >= POLL_FAIL_ALERT_ROUNDS or _stale >= POLL_STALE_ALERT_SECONDS:
                             # 告警条件达成：置降级（**先于**通知，ChatGPT 裁定）
-                            if batch_id not in self._poll_degraded_batches:
-                                self._poll_degraded_batches.add(batch_id)
-                                self._alert_poll_degraded(_streak, _stale, batch_id)
-                            elif _streak % 3 == 0:
-                                # 已降级但仍在失败：按间隔做"持续故障"有限提醒
+                            with self._poll_alert_lock:
+                                _new_degraded = batch_id not in self._poll_degraded_batches
+                                if _new_degraded:
+                                    self._poll_degraded_batches.add(batch_id)
+                                _should_notify = (_new_degraded or _streak % 3 == 0)
+                            if _should_notify:
                                 self._alert_poll_degraded(_streak, _stale, batch_id)
                         continue
 
@@ -10647,6 +10806,7 @@ class CryptoTrader:
                                 break
                             if _lc2 == 'unknown':
                                 print(f"  └─ ⏸️ [生命周期] 账本 UNKNOWN（损坏），本轮跳过归零结算")
+                                CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                                 continue
 
                             # 🔥 F2/F3-R5（七复审 P1）：成本待补证批次**绝不**落入下方
@@ -10664,6 +10824,7 @@ class CryptoTrader:
                                                   .get(batch_id) or {}).get('is_active'):
                                     print(f"  └─ ✅ [F2/F3] 批次 {batch_id} 已结算并清理，退出监控")
                                     break
+                                CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                                 continue
 
                             # 🔥 P5c（ChatGPT 二复审 Blocker 2，P0）：已被限价平仓 finalizer
@@ -10680,9 +10841,11 @@ class CryptoTrader:
                                         break
                                     print(f"  └─ ⚠️ [P5 finalizer] 批次 {batch_id} "
                                           f"本轮未完成（{_msg_f}），保持 phase=2 下轮重试")
+                                    CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                                     continue
                                 print(f"🚨【资金安全】批次 `{batch_id}` settled=True 但"
                                       f"限价订单 ID 缺失（异常态），已拒绝自行清理，请人工核对。")
+                                CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                                 continue
 
                             # 🔥 P5e：人工核对冻结态（持久化）——无副作用可见冻结，
@@ -10697,6 +10860,7 @@ class CryptoTrader:
                                         level='critical')
                                 print(f"  └─ 🧊 [P5] 批次 {batch_id} 人工核对冻结中"
                                       f"（manual_review），跳过保护单维护")
+                                CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                                 continue
                             # 🔥 P5c（同 Blocker 2）：限价平仓事务在途（未 settled）而仓位
                             # 已归零（如 SL 窗口触发）——在途限价单若不撤，价格回落可能
@@ -10714,6 +10878,7 @@ class CryptoTrader:
                                     symbol, batch_id, position_zero=0.0)
                                 print(f"  └─ {'✅' if _ok_r0 else '⚠️'} [P5] 批次 {batch_id} "
                                       f"限价在途+仓位归零分型: {_msg_r0}")
+                                CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                                 continue
 
                             # 🔥 如果是程序平仓，跳过结算
@@ -11129,6 +11294,7 @@ class CryptoTrader:
                         break
                     if _lc3 == 'unknown':
                         print(f"  └─ ⏸️ [生命周期] 账本 UNKNOWN（损坏），本轮保护单维护跳过")
+                        CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                         continue
 
                     if latest_b_data and 'pending_sl_orders' in latest_b_data:
@@ -11157,10 +11323,11 @@ class CryptoTrader:
                             _cok, _cwhy = self._finalize_cost_pending_settlement(symbol, batch_id)
                             print(f"  └─ [F2/F3] 成本待补证结算续跑: {_cwhy}")
                             if _cok and not (self.load_all_states().get(symbol, {})
-                                             .get(batch_id) or {}).get('is_active'):
+                                              .get(batch_id) or {}).get('is_active'):
                                 print(f"  └─ ✅ [F2/F3] 批次 {batch_id} 已结算并清理，退出监控")
                                 break
                             time.sleep(5)
+                            CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                             continue
 
                     # ===== P0（2026-08-28 限价平仓竞态）Batch A 风控冻结 =====
@@ -11266,6 +11433,7 @@ class CryptoTrader:
                                           f"已不在账本，放弃记账")
                             except Exception as _ff_e:
                                 print(f"  └─ ⚠️ [冻结·事实入账] 异常，下轮重试: {_ff_e}")
+                        CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                         continue
 
                     sl_triggered = False
@@ -11479,6 +11647,7 @@ class CryptoTrader:
                             _fok, _fwhy = self._finalize_qty_conflict(symbol, batch_id)
                             if not _fok:
                                 print(f"  └─ ⚠️ [T1-C] 冲突 PnL 落盘失败，保持 settling 待续跑: {_fwhy}")
+                            CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                             continue
 
                         sl_msg = (
@@ -11696,6 +11865,7 @@ class CryptoTrader:
                             _fok, _fwhy = self._finalize_qty_conflict(symbol, batch_id)
                             if not _fok:
                                 print(f"  └─ ⚠️ [T1-C] 冲突 PnL 落盘失败，保持 settling 待续跑: {_fwhy}")
+                            CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                             continue
 
                         tp_msg = (
@@ -11861,6 +12031,7 @@ class CryptoTrader:
                                             # F1: 网络异常 fail-closed——不清 id、不创建，保留下轮（防双单）
                                             print(f"  └─ ⚠️ 撤销旧止损单失败: {e}")
                                             sl_error_count += 1
+                                            CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                                             continue
 
                             if old_sl_id is None:
@@ -12422,10 +12593,12 @@ class CryptoTrader:
                         and (not _poll_needs_protection or
                              (bool(current_sl_id) and _poll_sl_validated)))
                     _poll_position_known = (current_actual_position is not None)
+                    _poll_complete_success = (
+                        not _poll_orders_unresolved
+                        and _poll_position_known
+                        and _poll_protection_confirmed)
                     if (self._poll_fail_streak.get(batch_id, 0) > 0
-                            and not _poll_orders_unresolved
-                            and _poll_position_known
-                            and _poll_protection_confirmed):
+                            and _poll_complete_success):
                         self._poll_fail_streak[batch_id] = 0
                         self._poll_first_fail_time.pop(batch_id, None)
                         self._poll_last_success_time[batch_id] = time.time()
@@ -12446,6 +12619,13 @@ class CryptoTrader:
                             and not _poll_protection_confirmed):
                         print(f"  └─ ⏸️ [POLL] 订单已可读但保护未确认"
                               f"（SL 锚点缺失/维护失败）→ 保持暂停新增风险")
+
+                    if _poll_complete_success:
+                        CryptoTrader._finish_poll_alert_event(self,
+                            "订单数据、持仓与现有保护核验均通过",
+                            send_recovery=True, batch_id=batch_id)
+                    else:
+                        CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
 
                     if _health_instance:
 
@@ -12533,6 +12713,7 @@ class CryptoTrader:
             # 🔥 异常捕获 - 监控循环内部异常
             # ================================================================
                 except Exception as inner_e:
+                    CryptoTrader._interrupt_poll_alert_recovery(self, batch_id)
                     if isinstance(_monitor_lifecycle, dict):
                         _monitor_lifecycle['exit_reason'] = f"monitor exception: {inner_e}"
                     print(f"⚠️ 监控循环内部异常: {inner_e}")
