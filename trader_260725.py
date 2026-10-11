@@ -2742,12 +2742,32 @@ class CryptoTrader:
             fe = dict(bb.get('fill_evidence') or {})
             key = str(int(idx))
             prev = fe.get(key) if isinstance(fe.get(key), dict) else {}
-            # Supplemental writes (for example delayed Funding evidence) must
-            # merge into, not replace, the durable fill/quantity proof.
-            record = dict(prev)
-            record.update(ev)
-            record['status'] = str(ev.get('status') or prev.get('status') or '')
-            record['order_id'] = str(order_id or prev.get('order_id') or '')
+            funding_supplement = ('funding_events' in ev
+                                  or 'funding_event_complete' in ev)
+            if funding_supplement:
+                # Delayed Funding results are bound to the order captured earlier.
+                # Drop stale results rather than creating evidence or overwriting a
+                # newer order generation's record.
+                orders = bb.get('entry_orders')
+                if (not prev or not isinstance(orders, list)
+                        or not 0 <= int(idx) < len(orders)
+                        or str(order_id) != str(orders[int(idx)])
+                        or (prev.get('order_id')
+                            and str(prev.get('order_id')) != str(order_id))):
+                    return False, False
+                # Funding supplementation may update only its own fields. In
+                # particular, never replay captured status/why/qty/side over a
+                # concurrently completed cost backfill or quantity reconciliation.
+                record = dict(prev)
+                record['funding_events'] = [dict(x) for x in
+                                            (ev.get('funding_events') or [])]
+                record['funding_event_complete'] = bool(
+                    ev.get('funding_event_complete'))
+            else:
+                record = dict(prev)
+                record.update(ev)
+                record['status'] = str(ev.get('status') or prev.get('status') or '')
+                record['order_id'] = str(order_id or prev.get('order_id') or '')
             if 'funding_events' in ev:
                 record['funding_events'] = [dict(x) for x in
                                             (ev.get('funding_events') or [])]
@@ -11904,11 +11924,14 @@ class CryptoTrader:
                                         _poll_orders_unresolved = True
                                         self._record_fill_evidence(
                                             symbol, batch_id, idx, order_id,
-                                            {'status': 'qty_unverified', 'why': _ev_why,
-                                             'qty': _ev_qty, 'planned': target_amounts[idx],
-                                             'side': _side_exp, 'order_status': ord_status,
-                                             'funding_events': _funding_events,
-                                             'funding_event_complete': _funding_complete})
+                                             {'status': 'qty_unverified', 'why': _ev_why,
+                                              'qty': _ev_qty, 'planned': target_amounts[idx],
+                                              'side': _side_exp, 'order_status': ord_status})
+                                        self._record_fill_evidence(
+                                            symbol, batch_id, idx, order_id,
+                                            {'funding_events': [],
+                                             'funding_event_complete': False},
+                                            alert=False)
                                         print(f"🛑 [批次 {batch_id}] 第 {idx + 1} 层成交数量"
                                               f"证据未通过，禁止按计划量入账: {_ev_why}")
                                         continue

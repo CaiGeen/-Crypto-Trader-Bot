@@ -425,9 +425,10 @@ def test_funding_fill_evidence_update_preserves_cost_pending_exit_proof():
     state = {"BTC/USDT:USDT": {"B1": {
         "side": "BUY", "entry_orders": ["algo-1"], "target_amounts": [0.001],
         "last_filled_count": 1, "filled_details": [0.0],
-        "cost_pending_layers": [0], "qty_reconcile_pending": [],
+        "total_entry_fee": 0.00005,
+        "cost_pending_layers": [], "qty_reconcile_pending": [],
         "fill_evidence": {"0": {
-            "status": "cost_pending", "why": "cost_unavailable",
+            "status": "confirmed", "why": "backfill_confirmed",
             "qty": 0.001, "side": "buy", "order_id": "algo-1",
             "identity_observed": True,
         }},
@@ -435,19 +436,61 @@ def test_funding_fill_evidence_update_preserves_cost_pending_exit_proof():
     trader._load_all_states_ex = lambda: (state, False, "")
     trader._persist_states = lambda *_a, **_k: True
     before = state["BTC/USDT:USDT"]["B1"]["fill_evidence"]["0"]
-    assert trader_260725._entry_quantity_evidence_valid(
-        state["BTC/USDT:USDT"]["B1"], 0, before)
+    assert before["status"] == "confirmed"
 
     CryptoTrader._record_fill_evidence(
         trader, "BTC/USDT:USDT", "B1", 0, "algo-1",
-        {"status": "cost_pending", "why": "cost_unavailable",
+        {"status": "cost_pending", "why": "stale_cost_pending_snapshot",
          "funding_events": [{"trade_id": "t1"}],
          "funding_event_complete": True}, alert=False)
     after = state["BTC/USDT:USDT"]["B1"]["fill_evidence"]["0"]
+    assert after["status"] == "confirmed"
+    assert after["why"] == "backfill_confirmed"
     assert after["qty"] == 0.001 and after["side"] == "buy"
     assert after["funding_events"] == [{"trade_id": "t1"}]
+    assert state["BTC/USDT:USDT"]["B1"]["cost_pending_layers"] == []
+    assert state["BTC/USDT:USDT"]["B1"]["total_entry_fee"] == pytest.approx(0.00005)
+
+    # A newer quantity hold must likewise survive a stale Funding completion.
+    after.update(status="qty_unverified", why="new_qty_conflict")
+    state["BTC/USDT:USDT"]["B1"]["qty_reconcile_pending"] = [0]
+    CryptoTrader._record_fill_evidence(
+        trader, "BTC/USDT:USDT", "B1", 0, "algo-1",
+        {"status": "cost_pending", "why": "stale_cost_pending_snapshot",
+         "funding_events": [{"trade_id": "t1"}],
+         "funding_event_complete": True}, alert=False)
+    latest = state["BTC/USDT:USDT"]["B1"]["fill_evidence"]["0"]
+    assert latest["status"] == "qty_unverified"
+    assert state["BTC/USDT:USDT"]["B1"]["qty_reconcile_pending"] == [0]
+    batch = state["BTC/USDT:USDT"]["B1"]
+    batch["entry_orders"][0] = "algo-2"
+    old_record = dict(latest)
+    persisted, changed = CryptoTrader._record_fill_evidence(
+        trader, "BTC/USDT:USDT", "B1", 0, "algo-1",
+        {"funding_events": [{"trade_id": "stale"}],
+         "funding_event_complete": True}, alert=False)
+    assert (persisted, changed) == (False, False)
+    assert batch["fill_evidence"]["0"] == old_record
+
+    pending_batch = {
+        "side": "BUY", "entry_orders": ["algo-p"], "target_amounts": [0.001],
+        "last_filled_count": 1, "filled_details": [0.0],
+        "cost_pending_layers": [0], "qty_reconcile_pending": [],
+        "fill_evidence": {"0": {
+            "status": "cost_pending", "why": "cost_unavailable", "qty": 0.001,
+            "side": "buy", "order_id": "algo-p", "identity_observed": True,
+        }},
+    }
+    state["BTC/USDT:USDT"]["B2"] = pending_batch
     assert trader_260725._entry_quantity_evidence_valid(
-        state["BTC/USDT:USDT"]["B1"], 0, after)
+        pending_batch, 0, pending_batch["fill_evidence"]["0"])
+    CryptoTrader._record_fill_evidence(
+        trader, "BTC/USDT:USDT", "B2", 0, "algo-p",
+        {"status": "confirmed", "why": "stale_status",
+         "funding_events": [], "funding_event_complete": False}, alert=False)
+    pending_record = pending_batch["fill_evidence"]["0"]
+    assert pending_record["status"] == "cost_pending"
+    assert trader_260725._entry_quantity_evidence_valid(pending_batch, 0, pending_record)
 
 
 def test_closecancel_attribution_commits_without_funding_query():
