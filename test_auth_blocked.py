@@ -158,6 +158,12 @@ def s1_gate_position_ast():
 
 def s2_2015_triggers_block():
     t, ex = make_trader(tempfile.mkdtemp(prefix='d010b2_'))
+    # 走真实 critical 分流，避免把普通 IP 邮件误当鉴权封锁邮件的证据。
+    def send_real(text, **kwargs):
+        t._sent.append(str(text))
+        return trader_260725.CryptoTrader.send_tg_notification(t, text, **kwargs)
+    t.send_tg_notification = send_real
+    t._send_email_alert = lambda text, subject='交易告警', **kwargs: t._emails.append((str(text), subject))
     ex.fetch_positions.side_effect = Exception(ERR_2015)
     try:
         t._safe_api_call(ex.fetch_positions, ['BTCUSDT'])
@@ -184,7 +190,7 @@ def s2_2015_triggers_block():
     ok = (data.get('blocked') is True
           and ex.fetch_positions.call_count == 1        # 无 5 次重试
           and any('盲区' in m for m in t._sent)          # 三通道告警含盲区字样
-          and len(t._emails) >= 1                        # Email 通道（critical 级）
+          and len(t._emails) == 1 and '盲区' in t._emails[0][0]  # 仅真实 critical 邮件
           and q_ok                                        # 队列事件无条件入队（三通道第3路）
           and t.last_known_ip == '1.2.3.4')              # IP 提取仍生效
     report('S2 -2015 触发', ok,
@@ -409,8 +415,8 @@ def s10_trader_queue_format():
     ok_type = typ == 'ip_notify' and '5.6.7.8' in msg
     ok_id = EVENT_ID_RE.match(files[0][:-len('.notify')]) is not None if files else False
     legacy = os.path.exists(os.path.join(os.path.dirname(t.notify_queue_dir), '.notify'))
-    # T5：Email 通道独立发送（不依赖 TG 成败）
-    ok_email = len(t._emails) >= 1 and '5.6.7.8' in t._emails[0][0]
+    # 普通 IP 变化仅 TG/队列；邮件留给真实鉴权封锁。
+    ok_email = len(t._emails) == 0
     report('S10 trader 入队格式闭环', ok_files and ok_type and ok_id and not legacy and ok_email,
            f'文件数={len(files)} type={typ} id格式={ok_id} 旧.notify存在={legacy} Email={len(t._emails)}')
 
@@ -513,7 +519,7 @@ def s13_channel_semantics():
 
     n_tg_ok, mail_ok = run_ip_case(True)       # TG 成功 → 队列 0（fallback-only 契约）
     n_tg_fail, mail_fail = run_ip_case(False)  # TG 失败 → 队列 1（安全网兜住）
-    ip_ok = (n_tg_ok == 0 and n_tg_fail == 1 and mail_ok >= 1 and mail_fail >= 1)
+    ip_ok = (n_tg_ok == 0 and n_tg_fail == 1 and mail_ok == 0 and mail_fail == 0)
 
     report('S13 三通道真实语义', q1 and q2 and q3 and ip_ok,
            f'AUTH_BLOCKED象限: TG成功={q1} TG失败={q2} 队列失败={q3}；'

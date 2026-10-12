@@ -4,22 +4,20 @@
 
 三条 .env 开关：
   EMAIL_ALERT_ENABLED=true/false              邮件总手动开关（缺省 true，兼容旧行为）
-  EMAIL_ALERT_ONLY_WITH_POSITION=true/false   仅在存在活跃批次时发送（缺省 false）
+  EMAIL_ALERT_ONLY_WITH_POSITION=true/false   旧配置兼容保留，不再放行普通邮件
   DAILY_REPORT_EMAIL_ENABLED=true/false       每日结算报告邮件独立开关（缺省 true）
 
 R0 事件维度（2026-09-25，交叉审查 D / F10 修复）：
-  should_send_email 新增 event 参数，按事件语义分三层裁决：
+  should_send_email 按明确事件语义裁决（2026-10-12 收紧普通邮件）：
     1. 总开关关闭        → 一律不发（reason=disabled）
     2. 资金安全致命事件  → **豁免持仓闸门与状态可读性**（reason=fatal_event）
     3. 每日结算报告      → 由 DAILY_REPORT_EMAIL_ENABLED 独立裁决（reason=daily_report）
-    4. 其余通用事件      → 沿用 EMAIL_ALERT_ONLY_WITH_POSITION 持仓闸门
+    4. 人工通道自检      → 显式 selftest 事件（不属于自动告警）
+    5. 普通/未分类事件   → 拒绝邮件；保留调用方的 TG 与日志
   修复前的致命缺陷：唯一开关同时管辖日报/崩溃/鉴权封锁/健康巡检，
   空仓（或 trade_state.json 不可读）时会把资金安全告警一并吞掉。
 
-持仓判定刻意只读本地 ``trade_state.json``，不调用交易所 API：
-  任一 symbol -> batch 的 ``is_active`` 为真即视为“有活跃批次”。
-文件缺失、不可解析或结构不符合预期时返回不允许发送（Fail-Silent for generic email），
-但本模块不触碰 Telegram，也不触碰交易状态。
+ 本模块不触碰 Telegram、交易状态或交易所 API。普通事件即使有活跃批次也不发邮件。
 """
 import json
 import os
@@ -40,9 +38,7 @@ FATAL_EVENTS = frozenset({
 # 每日结算报告：固定运营通知，不受持仓闸门约束
 DAILY_REPORT_EVENT = "daily_report"
 
-# 已知事件全集（含通用与非致命事件）。用于识别**拼写错误**的 event：
-# 致命事件拼错会静默降级为持仓闸门 → 空仓时被吞，且日志里只能看到模糊的
-# no_active_positions，难以定位。仅告警，不改变裁决语义（保持向后兼容）。
+# 已知事件全集（含明确拒绝的普通事件）；未知/拼错事件拒绝邮件并输出可定位日志。
 KNOWN_EVENTS = FATAL_EVENTS | {
     "generic",
     DAILY_REPORT_EVENT,
@@ -132,22 +128,22 @@ def should_send_email(env=None, state_path: str | None = None,
     R0 事件维度（2026-09-25）：
       event ∈ FATAL_EVENTS  → 资金安全致命事件，**豁免持仓闸门与状态可读性**
       event == "daily_report" → 由 DAILY_REPORT_EMAIL_ENABLED 独立裁决
-      其余（generic）        → 沿用 EMAIL_ALERT_ONLY_WITH_POSITION 持仓闸门
+      event == "selftest"    → 人工明确触发的通道自检
+      其余事件              → 拒绝邮件，不以持仓或邮件标题猜测严重性
 
     原因码：
       disabled / daily_report_disabled / fatal_event / daily_report /
-      position_gate_disabled / state_unreadable / no_active_positions /
-      active_positions
+      selftest / non_actionable_event / unknown_event
     """
     if not email_enabled(env):
         return False, "disabled"
 
     ev = str(event or "generic").strip().lower()
     if ev not in KNOWN_EVENTS:
-        # D7：拼写错误的致命事件会静默降级为持仓闸门（空仓即被吞），
-        # 且日志只会显示 no_active_positions，难以定位 —— 必须让原因可读。
-        print(f"⚠️ [邮件闸门] 未知 event={ev!r}，按普通事件(持仓闸门)裁决；"
+        # 不猜未知事件的严重性；可定位日志避免拼错的严重事件静默丢失。
+        print(f"⚠️ [邮件闸门] 未知 event={ev!r}，拒绝邮件；"
               f"若属资金安全事件请补入 email_gate.FATAL_EVENTS")
+        return False, "unknown_event"
     if ev in FATAL_EVENTS:
         # 致命事件：持仓与状态可读性都不参与裁决（无持仓 ≠ 无风险；状态文件坏 ≠ 无风险）
         return True, "fatal_event"
@@ -156,12 +152,6 @@ def should_send_email(env=None, state_path: str | None = None,
             return False, "daily_report_disabled"
         return True, "daily_report"
 
-    if not email_only_with_position(env):
-        return True, "position_gate_disabled"
-
-    count = count_active_positions(state_path, env)
-    if count is None:
-        return False, "state_unreadable"
-    if count <= 0:
-        return False, "no_active_positions"
-    return True, "active_positions"
+    if ev == "selftest":
+        return True, "selftest"
+    return False, "non_actionable_event"
