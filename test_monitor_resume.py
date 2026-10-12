@@ -1682,7 +1682,7 @@ def c25_filled_layer_missing_price_guard_and_be():
             ex3.cancel_calls, ex3.create_calls)
     assert (ex3.orders.get('SL1') or {}).get('status') == 'open', \
         '现有 SL 被撤销（应保持有效）'
-    assert any('缺有效成交价' in m and lv == 'critical'
+    assert any('缺有效成交价' in m and lv == 'warning'
                for lv, m in zip(t3.sent_tg_levels + [None] * len(t3.sent_tg),
                                 t3.sent_tg)), \
         '/be 缺价拒绝未告警: %r' % (t3.sent_tg[-3:],)
@@ -1693,7 +1693,7 @@ def c26_tp_refuses_when_cost_not_ready():
     成本未就绪时必须在**任何校验/撤单之前**拒绝——否则被 fd=0 拉低的 VWAP 会放行
     低于真实保本的止盈，随后撤旧挂新、触发即亏。断言：cost_pending 批 与
     已成交层缺价批 调用 update_batch_tp 均返回 False、TP1 原样、零 cancel/零 create、
-    critical 告警。"""
+    warning 提示（普通拒绝，不发严重邮件）。"""
     _reg = {
         '%s|ENTRY|L0|LONG' % BID: {
             'state': 'CONFIRMED', 'order_id': 'E1',
@@ -1717,7 +1717,7 @@ def c26_tp_refuses_when_cost_not_ready():
             ex.cancel_calls, ex.create_calls)
     assert (ex.orders.get('TP1') or {}).get('status') == 'open', \
         '现有 TP 被撤销（应保持有效）'
-    assert any('成本未就绪' in m and lv == 'critical'
+    assert any('成本未就绪' in m and lv == 'warning'
                for lv, m in zip(t.sent_tg_levels + [None] * len(t.sent_tg),
                                 t.sent_tg)), \
         '/tp cost_pending 拒绝未告警: %r' % (t.sent_tg[-3:],)
