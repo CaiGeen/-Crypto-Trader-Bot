@@ -19,12 +19,12 @@ class EmailGateTests(unittest.TestCase):
         with open(self.state_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
 
-    def test_default_keeps_legacy_behavior(self):
+    def test_default_blocks_unclassified_email(self):
         allowed, reason = email_gate.should_send_email(
             env={}, state_path=os.path.join(self.tmp.name, "missing.json")
         )
-        self.assertTrue(allowed)
-        self.assertEqual(reason, "position_gate_disabled")
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "non_actionable_event")
 
     def test_manual_switch_blocks_even_with_active_position(self):
         self._write_state({"BTCUSDT": {"b1": {"is_active": True}}})
@@ -38,7 +38,7 @@ class EmailGateTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(reason, "disabled")
 
-    def test_position_gate_allows_active_batch(self):
+    def test_active_batch_does_not_promote_generic_email(self):
         self._write_state({"BTCUSDT": {"b1": {"is_active": True}}})
         allowed, reason = email_gate.should_send_email(
             env={
@@ -47,8 +47,8 @@ class EmailGateTests(unittest.TestCase):
             },
             state_path=self.state_path,
         )
-        self.assertTrue(allowed)
-        self.assertEqual(reason, "active_positions")
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "non_actionable_event")
 
     def test_position_gate_blocks_no_active_batch(self):
         self._write_state({"BTCUSDT": {"b1": {"is_active": False}}})
@@ -60,7 +60,7 @@ class EmailGateTests(unittest.TestCase):
             state_path=self.state_path,
         )
         self.assertFalse(allowed)
-        self.assertEqual(reason, "no_active_positions")
+        self.assertEqual(reason, "non_actionable_event")
 
     def test_position_gate_blocks_unreadable_state(self):
         with open(self.state_path, "w", encoding="utf-8") as f:
@@ -73,15 +73,15 @@ class EmailGateTests(unittest.TestCase):
             state_path=self.state_path,
         )
         self.assertFalse(allowed)
-        self.assertEqual(reason, "state_unreadable")
+        self.assertEqual(reason, "non_actionable_event")
 
     def test_manual_switch_ignores_unreadable_state(self):
         allowed, reason = email_gate.should_send_email(
             env={"EMAIL_ALERT_ENABLED": "true"},
             state_path=os.path.join(self.tmp.name, "missing.json"),
         )
-        self.assertTrue(allowed)
-        self.assertEqual(reason, "position_gate_disabled")
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "non_actionable_event")
 
     # ---------------- R0 事件维度（2026-09-25，F10） ----------------
 
@@ -156,7 +156,7 @@ class EmailGateTests(unittest.TestCase):
         self.assertEqual(reason, "daily_report_disabled")
 
     def test_generic_event_keeps_position_gate(self):
-        """回归：普通事件（generic）行为不变，仍受持仓闸门约束"""
+        """普通事件不升级为邮件，与持仓无关。"""
         self._write_state({"BTCUSDT": {"b1": {"is_active": False}}})
         allowed, reason = email_gate.should_send_email(
             env={
@@ -166,7 +166,7 @@ class EmailGateTests(unittest.TestCase):
             state_path=self.state_path,
         )
         self.assertFalse(allowed)
-        self.assertEqual(reason, "no_active_positions")
+        self.assertEqual(reason, "non_actionable_event")
 
     # ---------------- 第三轮复审（D7：event 拼写错误必须可读） ----------------
 
@@ -188,7 +188,7 @@ class EmailGateTests(unittest.TestCase):
                 event="htalth",   # 故意拼错
             )
         self.assertFalse(allowed)
-        self.assertEqual(reason, "no_active_positions")
+        self.assertEqual(reason, "unknown_event")
         self.assertIn("未知 event", buf.getvalue())
 
     def test_known_fatal_event_no_warning(self):

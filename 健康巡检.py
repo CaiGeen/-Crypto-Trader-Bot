@@ -821,7 +821,7 @@ def main(argv) -> int:
                 "要看自检结果请去掉 --dry-run")
             return 0
         # 运维部署自检：逐通道实测（TG 经代理 / TG 直连 / 邮件兜底），结果只进日志。
-        # 复审 D4：邮件自检用 event="health" —— 与真实告警同一策略（致命豁免持仓闸门），
+        # 人工通道自检用独立 selftest 事件，不伪装成自动健康故障；同样豁免持仓闸门。
         # 否则空仓时自检会被闸门跳过，得出「邮件通道不可用」的错误结论。
         msg = ("🧪【自检】CryptoBot 健康巡检通道测试\n"
                "此消息证明告警通道可用，可忽略。\n"
@@ -830,7 +830,7 @@ def main(argv) -> int:
         ok_proxy = send_tg(env, msg + "\n（通道：TG 经代理）", use_proxy=True)
         ok_direct = send_tg(env, msg + "\n（通道：TG 直连）", use_proxy=False)
         ok_mail = send_email(env, "🧪 巡检通道自检", msg + "\n（通道：邮件兜底）",
-                             event="health")
+                              event="selftest")
         log(f"=== 自检结果: TG经代理={ok_proxy} TG直连={ok_direct} 邮件={ok_mail} ===")
         # D：出口 IP 白名单只读核验（自检用，不发消息、不写状态文件）
         _ip = get_egress_ip(env, proxy_url)

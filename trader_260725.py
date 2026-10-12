@@ -860,7 +860,7 @@ class CryptoTrader:
             f"📌 新 IP: {ip}\n"
             f"📂 来源: {source}\n"
             f"⏰ 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"💡 请将新 IP 添加到币安 API 白名单！"
+            f"ℹ️ IP 变化本身不代表鉴权失败；仅记录出口变化。"
         )
 
         print(f"\n{'=' * 60}")
@@ -870,12 +870,7 @@ class CryptoTrader:
 
         sent = self._try_async_send(msg)
 
-        # 🔥 D-010 T5：IP 变更三通道——Email 独立并行发送（不依赖 TG 成败；
-        # 8-28 事故"IP 变更无邮件提醒"根因补齐。critical 语义对齐：邮箱兜底通道）
-        try:
-            self._send_email_alert(msg, subject="⚠️ IP 地址变化告警")
-        except Exception as e:
-            print(f"⚠️ [IP告警] Email 发送失败: {e}")
+        # 普通出口变化仅 TG/日志；真正鉴权封锁由 _enter_auth_blocked 发 critical 邮件。
 
         if not sent:
             self._fallback_notify_file(ip, source)
@@ -916,7 +911,7 @@ class CryptoTrader:
                 f"新 IP: {ip}\n"
                 f"来源: {source}\n"
                 f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"请将新 IP 添加到币安 API 白名单！"
+                f"IP 变化本身不代表鉴权失败；仅记录出口变化。"
             )
             event_id = self._enqueue_notify_event("ip_notify", plain_msg)
             if event_id:
@@ -6106,7 +6101,7 @@ class CryptoTrader:
                 f"已拒绝修改止盈——成本缺失时算出的保本价必然失真，可能把止盈设到"
                 f"真实保本价以下；现有止盈/止损保持有效，保护维护不受限；"
                 f"请先补齐成交证据后再试 `/tp`。",
-                level='critical')
+                level='warning')
             return False, (f"⛔ 成本未就绪（{_why_tp_s}），拒绝修改止盈"
                            f"（撤单前拦截）")
 
@@ -6613,7 +6608,7 @@ class CryptoTrader:
                 f"⛔【资金安全】批次 `{batch_id}` 第 {[i + 1 for i in _bad_be]} 层"
                 f"缺有效成交价（缺失/非有限/非正），已拒绝设置保本损——"
                 f"现有止损保持有效，保护维护不受限；请先补齐成交证据"
-                f"（补证通道或人工核对）后再试 `/be`。", level='critical')
+                f"（补证通道或人工核对）后再试 `/be`。", level='warning')
             return False, (f"⛔ 第 {[i + 1 for i in _bad_be]} 层成交成本未知"
                            f"（缺失/非有限/非正），拒绝设置保本损（撤单前拦截）")
 
@@ -9060,7 +9055,7 @@ class CryptoTrader:
             is_valid, msg = self._validate_stop_losses(signal, current_mark_price)
             if not is_valid:
                 print(msg)
-                self.send_tg_notification(f"🚨 **挂单被阻断！**\n{msg}", level='critical')
+                self.send_tg_notification(f"🚨 **挂单被阻断！**\n{msg}", level='warning')
                 return None
             print(msg)
 
@@ -9071,7 +9066,7 @@ class CryptoTrader:
             tp_is_valid, tp_msg = self._validate_take_profit(signal, current_mark_price)
             if not tp_is_valid:
                 print(tp_msg)
-                self.send_tg_notification(f"🚨 **挂单被阻断！**\n{tp_msg}", level='critical')
+                self.send_tg_notification(f"🚨 **挂单被阻断！**\n{tp_msg}", level='warning')
                 return None
             print(tp_msg)
 
@@ -9135,7 +9130,7 @@ class CryptoTrader:
                     f"📊 已有批次占用 `{used_margin:.2f}` USDT\n"
                     f"📊 总需求 `{total_required_margin + used_margin:.2f}` USDT\n"
                     f"💡 请撤销部分挂单或增加保证金后再试。",
-                    level='critical'
+                    level='warning'
                 )
                 return None
             else:

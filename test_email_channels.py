@@ -56,7 +56,7 @@ class EmailChannelGateTests(unittest.TestCase):
             self.assertFalse(patrol.send_email(env, "subject", "text"))
         smtp.assert_not_called()
 
-    def test_patrol_email_sends_with_active_position(self):
+    def test_patrol_health_email_sends_with_active_position(self):
         env = self._env()
         with open(self.state_path, "w", encoding="utf-8") as f:
             json.dump({"BTCUSDT": {"b1": {"is_active": True}}}, f)
@@ -66,7 +66,7 @@ class EmailChannelGateTests(unittest.TestCase):
                 mock.patch("smtplib.SMTP_SSL") as smtp, \
                 mock.patch.object(patrol, "log") as plog:
             smtp.return_value.__enter__.return_value = server
-            self.assertTrue(patrol.send_email(env, "subject", "text"))
+            self.assertTrue(patrol.send_email(env, "subject", "text", event="health"))
         smtp.assert_called_once()
         server.sendmail.assert_called_once()
         # 第十六轮复审 P3：patrol.log() 会**追加进生产 logs/patrol.log**，于是这条与
