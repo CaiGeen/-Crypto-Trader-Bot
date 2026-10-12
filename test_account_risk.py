@@ -75,6 +75,17 @@ def _stats_file(trades):
     return tmp.name
 
 
+def _authoritative_trade(net_pnl, trade_time):
+    return {
+        "time": trade_time, "net_pnl": net_pnl,
+        "accounting_status": "AUTHORITATIVE_FINAL",
+        "pnl_source": "binance_income_history",
+        "income_complete": True, "commission_reconciled": True,
+        "funding_allocated": True, "fx_complete": True,
+        "pnl_not_authoritative": False,
+    }
+
+
 def _env(**over):
     """显式设置 D-006 相关 env（未给的键删除以测默认值）"""
     for k in ENV_KEYS:
@@ -134,20 +145,29 @@ def main():
 
         # ---------- T07-T09 日亏损门启用语义 ----------
         _env(RISK_DAILY_REALIZED_LOSS_LIMIT=500)
-        f_loss = _stats_file([{"time": f"{TODAY} 10:00:00", "net_pnl": -600.0}])
-        f_small = _stats_file([{"time": f"{TODAY} 10:00:00", "net_pnl": -400.0}])
-        f_yday = _stats_file([{"time": "2020-01-01 10:00:00", "net_pnl": -900.0}])
-        f_mixed = _stats_file([{"time": f"{TODAY} 10:00:00", "net_pnl": -350.0},
-                               {"time": f"{TODAY} 11:00:00", "net_pnl": 100.0}])
-        tmp_files += [f_loss, f_small, f_yday, f_mixed]
+        f_loss = _stats_file([_authoritative_trade(-600.0, f"{TODAY} 10:00:00")])
+        f_small = _stats_file([_authoritative_trade(-400.0, f"{TODAY} 10:00:00")])
+        f_yday = _stats_file([_authoritative_trade(-900.0, "2020-01-01 10:00:00")])
+        f_mixed = _stats_file([
+            _authoritative_trade(-350.0, f"{TODAY} 10:00:00"),
+            _authoritative_trade(100.0, f"{TODAY} 11:00:00")])
+        f_unknown_offset = _stats_file([
+            _authoritative_trade(-350.0, f"{TODAY} 10:00:00"),
+            {"time": f"{TODAY} 11:00:00", "net_pnl": 100.0,
+             "pnl_not_authoritative": True}])
+        tmp_files += [f_loss, f_small, f_yday, f_mixed, f_unknown_offset]
         a12, r12 = CryptoTrader._check_account_risk(fake, _states({SYMBOL: [1]}), _sig(), stats_file=f_loss)
         a13, _ = CryptoTrader._check_account_risk(fake, _states({SYMBOL: [1]}), _sig(), stats_file=f_small)
         a14, _ = CryptoTrader._check_account_risk(fake, _states({SYMBOL: [1]}), _sig(), stats_file=f_yday)
         a15, _ = CryptoTrader._check_account_risk(fake, _states({SYMBOL: [1]}), _sig(), stats_file=f_mixed)
+        a_unknown_offset, r_unknown_offset = CryptoTrader._check_account_risk(
+            fake, _states({SYMBOL: [1]}), _sig(), stats_file=f_unknown_offset)
         report("T07 当日亏 600>限 500 拒 / 亏 400 放行",
                a12 is False and "RISK_DAILY_REALIZED_LOSS" in r12 and a13 is True)
         report("T08 昨日亏损不计入（日切边界，北京时间）", a14 is True)
         report("T09 当日多笔求和判定（-350+100=-250 < 500 放行）", a15 is True)
+        report("T09b 非权威正收益不得抵销已知亏损（Fail-Closed）",
+               a_unknown_offset is False and "费用未对账" in r_unknown_offset)
 
         # ---------- T10/T11 stats 损坏 Fail-Closed（门启用时） ----------
         before = open(corrupt, encoding="utf-8").read()

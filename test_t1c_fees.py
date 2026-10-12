@@ -18,6 +18,7 @@ import json
 import os
 import tempfile
 import threading
+import pytest
 from datetime import datetime
 from datetime import timezone, timedelta
 
@@ -75,9 +76,64 @@ def _fill(qty, commission, asset='USDT', order='X', tid=1):
                      'commissionAsset': asset}}
 
 
+def _complete_fill(qty, commission, asset='USDT', order='X', tid=1,
+                   side='BUY', position_side='BOTH'):
+    row = _fill(qty, commission, asset, order, tid)
+    row.update(symbol=SYM, side=side.lower(), timestamp=1234)
+    row['info'].update(symbol='BTCUSDT', side=side, positionSide=position_side, time=1234)
+    return row
+
+
+def test_invalid_fill_identity_never_enters_authoritative_cache():
+    # A complete quantity and commission do not make a fill authoritative when
+    # the response omits market/direction/time/position identity.
+    t = _resolver_trader(fills_by_oid={
+        'L1': [_fill(0.002, 0.0389, order='L1')]
+    })
+    fee, source, note = t._resolve_order_fees(
+        SYM, {'kind': 'regular', 'order_id': 'L1'}, 0.002, 0.1,
+        order_snapshot={'executedQty': '0.002', 'filled': 0.002},
+        expected_side='BUY', expected_position_side='BOTH')
+    assert source == 'estimated'
+    assert note == 'fills_identity_incomplete'
+    assert fee == pytest.approx(0.1)
+    assert not getattr(t, '_pnl_fee_trade_evidence', {})
+
+
+def test_complete_fill_identity_remains_eligible_for_actual_fee():
+    row = _fill(0.002, 0.0389, order='L1', tid='trade-1')
+    row.update(symbol=SYM, side='buy', timestamp=1234)
+    row['info'].update(symbol='BTCUSDT', side='BUY', positionSide='BOTH', time=1234)
+    t = _resolver_trader(fills_by_oid={'L1': [row]})
+    t.exchange.market = lambda _symbol: {'id': 'BTCUSDT'}
+    fee, source, note = t._resolve_order_fees(
+        SYM, {'kind': 'regular', 'order_id': 'L1'}, 0.002, 0.1,
+        order_snapshot={'executedQty': '0.002', 'filled': 0.002},
+        expected_side='BUY', expected_position_side='BOTH')
+    assert fee == pytest.approx(0.0389)
+    assert source == 'actual' and note == ''
+    assert t._pnl_fee_trade_evidence[(SYM, 'L1')][0]['trade_id'] == 'trade-1'
+
+
+def test_exit_fee_direction_mismatch_is_not_authoritative():
+    row = _fill(0.002, 0.0389, order='L1', tid='trade-wrong-side')
+    row.update(symbol=SYM, side='buy', timestamp=1234)
+    row['info'].update(symbol='BTCUSDT', side='BUY', positionSide='BOTH', time=1234)
+    t = _resolver_trader(fills_by_oid={'L1': [row]})
+    t.exchange.market = lambda _symbol: {'id': 'BTCUSDT'}
+    fee, source, note = t._resolve_order_fees(
+        SYM, {'kind': 'regular', 'order_id': 'L1'}, 0.002, 0.1,
+        order_snapshot={'filled': 0.002}, expected_side='SELL',
+        expected_position_side='BOTH')
+    assert source == 'estimated' and note == 'fills_identity_incomplete'
+    assert fee == pytest.approx(0.1)
+    assert not getattr(t, '_pnl_fee_trade_evidence', {})
+
+
 # ── F1：普通单直查 actual ────────────────────────────────────────────────
 def f1_regular_order_direct_actual():
-    t = _resolver_trader(fills_by_oid={'L1': [_fill(0.002, 0.0389, order='L1')]})
+    t = _resolver_trader(fills_by_oid={'L1': [_complete_fill(0.002, 0.0389, order='L1')]})
+    t.exchange.market = lambda _symbol: {'id': 'BTCUSDT'}
     # 权威数量可得（快照）→ actual
     fee, source, note = t._resolve_order_fees(
         SYM, {'kind': 'regular', 'order_id': 'L1'}, 0.002, 0.999,
@@ -94,10 +150,12 @@ def f1_regular_order_direct_actual():
 # ── F2：条件单映射链（actualOrderId 命中 / 空 → 降级）────────────────────
 def f2_algo_mapping_chain():
     t = _resolver_trader(
-        fills_by_oid={'1123067286925': [_fill(0.001, 0.0389426, order='1123067286925')]},
+        fills_by_oid={'1123067286925': [_complete_fill(
+            0.001, 0.0389426, order='1123067286925', position_side='LONG')]},
         algo_by_id={'3000002168427079': {'algoId': 3000002168427079,
                                           'actualOrderId': '1123067286925',
                                           'actualQty': '0.001'}})
+    t.exchange.market = lambda _symbol: {'id': 'BTCUSDT'}
     fee, source, note = t._resolve_order_fees(
         SYM, {'kind': 'algo', 'order_id': '3000002168427079'}, 0.001, 0.999)
     assert abs(fee - 0.0389426) < 1e-9 and source == 'actual', (fee, source)
@@ -112,10 +170,13 @@ def f2_algo_mapping_chain():
 
 # ── F3：非 USDT → estimated + note ──────────────────────────────────────
 def f3_non_usdt_commission():
-    t = _resolver_trader(fills_by_oid={'L1': [_fill(0.002, 0.001, asset='BNB', order='L1')]})
+    t = _resolver_trader(fills_by_oid={'L1': [_complete_fill(
+        0.002, 0.001, asset='BNB', order='L1')]})
+    t.exchange.market = lambda _symbol: {'id': 'BTCUSDT'}
     fee, source, note = t._resolve_order_fees(
         SYM, {'kind': 'regular', 'order_id': 'L1'}, 0.002, 0.9,
-        order_snapshot={'filled': 0.002})
+        order_snapshot={'filled': 0.002}, expected_side='BUY',
+        expected_position_side='BOTH')
     assert source == 'estimated' and note == 'non_usdt_commission', (source, note)
     assert abs(fee - 0.9) < 1e-9, fee
 
@@ -224,8 +285,10 @@ def f7_finalizer_formula_counterexample():
         'algoId': b['entry_orders'][0], 'actualOrderId': 'E1FILL',
         'actualQty': '0.002'}
     ex.fetch_my_trades = lambda symbol, since=None, limit=None, params=None, **k: {
-        'E1FILL': [_fill(0.002, 0.077, order='E1FILL')],
-        'L1': [_fill(0.002, 0.0389426, order='L1')],
+        'E1FILL': [_complete_fill(0.002, 0.077, order='E1FILL',
+                                  position_side='LONG')],
+        'L1': [_complete_fill(0.002, 0.0389426, order='L1', side='SELL',
+                              position_side='LONG')],
     }.get(str((params or {}).get('orderId') or ''), [])
 
     ok, msg = t._finalize_limit_full_fill(SYM, p5.BID, 'L1')
@@ -423,6 +486,18 @@ def make_settlement_trader():
         t.exchange.__dict__.update(fetch_my_trades_calls=t.exchange.fetch_my_trades_calls + 1) or [])
     t.exchange.fapiPrivateGetAlgoOrder = lambda params, **k: {'actualOrderId': ''}
     return t
+
+
+def test_settlement_fees_preserve_funding_baseline_contract():
+    trader = make_settlement_trader()
+    baseline = {'captured_at_ms': 100, 'market_id': 'BTCUSDT',
+                'long_qty': '0', 'short_qty': '0'}
+    batch = _settle_batch(funding_position_baseline=baseline)
+    fees = trader._compute_settlement_fees(
+        SYM, batch, 0.002, {'kind': 'regular', 'order_id': 'exit-1'}, 0.01,
+        order_snapshot={'executedQty': '0.002', 'filled': 0.002})
+    assert fees['funding_position_baseline'] == baseline
+    assert fees['funding_baseline_complete'] is True
 
 
 
@@ -796,9 +871,12 @@ def f28_four_paths_and_daily_report_separation():
            'exit_note': '', 'fee_note': 'fee_unknown'}
     note_line, label = CryptoTrader._pnl_display_label(bad)
     assert label == '估算净盈亏' and '费用未对账' in note_line, (note_line, label)
-    good = dict(bad, fee_note='', entry_fee_source='actual', exit_fee_source='actual')
+    good = dict(bad, fee_note='', entry_fee_source='actual', exit_fee_source='actual',
+                accounting_status='AUTHORITATIVE_FINAL',
+                pnl_source='binance_income_history', income_complete=True,
+                commission_reconciled=True, funding_allocated=True, fx_complete=True)
     note_line2, label2 = CryptoTrader._pnl_display_label(good)
-    assert label2 == '最终净盈亏' and note_line2 == '', (note_line2, label2)
+    assert label2 == '交易所已实现口径净盈亏' and note_line2 == '', (note_line2, label2)
     # ③ 行为调用日报：权威总额与非权威金额必须分离
     tmp = tempfile.mkdtemp(prefix='t1c_f28_')
     t, ex = p5.make_trader(tmp)
@@ -809,39 +887,79 @@ def f28_four_paths_and_daily_report_separation():
     _today = (datetime.now(BEIJING_TZ) - timedelta(days=1)).strftime('%Y-%m-%d')
     json.dump({'trades': [
         {'time': f'{_today} 09:00:00', 'batch_id': 'a1', 'symbol': SYM,
-         'side': 'BUY', 'mode': '限价平仓', 'net_pnl': 10.0},
+         'side': 'BUY', 'mode': '限价平仓', 'net_pnl': 10.0,
+         'accounting_status': 'AUTHORITATIVE_FINAL',
+         'pnl_source': 'binance_income_history', 'income_complete': True,
+         'commission_reconciled': True, 'funding_allocated': True, 'fx_complete': True},
         {'time': f'{_today} 10:00:00', 'batch_id': 'a2', 'symbol': SYM,
          'side': 'BUY', 'mode': '市价平仓', 'net_pnl': -4.0,
          'pnl_not_authoritative': True, 'fee_metadata_error': True},
     ]}, open(stats_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
     t._send_daily_report(stats_file=stats_path)
     out = '\n'.join(sent)
-    assert '昨日已实现盈亏' in out, out[:300]
+    assert '昨日交易所已实现口径净盈亏' in out, out[:300]
     assert '`+10.00`' in out, f'权威总额必须只含权威记录（+10.00）: {out[:400]}'
-    assert '费用未对账（非权威）' in out, f'必须单列非权威段: {out[:400]}'
+    assert '账务未对账（非权威）' in out, f'必须单列非权威段: {out[:400]}'
     assert '`-4.00`' in out, out[:400]
+
+
+def f29_income_revision_promotes_same_record_idempotently():
+    tmp = tempfile.mkdtemp(prefix='t1c_f29_')
+    t, _ = p5.make_trader(tmp)
+    stats_path = os.path.join(tmp, 'trade_stats.json')
+    json.dump({'trades': [{'dedup_key': 'BTCUSDT:close-1', 'net_pnl': 0.5,
+                           'pnl_not_authoritative': True,
+                           'accounting_status': 'PENDING_RECONCILIATION'}]},
+              open(stats_path, 'w', encoding='utf-8'))
+    revision = {'revision_id': 'r1', 'income_complete': True,
+                'commission_reconciled': True, 'funding_allocated': True,
+                 'fx_complete': True, 'realized_usdt': '1', 'funding_usdt': '0.1',
+                 'commission_usdt': '-0.2', 'commission_entry_usdt': '-0.1',
+                 'commission_exit_usdt': '-0.1', 'rebate_usdt': '0.01',
+                'evidence_refs': ['income:REALIZED_PNL:1']}
+    assert t._apply_pnl_accounting_revision('BTCUSDT:close-1', revision,
+                                            stats_file=stats_path) == (True, 'ok')
+    assert t._apply_pnl_accounting_revision('BTCUSDT:close-1', revision,
+                                            stats_file=stats_path) == (True, 'ok')
+    data = json.load(open(stats_path, encoding='utf-8'))
+    assert len(data['trades']) == 1
+    assert data['trades'][0]['net_pnl'] == pytest.approx(0.91)
+    assert data['trades'][0]['accounting_status'] == 'AUTHORITATIVE_FINAL'
+    assert data['trades'][0]['entry_fee_source'] == 'actual'
+    assert data['trades'][0]['exit_fee_source'] == 'actual'
+    assert CryptoTrader._is_pnl_authoritative(data['trades'][0]) is True
+    assert len(data['accounting_v2']['revisions']) == 1
 
 
 
 # ── F25：非法 commission 不得标 actual 0 ─────────────────────────────────
 def f25_invalid_commission_not_actual_zero():
     bad = [{'order': 'L1', 'amount': 0.002,
-            'info': {'qty': '0.002', 'commission': 'abc',
-                     'commissionAsset': 'USDT'}}]
+            'symbol': SYM, 'side': 'sell', 'timestamp': 1234,
+            'info': {'orderId': 'L1', 'id': 'trade-1', 'qty': '0.002',
+                     'symbol': 'BTCUSDT', 'side': 'SELL', 'positionSide': 'BOTH',
+                     'time': 1234, 'commission': 'abc', 'commissionAsset': 'USDT'}}]
     t = _resolver_trader(fills_by_oid={'L1': bad})
+    t.exchange.market = lambda _symbol: {'id': 'BTCUSDT'}
     fee, source, note = t._resolve_order_fees(
         SYM, {'kind': 'regular', 'order_id': 'L1'}, 0.002, 0.9,
-        order_snapshot={'filled': 0.002})
+        order_snapshot={'filled': 0.002}, expected_side='SELL',
+        expected_position_side='BOTH')
     assert source == 'estimated', f'非法 commission 不得标 actual: {(source, note)}'
     assert note == 'commission_invalid', note
     assert not (source == 'actual' and fee == 0.0), '严禁 actual + 0 手续费'
 
     missing = [{'order': 'L1', 'amount': 0.002,
-                'info': {'qty': '0.002', 'commissionAsset': 'USDT'}}]
+                'symbol': SYM, 'side': 'sell', 'timestamp': 1234,
+                'info': {'orderId': 'L1', 'id': 'trade-1', 'qty': '0.002',
+                         'symbol': 'BTCUSDT', 'side': 'SELL', 'positionSide': 'BOTH',
+                         'time': 1234, 'commissionAsset': 'USDT'}}]
     t2 = _resolver_trader(fills_by_oid={'L1': missing})
+    t2.exchange.market = lambda _symbol: {'id': 'BTCUSDT'}
     f2, s2, n2 = t2._resolve_order_fees(
         SYM, {'kind': 'regular', 'order_id': 'L1'}, 0.002, 0.9,
-        order_snapshot={'filled': 0.002})
+        order_snapshot={'filled': 0.002}, expected_side='SELL',
+        expected_position_side='BOTH')
     assert s2 == 'estimated' and n2 == 'commission_invalid', (s2, n2)
 
 

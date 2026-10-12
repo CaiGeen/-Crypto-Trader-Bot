@@ -2731,6 +2731,10 @@ async def run_trader_recovery_on_startup(trader: CryptoTrader):
                 if recovery_result:
                     trader._ready = True        # SG1: 唯一置位来源 = recover 明确返回 True（含 0 批次）
                     trader._not_ready_reason = ""
+                    start_pnl_reconciliation = getattr(
+                        trader, 'start_pnl_reconciliation', None)
+                    if callable(start_pnl_reconciliation):
+                        start_pnl_reconciliation()
                     print("✅ [启动检测] 历史任务恢复校验完成！系统 READY")
                     return
                 else:

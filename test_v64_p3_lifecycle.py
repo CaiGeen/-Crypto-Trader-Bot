@@ -50,6 +50,7 @@ H.NS.setdefault('ccxt', _CCXTShim)
 H.NS.setdefault('current_instance_id', lambda: 'p3-fixture-instance')
 H.NS.setdefault('write_progress', lambda *a, **k: None)
 H.NS.setdefault('remove_batch', lambda *a, **k: None)
+H.NS.setdefault('CryptoTrader', trader_260725.CryptoTrader)
 
 # ── 路径隔离（先隔离 STATE_FILE 与墓碑路径，再运行夹具）────────────────────
 # STATE_FILE / TOMBSTONE_FILE 是相对路径（trader_260725.py:33/39），按 cwd 解析。
@@ -204,6 +205,9 @@ def _make_runner(states, position=0.002, fetch_order_result='open',
     t._state_lock = t._lock
     t._active_monitors = set()
     t._active_monitors_lock = threading.Lock()
+    t._conservation_event_lock = threading.Lock()
+    t._conservation_events = {}
+    t._poll_alert_budget = None
     t._criticals = []
     t.tg_msgs = []
     t.converge_calls = Counter()
