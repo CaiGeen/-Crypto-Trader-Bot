@@ -13,8 +13,11 @@ R3-v2 离线语义验收测试（不连交易所、不碰真实状态文件、�
 """
 import sys
 import threading
+import copy
+import unittest
 from unittest import mock
 
+import ccxt
 import trader_260725
 from trader_260725 import CryptoTrader
 
@@ -202,12 +205,133 @@ def scenario_partial():
            f"(返回值: {'异常 ' + type(raised).__name__ if raised else '未抛异常!'})")
 
 
+class EntryChannelRecoveryTests(unittest.TestCase):
+    """Startup must observe both order namespaces without guessing UNKNOWN away."""
+
+    def recover(self, normal, conditional, normal_detail=None, conditional_detail=None,
+                position=0.0):
+        ex = FakeExchange()
+        ex.create_order = mock.Mock()
+        ex.cancel_order = mock.Mock()
+        ex.open_calls = []
+        ex.detail_calls = []
+
+        def response(value):
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        def open_orders(symbol, params=None):
+            channel = bool((params or {}).get('stop'))
+            ex.open_calls.append(channel)
+            return response(conditional if channel else normal)
+
+        def fetch_order(order_id, symbol, params=None):
+            channel = bool((params or {}).get('stop'))
+            ex.detail_calls.append((order_id, channel))
+            return response(conditional_detail if channel else normal_detail)
+
+        ex.fetch_open_orders = open_orders
+        ex.fetch_order = fetch_order
+        batch = make_batch()
+        batch.update(entry_orders=['entry'], last_filled_count=0,
+                     protection_registry={}, pending_sl_orders=[0])
+        states = {SYMBOL: {'batch_001': batch}}
+        before = copy.deepcopy(states)
+        fake = make_fake_self(states, ex)
+        fake.clear_batch_state = mock.Mock()
+        fake._ready = True
+        fake._unresolved_intent_batches = set()
+        fake._get_current_position_amt = lambda *a, **k: position
+        with mock.patch.object(trader_260725.threading, 'Thread'), \
+             mock.patch.object(trader_260725.time, 'sleep'):
+            ok = CryptoTrader.recover_active_batches(fake)
+        self.assertEqual(states, before)
+        ex.create_order.assert_not_called()
+        ex.cancel_order.assert_not_called()
+        fake.clear_batch_state.assert_not_called()
+        if not ok:
+            self.assertIs(fake._ready, False)
+            self.assertTrue(any(c.kwargs.get('level') == 'critical'
+                                for c in fake.send_tg_notification.call_args_list))
+        return ok, ex
+
+    def test_conditional_entry_visible_only_in_algo_channel(self):
+        ok, ex = self.recover([], [{'id': 'entry', 'status': 'open'}])
+        self.assertIs(ok, True)
+        self.assertEqual(ex.open_calls, [False, True])
+        self.assertEqual(ex.detail_calls, [])
+
+    def test_normal_entry_and_duplicate_id_remain_supported(self):
+        for conditional in ([], [{'id': 'entry', 'status': 'open'}]):
+            with self.subTest(conditional=conditional):
+                ok, ex = self.recover([{'id': 'entry', 'status': 'open'}], conditional)
+                self.assertIs(ok, True)
+                self.assertEqual(ex.open_calls, [False, True])
+                self.assertEqual(ex.detail_calls, [])
+
+    def test_either_snapshot_failure_blocks_even_if_other_has_entry(self):
+        for failure in (ccxt.NetworkError('offline'), None, {}, 'invalid',
+                        [None], [{}]):
+            for channel in (False, True):
+                with self.subTest(failure=repr(failure), channel=channel):
+                    known = [{'id': 'entry', 'status': 'open'}]
+                    normal, conditional = (known, failure) if channel else (failure, known)
+                    ok, ex = self.recover(normal, conditional)
+                    self.assertIs(ok, False)
+                    self.assertEqual(ex.detail_calls, [])
+
+    def test_missing_normal_entry_can_be_proven_terminal(self):
+        for status in ('closed', 'filled', 'canceled', 'expired', 'rejected'):
+            with self.subTest(status=status):
+                ok, ex = self.recover([], [], normal_detail={'id': 'entry', 'status': status})
+                self.assertIs(ok, True)
+                self.assertEqual(ex.detail_calls, [('entry', False)])
+
+    def test_normal_not_found_routes_terminal_query_to_algo(self):
+        for status in ('closed', 'filled', 'canceled', 'expired', 'rejected'):
+            with self.subTest(status=status):
+                ok, ex = self.recover([], [], ccxt.OrderNotFound('normal absent'),
+                                      {'id': 'entry', 'status': status})
+                self.assertIs(ok, True)
+                self.assertEqual(ex.detail_calls, [('entry', False), ('entry', True)])
+
+    def test_not_found_in_both_channels_is_unknown_not_terminal(self):
+        ok, ex = self.recover([], [], ccxt.OrderNotFound('normal absent'),
+                              ccxt.OrderNotFound('algo absent'))
+        self.assertIs(ok, False)
+        self.assertEqual(ex.detail_calls, [('entry', False), ('entry', True)])
+
+    def test_normal_unknown_does_not_fall_through_to_algo_success(self):
+        for detail in (ccxt.NetworkError('offline'), None, {}, {'status': 'open'}):
+            with self.subTest(detail=repr(detail)):
+                ok, ex = self.recover([], [], detail, {'id': 'entry', 'status': 'closed'})
+                self.assertIs(ok, False)
+                self.assertEqual(ex.detail_calls, [('entry', False)])
+
+    def test_algo_unknown_or_open_still_blocks(self):
+        for detail in (ccxt.NetworkError('offline'), None, {},
+                       {'id': 'entry', 'status': 'open'}):
+            with self.subTest(detail=repr(detail)):
+                ok, _ = self.recover([], [], ccxt.OrderNotFound('normal absent'), detail)
+                self.assertIs(ok, False)
+
+    def test_entry_observed_but_position_unknown_or_unprotected_blocks(self):
+        for position in (None, 0.01):
+            with self.subTest(position=position):
+                ok, _ = self.recover([], [{'id': 'entry', 'status': 'open'}], position=position)
+                self.assertIs(ok, False)
+
+
 if __name__ == '__main__':
     scenario_a()
     scenario_b()
     scenario_c()
     scenario_d()
     scenario_partial()
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(EntryChannelRecoveryTests)
+    if not unittest.TextTestRunner().run(suite).wasSuccessful():
+        sys.exit(1)
     print("\n" + "#" * 60)
     failed = [n for n, p in RESULTS if not p]
     if failed:

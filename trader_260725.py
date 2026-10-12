@@ -5931,9 +5931,16 @@ class CryptoTrader:
                 _orders_known = True
                 if _local_entries:
                     try:
-                        _oo = self._safe_api_call(self.exchange.fetch_open_orders, _sym) or []
-                        for _o in _oo:
-                            if isinstance(_o, dict) and _o.get('id') is not None:
+                        # ENTRY may live in normal or algo namespaces. Both snapshots
+                        # must be trustworthy; None/malformed is UNKNOWN, not empty.
+                        for _kwargs in ({}, {'params': {'stop': True}}):
+                            _oo = self._safe_api_call(
+                                self.exchange.fetch_open_orders, _sym, **_kwargs)
+                            if not isinstance(_oo, list):
+                                raise ValueError('未结订单快照不是列表')
+                            for _o in _oo:
+                                if not isinstance(_o, dict) or _o.get('id') is None:
+                                    raise ValueError('未结订单快照含无效订单')
                                 _seen.add(str(_o['id']))
                     except Exception as _oe:
                         _orders_known = False
@@ -5945,7 +5952,14 @@ class CryptoTrader:
                         # 本地有 ENTRY 但交易所未结列表没有 → 判明成交/撤销/UNKNOWN
                         _st = None
                         try:
-                            _od = self._safe_api_call(self.exchange.fetch_order, _e, _sym)
+                            try:
+                                _od = self._safe_api_call(self.exchange.fetch_order, _e, _sym)
+                            except ccxt.OrderNotFound:
+                                # Not found in the normal namespace does not prove
+                                # the algo ENTRY is gone, filled, or canceled.
+                                _od = self._safe_api_call(
+                                    self.exchange.fetch_order, _e, _sym,
+                                    params={'stop': True})
                             if isinstance(_od, dict):
                                 _st = _od.get('status')
                         except Exception:
