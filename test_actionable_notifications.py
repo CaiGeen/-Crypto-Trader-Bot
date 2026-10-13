@@ -75,15 +75,35 @@ def test_real_email_sender_reports_smtp_result_without_live_io(monkeypatch, tls_
     monkeypatch.setenv('QQ_MAIL_AUTH_CODE', 'offline')
     monkeypatch.setenv('QQ_MAIL_TO', 'offline@example.com')
     monkeypatch.setattr(trader_260725.threading, 'Thread', InlineThread)
-    with mock.patch('smtplib.SMTP_SSL') as smtp:
+    # Patch both transports: this test is safe on the old SMTP_SSL implementation
+    # and remains safe when the required-STARTTLS helper is composed later.
+    with mock.patch('smtplib.SMTP_SSL') as implicit_tls, \
+            mock.patch('smtplib.SMTP') as starttls:
+        implicit_server = implicit_tls.return_value.__enter__.return_value
+        starttls_server = starttls.return_value.__enter__.return_value
+        starttls_server.ehlo.return_value = (250, b'OK')
+        starttls_server.has_extn.return_value = True
+        starttls_server.sendmail.return_value = {}
         if tls_failure:
-            smtp.side_effect = ssl.SSLError('WRONG_VERSION_NUMBER')
+            implicit_tls.side_effect = ssl.SSLError('legacy TLS failure')
+            starttls_server.starttls.side_effect = ssl.SSLError('TLS verification failed')
         result = CryptoTrader._send_email_alert(
             object(), 'offline risk', event='auth_blocked', wait=True)
         assert result is (not tls_failure)
-        smtp.assert_called_once_with('smtp.qq.com', 465, timeout=10)
-        if tls_failure:
-            smtp.return_value.__enter__.return_value.login.assert_not_called()
+        if starttls.called:
+            starttls.assert_called_once_with('smtp.qq.com', 587, timeout=10)
+            implicit_tls.assert_not_called()
+            if tls_failure:
+                starttls_server.login.assert_not_called()
+                starttls_server.sendmail.assert_not_called()
+            else:
+                starttls_server.login.assert_called_once()
+                starttls_server.sendmail.assert_called_once()
+        else:
+            implicit_tls.assert_called_once_with('smtp.qq.com', 465, timeout=10)
+            starttls.assert_not_called()
+            if tls_failure:
+                implicit_server.login.assert_not_called()
 
 
 @pytest.mark.parametrize('code', [-2015, -2014])
