@@ -648,12 +648,26 @@ def _strip_markdown(text: str) -> str:
 
 async def safe_reply(update: Update, text: str, parse_mode=None, reply_markup=None):
     """带网络超时重试保护的回复函数"""
+    # Optional diagnostics only; lookup/recording must never affect reply behavior.
+    _tgd = sys.modules.get("tg_diagnostics")
     try:
         if update.message:
-            return await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            _result = await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            try:
+                if _tgd:
+                    _tgd.record_reply(_result is not None)
+            except BaseException:
+                pass
+            return _result
         elif update.callback_query and update.callback_query.message:
-            return await update.callback_query.message.reply_text(text, parse_mode=parse_mode,
-                                                                  reply_markup=reply_markup)
+            _result = await update.callback_query.message.reply_text(text, parse_mode=parse_mode,
+                                                                      reply_markup=reply_markup)
+            try:
+                if _tgd:
+                    _tgd.record_reply(_result is not None)
+            except BaseException:
+                pass
+            return _result
     except BadRequest as e:
         # 真错误（Markdown 格式错、消息超长等），必须保留可见性
         logging.error(f"⚠️ 回复消息给 Telegram 失败（BadRequest，请检查消息格式）: {e}")
@@ -670,17 +684,42 @@ async def safe_reply(update: Update, text: str, parse_mode=None, reply_markup=No
                     sent = await update.callback_query.message.reply_text(plain, reply_markup=reply_markup)
                 if sent is not None:
                     logging.info("ℹ️ [TG回复] Markdown 解析失败，已降级纯文本发送")
+                try:
+                    if _tgd:
+                        _tgd.record_reply(sent is not None)
+                except BaseException:
+                    pass
                 return sent
             except Exception as e2:
                 logging.error(f"⚠️ [TG回复] 纯文本重发失败: {e2}")
+                try:
+                    if _tgd:
+                        _tgd.record_reply(False, f"fallback: {type(e2).__name__}")
+                except BaseException:
+                    pass
     except RetryAfter as e:
         # Flood control 限流，稍后自动恢复，正常现象
         logging.debug(f"ℹ️ Telegram 回复受限（Flood control，稍后自动恢复）: {e}")
+        try:
+            if _tgd:
+                _tgd.record_reply(False, type(e).__name__)
+        except BaseException:
+            pass
     except NetworkError as e:
         # 裸 NetworkError（Bad Gateway/ConnectError 等）网络抖动
         logging.debug(f"ℹ️ Telegram 回复失败（网络抖动，可忽略）: {e}")
+        try:
+            if _tgd:
+                _tgd.record_reply(False, type(e).__name__)
+        except BaseException:
+            pass
     except Exception as e:
         logging.error(f"⚠️ 回复消息给 Telegram 失败: {e}")
+        try:
+            if _tgd:
+                _tgd.record_reply(False, type(e).__name__)
+        except BaseException:
+            pass
 
 
 def get_standard_markup(batch_id: str) -> InlineKeyboardMarkup:
@@ -2883,6 +2922,12 @@ async def on_post_init(app: Application):
 # ==================== 全局错误处理器 ====================
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
+    try:
+        _tgd = sys.modules.get("tg_diagnostics")
+        if _tgd:
+            _tgd.record_error_callback(type(error).__name__, error)
+    except BaseException:
+        pass
 
     # BadRequest 是 NetworkError 子类（库的命名怪癖），但它是真错误（格式错/消息超长等），必须保留可见性
     if isinstance(error, BadRequest):
@@ -2971,6 +3016,15 @@ def main():
         get_updates_kwargs["proxy"] = proxy_url
     get_updates_req = HTTPXRequest(**get_updates_kwargs)
 
+    # Passive Telegram diagnostics; failure to install any probe is non-fatal.
+    try:
+        import tg_diagnostics
+        tg_diagnostics.install_poll_request_probe(get_updates_req, "getUpdates")
+        tg_diagnostics.install_poll_request_probe(req, "api")
+    except BaseException as _diag_error:
+        print(f"[TGDIAG] module/probe unavailable: {type(_diag_error).__name__}")
+        tg_diagnostics = None
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -3007,6 +3061,15 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_json_or_pending_input))
 
     print("🚀 Telegram Bot 监听服务已启动...")
+    try:
+        tg_diagnostics.install_updater_watch(app, interval=15.0)
+    except BaseException as _diag_error:
+        print(f"[TGDIAG] updater watch unavailable: {type(_diag_error).__name__}")
+    try:
+        if tg_diagnostics is not None:
+            tg_diagnostics.install_process_probe(app)
+    except BaseException as _diag_error:
+        print(f"[TGDIAG] process probe unavailable: {type(_diag_error).__name__}")
     app.run_polling(bootstrap_retries=-1)
 
 
