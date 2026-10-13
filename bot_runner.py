@@ -57,6 +57,33 @@ import email_gate
 # 2. 加载环境变量
 load_dotenv()
 
+
+def _load_own_tg_config(path):
+    """Read this project's Telegram credentials; never fall back to inherited values."""
+    if not os.path.isfile(path):
+        raise ValueError(f"❌ 缺少本项目 .env：{path}（拒绝使用继承的环境变量）")
+    try:
+        found = {}
+        with open(path, encoding="utf-8") as env_file:
+            for line in env_file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if key in ("TG_BOT_TOKEN", "TG_ALLOWED_USER_ID"):
+                    found[key] = value.strip().strip('"').strip("'")
+    except Exception as exc:
+        raise ValueError(f"❌ 读取本项目 .env 失败：{type(exc).__name__}") from exc
+
+    token = found.get("TG_BOT_TOKEN", "")
+    user_id = found.get("TG_ALLOWED_USER_ID", "")
+    if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token):
+        raise ValueError("❌ 本项目 .env 的 TG_BOT_TOKEN 缺失或格式无效")
+    if not re.fullmatch(r"-?[0-9]+", user_id):
+        raise ValueError("❌ 本项目 .env 的 TG_ALLOWED_USER_ID 缺失或非数字")
+    return token, user_id
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -67,12 +94,8 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-ALLOWED_USER_ID = os.getenv("TG_ALLOWED_USER_ID")
-
-if not BOT_TOKEN or not ALLOWED_USER_ID:
-    raise ValueError("❌ 请先在 .env 文件中配置 TG_BOT_TOKEN 和 TG_ALLOWED_USER_ID！")
-
-ALLOWED_USER_ID = int(ALLOWED_USER_ID.strip())
+_allowed_user_id = os.getenv("TG_ALLOWED_USER_ID", "").strip()
+ALLOWED_USER_ID = int(_allowed_user_id) if re.fullmatch(r"-?[0-9]+", _allowed_user_id) else None
 
 # 🔥 MAX_LEVERAGE 统一配置
 MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "100"))
@@ -2943,7 +2966,7 @@ def log_effective_config() -> str:
         f"RISK_DAILY_REALIZED_LOSS_LIMIT={os.getenv('RISK_DAILY_REALIZED_LOSS_LIMIT', '0（默认，禁用）')}",
         f"MAX_LEVERAGE={os.getenv('MAX_LEVERAGE', '100（默认）')}",
         f"EMAIL_ALERT_ENABLED={email_gate.email_enabled()}",
-        f"EMAIL_ALERT_ONLY_WITH_POSITION={email_gate.email_only_with_position()}",
+        "EMAIL_ALERT_ONLY_WITH_POSITION=已废弃（仅致命事件、日报和显式自检可发邮件）",
         f"DAILY_REPORT_EMAIL_ENABLED={email_gate.daily_report_email_enabled()}",
         # 标签保持中文可读性；watchdog 现只记录 stdout，不再把 CRASH/FATAL 文本
         # 当进程死亡控制信号（2026-09-25 D11 后续复审，见送审稿 §13）。
@@ -2956,6 +2979,14 @@ def log_effective_config() -> str:
 
 
 def main():
+    global BOT_TOKEN, ALLOWED_USER_ID
+    # Pin credentials before any startup action; imports need no machine-local .env.
+    token, allowed_user_id = _load_own_tg_config(os.path.join(BASE_DIR, ".env"))
+    user_id = int(allowed_user_id)
+    os.environ["TG_BOT_TOKEN"] = token
+    os.environ["TG_ALLOWED_USER_ID"] = allowed_user_id
+    BOT_TOKEN, ALLOWED_USER_ID = token, user_id
+
     acquire_instance_lock()  # P0-2: 单实例锁，双实例直接拒绝启动
     log_effective_config()   # M4：先落配置横幅，再做任何有配置依赖的动作
 
