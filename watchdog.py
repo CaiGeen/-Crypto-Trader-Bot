@@ -505,7 +505,7 @@ def monitor_process(process):
             logged = write_bot_log(line)  # 只有确认落盘后才允许省略常规行
             if logged and _is_normal_diagnostic_line(line):
                 continue
-            try:                      # 入队显示；队满则丢行（文件已有全量）
+            try:                      # 队满丢弃；仅 logged=True 的行已在文件中
                 _CONSOLE_QUEUE.put_nowait(line)
             except Exception:
                 pass

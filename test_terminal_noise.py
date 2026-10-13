@@ -1,6 +1,8 @@
 """Isolated tests for watchdog's log-confirmed routine console suppression."""
 
 import builtins
+import ast
+from pathlib import Path
 import queue
 
 import watchdog
@@ -79,3 +81,49 @@ def test_write_bot_log_reports_success_and_failure_without_recursive_disk_write(
     queued = list(watchdog._CONSOLE_QUEUE.queue)
     assert visible in queued
     assert not any("落盘失败" in line for line in queued)  # rate-limited
+
+
+def test_protection_status_text_has_no_fixed_sla_and_keeps_existing_call_site():
+    """Guard the factuality fix without asserting implementation timing."""
+    source_path = Path(__file__).with_name("trader_260725.py")
+    source = source_path.read_text(encoding="utf-8-sig")
+    tree = ast.parse(source)
+    trader_class = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "CryptoTrader"
+    )
+    operation = next(
+        node for node in trader_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "execute_signal"
+    )
+    monitor = next(
+        node for node in trader_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_start_monitoring"
+    )
+
+    statement = next(
+        node for node in ast.walk(operation)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "print"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and "止盈与止损挂单参数已预生成" in node.args[0].value
+    )
+    text = statement.args[0].value
+    assert "识别成交后按现有流程创建并核验保护单" in text
+    assert not any(sla in text for sla in ("1秒内", "1 秒内", "一秒内", "秒内"))
+
+    # Keep the informational print at the existing execute_signal call site,
+    # and verify the established monitor still owns protection creation.
+    protection_calls = [
+        node for node in ast.walk(monitor)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_place_prepared_orders_immediately"
+    ]
+    assert protection_calls
+    assert statement.lineno < min(node.lineno for node in protection_calls)
