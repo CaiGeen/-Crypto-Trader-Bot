@@ -13,7 +13,7 @@ D-010 Batch 2（trader/watchdog 写入侧 + AUTH_BLOCKED）离线验收测试
 
 覆盖场景：
   S1  闸门位置（AST）：raise AuthBlockedError 在 for 循环之前、不在任何 try 内
-  S2  -2015 触发：写锁 + 三通道告警（含"盲区"字样）+ 立即 raise，无 5 次重试
+  S2  -2015 触发：写锁 + TG 主队列/独立邮件（含"盲区"字样）+ 立即 raise，无 5 次重试
   S3  AUTH_BLOCKED 普通 API 零调用（6 个方法，mock 网络层计数=0）
   S4  连续 5 轮监控循环 → Binance API 调用 = 0
   S5  L920 动态验证：blocked + -1021 错误 → load_time_difference 零调用
@@ -21,11 +21,10 @@ D-010 Batch 2（trader/watchdog 写入侧 + AUTH_BLOCKED）离线验收测试
   S7  恢复链成败两路：探活失败保持锁；reconcile 失败回 BLOCKED 不半恢复
   S8  BLIND-SAFE 顺序（AST + 运行时）：reconcile 先于 clear，clear 前无 UNBLOCKED
   S9  watchdog 写入格式闭环：watchdog_alert|{text}，消费端可解析，旧 .notify 不再产生
-  S10 trader 入队格式闭环：ip_notify|{msg}，消费端可解析 + Email 通道（T5）
+  S10 普通 IP 变化仅日志，不外发或入队
   S11 auth_blocked.json 损坏 → Fail-Closed（按 BLOCKED 处理）+ 损坏告警去重
   S12 持久锁存在时 CryptoTrader.__init__ 不崩溃（跳过启动初始化 API，零网络调用）
-  S13 三通道真实语义（ChatGPT 复审补充）：AUTH_BLOCKED=三通道并行（队列无条件）；
-      IP=双通道+队列 fallback-only（用户裁定 B，设计稿同步）
+  S13 通道语义：AUTH_BLOCKED=TG 主队列 + 独立邮件，入队失败才直发；IP=仅日志
   S14 真实启动集成路径（ChatGPT 复审补充）：持久锁启动→探活恰1次→败=保持锁且
       recover 不可达；成=RECOVERING→reconcile→UNBLOCKED→READY（无普通 API 绕过）
 
@@ -107,7 +106,7 @@ def make_trader(tmp, pre_auth=None, configure=None):
     t._sent = []
     t._emails = []
     t.send_tg_notification = lambda text, **k: t._sent.append(str(text))
-    t._send_email_alert = lambda text, subject='交易告警': t._emails.append((str(text), subject))
+    t._send_email_alert = lambda text, subject='交易告警', **kwargs: t._emails.append((str(text), subject))
     return t, ex
 
 
@@ -175,8 +174,7 @@ def s2_2015_triggers_block():
         report('S2 -2015 触发', False, f'异常类型错误: {type(e).__name__}')
         return
     data = auth_file_of(t)
-    # 队列事件（S13 复审补充）：AUTH_BLOCKED 告警的队列通道为无条件写入，不依赖 TG 成败。
-    # 测试环境无 tg_bot → IP 事件也按 fallback 契约入队（ip_notify），故队列 = ip_notify + auth_blocked
+    # 鉴权事件持久入队承担 TG 主投递；普通 IP 不外发。
     qdir = t.notify_queue_dir
     q_files = [f for f in os.listdir(qdir) if f.endswith('.notify')] if os.path.isdir(qdir) else []
     types_in_queue = []
@@ -185,11 +183,11 @@ def s2_2015_triggers_block():
         with open(os.path.join(qdir, f), encoding='utf-8') as fh:
             typ, msg = _br._parse_notify_content(fh.read())
         types_in_queue.append(typ)
-    q_ok = (types_in_queue.count('auth_blocked') == 1
-            and set(types_in_queue) <= {'auth_blocked', 'ip_notify'})
+    q_ok = types_in_queue == ['auth_blocked']
+    q_text = msg if q_files else ''
     ok = (data.get('blocked') is True
           and ex.fetch_positions.call_count == 1        # 无 5 次重试
-          and any('盲区' in m for m in t._sent)          # 三通道告警含盲区字样
+          and '盲区' in q_text and len(t._sent) == 0   # 队列有告警，不直发重复
           and len(t._emails) == 1 and '盲区' in t._emails[0][0]  # 仅真实 critical 邮件
           and q_ok                                        # 队列事件无条件入队（三通道第3路）
           and t.last_known_ip == '1.2.3.4')              # IP 提取仍生效
@@ -402,23 +400,17 @@ def s9_watchdog_queue_format():
 def s10_trader_queue_format():
     import bot_runner
     t, ex = make_trader(tempfile.mkdtemp(prefix='d010b2_'))
-    # 无 tg_bot → _try_async_send 返回 False → 走 _fallback_notify_file 入队
+    # 普通 IP 变化只记录；真实鉴权拒绝由另一路处理。
     t._record_ip_change('5.6.7.8', source='binance_error')
     qdir = t.notify_queue_dir
-    files = [f for f in os.listdir(qdir) if f.endswith('.notify')]
-    ok_files = len(files) == 1
-    content = ''
-    if files:
-        with open(os.path.join(qdir, files[0]), encoding='utf-8') as fh:
-            content = fh.read()
-    typ, msg = bot_runner._parse_notify_content(content)
-    ok_type = typ == 'ip_notify' and '5.6.7.8' in msg
-    ok_id = EVENT_ID_RE.match(files[0][:-len('.notify')]) is not None if files else False
+    files = [f for f in os.listdir(qdir) if f.endswith('.notify')] if os.path.isdir(qdir) else []
+    ok_files = len(files) == 0
     legacy = os.path.exists(os.path.join(os.path.dirname(t.notify_queue_dir), '.notify'))
     # 普通 IP 变化仅 TG/队列；邮件留给真实鉴权封锁。
     ok_email = len(t._emails) == 0
-    report('S10 trader 入队格式闭环', ok_files and ok_type and ok_id and not legacy and ok_email,
-           f'文件数={len(files)} type={typ} id格式={ok_id} 旧.notify存在={legacy} Email={len(t._emails)}')
+    report('S10 普通 IP 仅日志', ok_files and not legacy and ok_email
+           and t.last_known_ip == '5.6.7.8',
+           f'文件数={len(files)} 旧.notify存在={legacy} Email={len(t._emails)}')
 
 
 # ==================== S11 锁文件损坏 Fail-Closed ====================
@@ -439,7 +431,9 @@ def s11_corrupt_fail_closed():
         t._safe_api_call(ex.fetch_open_orders, 'BTCUSDT')
     except trader_260725.AuthBlockedError:
         pass
-    corrupt_alerts = [m for m in t._sent if '损坏' in m]
+    q_files = list(__import__('pathlib').Path(t.notify_queue_dir).glob('*.notify'))
+    corrupt_alerts = [p.read_text(encoding='utf-8') for p in q_files
+                      if '损坏' in p.read_text(encoding='utf-8')]
     ok = (raised and ex.fetch_positions.call_count == 0 and len(corrupt_alerts) == 1
           and any('Fail-Closed' in m or '盲区' in m for m in corrupt_alerts))
     report('S11 锁文件损坏 Fail-Closed', ok,
@@ -461,15 +455,14 @@ def s12_init_survives_persistent_lock():
            f'{ex.load_time_difference.call_count + ex.load_markets.call_count + ex.fetch_time.call_count}（应为 0）')
 
 
-# ==================== S13 三通道真实语义（ChatGPT 复审 2026-08-28 补充） ====================
-# 钉死两路径正式契约（用户裁定 B，设计稿 v3.2 同步）：
-#   AUTH_BLOCKED 事件 = 完整三通道并行（TG/Email 路径 + 队列事件**无条件写入**，互不依赖）
-#   IP 变更事件     = TG + Email 双通道并行；队列仅 TG 失败时 fallback（安全网定位）
+# ==================== S13 通道语义（2026-10-13 仅通知策略改变） ====================
+#   AUTH_BLOCKED = TG 主队列 + 独立邮件；入队失败才走 critical 直发。
+#   IP 观测 = 仅日志，锁定/恢复状态机保持原契约。
 
 def s13_channel_semantics():
     import bot_runner
 
-    # --- AUTH_BLOCKED 路径（_enter_auth_blocked）：三通道互不依赖 ---
+    # --- AUTH_BLOCKED 路径：成功入队不重复直发，失败仍保留兜底 ---
     def run_blocked_case(tg_raises, queue_raises):
         t, ex = make_trader(tempfile.mkdtemp(prefix='d010b2_s13a_'))
         if tg_raises:
@@ -498,7 +491,7 @@ def s13_channel_semantics():
                 q_ok = typ == 'auth_blocked' and '盲区' in msg
         # 锁写入与 TG 发出互不受另一通道失败影响
         locked = auth_file_of(t).get('blocked') is True
-        tg_ok = (len(t._sent) == 0) if tg_raises else (len(t._sent) == 1)
+        tg_ok = (len(t._sent) == (0 if tg_raises else 1)) if queue_raises else len(t._sent) == 0
         return q_ok and locked and tg_ok
 
     # 象限1：TG 成功 → 队列仍有 1 个 auth_blocked 事件（无条件，非 fallback）
@@ -508,7 +501,7 @@ def s13_channel_semantics():
     # 象限3：队列写入失败 → 不阻塞 TG 已发出 + 锁仍写入（通道独立失败边界）
     q3 = run_blocked_case(tg_raises=False, queue_raises=True)
 
-    # --- IP 路径（_record_ip_change）：双通道并行 + 队列 fallback-only ---
+    # --- IP 路径：不调用 TG，也不入队 ---
     def run_ip_case(tg_ok):
         t, ex = make_trader(tempfile.mkdtemp(prefix='d010b2_s13b_'))
         t._try_async_send = lambda text: tg_ok
@@ -519,7 +512,7 @@ def s13_channel_semantics():
 
     n_tg_ok, mail_ok = run_ip_case(True)       # TG 成功 → 队列 0（fallback-only 契约）
     n_tg_fail, mail_fail = run_ip_case(False)  # TG 失败 → 队列 1（安全网兜住）
-    ip_ok = (n_tg_ok == 0 and n_tg_fail == 1 and mail_ok == 0 and mail_fail == 0)
+    ip_ok = (n_tg_ok == 0 and n_tg_fail == 0 and mail_ok == 0 and mail_fail == 0)
 
     report('S13 三通道真实语义', q1 and q2 and q3 and ip_ok,
            f'AUTH_BLOCKED象限: TG成功={q1} TG失败={q2} 队列失败={q3}；'

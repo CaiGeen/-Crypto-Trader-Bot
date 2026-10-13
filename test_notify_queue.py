@@ -68,13 +68,13 @@ class FakeTgBot:
         self.sent.append((text, parse_mode))
 
 
-# 事故原样复现的消息（含奇数个下划线：binance_error 1 个 + 批次号 0 → 共 1 个）
+# 故障告警 fixture 含奇数个下划线，复验真实 Markdown 降级路径。
 IP_MSG = (
-    "⚠️ IP 地址已变化！\n"
-    "新 IP: 220.246.89.210\n"
+    "🔒 签名鉴权已被拒绝！\n"
+    "币安报告请求 IP: 220.246.89.210\n"
     "来源: binance_error\n"
     "时间: 2026-08-28 09:56:03\n"
-    "请将新 IP 添加到币安 API 白名单！"
+    "请核查实际 API Key、IP 白名单和权限。"
 )
 
 
@@ -131,7 +131,7 @@ def scenario_1():
     """S1 场景1: 坏 Markdown（下划线）→ 纯文本 fallback 成功 → DONE"""
     env = Env()
     try:
-        env.enqueue("20260828_095603_123456_4f82c1a7", f"ip_notify|{IP_MSG}")
+        env.enqueue("20260828_095603_123456_4f82c1a7", f"auth_blocked|{IP_MSG}")
         bot = FakeTgBot()
         stats = run_round(bot, env)
 
@@ -152,7 +152,7 @@ def scenario_2():
     env = Env()
     try:
         eid = "20260828_095603_123456_4f82c1a7"
-        env.enqueue(eid, f"ip_notify|{IP_MSG}")
+        env.enqueue(eid, f"auth_blocked|{IP_MSG}")
 
         # 前 3 轮全部失败
         for i in range(3):
@@ -183,14 +183,14 @@ def scenario_3():
     try:
         eid_a = "20260828_100000_111111_aaaaaaaa"
         eid_b = "20260828_100500_222222_bbbbbbbb"
-        env.enqueue(eid_a, f"ip_notify|{IP_MSG}")
+        env.enqueue(eid_a, f"auth_blocked|{IP_MSG}")
 
         # 事件 A 先失败 2 轮
         for _ in range(2):
             run_round(FakeTgBot(always_fail=True), env)
 
         # 事件 B 到达（同内容、不同 event_id）
-        env.enqueue(eid_b, f"ip_notify|{IP_MSG}")
+        env.enqueue(eid_b, f"auth_blocked|{IP_MSG}")
         # 第 3 轮：A 失败第 3 轮 → SILENCED；B 失败第 1 轮
         run_round(FakeTgBot(always_fail=True), env)
 
@@ -212,7 +212,7 @@ def scenario_4():
     env = Env()
     try:
         # 手工制造"queue 有 state 无"：只写队列文件，不写该事件的 state
-        env.enqueue("20260828_100000_111111_cccccccc", f"ip_notify|{IP_MSG}")
+        env.enqueue("20260828_100000_111111_cccccccc", f"auth_blocked|{IP_MSG}")
         # 同时预置一条 SILENCED 孤儿条目（设计规定：SILENCED 记录永久保留，不参与孤儿清理）
         with open(env.state_file, "w", encoding="utf-8") as f:
             json.dump({"silenced_event": {"content_sha256": "x" * 64, "failed_attempts": 3,
@@ -261,7 +261,7 @@ def scenario_6():
     try:
         legacy = os.path.join(base, ".notify")
         with open(legacy, "w", encoding="utf-8") as f:
-            f.write(f"ip_notify|{IP_MSG}")
+            f.write(f"auth_blocked|{IP_MSG}")
 
         event_id = bot_runner._migrate_legacy_notify(base_dir=base)
 
@@ -273,7 +273,7 @@ def scenario_6():
         content_ok = False
         if migrated:
             with open(os.path.join(qdir, f"{event_id}.notify"), encoding="utf-8") as f:
-                content_ok = f.read() == f"ip_notify|{IP_MSG}"
+                content_ok = f.read() == f"auth_blocked|{IP_MSG}"
 
         # 迁移产物进入正常消费链路 → 纯文本送达
         sent = False
@@ -318,7 +318,7 @@ def scenario_7():
     # 行为验证：入队后目录中只有最终文件，无 tmp 残留
     env = Env()
     try:
-        eid = bot_runner._write_notify_event_file(f"ip_notify|{IP_MSG}", queue_dir=env.queue_dir)
+        eid = bot_runner._write_notify_event_file(f"auth_blocked|{IP_MSG}", queue_dir=env.queue_dir)
         leftovers = [f for f in os.listdir(env.queue_dir) if not f.endswith('.notify')]
         final_exists = eid is not None and os.listdir(env.queue_dir) == [f"{eid}.notify"]
         ok = ast_ok and eid is not None and leftovers == [] and final_exists
@@ -350,7 +350,7 @@ def scenario_9():
     """S9 C2: DONE 语义 = 发送成功+删除完成；下一轮 0 次调用不重发"""
     env = Env()
     try:
-        env.enqueue("20260828_100000_111111_eeeeeeee", f"ip_notify|{IP_MSG}")
+        env.enqueue("20260828_100000_111111_eeeeeeee", f"auth_blocked|{IP_MSG}")
         bot1 = FakeTgBot()
         run_round(bot1, env)
 
