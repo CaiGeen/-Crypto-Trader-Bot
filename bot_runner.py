@@ -3114,7 +3114,11 @@ def main():
             tg_diagnostics.install_process_probe(app)
         except BaseException as _diag_error:
             print(f"[TGDIAG] process probe unavailable: {type(_diag_error).__name__}")
-    app.run_polling(bootstrap_retries=-1)
+    # Preserve the approved production subscription overlay; do not reset offset.
+    app.run_polling(
+        bootstrap_retries=-1,
+        allowed_updates=["message", "callback_query"],
+    )
 
 
 if __name__ == "__main__":

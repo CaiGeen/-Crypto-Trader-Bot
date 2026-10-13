@@ -46,6 +46,8 @@ class ProjectTelegramConfigTests(unittest.TestCase):
                 bot_runner._load_own_tg_config(os.path.join(directory, '.env'))
 
     def test_main_pins_project_credentials_before_every_startup_boundary(self):
+        import tg_diagnostics
+
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, '.env').write_text(
                 f'TG_BOT_TOKEN={self.PROJECT_TOKEN}\nTG_ALLOWED_USER_ID=-42\n', encoding='utf-8')
@@ -80,14 +82,22 @@ class ProjectTelegramConfigTests(unittest.TestCase):
                     mock.patch.object(bot_runner, 'HTTPXRequest',
                                       side_effect=lambda **kwargs: (assert_pinned('request'), mock.Mock())[1]), \
                     mock.patch.object(bot_runner.Application, 'builder', return_value=builder), \
+                    mock.patch.object(tg_diagnostics, 'install_poll_request_probe',
+                                      side_effect=lambda *args: assert_pinned('request_probe')), \
+                    mock.patch.object(tg_diagnostics, 'install_updater_watch',
+                                      side_effect=lambda *args, **kwargs: assert_pinned('updater_watch')), \
+                    mock.patch.object(tg_diagnostics, 'install_process_probe',
+                                      side_effect=lambda *args: assert_pinned('process_probe')), \
                     mock.patch.object(bot_runner, 'CryptoTrader') as trader:
                 bot_runner.main()
                 builder.token.assert_called_once_with(self.PROJECT_TOKEN)
-                app.run_polling.assert_called_once_with(bootstrap_retries=-1)
+                app.run_polling.assert_called_once_with(
+                    bootstrap_retries=-1, allowed_updates=['message', 'callback_query'])
                 trader.assert_not_called()  # mock polling does not run handlers/post_init
             self.assertEqual(boundaries, [
                 'instance_lock', 'config_banner', 'request', 'request',
-                'app.token', 'app.build', 'run_polling'])
+                'request_probe', 'request_probe', 'app.token', 'app.build',
+                'updater_watch', 'process_probe', 'run_polling'])
 
     def test_main_invalid_config_stops_before_any_startup_side_effect(self):
         for contents in (None, 'TG_BOT_TOKEN=:\nTG_ALLOWED_USER_ID=42\n',
@@ -117,9 +127,15 @@ class ProjectTelegramConfigTests(unittest.TestCase):
     def test_import_needs_no_project_env_or_valid_inherited_user_id(self):
         # Fresh processes exercise module initialization, not an already-cached import.
         source_dir = str(Path(bot_runner.__file__).resolve().parent)
-        code = (f'import sys; sys.path.insert(0, {source_dir!r}); '
-                'import bot_runner; assert bot_runner.ALLOWED_USER_ID is None; '
-                'print("IMPORT_OK")')
+        # Composite verification has a synthetic .env for maintenance checks.
+        # Suppress generic dotenv loading, not the project's credential loader:
+        # an accidental import-time pin would still break this assertion.
+        code = (f'import sys; sys.path.insert(0, {source_dir!r})\n'
+                'from unittest import mock\n'
+                'with mock.patch("dotenv.load_dotenv", return_value=False):\n'
+                ' import bot_runner\n'
+                ' assert bot_runner.ALLOWED_USER_ID is None\n'
+                ' print("IMPORT_OK")\n')
         for inherited_id in (None, '--5'):
             with self.subTest(inherited_id=inherited_id), tempfile.TemporaryDirectory() as directory:
                 env = dict(os.environ)

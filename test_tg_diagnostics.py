@@ -198,7 +198,8 @@ def test_actual_main_keeps_independent_probes_and_polling(runner, monkeypatch, c
     builder.request.assert_called_once_with(requests[0])
     builder.get_updates_request.assert_called_once_with(requests[1])
     app.add_error_handler.assert_called_once_with(runner.error_handler)
-    app.run_polling.assert_called_once_with(bootstrap_retries=-1)
+    app.run_polling.assert_called_once_with(
+        bootstrap_retries=-1, allowed_updates=['message', 'callback_query'])
     trader.assert_not_called()  # fake polling does not run post_init/handlers
     output = capsys.readouterr().out
     if failed_probe == 'import':
