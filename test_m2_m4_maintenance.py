@@ -192,6 +192,11 @@ class M3D10WordingTests(unittest.TestCase):
         容量提示（**不是门禁，不拦任何值**）：批次 >= 7 落入 45~60s 档，
         **尚未压测**，调高前请按实际运行负载判断，不靠本测试承诺保护时延。
         """
+        # A clean checkout deliberately has no machine-local .env. Do not make
+        # the repository gate depend on (or read) a production configuration;
+        # parser and precedence behavior are covered below with isolated fixtures.
+        if not os.path.isfile(self.ENV_PATH):
+            self.skipTest("clean checkout has no local .env; isolated parser fixtures cover this contract")
         for key, default in (("RISK_MAX_ACTIVE_BATCHES", 3),
                              ("RISK_MAX_ACTIVE_SYMBOLS", 1)):
             file_val, eff_val = self._file_vs_effective(self.ENV_PATH, key, default)

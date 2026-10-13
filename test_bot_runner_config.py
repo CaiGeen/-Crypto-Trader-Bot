@@ -78,12 +78,14 @@ class ProjectTelegramConfigTests(unittest.TestCase):
                     mock.patch.object(bot_runner, 'log_effective_config',
                                       side_effect=lambda: assert_pinned('config_banner')), \
                     mock.patch.object(bot_runner, 'HTTPXRequest',
-                                      side_effect=lambda **kwargs: (assert_pinned('request'), mock.Mock())[1]), \
+                                       side_effect=lambda **kwargs: (assert_pinned('request'), mock.Mock())[1]), \
                     mock.patch.object(bot_runner.Application, 'builder', return_value=builder), \
+                    mock.patch('tg_diagnostics.install_updater_watch') as updater_watch, \
                     mock.patch.object(bot_runner, 'CryptoTrader') as trader:
                 bot_runner.main()
                 builder.token.assert_called_once_with(self.PROJECT_TOKEN)
                 app.run_polling.assert_called_once_with(bootstrap_retries=-1)
+                updater_watch.assert_called_once_with(app, interval=15.0)
                 trader.assert_not_called()  # mock polling does not run handlers/post_init
             self.assertEqual(boundaries, [
                 'instance_lock', 'config_banner', 'request', 'request',
