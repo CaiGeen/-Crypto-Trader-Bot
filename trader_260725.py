@@ -843,7 +843,7 @@ class CryptoTrader:
         return None
 
     def _record_ip_change(self, ip: str, source: str = "binance_error"):
-        """记录 IP 变化并发送通知"""
+        """只记录出口变化；真实鉴权拒绝由 AUTH_BLOCKED 单独告警。"""
         if not ip:
             return
 
@@ -868,12 +868,7 @@ class CryptoTrader:
         print(msg)
         print(f"{'=' * 60}\n")
 
-        sent = self._try_async_send(msg)
-
-        # 普通出口变化仅 TG/日志；真正鉴权封锁由 _enter_auth_blocked 发 critical 邮件。
-
-        if not sent:
-            self._fallback_notify_file(ip, source)
+        # 出口观测不是故障；不发 TG/邮件，也不生成备用队列事件。
 
     def _try_async_send(self, text: str) -> bool:
         """尝试通过异步方式发送，返回是否成功"""
@@ -901,25 +896,8 @@ class CryptoTrader:
             return False
 
     def _fallback_notify_file(self, ip: str, source: str = "binance_error"):
-        """备用方式：D-010 Batch 2 起写入 .notify_queue/{event_id}.notify 事件队列
-        （原单槽 .notify 互相覆盖已淘汰），由 bot_runner 消费循环送达。
-        写入端不写 state——C3 语义：queue 有 state 无 → 消费端新建 ACTIVE 正常发送。"""
-        try:
-            # 构建纯文本消息（去掉 Markdown 特殊字符）
-            plain_msg = (
-                f"⚠️ IP 地址已变化！\n"
-                f"新 IP: {ip}\n"
-                f"来源: {source}\n"
-                f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"IP 变化本身不代表鉴权失败；仅记录出口变化。"
-            )
-            event_id = self._enqueue_notify_event("ip_notify", plain_msg)
-            if event_id:
-                print(f"📝 [备用通知] 已入队事件 {event_id} → {self.notify_queue_dir}")
-        except Exception as e:
-            import traceback
-            print(f"⚠️ [备用通知] 写入失败: {e}")
-            traceback.print_exc()
+        """旧 IP 通知入口兼容：仅留日志，绝不再次入队。"""
+        print(f"ℹ️ [IP观测] {ip} 来源={source}；仅日志，不发送备用通知")
 
     def _enqueue_notify_event(self, notify_type: str, plain_msg: str) -> str | None:
         """D-010 T1/三通道：进程级原子入队（C1：tmp → flush → os.replace）。
@@ -973,7 +951,7 @@ class CryptoTrader:
                     'reason': f'AUTH_BLOCKED 状态文件损坏，系统进入 Fail-Closed 盲区安全模式（{e}）'}
 
     def _alert_auth_state_corrupted(self, exc: Exception) -> None:
-        """锁文件损坏告警（三通道 + 含 Fail-Closed/盲区字样，不伪装正常运行）"""
+        """锁文件损坏告警（持久队列 + 独立邮件，不伪装正常运行）"""
         msg = (f"🚨 AUTH_BLOCKED 状态文件损坏（auth_blocked.json 无法解析）\n"
                f"系统进入 Fail-Closed 盲区安全模式（BLIND-SAFE）：无法证明当前没有鉴权封锁，"
                f"按已封锁处理，全部 Binance API 已停摆。\n"
@@ -981,14 +959,23 @@ class CryptoTrader:
                f"处理方式：人工检查/修复或删除 auth_blocked.json 后重启（重启会走启动探活恢复链）\n"
                f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"\n{'=' * 60}\n🔒 {msg}\n{'=' * 60}")
+        self._notify_auth_blocked(msg)
+
+    def _notify_auth_blocked(self, msg: str) -> None:
+        """先持久入队承担 TG 主投递；邮件独立。入队失败才走直发兜底。"""
+        event_id = None
         try:
-            self.send_tg_notification(msg, level='critical')   # critical → 自动 Email 兜底
+            event_id = self._enqueue_notify_event("auth_blocked", msg)
         except Exception as e:
-            print(f"⚠️ [D-010] 锁损坏告警 TG 发送失败: {e}")
+            print(f"⚠️ [D-010] AUTH_BLOCKED 入队失败: {e}")
         try:
-            self._enqueue_notify_event("auth_blocked", msg)    # 队列事件（消费端安全网）
+            if event_id:
+                self._send_email_alert(msg, subject="🚨 鉴权封锁告警", event="auth_blocked")
+            else:
+                # critical 独立尝试邮件；队列失败不影响封锁或直发。
+                self.send_tg_notification(msg, level='critical')
         except Exception as e:
-            print(f"⚠️ [D-010] 锁损坏告警入队失败: {e}")
+            print(f"⚠️ [D-010] AUTH_BLOCKED 告警通道失败: {e}")
 
     def _save_auth_state(self, state: str, reason: str) -> None:
         """原子写 auth_blocked.json（tmp → flush → os.replace，项目惯例）。
@@ -1014,7 +1001,7 @@ class CryptoTrader:
                     pass
 
     def _enter_auth_blocked(self, reason: str) -> None:
-        """进入 AUTH_BLOCKED 盲区安全模式：写锁 + 三通道告警（TG + Email + 队列事件）。
+        """进入 AUTH_BLOCKED 盲区安全模式：写锁 + TG 主队列与独立邮件。
         告警文本必须包含"盲区安全模式"字样与已知盲区声明（设计稿 §3.3，用户知情）。"""
         try:
             self._save_auth_state('BLOCKED', reason)
@@ -1028,14 +1015,7 @@ class CryptoTrader:
                f"恢复方式：修复 IP 白名单/API 权限后发送 /auth_reset（探活→对账→自动解锁）\n"
                f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"\n{'=' * 60}\n🔒 [D-010] {msg}\n{'=' * 60}")
-        try:
-            self.send_tg_notification(msg, level='critical')   # TG + Email（critical 自动邮箱兜底）
-        except Exception as e:
-            print(f"⚠️ [D-010] AUTH_BLOCKED TG 告警失败: {e}")
-        try:
-            self._enqueue_notify_event("auth_blocked", msg)    # 队列事件（消费循环安全网）
-        except Exception as e:
-            print(f"⚠️ [D-010] AUTH_BLOCKED 队列事件入队失败: {e}")
+        self._notify_auth_blocked(msg)
 
     def _attempt_auth_recovery(self) -> tuple:
         """BLIND-SAFE 恢复链（ChatGPT 钉死约束 3，顺序锁死 Fail-Closed）：
@@ -4481,7 +4461,7 @@ class CryptoTrader:
                     if ip:
                         print(f"🔍 [IP检测] 币安报告的 IP: {ip} (当前记录的 IP: {self.last_known_ip})")
                         self._record_ip_change(ip, source="binance_error")
-                    # 立即进入 AUTH_BLOCKED 盲区安全模式 + 三通道告警，停止无意义重试
+                    # 立即进入 AUTH_BLOCKED 盲区安全模式并告警，停止无意义重试
                     # （旧行为 sleep+continue 最多 5 次重试 → 已删除；8-28 事故刷屏根因之一）
                     self._enter_auth_blocked(err_str)
                     raise AuthBlockedError(
@@ -8764,6 +8744,10 @@ class CryptoTrader:
         #   修复：normal + stop=True 双通道合并去重，任一通道异常 → return True（阻断开仓）+ critical
         try:
             normal_orders = self._safe_api_call(self.exchange.fetch_open_orders, symbol)
+        except AuthBlockedError as e:
+            # AUTH_BLOCKED 主事件已负责告警；此操作仍 Fail-Closed，不重复邮件。
+            print(f"🔒 防冲突扫描因鉴权封锁被阻断(普通通道): {e}")
+            return True
         except Exception as e:
             print(f"⚠️ 获取未结订单(普通通道)失败: {e}")
             self.send_tg_notification(
@@ -8775,6 +8759,9 @@ class CryptoTrader:
         try:
             stop_orders = self._safe_api_call(
                 self.exchange.fetch_open_orders, symbol, params={'stop': True})
+        except AuthBlockedError as e:
+            print(f"🔒 防冲突扫描因鉴权封锁被阻断(条件单通道): {e}")
+            return True
         except Exception as e:
             print(f"⚠️ 获取未结订单(条件单通道)失败: {e}")
             self.send_tg_notification(
