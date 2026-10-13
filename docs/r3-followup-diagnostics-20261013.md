@@ -31,9 +31,14 @@
   最近成功响应耗时 10.23s。仓库安装的 python-telegram-bot 22.8 `Updater.start_polling`
   默认 long-poll timeout 是 10s。因此约 10s 后返回空更新属于正常长轮询，不应计作网络失败。
 - 当前请求配置是 getUpdates `connect_timeout=30s`、`read_timeout=120s`、`write_timeout=30s`。
-  130s 实测与 120s read timeout 的差异需要继续从 HTTPX/SSL 阶段观测解释；现有日志不足以
-  证明是代理、服务端、TLS 中间设备或网络栈根因。用户提供的 20/5044 历史比率没有在本次
-  可见日志片段/当前计数中得到完整重算。**不调整代理、timeout 或 polling 策略。**
+  PTB 22.8 的 `Bot.get_updates` 在未显式传入单次 `read_timeout` 时，会把 request 的
+  configured read timeout 与 Bot API long-poll `timeout` 相加；`Updater.start_polling` 默认
+  `timeout=10s`，因此此处有效读取预算是 **120s + 10s = 130s**。见
+  [PTB 22.8 `Bot.get_updates`](https://github.com/python-telegram-bot/python-telegram-bot/blob/v22.8/src/telegram/_bot.py)
+  与 [`Updater.start_polling`](https://github.com/python-telegram-bot/python-telegram-bot/blob/v22.8/src/telegram/ext/_updater.py)。
+  日志中的 130.01/130.02s 与该超时预算吻合，不再视为超时配置差异；但为何请求未在预算内
+  收到响应仍未确定。用户提供的 20/5044 历史比率没有在本次可见日志片段/当前计数中得到
+  完整重算。**不调整代理、timeout 或 polling 策略。**
 - 建议继续按现有被动探针收集足够窗口的请求计数、状态码、错误类型链和请求耗时；只把
   `poll_success` 之外的异常按类型分类，区分 `ConnectTimeout`、`ReadTimeout`、`PoolTimeout`
   及 HTTP 5xx。保留 token/URL 脱敏。若要定位代理路径，另在非生产网络环境做对照，不改生产代理。
