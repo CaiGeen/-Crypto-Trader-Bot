@@ -53,6 +53,7 @@ from parser import parse_signal_from_json, parse_signal_from_dict
 from trader_260725 import CryptoTrader
 from health_progress import new_instance_id, write_progress
 import email_gate
+from smtp_transport import send_qq_mail
 
 # 2. 加载环境变量
 load_dotenv()
@@ -155,7 +156,6 @@ def send_email_alert(text: str, subject: str = "交易告警",
     def _do_send():
         with EMAIL_SEND_LOCK:
             try:
-                import smtplib
                 from email.mime.text import MIMEText
                 from email.header import Header
                 # 清理 Telegram Markdown 符号，邮件按纯文本显示
@@ -164,9 +164,7 @@ def send_email_alert(text: str, subject: str = "交易告警",
                 msg["Subject"] = Header(subject, "utf-8")
                 msg["From"] = mail_user
                 msg["To"] = mail_to
-                with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
-                    server.login(mail_user, mail_code)
-                    server.sendmail(mail_user, [mail_to], msg.as_string())
+                send_qq_mail(mail_user, mail_code, mail_to, msg.as_string(), timeout=10)
                 outcome["ok"] = True
                 logging.info(f"📧 [邮件] 已发送: {subject} (event={event})")
             except Exception as e:

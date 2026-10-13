@@ -10,7 +10,7 @@
   F2  A 轨校准（TCP）：socket.connect 同样被拦
   F3  B 轨校准：把异常**吞掉**之后计数仍然在（赖不掉）
   F4  后台线程覆盖：监视线程形态的外发照样被拦 + 计数
-  F5  SMTP 覆盖：事故元凶通道（smtplib）被拦——含生产实际使用的 SMTP_SSL
+  F5  SMTP egress is blocked for the required STARTTLS transport.
   F10 生产级 B 轨：`_get_public_ip()` 真实 urlopen→DNS 被拦，且异常被生产代码
       的 `except Exception` 吞掉后**计数仍在**（证明"只靠不抛异常"的验收会假绿）
   F6  构造阶段：绊线在 `CryptoTrader(...)` 之前就生效 → 构造期零外发
@@ -131,12 +131,7 @@ def f4_background_thread_covered():
 
 
 def f5_smtp_channel_covered():
-    """事故元凶通道：smtplib 构造即连（SMTP(host, port) → connect）。
-
-    生产走的是 `smtplib.SMTP_SSL("smtp.qq.com", 465)`（trader_260725.py:1194）；
-    SMTP_SSL **不覆盖** connect（继承 SMTP.connect），所以类级 patch 同样拦得住——
-    这里两形态各验一次，避免"只拦了没在用的那个类"。
-    """
+    """Production uses SMTP 587 with required STARTTLS; both SMTP classes stay blocked."""
     tw.install(raise_on_hit=True)
     tw.reset()
     try:
@@ -146,7 +141,7 @@ def f5_smtp_channel_covered():
     else:
         raise AssertionError('SMTP 通道没被拦（邮件风暴还能复现）')
     assert tw.count() == 1, tw.snapshot()
-    # 生产实际使用的 SMTP_SSL 必须继承到同一个被 patch 的 connect
+    # SMTP_SSL must also inherit the patched connect method.
     assert smtplib.SMTP_SSL.connect is smtplib.SMTP.connect, \
         'SMTP_SSL 没有继承被 patch 的 connect（生产通道漏拦）'
     tw.reset()
@@ -155,7 +150,7 @@ def f5_smtp_channel_covered():
     except tw.EgressBlocked as e:
         assert 'smtp' in str(e).lower(), e
     else:
-        raise AssertionError('SMTP_SSL（生产真实通道）没被拦')
+        raise AssertionError('SMTP_SSL channel was not blocked')
     assert tw.count() == 1, tw.snapshot()
 
 

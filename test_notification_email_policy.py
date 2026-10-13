@@ -62,7 +62,7 @@ class NotificationEmailPolicyTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {'EMAIL_ALERT_ENABLED': 'true',
                 'EMAIL_ALERT_ONLY_WITH_POSITION': 'false',
                 'QQ_MAIL_USER': 'test@example.com', 'QQ_MAIL_AUTH_CODE': 'test'}), \
-                mock.patch('smtplib.SMTP_SSL') as smtp, \
+                mock.patch('smtplib.SMTP') as smtp, \
                 mock.patch.object(trader_260725.threading, 'Thread') as thread, \
                 mock.patch.object(patrol, 'log'):
             self.assertFalse(trader_260725.CryptoTrader._send_email_alert(object(), 'info'))

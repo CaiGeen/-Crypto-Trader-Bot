@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from parser import TradeSignal, parse_signal_from_json
 from health_progress import current_instance_id, write_progress, remove_batch
 import email_gate
+from smtp_transport import send_qq_mail
 from poll_alert_state import (
     PollAlertBudget,
     POLL_ALERT_TG_RETRY_SECONDS,
@@ -1359,7 +1360,6 @@ class CryptoTrader:
         def _do_send():
             with EMAIL_SEND_LOCK:
                 try:
-                    import smtplib
                     from email.mime.text import MIMEText
                     from email.header import Header
                     # 清理 Telegram Markdown 符号，邮件按纯文本显示
@@ -1368,9 +1368,7 @@ class CryptoTrader:
                     msg["Subject"] = Header(subject, "utf-8")
                     msg["From"] = mail_user
                     msg["To"] = mail_to
-                    with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=10) as server:
-                        server.login(mail_user, mail_code)
-                        server.sendmail(mail_user, [mail_to], msg.as_string())
+                    send_qq_mail(mail_user, mail_code, mail_to, msg.as_string(), timeout=10)
                     outcome["ok"] = True
                     print(f"📧 [邮件] 已发送: {subject} (event={event})")
                 except Exception as e:
