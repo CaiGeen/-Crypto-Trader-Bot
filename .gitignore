@@ -85,6 +85,8 @@ logs/
 .patrol_alert.state.json
 .daily_report.state.json
 .daily_report.state.json.tmp
+.tg_diag.json
+.tg_diag.json.tmp
 .bot_health/
 .egress_ip.state.json
 .egress_ip.state.json.tmp
