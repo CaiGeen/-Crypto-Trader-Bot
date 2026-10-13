@@ -39,6 +39,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 import email_gate
+from smtp_transport import send_qq_mail
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
@@ -262,7 +263,7 @@ def send_tg(env: dict, text: str, use_proxy: bool) -> bool:
 
 
 def send_email(env: dict, subject: str, text: str, event: str = "generic") -> bool:
-    """QQ 邮件兜底：SMTP 国内直连，代理不可达时仍可用。
+    """QQ 邮件兜底：必须验证 STARTTLS 后登录；实际网络路径仍受系统路由影响。
 
     R0（2026-09-25，F10 修复）：健康巡检告警传 event="health" → 豁免持仓闸门。
     修复前：巡检每次运行重读磁盘 .env，磁盘 EMAIL_ALERT_ONLY_WITH_POSITION=true 且
@@ -282,15 +283,12 @@ def send_email(env: dict, subject: str, text: str, event: str = "generic") -> bo
         log("⚠️ 邮件未配置（QQ_MAIL_USER/AUTH_CODE），跳过")
         return False
     try:
-        import smtplib
         from email.header import Header
         from email.mime.text import MIMEText
         msg = MIMEText(text, "plain", "utf-8")
         msg["Subject"] = Header(subject, "utf-8")
         msg["From"], msg["To"] = user, to
-        with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=15) as s:
-            s.login(user, code)
-            s.sendmail(user, [to], msg.as_string())
+        send_qq_mail(user, code, to, msg.as_string(), timeout=15)
         log("✅ 邮件告警已发送")
         return True
     except Exception as e:
