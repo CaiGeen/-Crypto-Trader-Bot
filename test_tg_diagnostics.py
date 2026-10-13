@@ -164,8 +164,15 @@ def test_actual_error_handler_still_logs_and_replies(runner, monkeypatch, mode):
 
 
 @pytest.mark.parametrize('failed_probe', ['none', 'getUpdates', 'api', 'watch', 'process', 'import'])
-def test_actual_main_keeps_independent_probes_and_polling(runner, monkeypatch, capsys, failed_probe):
+def test_actual_main_keeps_independent_probes_and_polling(runner, monkeypatch, capsys,
+                                                           failed_probe, tmp_path):
     calls = []
+    config_dir = tmp_path / 'project'
+    config_dir.mkdir()
+    (config_dir / '.env').write_text(
+        'TG_BOT_TOKEN=123456789:OfflineDiagnosticsTestToken000000\n'
+        'TG_ALLOWED_USER_ID=1\n', encoding='utf-8')
+    monkeypatch.setattr(runner, 'BASE_DIR', str(config_dir))
     app = mock.Mock()
     builder = mock.Mock()
     for method in ('token', 'request', 'get_updates_request', 'post_init'):
