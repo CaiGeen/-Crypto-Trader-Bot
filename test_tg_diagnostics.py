@@ -107,11 +107,17 @@ def test_redaction_never_persists_token():
 
 
 @pytest.fixture
-def runner(monkeypatch):
+def runner(monkeypatch, tmp_path):
     # Import the actual PR18 runner with synthetic config, never machine credentials.
     monkeypatch.setenv('TG_BOT_TOKEN', '123456789:OfflineDiagnosticsTestToken000000')
     monkeypatch.setenv('TG_ALLOWED_USER_ID', '1')
     import bot_runner
+    project_dir = tmp_path / 'project'
+    project_dir.mkdir()
+    (project_dir / '.env').write_text(
+        'TG_BOT_TOKEN=123456789:OfflineDiagnosticsTestToken000000\n'
+        'TG_ALLOWED_USER_ID=1\n', encoding='utf-8')
+    monkeypatch.setattr(bot_runner, 'BASE_DIR', str(project_dir))
     return bot_runner
 
 
