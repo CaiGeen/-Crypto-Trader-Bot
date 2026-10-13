@@ -1,0 +1,60 @@
+{
+  "duration_s": 1800.0,
+  "isolated_dir": "%LOCALAPPDATA%\\Temp\\opencode\\health-replace-30m-wj1ob7fe",
+  "calibration_no_delete_share": {
+    "attempts": 25,
+    "expected_access_denied": 25,
+    "other_failures": 0,
+    "release_success": 8
+  },
+  "held_python_reader": {
+    "attempts": 158651,
+    "success": 0
+  },
+  "counts": {
+    "reader_ok": 15290354,
+    "reader_error": 110986,
+    "normal_attempts": 158651,
+    "normal_success": 68756,
+    "held_failure": 158651,
+    "normal_failure": 89895
+  },
+  "errors_by_scenario_type_winerror_errno": [
+    {
+      "scenario": "reader",
+      "type": "PermissionError",
+      "winerror": null,
+      "errno": 13,
+      "count": 110797
+    },
+    {
+      "scenario": "release",
+      "type": "PermissionError",
+      "winerror": 5,
+      "errno": 13,
+      "count": 17
+    },
+    {
+      "scenario": "held_python_reader",
+      "type": "PermissionError",
+      "winerror": 5,
+      "errno": 13,
+      "count": 158651
+    },
+    {
+      "scenario": "normal",
+      "type": "PermissionError",
+      "winerror": 5,
+      "errno": 13,
+      "count": 89895
+    },
+    {
+      "scenario": "reader",
+      "type": "FileNotFoundError",
+      "winerror": null,
+      "errno": 2,
+      "count": 189
+    }
+  ],
+  "target_exists": true
+}
