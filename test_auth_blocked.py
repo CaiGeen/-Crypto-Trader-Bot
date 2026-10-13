@@ -575,6 +575,14 @@ def s14_startup_integration():
 # ==================== S15（Batch 3）：/auth_reset 命令处理器集成 ====================
 
 def s15_auth_reset_command():
+    import bot_runner
+    # This scenario tests a configured command handler, not startup configuration.
+    # Always scope its fixture and restore the original (including None) on exit.
+    with mock.patch.object(bot_runner, 'ALLOWED_USER_ID', 123456):
+        _s15_auth_reset_command_configured()
+
+
+def _s15_auth_reset_command_configured():
     """Batch 3 场景 5 增量：命令入口行为（探活底层逻辑 S7/S14 已覆盖，不重复）。
     最小 fake 对象（无成熟 Update/Context mock 惯例，不引入模拟框架）：
     update.effective_user.id / update.message.reply_text / context.bot_data。
