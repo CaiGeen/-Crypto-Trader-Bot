@@ -49,10 +49,16 @@
   被调用；真实接线仍由 `test_tg_diagnostics` 覆盖。
 - `test_m2_m4_maintenance` 曾要求 checkout 有机器本地 `.env`。干净 checkout 没有该文件时现将
   仅此运行环境相关检查标记为 skip；文件解析与环境遮蔽规则仍由临时 fixture 测试覆盖。
-- 按 `run_test_gate.py` 正式忽略规则执行：pytest **340 passed, 1 skipped**；脚本段 **72 PASS，
-  1 NOT-VERIFIED，0 FAIL**。整门禁退出码 **2 / COMPLETED-WITH-EXCEPTIONS**：
-  `test_orphan_guard.py` 返回 42，因为正在运行的 Bot 持有实例互斥体；未停止生产以强行补验。
-  门禁的生产哨兵没有发现 checkout 中被监控文件变化。此结果不是“全绿”。
+- Bot 仍运行时的首次完整门禁结果：pytest **340 passed, 1 skipped**；脚本段 **72 PASS，
+  1 NOT-VERIFIED，0 FAIL**，退出码 **2 / COMPLETED-WITH-EXCEPTIONS**。`test_orphan_guard.py`
+  返回 42（互斥体占用），当时没有为补验停止生产。
+- 用户之后确认已停机；在不使用 `--allow-live` 的条件下重跑完整 `run_test_gate.py`：
+  pytest **340 passed, 1 skipped**；脚本段 **73/73 PASS**，`NOT-VERIFIED=0`、`FAIL=0`，
+  门禁退出码 **0 / ALL-GREEN**。`test_orphan_guard.py` 实际返回 0。两次门禁的生产哨兵均未发现
+  checkout 中被监控文件变化。
+- pytest 留有 1 条 `PytestUnhandledThreadExceptionWarning`，来自 `test_poll_degradation.py`
+  故意注入的“线程启动失败”场景；未导致测试失败。`test_m2_m4_maintenance` 的机器本地 `.env`
+  比较因干净 checkout 没有该文件而跳过，其解析/优先级 fixture 测试仍执行。
 - 完整 `run_test_gate.py` 仍有生产运行探测；在生产保持运行时如需跑门禁，必须在独立 checkout、
   清理敏感环境变量的进程中显式确认并执行，并审阅 `--allow-live` 含义。测试门禁自述其哨兵是
   事后检查而非隔离；本报告不把该哨兵当作安全隔离机制。
