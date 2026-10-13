@@ -3019,11 +3019,15 @@ def main():
     # Passive Telegram diagnostics; failure to install any probe is non-fatal.
     try:
         import tg_diagnostics
-        tg_diagnostics.install_poll_request_probe(get_updates_req, "getUpdates")
-        tg_diagnostics.install_poll_request_probe(req, "api")
     except BaseException as _diag_error:
-        print(f"[TGDIAG] module/probe unavailable: {type(_diag_error).__name__}")
+        print(f"[TGDIAG] module unavailable: {type(_diag_error).__name__}")
         tg_diagnostics = None
+    if tg_diagnostics is not None:
+        for _request, _label in ((get_updates_req, "getUpdates"), (req, "api")):
+            try:
+                tg_diagnostics.install_poll_request_probe(_request, _label)
+            except BaseException as _diag_error:
+                print(f"[TGDIAG] {_label} probe unavailable: {type(_diag_error).__name__}")
 
     app = (
         Application.builder()
@@ -3061,15 +3065,15 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_json_or_pending_input))
 
     print("🚀 Telegram Bot 监听服务已启动...")
-    try:
-        tg_diagnostics.install_updater_watch(app, interval=15.0)
-    except BaseException as _diag_error:
-        print(f"[TGDIAG] updater watch unavailable: {type(_diag_error).__name__}")
-    try:
-        if tg_diagnostics is not None:
+    if tg_diagnostics is not None:
+        try:
+            tg_diagnostics.install_updater_watch(app, interval=15.0)
+        except BaseException as _diag_error:
+            print(f"[TGDIAG] updater watch unavailable: {type(_diag_error).__name__}")
+        try:
             tg_diagnostics.install_process_probe(app)
-    except BaseException as _diag_error:
-        print(f"[TGDIAG] process probe unavailable: {type(_diag_error).__name__}")
+        except BaseException as _diag_error:
+            print(f"[TGDIAG] process probe unavailable: {type(_diag_error).__name__}")
     app.run_polling(bootstrap_retries=-1)
 
 
