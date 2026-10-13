@@ -58,9 +58,12 @@ class TraderEmailEventTests(unittest.TestCase):
         with open(state, "w", encoding="utf-8") as f:
             json.dump({"BTCUSDT": {"b1": {"is_active": False}}}, f)
         server = mock.MagicMock()
+        server.ehlo.return_value = (250, b"OK")
+        server.has_extn.return_value = True
+        server.sendmail.return_value = {}
         with mock.patch.dict(os.environ, MAIL_ENV), \
                 mock.patch.object(email_gate, "DEFAULT_STATE_FILE", state), \
-                mock.patch("smtplib.SMTP_SSL") as smtp:
+                mock.patch("smtplib.SMTP") as smtp:
             smtp.return_value.__enter__.return_value = server
             ok = trader_260725.CryptoTrader._send_email_alert(
                 object(), "资金安全", subject="测试", event="critical", wait=True)
@@ -76,7 +79,7 @@ class TraderEmailEventTests(unittest.TestCase):
             json.dump({"BTCUSDT": {"b1": {"is_active": False}}}, f)
         with mock.patch.dict(os.environ, MAIL_ENV), \
                 mock.patch.object(email_gate, "DEFAULT_STATE_FILE", state), \
-                mock.patch("smtplib.SMTP_SSL") as smtp:
+                mock.patch("smtplib.SMTP") as smtp:
             ok = trader_260725.CryptoTrader._send_email_alert(
                 object(), "普通", subject="测试", event="generic", wait=True)
         self.assertFalse(ok)
@@ -86,7 +89,7 @@ class TraderEmailEventTests(unittest.TestCase):
     def test_wait_true_returns_false_on_smtp_failure(self):
         """R2：SMTP 失败时 wait=True 必须回传 False（不能「提交即算送达」）"""
         with mock.patch.dict(os.environ, MAIL_ENV), \
-                mock.patch("smtplib.SMTP_SSL", side_effect=OSError("smtp down")):
+                mock.patch("smtplib.SMTP", side_effect=OSError("smtp down")):
             ok = trader_260725.CryptoTrader._send_email_alert(
                 object(), "日报", subject="测试", event="daily_report", wait=True)
         self.assertFalse(ok)
@@ -109,8 +112,11 @@ class BotRunnerEmailConfirmTests(unittest.TestCase):
 
     def test_crash_email_returns_true_on_confirmed_send(self):
         server = mock.MagicMock()
+        server.ehlo.return_value = (250, b"OK")
+        server.has_extn.return_value = True
+        server.sendmail.return_value = {}
         with mock.patch.dict(os.environ, MAIL_ENV), \
-                mock.patch("smtplib.SMTP_SSL") as smtp:
+                mock.patch("smtplib.SMTP") as smtp:
             smtp.return_value.__enter__.return_value = server
             ok = bot_runner.send_email_alert(
                 "崩溃报警", subject="测试", event="crash", wait=True)
@@ -120,7 +126,7 @@ class BotRunnerEmailConfirmTests(unittest.TestCase):
     def test_crash_email_returns_false_when_smtp_raises(self):
         """SMTP 抛错 → 必须 False，调用方据此不得记「已发送」"""
         with mock.patch.dict(os.environ, MAIL_ENV), \
-                mock.patch("smtplib.SMTP_SSL", side_effect=OSError("smtp down")):
+                mock.patch("smtplib.SMTP", side_effect=OSError("smtp down")):
             ok = bot_runner.send_email_alert(
                 "崩溃报警", subject="测试", event="crash", wait=True)
         self.assertFalse(ok)
@@ -128,7 +134,7 @@ class BotRunnerEmailConfirmTests(unittest.TestCase):
     def test_crash_email_false_when_gate_blocks(self):
         with mock.patch.object(email_gate, "should_send_email",
                                return_value=(False, "disabled")), \
-                mock.patch("smtplib.SMTP_SSL") as smtp:
+                mock.patch("smtplib.SMTP") as smtp:
             ok = bot_runner.send_email_alert(
                 "崩溃报警", subject="测试", event="crash", wait=True)
         self.assertFalse(ok)
@@ -424,8 +430,11 @@ class WatchdogFatalAlertTests(unittest.TestCase):
         with open(state, "w", encoding="utf-8") as f:
             json.dump({"BTCUSDT": {"b1": {"is_active": False}}}, f)
         server = mock.MagicMock()
+        server.ehlo.return_value = (250, b"OK")
+        server.has_extn.return_value = True
+        server.sendmail.return_value = {}
         with mock.patch.object(patrol, "TRADE_STATE_FILE", state), \
-                mock.patch("smtplib.SMTP_SSL") as smtp, \
+                mock.patch("smtplib.SMTP") as smtp, \
                 mock.patch.object(patrol, "log"):
             smtp.return_value.__enter__.return_value = server
             ok = patrol.send_email(dict(MAIL_ENV), "巡检异常", "text", event="health")

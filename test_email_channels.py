@@ -38,7 +38,7 @@ class EmailChannelGateTests(unittest.TestCase):
         env = self._env(EMAIL_ALERT_ENABLED="false")
         with mock.patch.object(
             email_gate, "should_send_email", return_value=(False, "disabled")
-        ) as gate, mock.patch("smtplib.SMTP_SSL") as smtp, \
+        ) as gate, mock.patch("smtplib.SMTP") as smtp, \
                 mock.patch.object(patrol, "log") as plog:
             self.assertFalse(patrol.send_email(env, "subject", "text"))
         gate.assert_called_once()
@@ -51,7 +51,7 @@ class EmailChannelGateTests(unittest.TestCase):
             json.dump({"BTCUSDT": {"b1": {"is_active": False}}}, f)
         with mock.patch.object(
             patrol, "TRADE_STATE_FILE", self.state_path
-        ), mock.patch("smtplib.SMTP_SSL") as smtp, \
+        ), mock.patch("smtplib.SMTP") as smtp, \
                 mock.patch.object(patrol, "log"):
             self.assertFalse(patrol.send_email(env, "subject", "text"))
         smtp.assert_not_called()
@@ -62,8 +62,11 @@ class EmailChannelGateTests(unittest.TestCase):
             json.dump({"BTCUSDT": {"b1": {"is_active": True}}}, f)
 
         server = mock.MagicMock()
+        server.ehlo.return_value = (250, b"OK")
+        server.has_extn.return_value = True
+        server.sendmail.return_value = {}
         with mock.patch.object(patrol, "TRADE_STATE_FILE", self.state_path), \
-                mock.patch("smtplib.SMTP_SSL") as smtp, \
+                mock.patch("smtplib.SMTP") as smtp, \
                 mock.patch.object(patrol, "log") as plog:
             smtp.return_value.__enter__.return_value = server
             self.assertTrue(patrol.send_email(env, "subject", "text", event="health"))
