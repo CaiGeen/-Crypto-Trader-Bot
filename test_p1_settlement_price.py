@@ -59,11 +59,12 @@ def check(name, passed, detail=""):
     return bool(passed)
 
 
-# ────────────────── 生产免疫快照（模块导入时采集）──────────────────
-
-_PROD_DIR = r'G:\my-crypto-bot'
+# ────────────────── 隔离 checkout 免疫快照（模块导入时采集）──────────
+# 该测试必须在干净 checkout 中可独立运行；禁止读取生产目录，尤其不能
+# 为了“证明未修改”而读取生产 .env（其中可能含凭证）。
+_PROD_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROD_FILES = ['trade_state.json', 'trade_state.json.bak', 'trade_tombstones.json',
-               'trade_stats.json', 'signal.json', 'signal_dedup.json', '.env']
+               'trade_stats.json', 'signal.json', 'signal_dedup.json']
 
 
 def _prod_snapshot():
@@ -331,7 +332,7 @@ def t98_shared_exec_namespace_untouched():
 def t99_production_files_untouched():
     after = _prod_snapshot()
     diff = [k for k in _PROD_AT_IMPORT if after.get(k) != _PROD_AT_IMPORT[k]]
-    ok = check('T99 生产账本/墓碑/统计/信号/.env 零变化（内容+mtime_ns）',
+    ok = check('T99 隔离 checkout 账本/墓碑/统计/信号零变化（内容+mtime_ns）',
                not diff, 'diff=%s' % diff)
     try:
         import trader_260725 as _tr
