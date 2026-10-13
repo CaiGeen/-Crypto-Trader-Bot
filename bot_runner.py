@@ -391,6 +391,15 @@ async def _process_notify_queue_once(bot, chat_id: int,
             continue
 
         notify_type, notify_msg = _parse_notify_content(content)
+        if notify_type == 'ip_notify':
+            # 历史普通出口通知不再外发。保留原事件文件与持久静默记录。
+            st['status'] = 'SILENCED'
+            st['silenced_reason'] = 'non_actionable_ip_change'
+            _append_notify_audit(event_id, 'POLICY_SILENCED',
+                                 st.get('failed_attempts', 0), evidence, audit_log)
+            stats['silenced'] += 1
+            print(f"ℹ️ [IP观测] 历史通知仅留证据，不外发: {event_id}")
+            continue
         stats['processed'] += 1
         ok = False
 
@@ -403,27 +412,21 @@ async def _process_notify_queue_once(bot, chat_id: int,
                 except Exception as e:
                     logging.warning(f"⚠️ 汇总通知发送失败: {e}")
         else:
-            if notify_type == 'ip_notify':
-                text = f"🌐 **IP 地址已变化！**\n\n{notify_msg}"
-            elif notify_type == 'crash_alert':
+            if notify_type == 'crash_alert':
                 text = f"💥 **程序崩溃报警！**\n\n{notify_msg}"
             elif notify_type == 'watchdog_alert':
                 # D-010 B2（W2/E5 对偶面）：watchdog 通用告警——独立类型语义（不复用
                 # crash_alert 的"崩溃/重启"语义，ChatGPT 终审批定）；普通 TG 发送，无 email/汇总副作用
                 text = f"🐕 **Watchdog 告警**\n\n{notify_msg}"
             elif notify_type == 'auth_blocked':
-                # D-010 B2：AUTH_BLOCKED 三通道的队列事件（TG 已由 trader 直发过时为
-                # 崩溃窗口重复投递，C2 语义接受）；普通 TG 发送，无 email 副作用（Email 由 trader critical 级负责）
+                # TG 主投递；邮件由 trader 独立尝试，消费重试不重复发邮件。
                 text = f"🔒 **鉴权封锁告警（盲区安全模式）**\n\n{notify_msg}"
             else:
                 text = f"📨 **通知**\n{notify_msg}"
 
             ok = await _send_notify_with_fallback(bot, chat_id, text)
 
-            if notify_type == 'ip_notify':
-                if ok:
-                    logging.info("📨 IP 备用通知已发送")
-            elif notify_type == 'crash_alert':
+            if notify_type == 'crash_alert':
                 # R0 / F11（2026-09-25）：崩溃邮件**独立于 Telegram 结果**。
                 # 修复前邮件位于 `if ok:` 内 → TG 连续失败 3 轮进 SILENCED 后永不发邮件，
                 # 即「TG 挂了就没人知道程序崩了」；bot 启动熔断时更无消费进程。
@@ -2673,8 +2676,14 @@ async def run_trader_execution(update: Update, context: ContextTypes.DEFAULT_TYP
                 await safe_reply(update, success_msg, parse_mode='Markdown', reply_markup=markup)
             else:
                 print(f"\n❌ execute_signal 返回 None")
-                await safe_reply(update, "⚠️ **挂单未执行**（可能触发防冲突机制或资金校验未通过）。",
-                                 parse_mode='Markdown')
+                auth = trader._load_auth_state()
+                if auth.get('locked'):
+                    await safe_reply(update,
+                        "🔒 挂单未执行：程序处于鉴权封锁/盲区安全模式。\n"
+                        "请检查实际 API Key、IP 白名单和权限；修复后发送 /auth_reset（探活→对账→解锁）。")
+                else:
+                    await safe_reply(update, "⚠️ **挂单未执行**（可能触发防冲突机制或资金校验未通过）。",
+                                     parse_mode='Markdown')
 
         except Exception as e:
             logging.exception("🚨 交易引擎运行崩溃:")

@@ -30,24 +30,24 @@ class NotificationEmailPolicyTests(unittest.TestCase):
                     env={'EMAIL_ALERT_ENABLED': 'false'}, event=event)
                 self.assertFalse(allowed)
 
-    def test_ip_rotation_keeps_tg_without_email_or_whitelist_claim(self):
+    def test_ip_rotation_only_records_without_any_external_notification(self):
         fake = mock.MagicMock()
         fake.last_known_ip = '119.237.242.94'
         fake._save_last_ip.side_effect = lambda ip: setattr(fake, 'last_known_ip', ip)
         fake._try_async_send.return_value = True
         for ip in ('219.76.133.122', '119.237.242.94', '219.76.133.122'):
             trader_260725.CryptoTrader._record_ip_change(fake, ip, 'periodic_check')
-        self.assertEqual(fake._try_async_send.call_count, 3)
+        self.assertEqual(fake.last_known_ip, '219.76.133.122')
+        self.assertEqual(fake._save_last_ip.call_count, 3)
+        fake._try_async_send.assert_not_called()
+        fake._fallback_notify_file.assert_not_called()
+        fake._enqueue_notify_event.assert_not_called()
         fake._send_email_alert.assert_not_called()
-        for call in fake._try_async_send.call_args_list:
-            self.assertNotIn('请将新 IP 添加', call.args[0])
 
-    def test_ip_fallback_is_tg_only_and_neutral(self):
+    def test_legacy_ip_fallback_never_enqueues(self):
         fake = mock.MagicMock()
         trader_260725.CryptoTrader._fallback_notify_file(fake, '119.237.242.94', 'periodic_check')
-        kind, text = fake._enqueue_notify_event.call_args.args
-        self.assertEqual(kind, 'ip_notify')
-        self.assertNotIn('请将新 IP 添加', text)
+        fake._enqueue_notify_event.assert_not_called()
         fake._send_email_alert.assert_not_called()
 
     def test_warning_does_not_email_but_critical_does(self):
